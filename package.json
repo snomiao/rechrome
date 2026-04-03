@@ -1,9 +1,10 @@
 {
-  "name": "rech",
-  "version": "0.1.0",
+  "name": "rechrome",
+  "version": "0.0.0-semantically-released",
   "type": "module",
   "bin": {
-    "rech": "./rech.ts"
+    "rech": "./rech.ts",
+    "rechrome": "./rech.ts"
   },
   "scripts": {
     "serve": "bun run rech.ts serve",
@@ -11,5 +12,15 @@
   },
   "devDependencies": {
     "@types/bun": "latest"
-  }
+  },
+  "release": {
+    "branches": ["main"]
+  },
+  "files": [
+    "rech.ts",
+    "serve.ts",
+    ".env.example",
+    "README.md",
+    "LICENSE"
+  ]
 }
