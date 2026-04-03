@@ -6,6 +6,11 @@ import { mkdirSync, appendFileSync, existsSync } from "fs";
 import { hostname } from "os";
 import { join, basename } from "path";
 
+export const ENV_KEY = "REMOTE_CHROME_URL";
+export const DEFAULT_PORT = 13775;
+export const RECH_DIR = join(import.meta.dir, ".rech");
+export const LOG_DIR = join(RECH_DIR, "logs");
+
 // Load .env.local from script's directory (works even when invoked from elsewhere)
 const envFile = join(import.meta.dir, ".env.local");
 
@@ -23,15 +28,12 @@ await loadEnv();
 
 // Watch .env.local for changes and hot-reload
 import { watch } from "node:fs";
-watch(envFile, async () => {
-  log(".env.local changed, reloading");
-  await loadEnv();
-});
-
-export const ENV_KEY = "REMOTE_CHROME_URL";
-export const DEFAULT_PORT = 13775;
-export const RECH_DIR = join(import.meta.dir, ".rech");
-export const LOG_DIR = join(RECH_DIR, "logs");
+if (existsSync(envFile)) {
+  watch(envFile, async () => {
+    log(".env.local changed, reloading");
+    await loadEnv();
+  });
+}
 
 /** Describe an image using Gemini vision API. Returns description or null on failure. */
 export async function describeImage(imagePath: string): Promise<string | null> {
