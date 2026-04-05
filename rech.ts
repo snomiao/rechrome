@@ -163,6 +163,11 @@ function getClientEnv(): Record<string, string> {
 
 async function run(url: string, args: string[]) {
   const { key, host, port } = parseUrl(url);
+
+  // Extract --gemini-vision flag (not forwarded to server args)
+  const geminiVision = args.includes("--gemini-vision");
+  const filteredArgs = args.filter((a) => a !== "--gemini-vision");
+
   const identity = await getClientIdentity();
   console.error(
     `[rech] connecting to ${host}:${port} (identity: ${identity.gitUrl || `${identity.hostname}:${identity.cwd}`})`,
@@ -170,7 +175,7 @@ async function run(url: string, args: string[]) {
   const res = await fetch(`http://${host}:${port}/run`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
-    body: JSON.stringify({ args, identity, env: getClientEnv() }),
+    body: JSON.stringify({ args: filteredArgs, identity, env: getClientEnv(), geminiVision }),
     signal: AbortSignal.timeout(70_000),
   }).catch((e) => {
     console.error(`[rech] ${e.message}`);

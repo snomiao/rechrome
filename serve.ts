@@ -53,6 +53,7 @@ export async function serve() {
       let sessionId: string;
       let clientName = "";
       let clientEnv: Record<string, string> = {};
+      let geminiVision = false;
       if (Array.isArray(body)) {
         args = body;
         const clientAddr = `${req.headers.get("x-forwarded-for") || server.requestIP(req)?.address || "unknown"}`;
@@ -81,6 +82,7 @@ export async function serve() {
             if (typeof body.env[key] === "string") clientEnv[key] = body.env[key];
           }
         }
+        if (body.geminiVision) geminiVision = true;
       }
 
       let clientSession = "";
@@ -200,12 +202,14 @@ export async function serve() {
         }
       }
 
-      // Auto-describe screenshot files with Gemini vision
+      // Auto-describe screenshot files with Gemini vision (opt-in via --gemini-vision)
       const descriptions: Record<string, string> = {};
-      for (const f of outputFiles) {
-        if (/\.(?:png|jpe?g)$/i.test(f)) {
-          const desc = await describeImage(join(workDir, f));
-          if (desc) descriptions[f] = desc;
+      if (geminiVision) {
+        for (const f of outputFiles) {
+          if (/\.(?:png|jpe?g)$/i.test(f)) {
+            const desc = await describeImage(join(workDir, f));
+            if (desc) descriptions[f] = desc;
+          }
         }
       }
 
