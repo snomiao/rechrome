@@ -141,7 +141,12 @@ async function getClientIdentity(): Promise<{ gitUrl?: string; hostname?: string
       }
       if (branch) gitUrl += `/tree/${branch}`;
       // Strip any embedded credentials from the URL
-      try { const u = new URL(gitUrl); u.username = ""; u.password = ""; gitUrl = u.toString(); } catch {}
+      try {
+        const u = new URL(gitUrl);
+        u.username = "";
+        u.password = "";
+        gitUrl = u.toString();
+      } catch {}
       return { gitUrl };
     }
   } catch {}

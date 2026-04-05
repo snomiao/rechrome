@@ -1,7 +1,6 @@
 {
   "name": "rechrome",
   "version": "0.0.0-semantically-released",
-  "type": "module",
   "repository": {
     "type": "git",
     "url": "https://github.com/snomiao/rechrome.git"
@@ -10,6 +9,16 @@
     "rech": "./rech.js",
     "rechrome": "./rech.js"
   },
+  "files": [
+    ".env.example",
+    "LICENSE",
+    "README.md",
+    "rech.js",
+    "rech.ts",
+    "serve.js",
+    "serve.ts"
+  ],
+  "type": "module",
   "scripts": {
     "serve": "bun run rech.ts serve",
     "test": "bun test",
@@ -19,15 +28,8 @@
     "@types/bun": "latest"
   },
   "release": {
-    "branches": ["main"]
-  },
-  "files": [
-    "rech.ts",
-    "rech.js",
-    "serve.ts",
-    "serve.js",
-    ".env.example",
-    "README.md",
-    "LICENSE"
-  ]
+    "branches": [
+      "main"
+    ]
+  }
 }

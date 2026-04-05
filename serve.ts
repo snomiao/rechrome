@@ -2,7 +2,15 @@ import { file } from "bun";
 import { createHash } from "crypto";
 import { mkdirSync } from "fs";
 import { join, resolve, relative, isAbsolute } from "path";
-import { log, parseUrl, getOrCreateUrl, authCheck, describeImage, RECH_DIR, PASSTHROUGH_ENV_KEYS } from "./rech.ts";
+import {
+  log,
+  parseUrl,
+  getOrCreateUrl,
+  authCheck,
+  describeImage,
+  RECH_DIR,
+  PASSTHROUGH_ENV_KEYS,
+} from "./rech.ts";
 
 export function isUnderDir(base: string, candidate: string): boolean {
   const absBase = resolve(base) + "/";
