@@ -101,8 +101,11 @@ export async function serve() {
 
       log(`run: rech ${filteredArgs.join(" ")} (session=${namespacedSession})`);
 
-      // For open commands, check if this session already has tabs open
+      // For open commands, default to about:blank to avoid leaving connect.html visible
       const isOpenCmd = filteredArgs[0] === "open";
+      if (isOpenCmd && filteredArgs.length === 1)
+        filteredArgs.push("about:blank");
+
       if (isOpenCmd) {
         try {
           const listProc = Bun.spawn([bin, ...binArgs, "tab-list", "--extension", `-s=${namespacedSession}`], {
