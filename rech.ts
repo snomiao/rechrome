@@ -152,11 +152,11 @@ function getClientEnv(urlExtras?: { extensionId?: string; extensionToken?: strin
   for (const key of PASSTHROUGH_ENV_KEYS) {
     if (process.env[key]) env[key] = process.env[key];
   }
-  if (urlExtras?.extensionId && !env["PLAYWRIGHT_MCP_EXTENSION_ID"])
+  if (urlExtras?.extensionId)
     env["PLAYWRIGHT_MCP_EXTENSION_ID"] = urlExtras.extensionId;
-  if (urlExtras?.extensionToken && !env["PLAYWRIGHT_MCP_EXTENSION_TOKEN"])
+  if (urlExtras?.extensionToken)
     env["PLAYWRIGHT_MCP_EXTENSION_TOKEN"] = urlExtras.extensionToken;
-  if (urlExtras?.profileDirectory && !env["PLAYWRIGHT_MCP_PROFILE_DIRECTORY"])
+  if (urlExtras?.profileDirectory)
     env["PLAYWRIGHT_MCP_PROFILE_DIRECTORY"] = urlExtras.profileDirectory;
   return env;
 }
