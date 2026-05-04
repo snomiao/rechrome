@@ -28,17 +28,16 @@ async function loadEnvFile(path: string): Promise<boolean> {
 }
 
 async function loadEnv() {
-  await loadEnvFile(envFile);
-  // Walk up from cwd if still not found
-  if (!process.env[ENV_KEY]) {
-    let dir = process.cwd();
-    while (true) {
-      if (await loadEnvFile(join(dir, ".env.local"))) break;
-      const parent = join(dir, "..");
-      if (parent === dir) break;
-      dir = parent;
-    }
+  // Walk up from cwd first — project-local .env.local takes priority
+  let dir = process.cwd();
+  while (true) {
+    if (await loadEnvFile(join(dir, ".env.local"))) break;
+    const parent = join(dir, "..");
+    if (parent === dir) break;
+    dir = parent;
   }
+  // Fall back to script dir's .env.local
+  if (!process.env[ENV_KEY]) await loadEnvFile(envFile);
 }
 await loadEnv();
 

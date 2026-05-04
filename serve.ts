@@ -17,6 +17,27 @@ export function isUnderDir(base: string, candidate: string): boolean {
   return absCandidate.startsWith(absBase);
 }
 
+async function resolveProfileDirectory(nameOrEmail: string): Promise<string> {
+  if (/^(Default|Profile \d+)$/i.test(nameOrEmail)) return nameOrEmail;
+  const home = process.env.HOME || "~";
+  const candidates = [
+    join(home, "Library/Application Support/Google/Chrome/Local State"),
+    join(home, ".config/google-chrome/Local State"),
+    join(home, "AppData/Local/Google/Chrome/User Data/Local State"),
+  ];
+  for (const statePath of candidates) {
+    const f = file(statePath);
+    if (!(await f.exists())) continue;
+    const data = JSON.parse(await f.text());
+    const cache: Record<string, any> = data?.profile?.info_cache ?? {};
+    for (const [dir, info] of Object.entries(cache)) {
+      if ([info.name, info.user_name, info.gaia_name].includes(nameOrEmail))
+        return dir;
+    }
+  }
+  return nameOrEmail;
+}
+
 export async function serve() {
   const url = await getOrCreateUrl();
   const { key, port } = parseUrl(url);
@@ -140,6 +161,14 @@ export async function serve() {
         if (process.env[key]) passthroughEnv[key] = process.env[key];
       }
       Object.assign(passthroughEnv, clientEnv);
+
+      // Resolve profile name/email → directory name
+      if (passthroughEnv.PLAYWRIGHT_MCP_PROFILE_DIRECTORY) {
+        const resolved = await resolveProfileDirectory(passthroughEnv.PLAYWRIGHT_MCP_PROFILE_DIRECTORY);
+        if (resolved !== passthroughEnv.PLAYWRIGHT_MCP_PROFILE_DIRECTORY)
+          log(`profile resolved: "${passthroughEnv.PLAYWRIGHT_MCP_PROFILE_DIRECTORY}" → "${resolved}"`);
+        passthroughEnv.PLAYWRIGHT_MCP_PROFILE_DIRECTORY = resolved;
+      }
 
       const childEnv: Record<string, string | undefined> = {
         PATH: process.env.PATH,
