@@ -166,16 +166,36 @@ function getClientEnv(urlExtras?: { extensionId?: string; extensionToken?: strin
   return env;
 }
 
+async function resolveProfileEmail(dir: string): Promise<string> {
+  const home = process.env.HOME || "~";
+  const candidates = [
+    join(home, "Library/Application Support/Google/Chrome/Local State"),
+    join(home, ".config/google-chrome/Local State"),
+    join(home, "AppData/Local/Google/Chrome/User Data/Local State"),
+  ];
+  for (const statePath of candidates) {
+    const f = file(statePath);
+    if (!(await f.exists())) continue;
+    try {
+      const data = JSON.parse(await f.text());
+      const info = data?.profile?.info_cache?.[dir];
+      if (info?.user_name) return info.user_name;
+    } catch {}
+  }
+  return dir;
+}
+
 async function run(url: string, args: string[]) {
   const { key, host, port, protocol, extensionId, extensionToken, profileDirectory } = parseUrl(url);
 
   // Effective profile: URL param takes priority over env var
   const effectiveProfile = profileDirectory || process.env.PLAYWRIGHT_MCP_PROFILE_DIRECTORY;
+  const displayProfile = effectiveProfile ? await resolveProfileEmail(effectiveProfile) : undefined;
 
   const identity = await getClientIdentity();
   if (effectiveProfile) (identity as any).profile = effectiveProfile;
 
-  const profileSuffix = effectiveProfile ? ` profile:${effectiveProfile}` : "";
+  const profileSuffix = displayProfile ? ` profile:${displayProfile}` : "";
   console.error(
     `[rech] connecting to ${host}:${port} (identity: ${identity.gitUrl || `${identity.hostname}:${identity.cwd}`}${profileSuffix})`,
   );
