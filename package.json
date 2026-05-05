@@ -6,8 +6,8 @@
     "url": "https://github.com/snomiao/rechrome.git"
   },
   "bin": {
-    "rech": "./rech.js",
-    "rechrome": "./rech.js"
+    "rech": "./rech.ts",
+    "rechrome": "./rech.ts"
   },
   "files": [
     ".env.example",

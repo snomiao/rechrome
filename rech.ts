@@ -169,9 +169,15 @@ function getClientEnv(urlExtras?: { extensionId?: string; extensionToken?: strin
 async function run(url: string, args: string[]) {
   const { key, host, port, protocol, extensionId, extensionToken, profileDirectory } = parseUrl(url);
 
+  // Effective profile: URL param takes priority over env var
+  const effectiveProfile = profileDirectory || process.env.PLAYWRIGHT_MCP_PROFILE_DIRECTORY;
+
   const identity = await getClientIdentity();
+  if (effectiveProfile) (identity as any).profile = effectiveProfile;
+
+  const profileSuffix = effectiveProfile ? ` profile:${effectiveProfile}` : "";
   console.error(
-    `[rech] connecting to ${host}:${port} (identity: ${identity.gitUrl || `${identity.hostname}:${identity.cwd}`})`,
+    `[rech] connecting to ${host}:${port} (identity: ${identity.gitUrl || `${identity.hostname}:${identity.cwd}`}${profileSuffix})`,
   );
   const res = await fetch(`${protocol}://${host}:${port}/run`, {
     method: "POST",

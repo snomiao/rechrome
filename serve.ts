@@ -82,9 +82,10 @@ export async function serve() {
       } else {
         args = body.args;
         const id = body.identity as
-          | { gitUrl?: string; hostname?: string; cwd?: string }
+          | { gitUrl?: string; hostname?: string; cwd?: string; profile?: string }
           | undefined;
-        const raw = id?.gitUrl || (id?.hostname && id?.cwd ? `${id.hostname}:${id.cwd}` : null);
+        const baseId = id?.gitUrl || (id?.hostname && id?.cwd ? `${id.hostname}:${id.cwd}` : null);
+        const raw = baseId && id?.profile ? `${baseId}@${id.profile}` : baseId;
         if (raw) {
           sessionId = createHash("sha256").update(raw).digest("hex").slice(0, 12);
           clientName = raw;
@@ -129,7 +130,7 @@ export async function serve() {
 
       if (isOpenCmd) {
         try {
-          const listProc = Bun.spawn([bin, ...binArgs, "tab-list", "--extension", `-s=${namespacedSession}`], {
+          const listProc = Bun.spawn([bin, ...binArgs, "tab-list", `-s=${namespacedSession}`], {
             cwd: workDir,
             stdin: "ignore",
             stdout: "pipe",
@@ -179,7 +180,7 @@ export async function serve() {
         ...(clientName ? { PLAYWRIGHT_MCP_CLIENT_NAME: clientName } : {}),
         ...passthroughEnv,
       };
-      const proc = Bun.spawn([bin, ...binArgs, ...filteredArgs, "--extension", `-s=${namespacedSession}`], {
+      const proc = Bun.spawn([bin, ...binArgs, ...filteredArgs, `-s=${namespacedSession}`], {
         cwd: workDir,
         stdin: "ignore",
         stdout: "pipe",
