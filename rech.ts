@@ -381,6 +381,11 @@ async function run(url: string, args: string[]) {
   const resolvedEnv = await getClientEnv({ extensionId, extensionToken, profileDirectory, userDataDir });
   const { status, stdout, stderr, files, existingSession } = await callServe(url, args);
 
+  const isOpenWithUrl = args[0] === "open" && args.length > 1;
+  if (existingSession && isOpenWithUrl) {
+    return run(url, ["goto", ...args.slice(1)]);
+  }
+
   if (existingSession)
     console.error(`[rech] session already has open tabs — listing existing tabs instead of opening a new window`);
   if (stderr) {
@@ -406,7 +411,7 @@ async function run(url: string, args: string[]) {
       });
       if (!fileRes.ok) continue;
       const dest = join(dlDir, basename(name));
-      await Bun.write(dest, fileRes);
+      await Bun.write(dest, await fileRes.arrayBuffer());
       console.error(`[rech] downloaded: ${dest}`);
     }
   }

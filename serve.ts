@@ -173,8 +173,8 @@ export async function serve() {
 
       // For open commands, default to about:blank to avoid leaving connect.html visible
       const isOpenCmd = filteredArgs[0] === "open";
-      if (isOpenCmd && filteredArgs.length === 1)
-        filteredArgs.push("about:blank");
+      const isOpenNoUrl = isOpenCmd && filteredArgs.length === 1;
+      if (isOpenNoUrl) filteredArgs.push("about:blank");
 
       // bare `rech open` with no URL: warn if session already has tabs
       if (isOpenCmd && filteredArgs.length === 1) {
@@ -186,19 +186,26 @@ export async function serve() {
             stderr: "pipe",
             env: { PATH: process.env.PATH, HOME: process.env.HOME },
           });
-          const [listStatus, listOut] = await Promise.all([
-            listProc.exited,
-            new Response(listProc.stdout).text(),
+          const [listStatus, listOut] = await Promise.race([
+            Promise.all([listProc.exited, new Response(listProc.stdout).text()]),
+            new Promise<[number, string]>((resolve) =>
+              setTimeout(() => { listProc.kill(); resolve([1, ""]); }, 5000)
+            ),
           ]);
           if (listStatus === 0 && listOut.trim()) {
-            log(`session ${namespacedSession} already has tabs, returning tab-list hint`);
-            return Response.json({
-              status: 0,
-              stdout: listOut,
-              stderr: `[rech] session "${namespacedSession}" already has open tabs:\n`,
-              files: [],
-              existingSession: true,
-            });
+            if (isOpenNoUrl) {
+              log(`session ${namespacedSession} already has tabs, returning tab-list hint`);
+              return Response.json({
+                status: 0,
+                stdout: listOut,
+                stderr: `[rech] session "${namespacedSession}" already has open tabs:\n`,
+                files: [],
+                existingSession: true,
+              });
+            }
+            // URL specified: navigate to it instead of returning tab-list
+            log(`session ${namespacedSession} already has tabs, converting open to goto`);
+            filteredArgs[0] = "goto";
           }
         } catch (e) {
           log(`tab-list check failed: ${e}`);
