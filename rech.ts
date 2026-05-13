@@ -382,6 +382,13 @@ function buildSetupHtml(extDistDir: string, profileDisplay: string): string {
   <h3>Step 4 — Return to terminal</h3>
   <p>Press <strong>Enter</strong> in the terminal to continue setup.</p>
 </div>
+
+<div class="step">
+  <h3>Step 5 — Copy auth token</h3>
+  <p>Click the extension icon in the Chrome toolbar (or open the URL below):</p>
+  <code id="statusUrl">chrome-extension://(detected after install)/status.html</code>
+  <p>The page shows <strong>PLAYWRIGHT_MCP_EXTENSION_TOKEN=...</strong> — paste that into the terminal when prompted.</p>
+</div>
 </body>
 </html>`;
 }
@@ -529,20 +536,25 @@ async function setup(): Promise<void> {
   }
   console.log(`      Extension found: ${extId}`);
 
-  // [4/4] Token
-  console.log("\n[4/4] Connecting to extension...");
-  const openResult = await callServe(url, ["open", `chrome-extension://${extId}/status.html`], profileEnv);
-  if (openResult.status !== 0) { process.stderr.write(openResult.stderr); rl.close(); process.exit(openResult.status); }
-  const evalResult = await callServe(url, ["eval", `() => localStorage.getItem('auth-token')`], profileEnv);
-  const tokenMatch = evalResult.stdout.match(/"([A-Za-z0-9_-]{20,})"/);
-  const token = tokenMatch?.[1];
-  if (!token) {
-    printInstallInstructions(profileDisplay);
-    console.error("      Could not read auth token — extension may not be loaded in this profile.");
+  // [4/4] Token — user copies it from the extension status page
+  const statusUrl = `chrome-extension://${extId}/status.html`;
+  console.log(`\n[4/4] Get auth token from the extension:`);
+  console.log(`\n      Open this URL in Chrome (profile: ${profileDisplay}):`);
+  console.log(`        ${statusUrl}`);
+  console.log(`\n      Or click the extension icon in the Chrome toolbar.`);
+  console.log(`      Copy the token shown on the page (PLAYWRIGHT_MCP_EXTENSION_TOKEN=...).\n`);
+  Bun.spawn(["open", statusUrl], { stdout: "ignore", stderr: "ignore" });
+  rl.resume();
+  const tokenInput = (await ask("      Paste token: ")).trim();
+  rl.pause();
+  // Accept bare token or KEY=value format
+  const token = tokenInput.replace(/^.*?=/, "").trim();
+  if (!token || token.length < 20) {
+    console.error("      Invalid token (too short)");
     rl.close();
     process.exit(1);
   }
-  console.log("      Auth token retrieved");
+  console.log("      Token accepted");
   rl.close();
 
   // Save config
