@@ -540,20 +540,17 @@ async function setup(): Promise<void> {
   }
   console.log(`      Extension found: ${extId}`);
 
-  // [4/4] Token — open status.html in the correct profile, user copies token
+  // [4/4] Token — open status.html directly in Chrome (no bridge yet, no stale token)
   const statusUrl = `chrome-extension://${extId}/status.html`;
   console.log(`\n[4/4] Get auth token from the extension:`);
   console.log(`        ${statusUrl}`);
 
-  // Try to open via playwright in the selected profile; fall back to Chrome CLI
-  const openResult = await callServe(url, ["open", statusUrl], profileEnv).catch(() => null);
-  if (!openResult || openResult.status !== 0) {
-    // macOS: open Chrome with explicit profile directory
-    Bun.spawn(
-      ["open", "-a", "Google Chrome", "--args", `--profile-directory=${profileDir}`, statusUrl],
-      { stdout: "ignore", stderr: "ignore" },
-    );
-  }
+  // Open via Chrome CLI with explicit profile — avoids using any stale extension token
+  Bun.spawn(
+    ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+     `--profile-directory=${profileDir}`, statusUrl],
+    { stdout: "ignore", stderr: "ignore", detached: true },
+  );
 
   console.log(`\n      Or click the extension icon in the Chrome toolbar.`);
   console.log(`      Copy the token shown on the page (PLAYWRIGHT_MCP_EXTENSION_TOKEN=...).\n`);
