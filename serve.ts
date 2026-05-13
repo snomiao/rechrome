@@ -87,6 +87,10 @@ export async function serve() {
     hostname: listenHost,
     port,
     tls,
+    error(err) {
+      log(`unhandled error: ${err.message}`);
+      return Response.json({ status: 1, stdout: "", stderr: err.message }, { status: 500 });
+    },
     async fetch(req) {
       const reqUrl = new URL(req.url);
 

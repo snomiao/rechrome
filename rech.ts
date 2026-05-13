@@ -94,10 +94,9 @@ export async function getOrCreateUrl(): Promise<string> {
   const key = randomBytes(9).toString("base64url"); // 12 chars
   const url = `http://${key}@127.0.0.1:${DEFAULT_PORT}`;
   const newLine = `${ENV_KEY}=${url}`;
-  const envRaw = await file(envFile)
-    .text()
-    .catch(() => "");
-  const content = envRaw.trimEnd() ? envRaw.trimEnd() + "\n" + newLine + "\n" : newLine + "\n";
+  const envRaw = await file(envFile).text().catch(() => "");
+  const lines = envRaw.trimEnd().split("\n").filter(l => !l.startsWith(`${ENV_KEY}=`));
+  const content = [...lines, newLine, ""].join("\n");
   Bun.write(envFile, content);
   process.env[ENV_KEY] = url;
   return url;
@@ -406,7 +405,9 @@ async function daemonInstall(serveUrl: string): Promise<boolean> {
   <key>EnvironmentVariables</key>
   <dict>
     <key>HOME</key><string>${home}</string>
-    <key>${ENV_KEY}</key><string>${serveUrl}</string>
+    <key>PATH</key><string>${process.env.PATH || "/usr/local/bin:/usr/bin:/bin"}</string>
+    <key>${ENV_KEY}</key><string>${serveUrl}</string>${process.env.PLAYWRIGHT_CLI ? `
+    <key>PLAYWRIGHT_CLI</key><string>${process.env.PLAYWRIGHT_CLI}</string>` : ""}
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
