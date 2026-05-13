@@ -2,7 +2,7 @@
 
 import { file } from "bun";
 import { randomBytes } from "crypto";
-import { mkdirSync, appendFileSync, existsSync } from "fs";
+import { mkdirSync, appendFileSync, existsSync, unlinkSync } from "fs";
 import { hostname } from "os";
 import { join, basename, dirname } from "path";
 
@@ -92,7 +92,7 @@ export function parseUrl(raw: string) {
 export async function getOrCreateUrl(): Promise<string> {
   if (process.env[ENV_KEY]) return process.env[ENV_KEY];
   const key = randomBytes(9).toString("base64url"); // 12 chars
-  const url = `http://${key}@${hostname()}:${DEFAULT_PORT}`;
+  const url = `http://${key}@127.0.0.1:${DEFAULT_PORT}`;
   const newLine = `${ENV_KEY}=${url}`;
   const envRaw = await file(envFile)
     .text()
@@ -331,83 +331,229 @@ async function run(url: string, args: string[]) {
   process.exit(status);
 }
 
-async function setup(): Promise<void> {
-  // 1. Require serve to be running
-  const url = process.env[ENV_KEY];
-  if (!url) {
-    console.error(`${ENV_KEY} not set — start the server first:\n  rech serve`);
-    process.exit(1);
-  }
-  const { host, port, protocol } = parseUrl(url);
-  const ping = await fetch(`${protocol}://${host}:${port}/`, { signal: AbortSignal.timeout(3000) }).catch(() => null);
-  if (!ping) {
-    console.error(`rech serve is not running at ${host}:${port}\nStart it with:\n  rech serve`);
-    process.exit(1);
-  }
+function buildSetupHtml(extDistDir: string, profileDisplay: string): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>rechrome — Extension Setup</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 40px auto; padding: 0 20px; color: #222; }
+  h1 { color: #1a73e8; }
+  .step { background: #f8f9fa; border-left: 4px solid #1a73e8; padding: 12px 16px; margin: 16px 0; border-radius: 0 8px 8px 0; }
+  .step h3 { margin: 0 0 8px; }
+  code { background: #e8eaed; padding: 2px 6px; border-radius: 4px; font-size: 0.95em; word-break: break-all; }
+  .path { display: flex; align-items: center; gap: 8px; }
+  button { background: #1a73e8; color: white; border: none; padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 0.9em; }
+  button:active { background: #1558b0; }
+  .note { color: #666; font-size: 0.9em; }
+</style>
+</head>
+<body>
+<h1>rechrome — Extension Setup</h1>
+<p>Install the multi-tab extension in Chrome profile: <strong>${profileDisplay}</strong></p>
 
-  // 2. Interactive profile selection
-  const cache = await readChromeProfileCache();
-  if (!cache) { console.error("Chrome profiles not found"); process.exit(1); }
-  const profiles = Object.entries(cache);
-  console.log("\nAvailable Chrome profiles:");
-  profiles.forEach(([dir, info], i) =>
-    console.log(`  ${String(i + 1).padStart(2)}.  ${(info.user_name || "(no email)").padEnd(32)}  ${(info.name || "").padEnd(20)}  [${dir}]`)
-  );
+<div class="step">
+  <h3>Step 1 — Open Chrome Extensions</h3>
+  <p>In the Chrome profile <strong>${profileDisplay}</strong>, navigate to:</p>
+  <code>chrome://extensions/</code>
+  <p class="note">Make sure you are in the correct profile (check the avatar in the top-right corner).</p>
+</div>
+
+<div class="step">
+  <h3>Step 2 — Enable Developer Mode</h3>
+  <p>Toggle <strong>Developer mode</strong> on (top-right of the extensions page).</p>
+</div>
+
+<div class="step">
+  <h3>Step 3 — Load the extension</h3>
+  <p>Click <strong>Load unpacked</strong> and select this directory:</p>
+  <div class="path">
+    <code id="extPath">${extDistDir}</code>
+    <button onclick="navigator.clipboard.writeText(document.getElementById('extPath').textContent).then(()=>{this.textContent='Copied!';setTimeout(()=>this.textContent='Copy path',1500)})">Copy path</button>
+  </div>
+</div>
+
+<div class="step">
+  <h3>Step 4 — Return to terminal</h3>
+  <p>Press <strong>Enter</strong> in the terminal to continue setup.</p>
+</div>
+</body>
+</html>`;
+}
+
+const LAUNCHD_LABEL = "com.rechrome.serve";
+const LAUNCHD_PLIST = join(process.env.HOME!, "Library/LaunchAgents", `${LAUNCHD_LABEL}.plist`);
+
+async function daemonInstall(serveUrl: string): Promise<boolean> {
+  const home = process.env.HOME!;
+  const logDir = join(home, ".rech", "logs");
+  mkdirSync(logDir, { recursive: true });
+  // Use absolute bun + script paths — launchd has no user PATH
+  const bunBin = Bun.which("bun") ?? process.execPath;
+  const rechScript = import.meta.filename;
+  const plist = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${LAUNCHD_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${bunBin}</string>
+    <string>${rechScript}</string>
+    <string>serve</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>${home}</string>
+    <key>${ENV_KEY}</key><string>${serveUrl}</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>${join(logDir, "serve.out.log")}</string>
+  <key>StandardErrorPath</key><string>${join(logDir, "serve.err.log")}</string>
+  <key>WorkingDirectory</key><string>${home}</string>
+</dict>
+</plist>`;
+  await Bun.write(LAUNCHD_PLIST, plist);
+  await Bun.spawn(["launchctl", "unload", LAUNCHD_PLIST], { stdout: "ignore", stderr: "ignore" }).exited;
+  const proc = Bun.spawn(["launchctl", "load", "-w", LAUNCHD_PLIST], { stdout: "ignore", stderr: "ignore" });
+  await proc.exited;
+  return proc.exitCode === 0;
+}
+
+async function daemonUninstall(): Promise<void> {
+  const proc = Bun.spawn(["launchctl", "unload", "-w", LAUNCHD_PLIST], { stdout: "ignore", stderr: "ignore" });
+  await proc.exited;
+  try { unlinkSync(LAUNCHD_PLIST); } catch {}
+  console.log(`Removed launchd agent: ${LAUNCHD_LABEL}`);
+}
+
+async function setup(): Promise<void> {
   const { createInterface } = await import("readline");
   const rl = createInterface({ input: process.stdin, output: process.stdout });
-  const answer = await new Promise<string>(r => rl.question("\nProfile number: ", r));
-  rl.close();
+  const ask = (q: string) => new Promise<string>(r => rl.question(q, r));
+
+  // [1/4] Daemon
+  console.log("\n[1/4] Setting up serve daemon...");
+  const rechBin = Bun.which("rech") ?? process.execPath;
+  // Clear stale hostname-based URL so we always use 127.0.0.1 locally
+  if (process.env[ENV_KEY]) {
+    try {
+      const u = new URL(process.env[ENV_KEY]);
+      if (!["127.0.0.1", "localhost"].includes(u.hostname)) delete process.env[ENV_KEY];
+    } catch {}
+  }
+  const url = await getOrCreateUrl();
+  const { host, port, protocol } = parseUrl(url);
+
+  let ping = await fetch(`${protocol}://${host}:${port}/`, { signal: AbortSignal.timeout(2000) }).catch(() => null);
+  if (ping) {
+    console.log(`      Already running at ${protocol}://${host}:${port}`);
+    if (process.platform === "darwin" && !existsSync(LAUNCHD_PLIST)) {
+      await daemonInstall(url);
+      console.log(`      Registered as login daemon: ${LAUNCHD_LABEL}`);
+    }
+  } else {
+    if (process.platform === "darwin") {
+      await daemonInstall(url);
+      console.log(`      Registered as login daemon: ${LAUNCHD_LABEL}`);
+      process.stdout.write("      Starting");
+      for (let i = 0; i < 15; i++) {
+        await Bun.sleep(1000);
+        ping = await fetch(`${protocol}://${host}:${port}/`, { signal: AbortSignal.timeout(2000) }).catch(() => null);
+        if (ping) break;
+        process.stdout.write(".");
+      }
+      process.stdout.write("\n");
+    }
+    if (!ping) {
+      Bun.spawn([rechBin, "serve"], { stdout: "ignore", stderr: "ignore", detached: true });
+      process.stdout.write("      Starting");
+      for (let i = 0; i < 10; i++) {
+        await Bun.sleep(1000);
+        ping = await fetch(`${protocol}://${host}:${port}/`, { signal: AbortSignal.timeout(2000) }).catch(() => null);
+        if (ping) break;
+        process.stdout.write(".");
+      }
+      process.stdout.write("\n");
+    }
+    if (!ping) {
+      console.error(`      Failed to start serve at ${host}:${port}`);
+      rl.close();
+      process.exit(1);
+    }
+    console.log(`      Serve running at ${protocol}://${host}:${port}`);
+  }
+
+  // [2/4] Profile selection
+  console.log("\n[2/4] Select Chrome profile:");
+  const cache = await readChromeProfileCache();
+  if (!cache) { console.error("      Chrome profiles not found"); rl.close(); process.exit(1); }
+  const profiles = Object.entries(cache);
+  profiles.forEach(([dir, info], i) =>
+    console.log(`        ${String(i + 1).padStart(2)}.  ${(info.user_name || "(no email)").padEnd(32)}  ${(info.name || "").padEnd(20)}  [${dir}]`)
+  );
+  const answer = await ask("\n      Profile number: ");
+  rl.pause();
   const idx = parseInt(answer.trim()) - 1;
-  if (isNaN(idx) || idx < 0 || idx >= profiles.length) { console.error("Invalid selection"); process.exit(1); }
+  if (isNaN(idx) || idx < 0 || idx >= profiles.length) { console.error("      Invalid selection"); rl.close(); process.exit(1); }
   const [profileDir, profileInfoSel] = profiles[idx];
   const profileEnv = { PLAYWRIGHT_MCP_PROFILE_DIRECTORY: profileDir };
   const profileDisplay = profileInfoSel.user_name || profileInfoSel.name || profileDir;
 
-  // 3. Discover the extension ID. Unpacked extension IDs are derived from the
-  //    load path, so look up the actual ID from Chrome's Secure Preferences.
-  //    Env override wins if set explicitly.
-  let extId = process.env.PLAYWRIGHT_MCP_EXTENSION_ID;
-  if (!extId) {
-    const found = await findInstalledExtension(profileDir);
-    if (found) extId = found.id;
+  // [3/4] Extension
+  console.log("\n[3/4] Checking extension...");
+  let extId: string | undefined;
+  while (true) {
+    extId = process.env.PLAYWRIGHT_MCP_EXTENSION_ID || undefined;
+    if (!extId) {
+      const found = await findInstalledExtension(profileDir);
+      if (found) extId = found.id;
+    }
+    if (extId) break;
+
+    // Generate and open setup guide in system browser
+    const setupHtmlPath = join(process.env.HOME!, ".rech", "setup.html");
+    mkdirSync(join(process.env.HOME!, ".rech"), { recursive: true });
+    await Bun.write(setupHtmlPath, buildSetupHtml(EXTENSION_DIST_DIR, profileDisplay));
+    console.log(`\n      Extension not found in profile: ${profileDisplay}`);
+    console.log(`      Extension dist: ${EXTENSION_DIST_DIR}`);
+    console.log(`\n      Opening install guide in your browser...`);
+    Bun.spawn(["open", setupHtmlPath], { stdout: "ignore", stderr: "ignore" });
+    rl.resume();
+    await ask("\n      Press Enter after loading the extension to retry...");
+    rl.pause();
   }
+  console.log(`      Extension found: ${extId}`);
 
-  if (!extId) {
-    printInstallInstructions(profileDisplay);
-    console.error("Opening chrome://extensions/ in the selected profile...");
-    await callServe(url, ["open", "chrome://extensions/"], profileEnv);
-    process.exit(1);
-  }
-
-  const statusUrl = `chrome-extension://${extId}/status.html`;
-  console.log(`\nOpening ${statusUrl}...`);
-  const openResult = await callServe(url, ["open", statusUrl], profileEnv);
-  if (openResult.status !== 0) { process.stderr.write(openResult.stderr); process.exit(openResult.status); }
-
-  // 4. Read token from extension page localStorage
+  // [4/4] Token
+  console.log("\n[4/4] Connecting to extension...");
+  const openResult = await callServe(url, ["open", `chrome-extension://${extId}/status.html`], profileEnv);
+  if (openResult.status !== 0) { process.stderr.write(openResult.stderr); rl.close(); process.exit(openResult.status); }
   const evalResult = await callServe(url, ["eval", `() => localStorage.getItem('auth-token')`], profileEnv);
   const tokenMatch = evalResult.stdout.match(/"([A-Za-z0-9_-]{20,})"/);
   const token = tokenMatch?.[1];
   if (!token) {
     printInstallInstructions(profileDisplay);
-    console.error("Tried to read the auth token from the extension's status page but failed.");
-    console.error("This usually means the extension is not loaded in this profile.");
+    console.error("      Could not read auth token — extension may not be loaded in this profile.");
+    rl.close();
     process.exit(1);
   }
+  console.log("      Auth token retrieved");
+  rl.close();
 
-  // 5. Write single RECHROME_URL with all params to ~/.env.local
+  // Save config
   const home = process.env.HOME!;
   const globalEnvPath = join(home, ".env.local");
   const existing = await file(globalEnvPath).text().catch(() => "");
   const rechUrl = new URL(url);
   rechUrl.searchParams.set("extension_id", extId);
   rechUrl.searchParams.set("token", token);
-  // Prefer email for readability, fall back to directory name
   rechUrl.searchParams.set("profile", profileInfoSel.user_name || profileDir);
   const userDataDir = await findChromeUserDataDir();
   if (userDataDir) rechUrl.searchParams.set("user_data_dir", userDataDir);
   const newLine = `RECHROME_URL=${rechUrl.toString()}`;
-  // Remove old separate vars and update RECHROME_URL
   const keysToRemove = ["PLAYWRIGHT_MCP_USER_DATA_DIR", "PLAYWRIGHT_MCP_EXTENSION_ID", "PLAYWRIGHT_MCP_EXTENSION_TOKEN", "PLAYWRIGHT_MCP_PROFILE_DIRECTORY"];
   let lines = existing.trimEnd().split("\n").filter(l => !keysToRemove.some(k => l.startsWith(`${k}=`)));
   const rechIdx = lines.findIndex(l => l.startsWith("RECHROME_URL="));
@@ -415,25 +561,49 @@ async function setup(): Promise<void> {
   else lines.push(newLine);
   await Bun.write(globalEnvPath, lines.join("\n").trim() + "\n");
   console.log(`\nSaved to ${globalEnvPath}:\n  ${newLine}`);
-  console.log("\nDone!");
+  console.log('\nDone! Test with: rech eval "() => document.title"');
+}
+
+function printHelp(): void {
+  console.log(`rechrome (rech) — drive Chrome via Playwright over HTTP
+
+Usage:
+  rech setup                   First-time setup: daemon + Chrome extension + config
+  rech uninstall               Remove the serve daemon and clear config
+  rech serve                   Start the serve server manually (foreground)
+  rech profiles                List Chrome profiles
+  rech <playwright-args...>    Run Playwright CLI command (requires ${ENV_KEY})
+
+Environment:
+  ${ENV_KEY}   Server URL set by \`rech setup\`
+
+Examples:
+  rech setup
+  rech eval "() => document.title"
+  rech open https://example.com
+  rech screenshot`);
 }
 
 if (import.meta.main) {
   const args = process.argv.slice(2);
+  const cmd = args[0]?.toLowerCase();
 
-  if (args[0] === "serve") {
+  if (cmd === "serve") {
     const { serve } = await import("./serve.ts");
     serve();
-  } else if (args[0] === "profiles") {
+  } else if (cmd === "profiles") {
     await listProfiles();
-  } else if (args[0] === "setup") {
+  } else if (cmd === "setup") {
     await setup();
+  } else if (cmd === "uninstall") {
+    await daemonUninstall();
+  } else if (cmd === "help" || cmd === "--help" || cmd === "-h" || args.length === 0) {
+    printHelp();
   } else {
     const url = process.env[ENV_KEY];
     if (!url) {
-      console.error(
-        `Usage:\n  rech serve\n  ${ENV_KEY}=http://key@host:${DEFAULT_PORT}?extension_id=ID&token=TOKEN rech <playwright-args...>\n  ${ENV_KEY}=https://key@host/path?extension_id=ID&token=TOKEN rech <playwright-args...>`,
-      );
+      console.error(`${ENV_KEY} is not set. Run \`rech setup\` to configure.\n`);
+      printHelp();
       process.exit(1);
     }
     run(url, args);
