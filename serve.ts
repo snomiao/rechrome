@@ -1,6 +1,6 @@
 import { file } from "bun";
 import { createHash, X509Certificate } from "crypto";
-import { mkdirSync, unlinkSync } from "fs";
+import { mkdirSync, unlinkSync, accessSync, constants as fsConstants } from "fs";
 import { join, resolve, relative, isAbsolute } from "path";
 import {
   log,
@@ -72,8 +72,9 @@ export async function serve() {
   mkdirSync(workDir, { recursive: true });
 
   const listenHost = process.env.RECH_HOST || "127.0.0.1";
-  const certPath = process.env.RECH_TLS_CERT;
-  const keyPath = process.env.RECH_TLS_KEY;
+  const canRead = (p?: string) => { try { accessSync(p!, fsConstants.R_OK); return true; } catch { return false; } };
+  const certPath = canRead(process.env.RECH_TLS_CERT) ? process.env.RECH_TLS_CERT : undefined;
+  const keyPath = canRead(process.env.RECH_TLS_KEY) ? process.env.RECH_TLS_KEY : undefined;
   if (certPath && keyPath) {
     const renewed = await renewCertIfNeeded(certPath, keyPath);
     if (renewed) { log("Restarting to load renewed TLS cert..."); process.exit(0); }
