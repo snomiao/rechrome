@@ -592,6 +592,7 @@ async function setup(): Promise<void> {
   console.log(`\nSaved to ${globalEnvPath}`);
   console.log(`\n  ${newLine}`);
   console.log(`\nDone! Test with:\n  rech eval "() => document.title"`);
+  process.exit(0);
 }
 
 function printHelp(): void {
