@@ -29,17 +29,19 @@ async function loadEnvFile(path: string): Promise<boolean> {
 }
 
 async function loadEnv() {
-  // Load global ~/.env.local first (lowest priority — RECHROME_URL lives here)
-  await loadEnvFile(globalEnvFile);
-  // Walk up from cwd and overlay — local settings override global
+  // Collect dirs from CWD up to root, then load root→CWD so CWD wins
+  const dirs: string[] = [];
   let dir = process.cwd();
   while (true) {
-    await loadEnvFile(join(dir, ".env.local"));
+    dirs.push(dir);
     const parent = join(dir, "..");
     if (parent === dir) break;
     dir = parent;
   }
-  // Fall back to script dir's .env.local
+  for (const d of dirs.reverse()) {
+    await loadEnvFile(join(d, ".env.local"));
+  }
+  // Fall back to script dir's .env.local if still no RECHROME_URL
   if (!process.env[ENV_KEY]) await loadEnvFile(envFile);
 }
 // Shell-set passthrough vars survive .env.local loading
@@ -593,11 +595,33 @@ async function setup(): Promise<void> {
   console.log(`\nDone! Test with:\n  rech eval "() => document.title"`);
 }
 
+async function status(): Promise<void> {
+  const url = process.env[ENV_KEY];
+  if (!url) {
+    console.log(`serve:    not configured (run \`rech setup\`)`);
+    return;
+  }
+  const { host, port, protocol } = parseUrl(url);
+  const parsed = parseUrl(url);
+  const ping = await fetch(`${protocol}://${host}:${port}/`, { signal: AbortSignal.timeout(2000) }).catch(() => null);
+  console.log(`serve:    ${ping ? `running  ${protocol}://${host}:${port}` : "not running"}`);
+  if (parsed.extensionId) console.log(`ext:      ${parsed.extensionId}`);
+  if (parsed.profileDirectory) {
+    const email = await resolveProfileEmail(parsed.profileDirectory).catch(() => parsed.profileDirectory);
+    const profileLabel = email !== parsed.profileDirectory ? `${email} (${parsed.profileDirectory})` : email;
+    console.log(`profile:  ${profileLabel}`);
+  }
+  if (parsed.userDataDir) console.log(`data dir: ${parsed.userDataDir}`);
+  const launchdRunning = process.platform === "darwin" && existsSync(LAUNCHD_PLIST);
+  console.log(`daemon:   ${launchdRunning ? `launchd (${LAUNCHD_LABEL})` : "not installed"}`);
+}
+
 function printHelp(): void {
   console.log(`rechrome (rech) — drive Chrome via Playwright over HTTP
 
 Usage:
   rech setup                   First-time setup: daemon + Chrome extension + config
+  rech status                  Show current configuration and serve health
   rech uninstall               Remove the serve daemon and clear config
   rech serve                   Start the serve server manually (foreground)
   rech profiles                List Chrome profiles
@@ -619,15 +643,21 @@ if (import.meta.main) {
 
   if (cmd === "serve") {
     const { serve } = await import("./serve.ts");
-    serve();
+    serve(); // long-lived; watcher intentionally kept alive
+  } else if (cmd === "status") {
+    await status();
+    envWatcher?.close();
   } else if (cmd === "profiles") {
     await listProfiles();
+    envWatcher?.close();
   } else if (cmd === "setup") {
-    await setup();
+    await setup(); // setup closes envWatcher itself before printing Done
   } else if (cmd === "uninstall") {
     await daemonUninstall();
+    envWatcher?.close();
   } else if (cmd === "help" || cmd === "--help" || cmd === "-h" || args.length === 0) {
     printHelp();
+    envWatcher?.close();
   } else {
     const url = process.env[ENV_KEY];
     if (!url) {
@@ -635,6 +665,7 @@ if (import.meta.main) {
       printHelp();
       process.exit(1);
     }
-    run(url, args);
+    await run(url, args);
+    envWatcher?.close();
   }
 }
