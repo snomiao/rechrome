@@ -62,10 +62,7 @@ export async function loadNearestEnv(extraFallbacks: string[] = []) {
 }
 
 async function loadEnv() {
-  await loadNearestEnv([
-    join(import.meta.dir, ".rechrome", ".env.local"),
-    envFile,
-  ]);
+  await loadNearestEnv();
 }
 // Shell-set passthrough vars survive .env.local loading
 const _shellPassthrough: Record<string, string> = {};
