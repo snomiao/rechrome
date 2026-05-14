@@ -2,7 +2,7 @@
 
 import { file } from "bun";
 import { randomBytes } from "crypto";
-import { mkdirSync, appendFileSync, existsSync, unlinkSync, realpathSync } from "fs";
+import { mkdirSync, appendFileSync, existsSync, unlinkSync, realpathSync, accessSync, constants as fsConstants } from "fs";
 import { hostname } from "os";
 import { join, basename, dirname } from "path";
 
@@ -64,6 +64,11 @@ export const PASSTHROUGH_ENV_KEYS = [
   "PLAYWRIGHT_MCP_PROFILE_DIRECTORY",
   "PLAYWRIGHT_MCP_USER_DATA_DIR",
 ] as const;
+
+function isReadable(p?: string): boolean {
+  if (!p) return false;
+  try { accessSync(p, fsConstants.R_OK); return true; } catch { return false; }
+}
 
 export function log(msg: string) {
   mkdirSync(LOG_DIR, { recursive: true });
@@ -422,7 +427,10 @@ async function daemonInstall(serveUrl: string): Promise<boolean> {
     <key>HOME</key><string>${home}</string>
     <key>PATH</key><string>${process.env.PATH || "/usr/local/bin:/usr/bin:/bin"}</string>
     <key>${ENV_KEY}</key><string>${serveUrl}</string>${process.env.PLAYWRIGHT_CLI ? `
-    <key>PLAYWRIGHT_CLI</key><string>${process.env.PLAYWRIGHT_CLI}</string>` : ""}
+    <key>PLAYWRIGHT_CLI</key><string>${process.env.PLAYWRIGHT_CLI}</string>` : ""}${process.env.RECH_HOST ? `
+    <key>RECH_HOST</key><string>${process.env.RECH_HOST}</string>` : ""}${isReadable(process.env.RECH_TLS_CERT) ? `
+    <key>RECH_TLS_CERT</key><string>${process.env.RECH_TLS_CERT}</string>` : ""}${isReadable(process.env.RECH_TLS_KEY) ? `
+    <key>RECH_TLS_KEY</key><string>${process.env.RECH_TLS_KEY}</string>` : ""}
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -431,6 +439,8 @@ async function daemonInstall(serveUrl: string): Promise<boolean> {
   <key>WorkingDirectory</key><string>${home}</string>
 </dict>
 </plist>`;
+  const existing = await file(LAUNCHD_PLIST).text().catch(() => "");
+  if (existing === plist) return false; // nothing changed
   await Bun.write(LAUNCHD_PLIST, plist);
   await Bun.spawn(["launchctl", "unload", LAUNCHD_PLIST], { stdout: "ignore", stderr: "ignore" }).exited;
   const proc = Bun.spawn(["launchctl", "load", "-w", LAUNCHD_PLIST], { stdout: "ignore", stderr: "ignore" });
@@ -467,12 +477,9 @@ async function setup(): Promise<void> {
   if (ping) {
     console.log(`      Already running at ${protocol}://${host}:${port}`);
     if (process.platform === "darwin") {
-      const plistContent = await file(LAUNCHD_PLIST).text().catch(() => "");
-      const plistKey = plistContent.match(new RegExp(`<key>${ENV_KEY}</key><string>http://([^@]+)@`))?.[1];
-      if (!existsSync(LAUNCHD_PLIST) || plistKey !== parseUrl(url).key) {
-        await daemonInstall(url);
-        console.log(`      ${existsSync(LAUNCHD_PLIST) ? "Updated" : "Registered"} login daemon: ${LAUNCHD_LABEL}`);
-      }
+      const existed = existsSync(LAUNCHD_PLIST);
+      const reinstalled = await daemonInstall(url);
+      if (reinstalled) console.log(`      ${existed ? "Updated" : "Registered"} login daemon: ${LAUNCHD_LABEL}`);
     }
   } else {
     if (process.platform === "darwin") {
@@ -608,7 +615,12 @@ async function status(): Promise<void> {
   const { host, port, protocol } = parseUrl(url);
   const parsed = parseUrl(url);
   const ping = await fetch(`${protocol}://${host}:${port}/`, { signal: AbortSignal.timeout(2000) }).catch(() => null);
-  console.log(`serve:    ${ping ? `running  ${protocol}://${host}:${port}` : "not running"}`);
+  // Check actual socket binding via lsof (shows * for 0.0.0.0, or exact IP for loopback-only)
+  const lsofProc = Bun.spawn(["lsof", "-nP", `-iTCP:${port}`, "-sTCP:LISTEN"], { stdout: "pipe", stderr: "ignore" });
+  const lsofOut = await new Response(lsofProc.stdout).text();
+  const listenLine = lsofOut.split("\n").find(l => l.includes(`:${port}`));
+  const listenAddr = listenLine?.match(/TCP\s+(\S+:\d+)/)?.[1] ?? (ping ? `${host}:${port}` : null);
+  console.log(`serve:    ${ping ? `running  ${protocol}://${listenAddr ?? `${host}:${port}`}` : "not running"}`);
   if (parsed.extensionId) console.log(`ext:      ${parsed.extensionId}`);
   if (parsed.profileDirectory) {
     const email = await resolveProfileEmail(parsed.profileDirectory).catch(() => parsed.profileDirectory);
