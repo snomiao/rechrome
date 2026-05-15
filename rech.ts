@@ -535,15 +535,19 @@ async function setup(opts: { profile?: string } = {}): Promise<void> {
   const url = await getOrCreateUrl();
   const { host, port, protocol } = parseUrl(url);
 
-  let ping = await fetch(`${protocol}://${host}:${port}/`, { signal: AbortSignal.timeout(2000) }).catch(() => null);
-  if (ping) {
-    console.log(`      Already running at ${protocol}://${host}:${port}`);
-    await daemonInstall(url);
-    console.log(`      Updated daemon: ${OXMGR_PROCESS_NAME}`);
+  const { key: serveKey } = parseUrl(url);
+  const authPing = await fetch(`${protocol}://${host}:${port}/ping`, {
+    headers: { Authorization: `Bearer ${serveKey}` },
+    signal: AbortSignal.timeout(2000),
+  }).catch(() => null);
+  if (authPing?.ok) {
+    console.log(`      Already running at ${protocol}://${host}:${port} — skipping reinstall`);
+    await runOxmgr(["service", "install"]);
   } else {
     await daemonInstall(url);
     console.log(`      Registered daemon: ${OXMGR_PROCESS_NAME}`);
     process.stdout.write("      Starting");
+    let ping = null;
     for (let i = 0; i < 15; i++) {
       await Bun.sleep(1000);
       ping = await fetch(`${protocol}://${host}:${port}/`, { signal: AbortSignal.timeout(2000) }).catch(() => null);
