@@ -517,10 +517,23 @@ async function daemonUninstall(): Promise<void> {
 async function setup(opts: { profile?: string } = {}): Promise<void> {
   const { createInterface } = await import("readline");
   const isTTY = process.stdin.isTTY ?? false;
-  const rl = isTTY ? createInterface({ input: process.stdin, output: process.stdout }) : null;
+  let rl: ReturnType<typeof createInterface> | null = null;
+  let stdinQueue: string[] | null = null;
+  if (isTTY) {
+    rl = createInterface({ input: process.stdin, output: process.stdout });
+  } else {
+    // Pre-read all piped stdin lines so readline close doesn't block later prompts
+    stdinQueue = await new Promise<string[]>(resolve => {
+      const lines: string[] = [];
+      const r = createInterface({ input: process.stdin });
+      r.on("line", l => lines.push(l));
+      r.on("close", () => resolve(lines));
+    });
+  }
   const ask = (q: string, def = "") => {
-    if (!rl) { process.stdout.write(`${q}${def}\n`); return Promise.resolve(def); }
-    return new Promise<string>(r => rl.question(q, r));
+    process.stdout.write(q);
+    if (stdinQueue !== null) { const ans = stdinQueue.shift() ?? def; process.stdout.write(ans + "\n"); return Promise.resolve(ans); }
+    return new Promise<string>(r => rl!.question("", ans => r(ans || def)));
   };
 
   // [1/4] Daemon
@@ -611,13 +624,19 @@ async function setup(opts: { profile?: string } = {}): Promise<void> {
     const statusUrl = `chrome-extension://${extId}/status.html`;
     console.log(`\n      Get auth token from the extension:`);
     console.log(`        ${statusUrl}`);
-    Bun.spawn(
-      ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-       `--profile-directory=${profileDir}`, statusUrl],
-      { stdout: "ignore", stderr: "ignore", detached: true },
-    );
-    console.log(`\n      Or click the extension icon in the Chrome toolbar.`);
-    console.log(`      Copy the token shown on the page (PLAYWRIGHT_MCP_EXTENSION_TOKEN=...).\n`);
+    if (isTTY) {
+      Bun.spawn(
+        ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+         `--profile-directory=${profileDir}`, statusUrl],
+        { stdout: "ignore", stderr: "ignore", detached: true },
+      );
+      console.log(`\n      Or click the extension icon in the Chrome toolbar.`);
+      console.log(`      Copy the token shown on the page (PLAYWRIGHT_MCP_EXTENSION_TOKEN=...).\n`);
+    } else {
+      console.log(`\n      [agent] Open the URL above in Chrome (profile: ${profileDisplay})`);
+      console.log(`      [agent] Find PLAYWRIGHT_MCP_EXTENSION_TOKEN=... on that page`);
+      console.log(`      [agent] Provide the token value on next stdin line:\n`);
+    }
     const tokenInput = (await ask("      Paste token: ")).trim();
     const token = tokenInput.replace(/^.*?=/, "").trim();
     if (!token || token.length < 20) { console.error("      Invalid token (too short)"); return null; }
@@ -648,6 +667,7 @@ async function setup(opts: { profile?: string } = {}): Promise<void> {
   if (userDataDir) rechUrl.searchParams.set("user_data_dir", userDataDir);
   const newLine = `RECHROME_URL=${rechUrl.toString()}`;
   console.log(`\n[4/4] Your RECHROME_URL:\n\n  ${newLine}\n`);
+  if (!isTTY) console.log(`  [agent] Provide save destination on next stdin line: 1=cwd, 2=cwd rechrome-only, 3=home, 4=skip\n`);
 
   const pwdEnvPath = join(process.cwd(), ".env.local");
   const pwdRechPath = join(process.cwd(), ".rechrome", ".env.local");
