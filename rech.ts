@@ -362,7 +362,7 @@ async function callServe(
     process.exit(1);
   });
   if (res.status === 401) {
-    console.error(`[rech] rech-client -> rech-server[ok]\n  -x: token rejected -> playwright[unknown]`);
+    console.error(`[rech] rech-client -> rech-server[ok]\n  -x: token rejected (used: ${key.slice(0, 6)}...) -> playwright[unknown]`);
     process.exit(1);
   }
   return res.json();
@@ -549,13 +549,18 @@ async function setup(opts: { profile?: string } = {}): Promise<void> {
   const { host, port, protocol } = parseUrl(url);
 
   const { key: serveKey } = parseUrl(url);
-  const authPing = await fetch(`${protocol}://${host}:${port}/ping`, {
+  // First check if server is up at all (unauthenticated root), then verify our key matches
+  const anonPing = await fetch(`${protocol}://${host}:${port}/`, { signal: AbortSignal.timeout(2000) }).catch(() => null);
+  const authPing = anonPing ? await fetch(`${protocol}://${host}:${port}/ping`, {
     headers: { Authorization: `Bearer ${serveKey}` },
     signal: AbortSignal.timeout(2000),
-  }).catch(() => null);
-  if (authPing?.ok) {
+  }).catch(() => null) : null;
+  if (anonPing && authPing?.ok) {
     console.log(`      Already running at ${protocol}://${host}:${port} — skipping reinstall`);
     await runOxmgr(["service", "install"]);
+  } else if (anonPing && !authPing?.ok) {
+    console.log(`      Server running but key mismatch — reinstalling with new key`);
+    await daemonInstall(url);
   } else {
     await daemonInstall(url);
     console.log(`      Registered daemon: ${OXMGR_PROCESS_NAME}`);
