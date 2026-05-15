@@ -118,7 +118,8 @@ export function parseUrl(raw: string) {
 }
 
 export async function getOrCreateUrl(): Promise<string> {
-  if (process.env[ENV_KEY]) return process.env[ENV_KEY];
+  // Treat a URL without a bearer key as missing — it cannot authenticate
+  try { if (process.env[ENV_KEY] && new URL(process.env[ENV_KEY]!).username) return process.env[ENV_KEY]!; } catch {}
   const key = randomBytes(9).toString("base64url"); // 12 chars
   const url = `http://${key}@127.0.0.1:${DEFAULT_PORT}`;
   const newLine = `${ENV_KEY}=${url}`;
@@ -645,6 +646,7 @@ async function setup(opts: { profile?: string } = {}): Promise<void> {
   if (saveChoice === "2") mkdirSync(join(process.cwd(), ".rechrome"), { recursive: true });
   const existing = await file(globalEnvPath).text().catch(() => "");
   const rechUrl = new URL(url);
+  if (!rechUrl.username) rechUrl.username = randomBytes(9).toString("base64url");
   rechUrl.searchParams.set("extension_id", extId);
   rechUrl.searchParams.set("token", token);
   rechUrl.searchParams.set("profile", profileEmail);
