@@ -608,7 +608,7 @@ async function setup(opts: { profile?: string } = {}): Promise<void> {
     return available[idx];
   }
 
-  async function getExtAndToken(profileDir: string, profileDisplay: string): Promise<{ extId: string; token: string } | null> {
+  async function getExtAndToken(profileDir: string, profileDisplay: string, profileKey: string): Promise<{ extId: string; token: string } | null> {
     // Extension check
     let extId: string | undefined;
     while (true) {
@@ -624,6 +624,19 @@ async function setup(opts: { profile?: string } = {}): Promise<void> {
       await ask("\n      Press Enter after loading the extension to retry...");
     }
     console.log(`      Extension found: ${extId}`);
+
+    // Check for existing token in registry
+    const registry = await readTokenRegistry();
+    const existing = registry[profileKey];
+    if (existing && existing.extensionId === extId && existing.token) {
+      console.log(`      Existing token found: ${existing.token.slice(0, 6)}…`);
+      if (!isTTY) console.log(`      [agent] Provide y to keep existing token, n to refresh on next stdin line`);
+      const keep = (await ask("      Keep existing token? [Y/n]: ")).trim().toLowerCase();
+      if (keep !== "n") {
+        console.log("      Keeping existing token");
+        return { extId, token: existing.token };
+      }
+    }
 
     // Token
     const statusUrl = `chrome-extension://${extId}/status.html`;
@@ -658,10 +671,10 @@ async function setup(opts: { profile?: string } = {}): Promise<void> {
 
   // [3+4/4] Extension + token for primary profile
   console.log("\n[3/4] Checking extension...");
-  const primary = await getExtAndToken(profileDir, profileDisplay);
+  const profileEmail = profileInfoSel.user_name || profileDir;
+  const primary = await getExtAndToken(profileDir, profileDisplay, profileEmail);
   if (!primary) { rl?.close(); process.exit(1); }
   const { extId, token } = primary;
-  const profileEmail = profileInfoSel.user_name || profileDir;
 
   // Build RECHROME_URL and show it before asking where to save
   const rechUrl = new URL(url);
@@ -708,10 +721,10 @@ async function setup(opts: { profile?: string } = {}): Promise<void> {
     if (!extra) { console.log("      Skipped."); continue; }
     const [extraDir, extraInfo] = extra;
     const extraDisplay = extraInfo.user_name || extraInfo.name || extraDir;
-    console.log(`\n      Setting up: ${extraDisplay}`);
-    const result = await getExtAndToken(extraDir, extraDisplay);
-    if (!result) { console.log("      Skipped."); continue; }
     const extraEmail = extraInfo.user_name || extraDir;
+    console.log(`\n      Setting up: ${extraDisplay}`);
+    const result = await getExtAndToken(extraDir, extraDisplay, extraEmail);
+    if (!result) { console.log("      Skipped."); continue; }
     await saveTokenEntry(extraEmail, { extensionId: result.extId, token: result.token, profileDir: extraDir, userDataDir: userDataDir ?? undefined });
     configured.add(extraDir);
     console.log(`      Saved token for ${extraDisplay}`);
