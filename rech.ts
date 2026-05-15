@@ -557,7 +557,6 @@ async function setup(opts: { profile?: string } = {}): Promise<void> {
   }).catch(() => null) : null;
   if (anonPing && authPing?.ok) {
     console.log(`      Already running at ${protocol}://${host}:${port} — skipping reinstall`);
-    await runOxmgr(["service", "install"]);
   } else if (anonPing && !authPing?.ok) {
     console.log(`      Server running but key mismatch — reinstalling with new key`);
     await daemonInstall(url);
