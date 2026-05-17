@@ -120,7 +120,7 @@ export function parseUrl(raw: string) {
 export async function getOrCreateUrl(): Promise<string> {
   // Treat a URL without a bearer key as missing — it cannot authenticate
   try { if (process.env[ENV_KEY] && new URL(process.env[ENV_KEY]!).username) return process.env[ENV_KEY]!; } catch {}
-  const key = randomBytes(9).toString("base64url"); // 12 chars
+  const key = randomBytes(12).toString("base64url"); // 16 chars
   const url = `http://${key}@127.0.0.1:${DEFAULT_PORT}`;
   const newLine = `${ENV_KEY}=${url}`;
   // Write to ~/.env.local so it's not shadowed by project .env.local
@@ -362,7 +362,7 @@ async function callServe(
     process.exit(1);
   });
   if (res.status === 401) {
-    console.error(`[rech] rech-client -> rech-server[ok]\n  -x: token rejected (used: ${key.slice(0, 6)}...) -> playwright[unknown]`);
+    console.error(`[rech] rech-client -> rech-server[ok]\n  -x: token rejected (used: ${key.slice(0, 4)}...) -> playwright[unknown]`);
     process.exit(1);
   }
   return res.json();
@@ -682,7 +682,7 @@ async function setup(opts: { profile?: string } = {}): Promise<void> {
 
   // Build RECHROME_URL and show it before asking where to save
   const rechUrl = new URL(url);
-  if (!rechUrl.username) rechUrl.username = randomBytes(9).toString("base64url");
+  if (!rechUrl.username) rechUrl.username = randomBytes(12).toString("base64url");
   rechUrl.searchParams.set("extension_id", extId);
   rechUrl.searchParams.set("token", token);
   rechUrl.searchParams.set("profile", profileEmail);
