@@ -362,7 +362,7 @@ async function callServe(
     process.exit(1);
   });
   if (res.status === 401) {
-    console.error(`[rech] rech-client -> rech-server[ok]\n  -x: token rejected (used: ${key.slice(0, 4)}...) -> playwright[unknown]`);
+    console.error(`[rech] rech-client -> rech-server[ok]\n  -x: bearer key rejected (used: ${key.slice(0, 4)}...) -> playwright[unknown]`);
     process.exit(1);
   }
   return res.json();
@@ -486,6 +486,17 @@ async function runOxmgr(args: string[]): Promise<number> {
 }
 
 async function daemonInstall(serveUrl: string): Promise<void> {
+  // Persist the URL to ~/.env.local before starting the daemon. The daemon's
+  // loadEnv() walks CWD→root reading .env.local files and unconditionally
+  // overwrites process.env.RECHROME_URL from whichever file it finds first.
+  // Without this write, oxmgr's --env RECHROME_URL=... gets clobbered by a
+  // stale ~/.env.local entry — the daemon then listens on a different bearer
+  // key than the one daemonInstall was called with, and every client request
+  // is rejected with "bearer key rejected".
+  const envRaw = await file(globalEnvFile).text().catch(() => "");
+  const filtered = envRaw.trimEnd().split("\n").filter(l => !l.startsWith(`${ENV_KEY}=`));
+  await Bun.write(globalEnvFile, [...filtered, `${ENV_KEY}=${serveUrl}`, ""].join("\n"));
+
   const home = process.env.HOME!;
   const bunBin = Bun.which("bun") ?? process.execPath;
   const rechScript = import.meta.filename;
