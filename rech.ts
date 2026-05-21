@@ -678,11 +678,17 @@ async function setup(opts: { profile?: string } = {}): Promise<void> {
     while (true) {
       const found = await findInstalledExtension(profileDir);
       if (found) { extId = found.id; break; }
+      console.log(`\n      Extension not found in profile: ${profileDisplay}`);
+      console.log(`      Extension dist: ${EXTENSION_DIST_DIR}`);
+      // Non-TTY (agent/pipe) can't install an extension interactively, and `ask` doesn't block on an exhausted stdin queue —
+      // looping here would spawn `open` per iteration until the OS runs out of resources. Fail fast instead.
+      if (!isTTY) {
+        console.error(`      Non-TTY: cannot install extension interactively — aborting`);
+        return null;
+      }
       const setupHtmlPath = join(RECH_HOME_DIR, "setup.html");
       mkdirSync(RECH_HOME_DIR, { recursive: true });
       await Bun.write(setupHtmlPath, buildSetupHtml(EXTENSION_DIST_DIR, profileDisplay));
-      console.log(`\n      Extension not found in profile: ${profileDisplay}`);
-      console.log(`      Extension dist: ${EXTENSION_DIST_DIR}`);
       console.log(`\n      Opening install guide in your browser...`);
       Bun.spawn(["open", setupHtmlPath], { stdout: "ignore", stderr: "ignore" });
       await ask("\n      Press Enter after loading the extension to retry...");
