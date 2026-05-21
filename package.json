@@ -13,6 +13,7 @@
     ".env.example",
     "LICENSE",
     "README.md",
+    "extension",
     "rech.js",
     "rech.ts",
     "serve.js",

@@ -2,7 +2,7 @@
 
 import { file } from "bun";
 import { randomBytes } from "crypto";
-import { mkdirSync, appendFileSync, existsSync, realpathSync, accessSync, constants as fsConstants } from "fs";
+import { mkdirSync, appendFileSync, existsSync, realpathSync, accessSync, cpSync, constants as fsConstants } from "fs";
 import { hostname } from "os";
 import { join, basename, dirname } from "path";
 
@@ -242,15 +242,35 @@ async function findChromeUserDataDir(): Promise<string | null> {
   return null;
 }
 
-export const EXTENSION_DIST_DIR = join(
-  import.meta.dir,
-  "lib/playwright-multi-tab/lib/playwright-mcp/packages/extension/dist",
-);
+// Bundled extension dist (shipped via package.json `files`). `import.meta.dir` resolves to the install
+// location at runtime — under local dev that's the repo root, under bunx/npm it's the package dir.
+const BUNDLED_EXTENSION_DIST_DIR = join(import.meta.dir, "extension");
+// The legacy submodule path (pre-1.12). Kept for backwards-compat with users who installed from there.
+const LEGACY_EXTENSION_DIST_DIR = join(import.meta.dir, "lib/playwright-multi-tab/lib/playwright-mcp/packages/extension/dist");
 
-// Walk all Chrome profiles' Secure Preferences and find an extension
-// whose loaded `path` matches our dist directory. The extension ID Chrome
-// generates for an unpacked extension is path-dependent, so we cannot rely
-// on a hardcoded ID across machines.
+// Stable per-user location: we copy the bundled dist here so Chrome's recorded install path survives
+// the ephemeral bunx temp dir being cleaned up between invocations.
+export const EXTENSION_DIST_DIR = join(process.env.HOME!, ".rechrome", "extension");
+
+// With the manifest `key` field set, Chrome derives this ID deterministically from the key (not the path),
+// so we can locate the extension by ID even when the on-disk path differs from what Chrome stored.
+export const EXTENSION_ID = "fokngfbogklgiffokdnekajodmhgfnhk";
+
+async function ensureExtensionDistInstalled(): Promise<string> {
+  const source = existsSync(BUNDLED_EXTENSION_DIST_DIR)
+    ? BUNDLED_EXTENSION_DIST_DIR
+    : existsSync(LEGACY_EXTENSION_DIST_DIR)
+      ? LEGACY_EXTENSION_DIST_DIR
+      : null;
+  if (!source) return EXTENSION_DIST_DIR;
+  const sourceManifest = await file(join(source, "manifest.json")).text().catch(() => "");
+  const destManifest = await file(join(EXTENSION_DIST_DIR, "manifest.json")).text().catch(() => "");
+  if (sourceManifest && sourceManifest === destManifest) return EXTENSION_DIST_DIR;
+  mkdirSync(EXTENSION_DIST_DIR, { recursive: true });
+  cpSync(source, EXTENSION_DIST_DIR, { recursive: true, force: true });
+  return EXTENSION_DIST_DIR;
+}
+
 async function findInstalledExtension(
   profileDir?: string,
 ): Promise<{ id: string; profile: string } | null> {
@@ -258,6 +278,11 @@ async function findInstalledExtension(
   if (!userDataDir) return null;
   const cache = await readChromeProfileCache();
   const profiles = profileDir ? [profileDir] : (cache ? Object.keys(cache) : []);
+  // Resolve our known-good install paths up front for path-based fallback matching.
+  const knownPaths = new Set<string>();
+  for (const p of [EXTENSION_DIST_DIR, BUNDLED_EXTENSION_DIST_DIR, LEGACY_EXTENSION_DIST_DIR]) {
+    try { knownPaths.add(realpathSync(p)); } catch {}
+  }
   for (const prof of profiles) {
     const prefsPath = join(userDataDir, prof, "Secure Preferences");
     const f = file(prefsPath);
@@ -267,11 +292,12 @@ async function findInstalledExtension(
       const settings = data?.extensions?.settings ?? {};
       for (const [extId, info] of Object.entries(settings as Record<string, any>)) {
         if (!info?.path || info.state === 0) continue; // state 0 = explicitly disabled
+        // Primary: stable ID match (works when manifest `key` is set, regardless of path).
+        if (extId === EXTENSION_ID) return { id: extId, profile: prof };
+        // Fallback: path equality for legacy installs without a stable key.
         let storedPath = info.path as string;
         try { storedPath = realpathSync(storedPath); } catch {}
-        let distPath = EXTENSION_DIST_DIR;
-        try { distPath = realpathSync(distPath); } catch {}
-        if (storedPath === distPath) return { id: extId, profile: prof };
+        if (knownPaths.has(storedPath)) return { id: extId, profile: prof };
       }
     } catch {}
   }
@@ -675,6 +701,8 @@ async function setup(opts: { profile?: string } = {}): Promise<void> {
   async function getExtAndToken(profileDir: string, profileDisplay: string, profileKey: string): Promise<{ extId: string; token: string } | null> {
     // Extension check
     let extId: string | undefined;
+    // Copy bundled dist to a stable per-user location so the install path survives bunx temp-dir cleanup.
+    await ensureExtensionDistInstalled();
     while (true) {
       const found = await findInstalledExtension(profileDir);
       if (found) { extId = found.id; break; }
