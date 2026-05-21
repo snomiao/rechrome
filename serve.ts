@@ -110,7 +110,7 @@ export async function serve() {
       if (reqUrl.pathname === "/ping") {
         const denied = authCheck(req, key);
         if (denied) return denied;
-        return new Response("ok");
+        return Response.json({ ok: true, bind: listenHost });
       }
       if (reqUrl.pathname !== "/run") return new Response("rech server\n");
       const denied = authCheck(req, key);

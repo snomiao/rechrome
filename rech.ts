@@ -554,6 +554,13 @@ async function setup(opts: { profile?: string } = {}): Promise<void> {
 
   // [1/4] Daemon
   console.log("\n[1/4] Setting up serve daemon...");
+
+  // Bind address (persists to ~/.env.local as RECH_HOST).
+  // Read the persisted value from ~/.env.local directly — process.env may be shadowed by nearer .env files.
+  const globalEnvRaw = await file(globalEnvFile).text().catch(() => "");
+  const persistedBindMatch = globalEnvRaw.match(/^\s*RECH_HOST\s*=\s*(.*?)\s*$/m);
+  const persistedBind = persistedBindMatch?.[1].replace(/^["']|["']$/g, "") || "127.0.0.1";
+
   // Clear stale hostname-based URL so we always use 127.0.0.1 locally
   if (process.env[ENV_KEY]) {
     try {
@@ -571,14 +578,35 @@ async function setup(opts: { profile?: string } = {}): Promise<void> {
     headers: { Authorization: `Bearer ${serveKey}` },
     signal: AbortSignal.timeout(2000),
   }).catch(() => null) : null;
-  if (anonPing && authPing?.ok) {
-    console.log(`      Already running at ${protocol}://${host}:${port} — skipping reinstall`);
-  } else if (anonPing && !authPing?.ok) {
-    console.log(`      Server running but key mismatch — reinstalling with new key`);
-    await daemonInstall(url);
-  } else {
-    await daemonInstall(url);
-    console.log(`      Registered daemon: ${OXMGR_PROCESS_NAME}`);
+  // The daemon's *live* bind (from /ping) is authoritative — persisted RECH_HOST may diverge if the user edited it manually.
+  const liveBind = authPing?.ok
+    ? await authPing.clone().json().then((b: { bind?: string }) => b?.bind).catch(() => undefined)
+    : undefined;
+  // Pre-patch daemons return plain "ok" with no bind info — we can't trust persisted/env values to match their live bind, so force reinstall to be safe.
+  const liveBindUnknown = !!authPing?.ok && !liveBind;
+  const currentBind = liveBind || persistedBind;
+
+  // Non-TTY honors explicit process.env.RECH_HOST (shell or merged env stack) — matches the documented `RECH_HOST=0.0.0.0 rech setup` flow.
+  let desiredBind = process.env.RECH_HOST || currentBind;
+  if (isTTY) {
+    console.log(`\n      Bind address (current: ${currentBind}):`);
+    console.log(`        1.  127.0.0.1  (localhost only)`);
+    console.log(`        2.  0.0.0.0    (all interfaces — HTTP plaintext, trust your network)`);
+    const defaultBindChoice = currentBind === "0.0.0.0" ? "2" : "1";
+    const bindAns = (await ask(`      Choice [${defaultBindChoice}]: `, defaultBindChoice)).trim();
+    desiredBind = bindAns === "2" || bindAns === "0.0.0.0" ? "0.0.0.0" : "127.0.0.1";
+  }
+  const bindChanged = desiredBind !== currentBind;
+  const persistedChanged = desiredBind !== persistedBind;
+  if (persistedChanged) {
+    const lines = globalEnvRaw.trimEnd().split("\n").filter(l => !/^\s*RECH_HOST\s*=/.test(l));
+    await Bun.write(globalEnvFile, [...lines, `RECH_HOST=${desiredBind}`, ""].join("\n"));
+    console.log(`      Saved RECH_HOST=${desiredBind} to ~/.env.local`);
+  }
+  // Always align process.env with the desired bind — a nearer .env.local may have shadowed it.
+  process.env.RECH_HOST = desiredBind;
+
+  const waitForServe = async () => {
     process.stdout.write("      Starting");
     let ping = null;
     for (let i = 0; i < 15; i++) {
@@ -594,6 +622,26 @@ async function setup(opts: { profile?: string } = {}): Promise<void> {
       process.exit(1);
     }
     console.log(`      Serve running at ${protocol}://${host}:${port}`);
+  };
+
+  if (anonPing && authPing?.ok && !bindChanged && !liveBindUnknown) {
+    console.log(`      Already running at ${protocol}://${host}:${port} — skipping reinstall`);
+  } else if (anonPing && authPing?.ok && liveBindUnknown) {
+    console.log(`      Pre-patch daemon detected (no live bind info) — reinstalling to verify bind`);
+    await daemonInstall(url);
+    await waitForServe();
+  } else if (anonPing && bindChanged) {
+    console.log(`      Bind changed (${currentBind} → ${desiredBind}) — reinstalling`);
+    await daemonInstall(url);
+    await waitForServe();
+  } else if (anonPing && !authPing?.ok) {
+    console.log(`      Server running but key mismatch — reinstalling with new key`);
+    await daemonInstall(url);
+    await waitForServe();
+  } else {
+    await daemonInstall(url);
+    console.log(`      Registered daemon: ${OXMGR_PROCESS_NAME}`);
+    await waitForServe();
   }
 
   const cache = await readChromeProfileCache();
