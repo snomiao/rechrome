@@ -661,10 +661,11 @@ async function setup(opts: { profile?: string } = {}): Promise<void> {
         (info.user_name ?? "").toLowerCase().includes(opts.profile!.toLowerCase())
       ) ?? null;
     }
-    if (!isTTY) {
-      console.log("      Non-TTY: auto-selecting first profile");
-      return available[0] ?? null;
+    if (available.length === 1) {
+      console.log(`      Only one profile available — selecting: ${available[0][1].user_name || available[0][0]}`);
+      return available[0];
     }
+    if (!isTTY) console.log("      [agent] Provide profile number on next stdin line, or rerun with --profile <num|email>");
     const answer = await ask("\n      Profile number: ");
     const idx = parseInt(answer.trim()) - 1;
     if (isNaN(idx) || idx < 0 || idx >= available.length) return null;
