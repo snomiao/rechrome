@@ -527,13 +527,18 @@ async function daemonInstall(serveUrl: string): Promise<void> {
   const bunBin = Bun.which("bun") ?? process.execPath;
   const rechScript = import.meta.filename;
 
+  // Resolve PLAYWRIGHT_CLI: env override > bundled fork (development checkout) > "playwright-cli-multi-tab"
+  const bundledForkCli = join(import.meta.dir, "lib/playwright-cli/playwright-cli.js");
+  const resolvedPlaywrightCli = process.env.PLAYWRIGHT_CLI
+    || (existsSync(bundledForkCli) ? bundledForkCli : "playwright-cli-multi-tab");
+
   const envArgs: string[] = [
     "--env", `HOME=${home}`,
     "--env", `PATH=${process.env.PATH || "/usr/local/bin:/usr/bin:/bin"}`,
     "--env", `${ENV_KEY}=${serveUrl}`,
     "--env", `PWMCP_TEST_CONNECTION_TIMEOUT=${process.env.PWMCP_TEST_CONNECTION_TIMEOUT || "30000"}`,
+    "--env", `PLAYWRIGHT_CLI=${resolvedPlaywrightCli}`,
   ];
-  if (process.env.PLAYWRIGHT_CLI) envArgs.push("--env", `PLAYWRIGHT_CLI=${process.env.PLAYWRIGHT_CLI}`);
   if (process.env.RECH_HOST) envArgs.push("--env", `RECH_HOST=${process.env.RECH_HOST}`);
   if (isReadable(process.env.RECH_TLS_CERT)) envArgs.push("--env", `RECH_TLS_CERT=${process.env.RECH_TLS_CERT}`);
   if (isReadable(process.env.RECH_TLS_KEY)) envArgs.push("--env", `RECH_TLS_KEY=${process.env.RECH_TLS_KEY}`);

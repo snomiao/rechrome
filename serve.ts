@@ -163,7 +163,7 @@ export async function serve() {
       });
       const namespacedSession = clientSession ? `${sessionId}-${clientSession}` : sessionId;
 
-      const [bin, ...binArgs] = (process.env.PLAYWRIGHT_CLI || "playwright-cli").split(" ");
+      const [bin, ...binArgs] = (process.env.PLAYWRIGHT_CLI || "playwright-cli-multi-tab").split(" ");
 
       if (filteredArgs.length === 0) {
         filteredArgs.push("--help");
