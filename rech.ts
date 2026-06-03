@@ -687,9 +687,12 @@ async function setup(opts: { profile?: string } = {}): Promise<void> {
     );
     if (opts.profile !== undefined) {
       const num = parseInt(opts.profile);
-      if (!isNaN(num)) return available[num - 1] ?? null;
-      return available.find(([, info]) =>
-        (info.user_name ?? "").toLowerCase().includes(opts.profile!.toLowerCase())
+      if (!isNaN(num) && String(num) === opts.profile.trim()) return available[num - 1] ?? null;
+      const needle = opts.profile.toLowerCase();
+      return available.find(([dir, info]) =>
+        dir.toLowerCase() === needle
+        || (info.name ?? "").toLowerCase() === needle
+        || (info.user_name ?? "").toLowerCase().includes(needle)
       ) ?? null;
     }
     if (available.length === 1) {
