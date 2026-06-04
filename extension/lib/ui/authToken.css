@@ -41,7 +41,6 @@ body {
   align-items: center;
   justify-content: space-between;
   margin-bottom: 16px;
-  padding-right: 12px;
 }
 
 .status-banner {
@@ -72,12 +71,27 @@ body {
   margin-right: 8px;
 }
 
+/* Warning banner */
+.warning-banner {
+  margin: 0 0 16px 0;
+  padding: 12px;
+  background-color: #fff8e1;
+  border: 1px solid #f0c674;
+  border-radius: 6px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: #5c4408;
+}
+
+.warning-banner strong {
+  color: #1f2328;
+}
+
 /* Buttons */
 .button-container {
-  margin-bottom: 16px;
   display: flex;
   justify-content: flex-end;
-  padding-right: 12px;
+  gap: 8px;
 }
 
 .button {
@@ -91,7 +105,6 @@ body {
   align-items: center;
   justify-content: center;
   text-decoration: none;
-  margin-right: 8px;
   min-width: 90px;
 }
 
@@ -127,6 +140,21 @@ body {
   border-color: #c73836;
 }
 
+/* Connection header */
+.connection-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 12px;
+  margin-bottom: 16px;
+}
+
+.client-info {
+  font-size: 14px;
+  color: #1f2328;
+}
+
 /* Tab selection */
 .tab-section-title {
   padding-left: 12px;
@@ -139,7 +167,7 @@ body {
 .tab-item {
   display: flex;
   align-items: center;
-  padding: 12px;
+  padding: 12px 0 12px 12px;
   margin-bottom: 8px;
   background-color: #ffffff;
   cursor: pointer;
@@ -208,7 +236,7 @@ body {
 /* Auth token section */
 .auth-token-section {
   margin: 16px 0;
-  padding: 16px;
+  padding: 12px;
   background-color: #f6f8fa;
   border-radius: 6px;
 }

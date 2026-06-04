@@ -1,13 +1,13 @@
 {
   "manifest_version": 3,
-  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAyr3kV2bBGDawVu1+vxLx2epYDN18tw/MSHbBunj5XLXho2gYcU2IYjBFZBt65A48IDJJ94D7LEnoFuaJScjEbxmPaPqvE1UrvplkwWiUPoN/3d4bshwx+wybln1oM4jnO/qGcOkyWZ28RrEhewgRznPYisJhVkBZWi+YoSYaQTkURLxi3CZ68xmWVQLyec3v3sxnOYu+ibOBtBgOFI+WYEBQAvI38y4jUdOTyoHyWw32Plr+y/4fnOzxEXVs7emCdQpVeZuNbru4x1UltrhwtXgl37mIGoOQmf6PzafCO9MaQ+mmRSY5e8Ht/Z5/eWY30mwjbc7H3HAtYOUaPZbp8wIDAQAB",
-  "name": "Playwright MCP Bridge (multi-tab)",
-  "version": "0.0.68.3",
-  "description": "Share browser tabs with Playwright MCP server (multi-tab fork: Playwright can open and control multiple tabs)",
+  "name": "Playwright Extension",
+  "version": "0.2.1",
+  "description": "Connect your browser to AI agents through Playwright MCP server and CLI. Enables AI-driven web testing, debugging, and automation.",
   "permissions": [
     "debugger",
     "activeTab",
-    "tabs"
+    "tabs",
+    "tabGroups"
   ],
   "host_permissions": [
     "<all_urls>"
@@ -17,7 +17,7 @@
     "type": "module"
   },
   "action": {
-    "default_title": "Playwright MCP Bridge",
+    "default_title": "Playwright Extension",
     "default_icon": {
       "16": "icons/icon-16.png",
       "32": "icons/icon-32.png",
@@ -30,5 +30,6 @@
     "32": "icons/icon-32.png",
     "48": "icons/icon-48.png",
     "128": "icons/icon-128.png"
-  }
+  },
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwRsUUO4mmbCi4JpmrIoIw31iVW9+xUJRZ6nSzya17PQkaUPDxe1IpgM+vpd/xB6mJWlJSyE1Lj95c0sbomGfVY1M0zUeKbaRVcAb+/a6m59gNR+ubFlmTX0nK9/8fE2FpRB9D+4N5jyeIPQuASW/0oswI2/ijK7hH5NTRX8gWc/ROMSgUj7rKhTAgBrICt/NsStgDPsxRTPPJnhJ/ViJtM1P5KsSYswE987DPoFnpmkFpq8g1ae0eYbQfXy55ieaacC4QWyJPj3daU2kMfBQw7MXnnk0H/WDxouMOIHnd8MlQxpEMqAihj7KpuONH+MUhuj9HEQo4df6bSaIuQ0b4QIDAQAB"
 }

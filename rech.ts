@@ -254,7 +254,7 @@ export const EXTENSION_DIST_DIR = join(process.env.HOME!, ".rechrome", "extensio
 
 // With the manifest `key` field set, Chrome derives this ID deterministically from the key (not the path),
 // so we can locate the extension by ID even when the on-disk path differs from what Chrome stored.
-export const EXTENSION_ID = "fokngfbogklgiffokdnekajodmhgfnhk";
+export const EXTENSION_ID = "mmlmfjhmonkocbjadbfplnigmagldckm";
 
 async function ensureExtensionDistInstalled(): Promise<string> {
   const source = existsSync(BUNDLED_EXTENSION_DIST_DIR)
@@ -279,27 +279,40 @@ async function findInstalledExtension(
   const cache = await readChromeProfileCache();
   const profiles = profileDir ? [profileDir] : (cache ? Object.keys(cache) : []);
   // Resolve our known-good install paths up front for path-based fallback matching.
+  // LEGACY_EXTENSION_DIST_DIR is intentionally excluded: it points at the pre-V2 multi-tab
+  // bridge, which is incompatible with the current cdpRelayV2 relay — matching it would hand
+  // setup a stale, broken extension.
   const knownPaths = new Set<string>();
-  for (const p of [EXTENSION_DIST_DIR, BUNDLED_EXTENSION_DIST_DIR, LEGACY_EXTENSION_DIST_DIR]) {
+  for (const p of [EXTENSION_DIST_DIR, BUNDLED_EXTENSION_DIST_DIR]) {
     try { knownPaths.add(realpathSync(p)); } catch {}
   }
+  // Read each profile's settings once so we can prioritize stable-ID matches over path fallbacks.
+  const perProfile: Array<{ prof: string; settings: Record<string, any> }> = [];
   for (const prof of profiles) {
     const prefsPath = join(userDataDir, prof, "Secure Preferences");
     const f = file(prefsPath);
     if (!(await f.exists())) continue;
     try {
       const data = JSON.parse(await f.text());
-      const settings = data?.extensions?.settings ?? {};
-      for (const [extId, info] of Object.entries(settings as Record<string, any>)) {
-        if (!info?.path || info.state === 0) continue; // state 0 = explicitly disabled
-        // Primary: stable ID match (works when manifest `key` is set, regardless of path).
-        if (extId === EXTENSION_ID) return { id: extId, profile: prof };
-        // Fallback: path equality for legacy installs without a stable key.
-        let storedPath = info.path as string;
-        try { storedPath = realpathSync(storedPath); } catch {}
-        if (knownPaths.has(storedPath)) return { id: extId, profile: prof };
-      }
+      perProfile.push({ prof, settings: (data?.extensions?.settings ?? {}) as Record<string, any> });
     } catch {}
+  }
+  // Pass 1: stable ID match (manifest `key` set, path-independent). This must win over any path
+  // fallback so a stale legacy install sitting on a known path can't shadow the current extension.
+  for (const { prof, settings } of perProfile) {
+    for (const [extId, info] of Object.entries(settings)) {
+      if (!info?.path || info.state === 0) continue; // state 0 = explicitly disabled
+      if (extId === EXTENSION_ID) return { id: extId, profile: prof };
+    }
+  }
+  // Pass 2: path equality fallback for legacy keyless installs without a stable ID.
+  for (const { prof, settings } of perProfile) {
+    for (const [extId, info] of Object.entries(settings)) {
+      if (!info?.path || info.state === 0) continue;
+      let storedPath = info.path as string;
+      try { storedPath = realpathSync(storedPath); } catch {}
+      if (knownPaths.has(storedPath)) return { id: extId, profile: prof };
+    }
   }
   return null;
 }

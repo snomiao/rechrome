@@ -1,50 +1,48 @@
-import { c as clientExports, j as jsxRuntimeExports, r as reactExports, B as Button, A as AuthTokenSection, T as TabItem, g as getOrCreateAuthToken } from "./authToken.js";
+import { c as clientExports, j as jsxRuntimeExports, r as reactExports, A as AuthTokenSection, T as TabItem, B as Button, g as getOrCreateAuthToken } from "./authToken.js";
 const SUPPORTED_PROTOCOL_VERSION = 2;
 const ConnectApp = () => {
   const [tabs, setTabs] = reactExports.useState([]);
   const [status, setStatus] = reactExports.useState(null);
-  const [showButtons, setShowButtons] = reactExports.useState(true);
   const [showTabList, setShowTabList] = reactExports.useState(true);
   const [clientInfo, setClientInfo] = reactExports.useState("unknown");
-  const [mcpRelayUrl, setMcpRelayUrl] = reactExports.useState("");
-  const [newTab, setNewTab] = reactExports.useState(false);
+  const setError = reactExports.useCallback((message) => {
+    setShowTabList(false);
+    setStatus({ type: "error", message });
+  }, []);
   reactExports.useEffect(() => {
     const runAsync = async () => {
       const params = new URLSearchParams(window.location.search);
       const relayUrl = params.get("mcpRelayUrl");
       if (!relayUrl) {
-        handleReject("Missing mcpRelayUrl parameter in URL.");
+        setError("Missing mcpRelayUrl parameter in URL.");
         return;
       }
       try {
         const host = new URL(relayUrl).hostname;
         if (host !== "127.0.0.1" && host !== "[::1]") {
-          handleReject(`MCP extension only allows loopback connections (127.0.0.1 or [::1]). Received host: ${host}`);
+          setError(`Playwright extension only allows loopback connections (127.0.0.1 or [::1]). Received host: ${host}`);
           return;
         }
       } catch (e) {
-        handleReject(`Invalid mcpRelayUrl parameter in URL: ${relayUrl}. ${e}`);
+        setError(`Invalid mcpRelayUrl parameter in URL: ${relayUrl}. ${e}`);
         return;
       }
-      setMcpRelayUrl(relayUrl);
-      let info = "unknown";
       try {
         const client = JSON.parse(params.get("client") || "{}");
-        info = `${client.name}/${client.version}`;
+        const info = `${client.name || "unknown"}`;
         setClientInfo(info);
         setStatus({
           type: "connecting",
-          message: `🎭 Playwright MCP started from  "${info}" is trying to connect. Do you want to continue?`
+          message: `"${info}" is trying to connect to the Playwright Extension.`
         });
       } catch (e) {
         setStatus({ type: "error", message: "Failed to parse client version." });
         return;
       }
       const parsedVersion = parseInt(params.get("protocolVersion") ?? "", 10);
-      const requiredVersion = isNaN(parsedVersion) ? 1 : parsedVersion;
-      if (requiredVersion > SUPPORTED_PROTOCOL_VERSION) {
+      const requestedVersion = isNaN(parsedVersion) ? 1 : parsedVersion;
+      if (requestedVersion > SUPPORTED_PROTOCOL_VERSION) {
         const extensionVersion = chrome.runtime.getManifest().version;
-        setShowButtons(false);
         setShowTabList(false);
         setStatus({
           type: "error",
@@ -54,37 +52,33 @@ const ConnectApp = () => {
         });
         return;
       }
+      const response = await chrome.runtime.sendMessage({ type: "connectionRequested", mcpRelayUrl: relayUrl, protocolVersion: requestedVersion });
+      if (!response.success) {
+        setError(response.error);
+        return;
+      }
       const expectedToken = getOrCreateAuthToken();
       const token = params.get("token");
       if (token === expectedToken) {
-        await connectToMCPRelay(relayUrl);
-        await handleConnectToTab(void 0, info);
+        await handleConnectToTab();
         return;
       }
       if (token) {
-        handleReject("Invalid token provided.");
+        setError("Invalid token provided.");
         return;
       }
-      await connectToMCPRelay(relayUrl);
-      if (params.get("newTab") === "true") {
-        setNewTab(true);
+      if (params.get("newTab") === "true")
         setShowTabList(false);
-      } else {
+      else
         await loadTabs();
-      }
     };
     void runAsync();
+    const keepalive = setInterval(() => {
+      chrome.runtime.sendMessage({ type: "keepalive" }).catch(() => {
+      });
+    }, 2e4);
+    return () => clearInterval(keepalive);
   }, []);
-  const handleReject = reactExports.useCallback((message) => {
-    setShowButtons(false);
-    setShowTabList(false);
-    setStatus({ type: "error", message });
-  }, []);
-  const connectToMCPRelay = reactExports.useCallback(async (mcpRelayUrl2) => {
-    const response = await chrome.runtime.sendMessage({ type: "connectToMCPRelay", mcpRelayUrl: mcpRelayUrl2 });
-    if (!response.success)
-      handleReject(response.error);
-  }, [handleReject]);
   const loadTabs = reactExports.useCallback(async () => {
     const response = await chrome.runtime.sendMessage({ type: "getTabs" });
     if (response.success)
@@ -92,58 +86,55 @@ const ConnectApp = () => {
     else
       setStatus({ type: "error", message: "Failed to load tabs: " + response.error });
   }, []);
-  const handleConnectToTab = reactExports.useCallback(async (tab, clientInfoOverride) => {
-    const displayName = clientInfoOverride || clientInfo;
-    setShowButtons(false);
+  const handleConnectToTab = reactExports.useCallback(async (tab) => {
     setShowTabList(false);
     try {
       const response = await chrome.runtime.sendMessage({
         type: "connectToTab",
-        mcpRelayUrl,
-        tabId: tab?.id,
-        windowId: tab?.windowId
+        tab,
+        clientName: clientInfo
       });
-      if (response?.success) {
-        setStatus({ type: "connected", message: `MCP client "${displayName}" connected. Do not close this tab — it maintains the connection to the browser. Closing it will disconnect the session.` });
+      if (response == null ? void 0 : response.success) {
+        setStatus({ type: "connected", message: `"${clientInfo}" connected.` });
       } else {
         setStatus({
           type: "error",
-          message: response?.error || `MCP client "${displayName}" failed to connect.`
+          message: (response == null ? void 0 : response.error) || `"${clientInfo}" failed to connect.`
         });
       }
     } catch (e) {
       setStatus({
         type: "error",
-        message: `MCP client "${displayName}" failed to connect: ${e}`
+        message: `"${clientInfo}" failed to connect: ${e}`
       });
     }
-  }, [clientInfo, mcpRelayUrl]);
+  }, [clientInfo]);
   reactExports.useEffect(() => {
     const listener = (message) => {
-      if (message.type === "connectionTimeout")
-        handleReject("Connection timed out.");
+      if (message.type === "pendingConnectionClosed") {
+        setError("Pending client connection closed.");
+        document.title = "Playwright Extension";
+      }
     };
     chrome.runtime.onMessage.addListener(listener);
     return () => {
       chrome.runtime.onMessage.removeListener(listener);
     };
-  }, [handleReject]);
+  }, [setError]);
   return /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "app-container", children: /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "content-wrapper", children: [
-    status && /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "status-container", children: [
-      /* @__PURE__ */ jsxRuntimeExports.jsx(StatusBanner, { status }),
-      showButtons && /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "button-container", children: newTab ? /* @__PURE__ */ jsxRuntimeExports.jsxs(jsxRuntimeExports.Fragment, { children: [
-        /* @__PURE__ */ jsxRuntimeExports.jsx(Button, { variant: "primary", onClick: () => handleConnectToTab(), children: "Allow" }),
-        /* @__PURE__ */ jsxRuntimeExports.jsx(Button, { variant: "reject", onClick: () => handleReject("Connection rejected. This tab can be closed."), children: "Reject" })
-      ] }) : /* @__PURE__ */ jsxRuntimeExports.jsx(Button, { variant: "reject", onClick: () => handleReject("Connection rejected. This tab can be closed."), children: "Reject" }) })
+    status && /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "status-container", children: /* @__PURE__ */ jsxRuntimeExports.jsx(StatusBanner, { status }) }),
+    (status == null ? void 0 : status.type) === "connecting" && /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "warning-banner", children: [
+      /* @__PURE__ */ jsxRuntimeExports.jsx("strong", { children: "⚠️ Warning:" }),
+      " Allowing this connection exposes the entire browser to the client, including any signed-in sessions, cookies, and content in other tabs and windows. Once approved, the client may also be able to reconnect later without showing this dialog again, unless you regenerate the token below and then restart the browser."
     ] }),
-    status?.type === "connecting" && /* @__PURE__ */ jsxRuntimeExports.jsx(AuthTokenSection, {}),
+    (status == null ? void 0 : status.type) === "connecting" && /* @__PURE__ */ jsxRuntimeExports.jsx(AuthTokenSection, {}),
     showTabList && /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { children: [
-      /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "tab-section-title", children: "Select page to expose to MCP server:" }),
+      /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "tab-section-title", children: "You can drag tabs into the Playwright group later to make them accessible to the client. Optionally, select a tab to allow and immediately switch to it:" }),
       /* @__PURE__ */ jsxRuntimeExports.jsx("div", { children: tabs.map((tab) => /* @__PURE__ */ jsxRuntimeExports.jsx(
         TabItem,
         {
           tab,
-          button: /* @__PURE__ */ jsxRuntimeExports.jsx(Button, { variant: "primary", onClick: () => handleConnectToTab(tab), children: "Connect" })
+          button: /* @__PURE__ */ jsxRuntimeExports.jsx(Button, { variant: "primary", onClick: () => handleConnectToTab(tab), children: "Allow & select" })
         },
         tab.id
       )) })
@@ -151,15 +142,16 @@ const ConnectApp = () => {
   ] }) });
 };
 const VersionMismatchError = ({ extensionVersion }) => {
-  const readmeUrl = "https://github.com/microsoft/playwright-mcp/blob/main/extension/README.md";
-  const latestReleaseUrl = "https://github.com/microsoft/playwright-mcp/releases/latest";
+  const readmeUrl = "https://github.com/microsoft/playwright/blob/main/packages/extension/README.md";
+  const chromeWebStoreUrl = "https://chromewebstore.google.com/detail/playwright-extension/mmlmfjhmonkocbjadbfplnigmagldckm";
   return /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { children: [
-    "Playwright MCP version trying to connect requires newer extension version (current version: ",
+    "Playwright client trying to connect requires newer extension version (current version: ",
     extensionVersion,
     ").",
     " ",
-    /* @__PURE__ */ jsxRuntimeExports.jsx("a", { href: latestReleaseUrl, children: "Click here" }),
-    " to download latest version of the extension, then drag and drop it into the Chrome Extensions page.",
+    "Update ",
+    /* @__PURE__ */ jsxRuntimeExports.jsx("a", { href: chromeWebStoreUrl, target: "_blank", rel: "noopener noreferrer", children: "Playwright Extension" }),
+    " from the Chrome Web Store to the latest version.",
     " ",
     "See ",
     /* @__PURE__ */ jsxRuntimeExports.jsx("a", { href: readmeUrl, target: "_blank", rel: "noopener noreferrer", children: "installation instructions" }),
