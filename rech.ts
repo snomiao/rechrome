@@ -597,7 +597,7 @@ async function setup(opts: { profile?: string } = {}): Promise<void> {
   };
 
   // [1/4] Daemon
-  console.log("\n[1/4] Setting up serve daemon...");
+  console.log("\n[1/4] Checking serve daemon...");
 
   // Bind address (persists to ~/.env.local as RECH_HOST).
   // Read the persisted value from ~/.env.local directly — process.env may be shadowed by nearer .env files.
@@ -630,15 +630,24 @@ async function setup(opts: { profile?: string } = {}): Promise<void> {
   const liveBindUnknown = !!authPing?.ok && !liveBind;
   const currentBind = liveBind || persistedBind;
 
+  // A healthy daemon already answering on our key needs no reinstall — don't re-prompt for it.
+  const daemonHealthy = !!(anonPing && authPing?.ok && !liveBindUnknown);
+  // An explicit RECH_HOST override that differs from the live bind is a deliberate rebind request.
+  const explicitRebind = !!process.env.RECH_HOST && process.env.RECH_HOST !== currentBind;
+
   // Non-TTY honors explicit process.env.RECH_HOST (shell or merged env stack) — matches the documented `RECH_HOST=0.0.0.0 rech setup` flow.
   let desiredBind = process.env.RECH_HOST || currentBind;
-  if (isTTY) {
+  // Only prompt to (re)configure the bind when we actually need to set up the daemon. A running
+  // daemon is left alone unless the user explicitly asks for a different bind via RECH_HOST.
+  if (isTTY && (!daemonHealthy || explicitRebind)) {
     console.log(`\n      Bind address (current: ${currentBind}):`);
     console.log(`        1.  127.0.0.1  (localhost only)`);
     console.log(`        2.  0.0.0.0    (all interfaces — HTTP plaintext, trust your network)`);
     const defaultBindChoice = currentBind === "0.0.0.0" ? "2" : "1";
     const bindAns = (await ask(`      Choice [${defaultBindChoice}]: `, defaultBindChoice)).trim();
     desiredBind = bindAns === "2" || bindAns === "0.0.0.0" ? "0.0.0.0" : "127.0.0.1";
+  } else if (daemonHealthy) {
+    console.log(`      Daemon already running at ${protocol}://${host}:${port} (bind: ${currentBind}) — skipping daemon setup`);
   }
   const bindChanged = desiredBind !== currentBind;
   const persistedChanged = desiredBind !== persistedBind;
@@ -774,11 +783,26 @@ async function setup(opts: { profile?: string } = {}): Promise<void> {
       console.log(`      [agent] Find PLAYWRIGHT_MCP_EXTENSION_TOKEN=... on that page`);
       console.log(`      [agent] Provide the token value on next stdin line:\n`);
     }
-    const tokenInput = (await ask("      Paste token: ")).trim();
-    const token = tokenInput.replace(/^.*?=/, "").trim();
-    if (!token || token.length < 20) { console.error("      Invalid token (too short)"); return null; }
-    console.log("      Token accepted");
-    return { extId, token };
+    // Retry on empty/too-short paste — a truncated copy or a stale token shouldn't
+    // abort the whole setup. Bounded so a non-TTY agent with exhausted stdin can't spin.
+    const maxTries = isTTY ? 5 : 3;
+    for (let attempt = 1; attempt <= maxTries; attempt++) {
+      const tokenInput = (await ask("      Paste token: ")).trim();
+      const token = tokenInput.replace(/^.*?=/, "").trim();
+      const retriesLeft = maxTries - attempt;
+      if (!token) {
+        console.error(`      No token entered.${retriesLeft ? " Copy the full PLAYWRIGHT_MCP_EXTENSION_TOKEN value and try again." : ""}`);
+      } else if (token.length < 20) {
+        console.error(`      Token too short (${token.length} chars) — likely truncated when copying.${retriesLeft ? " Re-copy the full value and try again." : ""}`);
+      } else {
+        console.log("      Token accepted");
+        return { extId, token };
+      }
+      // Non-TTY with no input left: ask() won't block, so stop instead of burning retries on empty reads.
+      if (!isTTY && !tokenInput) break;
+    }
+    console.error("      No valid token provided — aborting");
+    return null;
   }
 
   // [2/4] Primary profile
@@ -809,12 +833,16 @@ async function setup(opts: { profile?: string } = {}): Promise<void> {
   const pwdEnvPath = join(process.cwd(), ".env.local");
   const pwdRechPath = join(process.cwd(), ".rechrome", ".env.local");
   const homeEnvPath = join(process.env.HOME!, ".env.local");
+  // Show whether each target already exists so it's clear we'll update (merge) vs create.
+  const tag = async (p: string) => (await file(p).exists()) ? "exists → will update" : "new file";
+  const [pwdTag, pwdRechTag, homeTag] = await Promise.all([tag(pwdEnvPath), tag(pwdRechPath), tag(homeEnvPath)]);
   const saveChoice = (await ask(
-    `Save to:\n  1. ${pwdEnvPath} (current dir) [default]\n  2. ${pwdRechPath} (current dir, rechrome-only)\n  3. ${homeEnvPath} (user home)\n  4. Skip (already copied)\n\n  Choice [1]: `
+    `Save to:\n  1. ${pwdEnvPath} (current dir) [${pwdTag}] [default]\n  2. ${pwdRechPath} (current dir, rechrome-only) [${pwdRechTag}]\n  3. ${homeEnvPath} (user home) [${homeTag}]\n  4. Skip (already copied)\n\n  Choice [1]: `
   )).trim();
   if (saveChoice !== "4") {
     const globalEnvPath = saveChoice === "3" ? homeEnvPath : saveChoice === "2" ? pwdRechPath : pwdEnvPath;
     if (saveChoice === "2") mkdirSync(join(process.cwd(), ".rechrome"), { recursive: true });
+    const existedBefore = await file(globalEnvPath).exists();
     const existing = await file(globalEnvPath).text().catch(() => "");
     const keysToRemove = ["PLAYWRIGHT_MCP_USER_DATA_DIR", "PLAYWRIGHT_MCP_EXTENSION_ID", "PLAYWRIGHT_MCP_EXTENSION_TOKEN", "PLAYWRIGHT_MCP_PROFILE_DIRECTORY"];
     let lines = existing.trimEnd().split("\n").filter(l => !keysToRemove.some(k => l.startsWith(`${k}=`)));
@@ -822,7 +850,7 @@ async function setup(opts: { profile?: string } = {}): Promise<void> {
     if (rechIdx >= 0) lines[rechIdx] = newLine;
     else lines.push(newLine);
     await Bun.write(globalEnvPath, lines.join("\n").trim() + "\n");
-    console.log(`\nSaved to ${globalEnvPath}`);
+    console.log(`\n${existedBefore ? "Updated" : "Created"} ${globalEnvPath}`);
   }
 
   // Save primary to token registry
@@ -850,7 +878,7 @@ async function setup(opts: { profile?: string } = {}): Promise<void> {
   }
   rl?.close();
   envWatcher?.close();
-  console.log(`\nDone! Test with:\n  rech eval "() => document.title"`);
+  console.log(`\nDone! Test with:\n  rech open github.com/snomiao`);
 }
 
 async function status(): Promise<void> {
