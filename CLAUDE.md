@@ -1,5 +1,13 @@
 # rechrome — repo-scoped Claude rules
 
+## NEVER restart / quit the user's Chrome without explicit approval
+
+Do **not** run `osascript -e 'quit app "Google Chrome"'`, `pkill`/`kill` on Chrome, or anything that
+closes/relaunches the user's Chrome — it destroys their live browsing session. This includes "just to
+reload the extension." If a patched unpacked extension needs to be reloaded, **ask the user to reload it**
+(chrome://extensions → reload, or the extension's own reload), or find a non-destructive path. Only quit/
+restart Chrome when the user has explicitly approved it in the current request.
+
 ## Never modify node_modules
 
 This repo has **vendored forks** in `./lib/`:

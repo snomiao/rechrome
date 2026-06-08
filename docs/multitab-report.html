@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rechrome — Multi-tab Feature Gap & Restore Report</title>
+<style>
+  :root{--bg:#0d1117;--panel:#161b22;--bd:#30363d;--fg:#e6edf3;--mut:#8b949e;--accent:#58a6ff;--ok:#3fb950;--bad:#f85149;--warn:#d29922;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  .wrap{max-width:960px;margin:0 auto;padding:40px 24px 80px}
+  h1{font-size:28px;margin:0 0 4px}
+  .sub{color:var(--mut);margin:0 0 28px}
+  h2{font-size:19px;margin:34px 0 12px;padding-bottom:6px;border-bottom:1px solid var(--bd)}
+  .panel{background:var(--panel);border:1px solid var(--bd);border-radius:10px;padding:16px 18px;margin:14px 0}
+  code,pre{font-family:var(--mono)}
+  pre{background:#0b0f14;border:1px solid var(--bd);border-radius:8px;padding:12px 14px;overflow-x:auto;font-size:13px}
+  .pill{display:inline-block;padding:2px 9px;border-radius:999px;font-size:12px;font-weight:600;vertical-align:middle}
+  .p-ok{background:rgba(63,185,80,.15);color:var(--ok);border:1px solid rgba(63,185,80,.4)}
+  .p-bad{background:rgba(248,81,73,.15);color:var(--bad);border:1px solid rgba(248,81,73,.4)}
+  .p-warn{background:rgba(210,153,34,.15);color:var(--warn);border:1px solid rgba(210,153,34,.4)}
+  .p-do{background:rgba(88,166,255,.15);color:var(--accent);border:1px solid rgba(88,166,255,.4)}
+  table{border-collapse:collapse;width:100%;margin:8px 0;font-size:14px}
+  th,td{border:1px solid var(--bd);padding:8px 10px;text-align:left;vertical-align:top}
+  th{background:#1c2128;color:var(--mut);font-weight:600}
+  .ok{color:var(--ok)} .bad{color:var(--bad)} .warn{color:var(--warn)} .mut{color:var(--mut)}
+  ul{margin:8px 0 8px 0;padding-left:22px} li{margin:4px 0}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  @media(max-width:680px){.grid{grid-template-columns:1fr}}
+  .kbd{font-family:var(--mono);background:#0b0f14;border:1px solid var(--bd);border-radius:4px;padding:1px 6px;font-size:12px}
+  .step{display:flex;gap:10px;align-items:flex-start;margin:8px 0}
+  .num{flex:0 0 24px;height:24px;border-radius:50%;background:#1c2128;border:1px solid var(--bd);text-align:center;line-height:23px;font-size:12px;color:var(--mut)}
+  .diff-del{color:var(--bad)} .diff-add{color:var(--ok)}
+  small{color:var(--mut)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Multi-tab Feature — Gap Analysis &amp; Restore Plan</h1>
+  <p class="sub">rechrome · lib/playwright @ <code>bfb53d2</code> → branch <code>multitab-concurrent</code> · generated 2026-06-08</p>
+
+  <div class="panel">
+    <strong>TL;DR.</strong> "Multi-tab" is two distinct capabilities. One was never lost; the other was.
+    <ul>
+      <li><span class="pill p-ok">PRESENT</span> <b>A — multi-tab within one session</b> (<code>tab-new</code>/<code>tab-list</code>/<code>tab-select</code>): upstream-native in playwright V2 (<code>browserModel.ts</code> + per-connection Chrome tab group via <code>connectedTabGroup.ts</code>).</li>
+      <li><span class="pill p-bad">WAS MISSING</span> <b>B — concurrent sessions sharing one Chrome profile</b>: a 2nd client on the same profile <i>evicted</i> the first. This is the feature being restored.</li>
+    </ul>
+  </div>
+
+  <h2>1. What we were lacking — proven by the 2×2×2 test</h2>
+  <p>identity × profile × tabs. Two identities targeting the <b>same</b> Chrome profile were run, each opening 2 tabs:</p>
+  <table>
+    <tr><th>identity (cwd)</th><th>profile</th><th>session</th><th>result</th></tr>
+    <tr><td>id1-sno</td><td>snomiao@gmail.com</td><td><code>7df4b464</code></td><td class="bad">EVICTED — only 1 tab, then "not open"</td></tr>
+    <tr><td>id2-sno</td><td>snomiao@gmail.com</td><td><code>3ad9fea2</code></td><td class="ok">alive, 2 tabs</td></tr>
+    <tr><td>id1-taku</td><td>taku@symphoneed.co.jp</td><td><code>bb1e7262</code></td><td class="bad">EVICTED</td></tr>
+    <tr><td>id2-taku</td><td>taku@symphoneed.co.jp</td><td><code>87cfa765</code></td><td class="ok">alive, 2 tabs</td></tr>
+  </table>
+  <p class="mut">Only the <b>last</b> session per profile survived → 4 of 8 pages reachable. The first identity on each profile was killed the moment the second connected.</p>
+
+  <h2>2. Root cause <span class="pill p-do">extension-only</span></h2>
+  <p>The Chrome extension held a <b>single</b> connection slot and explicitly evicted on every new connect — in <code>packages/extension/src/background.ts</code>:</p>
+  <pre><span class="mut">// before</span>
+private <span class="diff-del">_activeGroup</span>: ConnectedTabGroup | undefined;   <span class="mut">// one slot</span>
+private _activeClientName: string | undefined;
+
+async _connectTab(...) {
+  await this._cleanupPromise;
+  <span class="diff-del">this._disconnect('Another connection is requested');</span>  <span class="bad">// ← evicts existing client</span>
+  ...
+  this._activeGroup = group;                          <span class="mut">// single assignment</span>
+}</pre>
+  <p><b>Why extension-only:</b> the relay already isolates per client. <code>extensionContextFactory.ts</code> calls
+  <code>new CDPRelayServer(...)</code> per browser session — each with its own <code>uuid</code> WebSocket path and its own
+  <code>_extensionConnection</code>. Distinct session ids per identity (<code>7df4b464 ≠ 3ad9fea2</code>) confirm separate relays.
+  So a 2nd client already drives a 2nd <code>connectionRequested → _connectTab</code> in the extension; the only contention is the
+  single <code>_activeGroup</code>. <b>No relay change required.</b> <code>ConnectedTabGroup</code> already encapsulates one
+  connection + one Chrome tab group, keyed by its own <code>_groupId</code> — built for isolation, just never allowed to coexist.</p>
+
+  <h2>3. The patch (applied) — multi-group, no eviction</h2>
+  <pre><span class="mut">// after — background.ts</span>
+private <span class="diff-add">_activeGroups = new Set&lt;ConnectedTabGroup&gt;()</span>;          <span class="ok">// N concurrent clients</span>
+private <span class="diff-add">_clientNames = new Map&lt;ConnectedTabGroup, string|undefined&gt;()</span>;
+
+async _connectTab(...) {
+  await this._cleanupPromise;
+  <span class="diff-add">// no eviction — clients coexist, each in its own tab group</span>
+  const group = new ConnectedTabGroup(connection, tab);
+  group.onclose = () =&gt; { this._activeGroups.delete(group); this._clientNames.delete(group); };
+  <span class="diff-add">this._activeGroups.add(group); this._clientNames.set(group, clientName);</span>
+}
+<span class="mut">// getConnectionStatus aggregates across groups; _disconnect closes all</span></pre>
+  <p class="mut">Isolation rests on each <code>ConnectedTabGroup</code>'s own <code>_groupId</code> / <code>attachedTabs</code> filters, so a
+  tab created by client A cannot be claimed into client B's group.</p>
+
+  <h2>4. Status &amp; remaining implementation</h2>
+  <div class="grid">
+    <div class="panel">
+      <div class="step"><div class="num">✓</div><div>Diagnose eviction + topology <span class="pill p-ok">done</span></div></div>
+      <div class="step"><div class="num">✓</div><div>Patch <code>background.ts</code> → multi-group <span class="pill p-ok">done</span></div></div>
+      <div class="step"><div class="num">✓</div><div>Rebuild core + extension (<code>background.mjs</code> has <code>_activeGroups</code>) <span class="pill p-ok">done</span></div></div>
+    </div>
+    <div class="panel">
+      <div class="step"><div class="num">→</div><div>Sync repo <code>extension/</code> + <code>~/.rechrome/extension</code> from rebuilt dist <span class="pill p-do">next</span></div></div>
+      <div class="step"><div class="num">→</div><div>Reload extension in Chrome &amp; restart daemon <span class="pill p-do">next</span></div></div>
+      <div class="step"><div class="num">→</div><div>Re-run 2×2×2 → expect <b>no eviction</b>, all 4 sessions live <span class="pill p-do">verify</span></div></div>
+      <div class="step"><div class="num">→</div><div>Commit patch on <code>lib/playwright</code>, bump submodule pointer <span class="pill p-do">finalize</span></div></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <strong>Acceptance test (the spec):</strong> two identities, same Chrome profile, two tabs each → both sessions remain
+    open, each session's tabs isolated in its own Chrome tab group, no <span class="kbd">Browser 'xxxx' is not open</span>.
+  </div>
+
+  <p><small>This report is regenerated by the restore task. Capabilities A (within-session multi-tab) and B (concurrent
+  same-profile sessions) are tracked separately so "multi-tab" is never ambiguous again.</small></p>
+</div>
+</body>
+</html>

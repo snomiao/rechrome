@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reload the Playwright Extension — Help me test the multi-tab patch</title>
+<style>
+  :root{--bg:#0d1117;--panel:#161b22;--bd:#30363d;--fg:#e6edf3;--mut:#8b949e;--accent:#58a6ff;--ok:#3fb950;--warn:#d29922;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  .wrap{max-width:820px;margin:0 auto;padding:40px 24px 80px}
+  h1{font-size:26px;margin:0 0 6px}
+  .sub{color:var(--mut);margin:0 0 24px}
+  h2{font-size:18px;margin:30px 0 10px;padding-bottom:6px;border-bottom:1px solid var(--bd)}
+  .panel{background:var(--panel);border:1px solid var(--bd);border-radius:10px;padding:16px 18px;margin:14px 0}
+  .warn{border-color:rgba(210,153,34,.5);background:rgba(210,153,34,.08)}
+  .ok{border-color:rgba(63,185,80,.5);background:rgba(63,185,80,.08)}
+  code{font-family:var(--mono);background:#0b0f14;border:1px solid var(--bd);border-radius:5px;padding:1px 7px;font-size:14px}
+  a.url{color:var(--accent);text-decoration:none;font-family:var(--mono);font-size:15px}
+  ol{counter-reset:step;list-style:none;padding-left:0;margin:0}
+  ol li{counter-increment:step;position:relative;padding:14px 0 14px 56px;border-bottom:1px solid var(--bd)}
+  ol li:last-child{border-bottom:0}
+  ol li::before{content:counter(step);position:absolute;left:0;top:12px;width:34px;height:34px;border-radius:50%;
+    background:var(--accent);color:#0b0f14;font-weight:700;text-align:center;line-height:34px;font-size:16px}
+  .big{font-size:17px;font-weight:600}
+  .pill{display:inline-block;padding:2px 9px;border-radius:999px;font-size:12px;font-weight:600;background:rgba(88,166,255,.15);color:var(--accent);border:1px solid rgba(88,166,255,.4)}
+  kbd{font-family:var(--mono);background:#1c2128;border:1px solid var(--bd);border-bottom-width:2px;border-radius:5px;padding:2px 7px;font-size:13px}
+  .reload-icon{display:inline-block;width:18px;height:18px;vertical-align:-3px;border:2px solid var(--accent);border-top-color:transparent;border-radius:50%;position:relative}
+  .muted{color:var(--mut)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>↻ Reload the Playwright Extension</h1>
+  <p class="sub">So I can test the multi-tab patch — <b>without</b> restarting your Chrome.</p>
+
+  <div class="panel ok">
+    <span class="big">Why this is safe.</span> Reloading an unpacked extension only re-reads its files from disk and
+    restarts <i>its own</i> background worker. It does <b>not</b> close your tabs, windows, or restart Chrome. I will
+    never quit your Chrome (noted in CLAUDE.md).
+  </div>
+
+  <h2>What changed</h2>
+  <p>I patched the extension so multiple rech sessions can share one Chrome profile (no more eviction). The new code is
+  already on disk at <code>/Users/sno/.rechrome/extension</code> — Chrome just needs to reload it to drop the cached old code.</p>
+
+  <h2>Steps (about 15 seconds)</h2>
+  <div class="panel">
+  <ol>
+    <li><span class="big">Open the extensions page.</span><br>
+        New tab → go to <a class="url" href="chrome://extensions">chrome://extensions</a>
+        <span class="muted">(can't click here — copy/paste it into Chrome's address bar).</span></li>
+    <li><span class="big">Turn on Developer mode.</span><br>
+        Toggle <kbd>Developer mode</kbd> in the <b>top-right</b> (skip if already on).</li>
+    <li><span class="big">Find “Playwright Extension”.</span><br>
+        Card with ID <code>mmlmfjhmonkocbjadbfplnigmagldckm</code>, “Loaded from
+        <code>/Users/sno/.rechrome/extension</code>”.</li>
+    <li><span class="big">Click the <span class="reload-icon"></span> Reload icon</span> on that card
+        (the circular arrow, bottom-right of the card).</li>
+    <li><span class="big">Do it for each profile that has it.</span><br>
+        You use it in <b>Profile 1</b> (snomiao@gmail.com) and <b>Default</b> (taku@symphoneed.co.jp). Switch profile
+        window if needed and reload there too. <span class="muted">(Each Chrome profile has its own copy.)</span></li>
+    <li><span class="big">Tell me “reloaded”.</span><br>
+        I'll immediately re-run the <code>2×2×2</code> test (2 identities × same profile × 2 tabs) and confirm both
+        sessions stay alive with no eviction.</li>
+  </ol>
+  </div>
+
+  <div class="panel warn">
+    <b>Optional check:</b> on the extension card, if you see <kbd>service worker</kbd>, you can click it to confirm it
+    restarted cleanly. No errors expected.
+  </div>
+
+  <p class="muted">After your reload I'll verify, and if anything still evicts I'll keep patching (likely the MV3
+  service-worker lifecycle / stale-group cleanup) until two same-profile sessions coexist.</p>
+</div>
+</body>
+</html>
