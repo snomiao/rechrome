@@ -27,9 +27,10 @@ const ConnectApp = () => {
         setError(`Invalid mcpRelayUrl parameter in URL: ${relayUrl}. ${e}`);
         return;
       }
+      let info = "unknown";
       try {
         const client = JSON.parse(params.get("client") || "{}");
-        const info = `${client.name || "unknown"}`;
+        info = `${client.name || "unknown"}`;
         setClientInfo(info);
         setStatus({
           type: "connecting",
@@ -60,7 +61,7 @@ const ConnectApp = () => {
       const expectedToken = getOrCreateAuthToken();
       const token = params.get("token");
       if (token === expectedToken) {
-        await handleConnectToTab();
+        await handleConnectToTab(void 0, info);
         return;
       }
       if (token) {
@@ -86,26 +87,26 @@ const ConnectApp = () => {
     else
       setStatus({ type: "error", message: "Failed to load tabs: " + response.error });
   }, []);
-  const handleConnectToTab = reactExports.useCallback(async (tab) => {
+  const handleConnectToTab = reactExports.useCallback(async (tab, clientName = clientInfo) => {
     setShowTabList(false);
     try {
       const response = await chrome.runtime.sendMessage({
         type: "connectToTab",
         tab,
-        clientName: clientInfo
+        clientName
       });
       if (response == null ? void 0 : response.success) {
-        setStatus({ type: "connected", message: `"${clientInfo}" connected.` });
+        setStatus({ type: "connected", message: `"${clientName}" connected.` });
       } else {
         setStatus({
           type: "error",
-          message: (response == null ? void 0 : response.error) || `"${clientInfo}" failed to connect.`
+          message: (response == null ? void 0 : response.error) || `"${clientName}" failed to connect.`
         });
       }
     } catch (e) {
       setStatus({
         type: "error",
-        message: `"${clientInfo}" failed to connect: ${e}`
+        message: `"${clientName}" failed to connect: ${e}`
       });
     }
   }, [clientInfo]);
