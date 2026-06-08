@@ -39,6 +39,13 @@
   <h1>Multi-tab Feature — Gap Analysis &amp; Restore Plan</h1>
   <p class="sub">rechrome · lib/playwright @ <code>bfb53d2</code> → branch <code>multitab-concurrent</code> · generated 2026-06-08</p>
 
+  <div class="panel ok">
+    <strong>STATUS: FIXED &amp; VERIFIED.</strong> The concurrent-session capability is restored in the extension and
+    proven by an automated test that <b>fails on the pre-fix code and passes after</b> — verified in an isolated test
+    Chrome, your browser untouched. To use it in your live Chrome, reload the unpacked extension once
+    (see <code>docs/reload-extension-guide.html</code>).
+  </div>
+
   <div class="panel">
     <strong>TL;DR.</strong> "Multi-tab" is two distinct capabilities. One was never lost; the other was.
     <ul>
@@ -101,10 +108,10 @@ async _connectTab(...) {
       <div class="step"><div class="num">✓</div><div>Rebuild core + extension (<code>background.mjs</code> has <code>_activeGroups</code>) <span class="pill p-ok">done</span></div></div>
     </div>
     <div class="panel">
-      <div class="step"><div class="num">→</div><div>Sync repo <code>extension/</code> + <code>~/.rechrome/extension</code> from rebuilt dist <span class="pill p-do">next</span></div></div>
-      <div class="step"><div class="num">→</div><div>Reload extension in Chrome &amp; restart daemon <span class="pill p-do">next</span></div></div>
-      <div class="step"><div class="num">→</div><div>Re-run 2×2×2 → expect <b>no eviction</b>, all 4 sessions live <span class="pill p-do">verify</span></div></div>
-      <div class="step"><div class="num">→</div><div>Commit patch on <code>lib/playwright</code>, bump submodule pointer <span class="pill p-do">finalize</span></div></div>
+      <div class="step"><div class="num">✓</div><div>Sync repo <code>extension/</code> + <code>~/.rechrome/extension</code> from rebuilt dist <span class="pill p-ok">done</span></div></div>
+      <div class="step"><div class="num">✓</div><div>Autonomous regression test (isolated Chrome): fails pre-fix, passes after <span class="pill p-ok">verified</span></div></div>
+      <div class="step"><div class="num">✓</div><div>Commit patch + test on <code>lib/playwright</code>, bump submodule pointer <span class="pill p-ok">done</span></div></div>
+      <div class="step"><div class="num">→</div><div>You: reload the unpacked extension once → live in your Chrome <span class="pill p-do">your turn</span></div></div>
     </div>
   </div>
 
