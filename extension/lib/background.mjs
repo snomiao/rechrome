@@ -368,14 +368,33 @@ async function openRelayConnection(mcpRelayUrl, protocolVersion) {
 }
 const PLAYWRIGHT_GROUP_TITLE = "Playwright";
 const PLAYWRIGHT_GROUP_COLOR = "green";
+const PLAYWRIGHT_GROUP_MARK = "🎭";
 const NON_DEBUGGABLE_SCHEMES = ["chrome:", "edge:", "devtools:"];
 const CONNECTED_BADGE = { text: "✓", color: "#4CAF50", title: "Connected to Playwright client" };
 function isNonDebuggableUrl(url) {
   return !!url && NON_DEBUGGABLE_SCHEMES.some((s) => url.startsWith(s));
 }
+function urlDomain(url) {
+  if (!url)
+    return void 0;
+  try {
+    const u = new URL(url);
+    if (u.protocol !== "http:" && u.protocol !== "https:")
+      return void 0;
+    return u.hostname.replace(/^www\./, "");
+  } catch {
+    return void 0;
+  }
+}
+function groupTitle(clientName, seedUrl) {
+  return `${PLAYWRIGHT_GROUP_MARK} ${clientName || urlDomain(seedUrl) || PLAYWRIGHT_GROUP_TITLE}`;
+}
 async function cleanupStalePlaywrightGroups() {
   try {
-    const groups = await chrome.tabGroups.query({ title: PLAYWRIGHT_GROUP_TITLE });
+    const groups = (await chrome.tabGroups.query({})).filter((g) => {
+      var _a;
+      return (_a = g.title) == null ? void 0 : _a.startsWith(PLAYWRIGHT_GROUP_MARK);
+    });
     const tabsPerGroup = await Promise.all(groups.map((g) => chrome.tabs.query({ groupId: g.id })));
     const tabIds = tabsPerGroup.flat().map((t) => t.id).filter((id) => id !== void 0);
     if (tabIds.length)
@@ -385,14 +404,16 @@ async function cleanupStalePlaywrightGroups() {
   }
 }
 class ConnectedTabGroup {
-  constructor(connection, selectedTab) {
+  constructor(connection, selectedTab, clientName) {
     __publicField(this, "_connection");
     __publicField(this, "_groupId", null);
     __publicField(this, "_groupTabIds", /* @__PURE__ */ new Set());
     __publicField(this, "_onTabUpdatedListener");
     __publicField(this, "_onTabRemovedListener");
+    __publicField(this, "_groupTitle");
     __publicField(this, "onclose");
     this._connection = connection;
+    this._groupTitle = groupTitle(clientName, selectedTab.url);
     this._connection.onclose = () => this._onConnectionClose();
     this._connection.ontabattached = (tabId) => this._onTabAttached(tabId);
     this._connection.ontabdetached = (tabId) => this._onTabDetached(tabId);
@@ -485,7 +506,7 @@ class ConnectedTabGroup {
       await this._retryOnDrag(async () => {
         if (this._groupId === null) {
           this._groupId = await chrome.tabs.group({ tabIds: [tabId] });
-          await chrome.tabGroups.update(this._groupId, { color: PLAYWRIGHT_GROUP_COLOR, title: PLAYWRIGHT_GROUP_TITLE });
+          await chrome.tabGroups.update(this._groupId, { color: PLAYWRIGHT_GROUP_COLOR, title: this._groupTitle });
         } else {
           await chrome.tabs.group({ groupId: this._groupId, tabIds: [tabId] });
         }
@@ -581,7 +602,7 @@ class PlaywrightExtension {
       const connection = await this._pendingConnections.take(selectorTabId);
       if (!connection)
         throw new Error("Pending client connection closed");
-      const group = new ConnectedTabGroup(connection, tab);
+      const group = new ConnectedTabGroup(connection, tab, clientName);
       group.onclose = () => {
         this._activeGroups.delete(group);
         this._clientNames.delete(group);

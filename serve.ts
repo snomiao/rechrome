@@ -14,6 +14,20 @@ import {
 const TAILSCALE_BIN = process.env.TAILSCALE_BIN || "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
 const CERT_RENEW_THRESHOLD_DAYS = 7;
 
+// Short, human-friendly label for a client identity, used as the Chrome tab-group
+// name so concurrent sessions on one profile are distinguishable.
+// gitUrl ".../owner/repo/tree/branch" -> "repo:branch"; "host:/path/to/dir" -> "dir";
+// bare host/IP -> as-is. Strips a trailing "@profile" (email) suffix first.
+function shortClientLabel(raw: string): string {
+  if (!raw) return raw;
+  const baseId = raw.includes("@") ? raw.slice(0, raw.indexOf("@")) : raw;
+  const git = baseId.match(/^https?:\/\/[^/]+\/[^/]+\/([^/]+?)(?:\/tree\/(.+))?$/);
+  if (git) return git[2] ? `${git[1]}:${git[2]}` : git[1];
+  const hostCwd = baseId.match(/^[^:]+:(.+)$/);
+  if (hostCwd) return hostCwd[1].split("/").filter(Boolean).pop() || baseId;
+  return baseId;
+}
+
 async function renewCertIfNeeded(certPath: string, keyPath: string): Promise<boolean> {
   const certContent = await file(certPath).text().catch(() => null);
   if (!certContent) return false;
@@ -233,7 +247,7 @@ export async function serve() {
         TMPDIR: process.env.TMPDIR,
         DISPLAY: process.env.DISPLAY,
         XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR,
-        ...(clientName ? { PLAYWRIGHT_MCP_CLIENT_NAME: clientName } : {}),
+        ...(clientName ? { PLAYWRIGHT_MCP_CLIENT_NAME: shortClientLabel(clientName) } : {}),
         ...passthroughEnv,
         // Enable extension bridge when credentials are present
         ...(passthroughEnv.PLAYWRIGHT_MCP_EXTENSION_ID && passthroughEnv.PLAYWRIGHT_MCP_EXTENSION_TOKEN
