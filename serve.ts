@@ -14,18 +14,23 @@ import {
 const TAILSCALE_BIN = process.env.TAILSCALE_BIN || "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
 const CERT_RENEW_THRESHOLD_DAYS = 7;
 
-// Short, human-friendly label for a client identity, used as the Chrome tab-group
-// name so concurrent sessions on one profile are distinguishable.
-// gitUrl ".../owner/repo/tree/branch" -> "repo:branch"; "host:/path/to/dir" -> "dir";
-// bare host/IP -> as-is. Strips a trailing "@profile" (email) suffix first.
+// Short label for a client identity, used as the Chrome tab-group name (the tab
+// strip is space-constrained, so cap at 7 chars). gitUrl ".../owner/repo/tree/branch"
+// -> "rep:bra" (3+3); "host:/path/to/dir" -> "dir"; bare host/IP -> as-is. Strips a
+// trailing "@profile" suffix first.
+const MAX_GROUP_LABEL_LEN = 7;
 function shortClientLabel(raw: string): string {
   if (!raw) return raw;
   const baseId = raw.includes("@") ? raw.slice(0, raw.indexOf("@")) : raw;
   const git = baseId.match(/^https?:\/\/[^/]+\/[^/]+\/([^/]+?)(?:\/tree\/(.+))?$/);
-  if (git) return git[2] ? `${git[1]}:${git[2]}` : git[1];
-  const hostCwd = baseId.match(/^[^:]+:(.+)$/);
-  if (hostCwd) return hostCwd[1].split("/").filter(Boolean).pop() || baseId;
-  return baseId;
+  let label: string;
+  if (git)
+    label = git[2] ? `${git[1].slice(0, 3)}:${git[2].slice(0, 3)}` : git[1];
+  else {
+    const hostCwd = baseId.match(/^[^:]+:(.+)$/);
+    label = hostCwd ? (hostCwd[1].split("/").filter(Boolean).pop() || baseId) : baseId;
+  }
+  return label.slice(0, MAX_GROUP_LABEL_LEN);
 }
 
 async function renewCertIfNeeded(certPath: string, keyPath: string): Promise<boolean> {
