@@ -366,9 +366,9 @@ async function openRelayConnection(mcpRelayUrl, protocolVersion) {
     throw new Error(message);
   }
 }
-const PLAYWRIGHT_GROUP_TITLE = "Playwright";
+const PLAYWRIGHT_GROUP_TITLE = "pw";
 const PLAYWRIGHT_GROUP_COLOR = "green";
-const PLAYWRIGHT_GROUP_MARK = "🎭";
+const MAX_GROUP_TITLE_LEN = 7;
 const NON_DEBUGGABLE_SCHEMES = ["chrome:", "edge:", "devtools:"];
 const CONNECTED_BADGE = { text: "✓", color: "#4CAF50", title: "Connected to Playwright client" };
 function isNonDebuggableUrl(url) {
@@ -381,20 +381,17 @@ function urlDomain(url) {
     const u = new URL(url);
     if (u.protocol !== "http:" && u.protocol !== "https:")
       return void 0;
-    return u.hostname.replace(/^www\./, "");
+    return u.hostname.replace(/^www\./, "").split(".")[0];
   } catch {
     return void 0;
   }
 }
 function groupTitle(clientName, seedUrl) {
-  return `${PLAYWRIGHT_GROUP_MARK} ${clientName || urlDomain(seedUrl) || PLAYWRIGHT_GROUP_TITLE}`;
+  return (clientName || urlDomain(seedUrl) || PLAYWRIGHT_GROUP_TITLE).slice(0, MAX_GROUP_TITLE_LEN);
 }
 async function cleanupStalePlaywrightGroups() {
   try {
-    const groups = (await chrome.tabGroups.query({})).filter((g) => {
-      var _a;
-      return (_a = g.title) == null ? void 0 : _a.startsWith(PLAYWRIGHT_GROUP_MARK);
-    });
+    const groups = await chrome.tabGroups.query({ color: PLAYWRIGHT_GROUP_COLOR });
     const tabsPerGroup = await Promise.all(groups.map((g) => chrome.tabs.query({ groupId: g.id })));
     const tabIds = tabsPerGroup.flat().map((t) => t.id).filter((id) => id !== void 0);
     if (tabIds.length)
