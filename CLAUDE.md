@@ -53,3 +53,26 @@ Hard-won notes — a source edit not taking effect at runtime is almost always o
 - **A daemon (`serve`) change needs the daemon restarted** (`oxmgr restart rechrome-serve`) to take
   effect; the daemon runs the `serve` source directly (no build step). Restarting it does not touch
   Chrome or live browser sessions.
+
+## Driving rech as a client (screenshotting a page)
+
+For an agent that just wants to *use* rech to open/verify a URL in the user's Chrome:
+
+- **Package is `rechrome`, CLI alias `rech` — `bunx rech` 404s.** Not on PATH; run `bun rech.ts <cmd>`
+  from this repo (or `bunx rechrome <cmd>`).
+- **Env:** `PLAYWRIGHT_CLI="bunx playwright-cli" PLAYWRIGHT_BROWSERS_PATH="$HOME/.cache/ms-playwright"`
+  (npm `playwright-cli` works when the vendored fork isn't checked out). It auto-loads `RECHROME_URL`
+  from the nearest `.env.local` (walks cwd→root and **overwrites** `process.env`, so a URL passed on the
+  CLI is ignored — edit the file).
+- **`bun rech.ts status` first.** "bearer key rejected" = the `<KEY>@host` userinfo rotated (it does so
+  every Mac serve restart) → ask the user for a fresh `RECHROME_URL`; can't SSH into the Mac.
+- **Commands:** `open <url>` · `screenshot [--full-page] [--filename x.png]` · `resize <w> <h>` ·
+  `eval "() => …"`. Screenshots download to `./.playwright-cli-multi-tab/` (gitignored).
+- **Each call is a SEPARATE session.** An `eval` that scrolls does NOT persist into the next
+  `screenshot` (it re-opens at top) — but **`resize` DOES** persist (it's a window property). To shoot
+  below the fold on a page that scrolls an inner container (where `--full-page` only captures the
+  viewport): `resize` the window tall so everything lays out without inner-scroll, `eval` the target's
+  `getBoundingClientRect()` for its y, `screenshot`, then crop (e.g. PIL). Mobile view = `resize` to a
+  phone width.
+- **It's the user's real Chrome:** `resize` back to a normal size when done, and never quit/restart it
+  (see the top rule). Browser HTTP cache is real — add a `?cb=<ts>` cache-buster after a deploy.
