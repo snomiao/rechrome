@@ -1,0 +1,7 @@
+# Serve install scripts as plain text (nice in-browser, harmless for curl|bash)
+/setup.sh
+  Content-Type: text/plain; charset=utf-8
+  Cache-Control: public, max-age=300
+/setup.ps1
+  Content-Type: text/plain; charset=utf-8
+  Cache-Control: public, max-age=300
