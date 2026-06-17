@@ -20,9 +20,13 @@ if (-not (Get-Command rech -ErrorAction SilentlyContinue)) {
   exit 1
 }
 
-# 4. Run first-time setup (daemon + Chrome extension + config)
-Write-Host '==> Running ''rech setup'' ...' -ForegroundColor Cyan
-rech setup
-
-Write-Host "All set. Drive your browser with 'rech open <url>' / 'rech screenshot'." -ForegroundColor Green
-Write-Host "Docs: https://github.com/snomiao/rechrome"
+# 4. Done. We do NOT auto-run setup — `rech setup` is interactive (it installs
+# the Chrome extension + starts a daemon) and is only needed on the machine
+# that hosts the browser. Print the next step instead.
+Write-Host '==> rechrome installed.' -ForegroundColor Green
+Write-Host ''
+Write-Host '  Next, on the machine with a browser, run first-time setup:'
+Write-Host '      rech setup' -ForegroundColor Cyan
+Write-Host ''
+Write-Host '  Then drive it:  rech open <url>  |  rech screenshot  |  rech tab-list'
+Write-Host '  Docs: https://github.com/snomiao/rechrome'

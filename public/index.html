@@ -92,9 +92,9 @@
       <button class="copy" data-target="ps">Copy</button>
     </div>
 
-    <p class="what">One shot: installs <code>bun</code>, the <code>rechrome</code> package, then runs
-      <code>rech setup</code> (daemon + Chrome extension + config). When it finishes you can
-      <code>rech open &lt;url&gt;</code> and <code>rech screenshot</code> right away.</p>
+    <p class="what">Installs <code>bun</code> and the <code>rechrome</code> package, then prints the next step.
+      On the machine that hosts the browser, run <code>rech setup</code> once (daemon + Chrome extension + config);
+      after that you can <code>rech open &lt;url&gt;</code> and <code>rech screenshot</code>.</p>
   </section>
 
   <section class="grid">
@@ -119,7 +119,7 @@
   <section class="steps">
     <h2>After install</h2>
     <ol>
-      <li>On the machine with a browser, the installer already ran <code>rech setup</code> and started the daemon.</li>
+      <li>On the machine with a browser, run <code>rech setup</code> once — it installs the Chrome extension and starts the daemon.</li>
       <li>Copy the generated <code>RECHROME_URL</code> from <code>.env.local</code> to any client project.</li>
       <li>Drive it: <code>rech open https://example.com</code> → <code>rech screenshot</code> → <code>rech tab-list</code>.</li>
     </ol>

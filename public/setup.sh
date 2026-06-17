@@ -27,15 +27,11 @@ if ! command -v rech >/dev/null 2>&1; then
   exit 1
 fi
 
-# 4. Run first-time setup (daemon + Chrome extension + config).
-# When piped via `curl ... | bash`, stdin is the script, so reconnect the
-# terminal for the interactive prompts; fall back to non-interactive otherwise.
-info "Running 'rech setup' ..."
-if [ -t 1 ] && [ -r /dev/tty ]; then
-  rech setup </dev/tty
-else
-  rech setup || true
-fi
-
-info "All set. Drive your browser with 'rech open <url>' / 'rech screenshot'."
-info "Docs: https://github.com/snomiao/rechrome"
+# 4. Done. We do NOT auto-run setup — `rech setup` is interactive (it installs
+# the Chrome extension + starts a daemon) and is only needed on the machine
+# that hosts the browser. Print the next step instead.
+info "rechrome installed."
+printf '\n  Next, on the machine with a browser, run first-time setup:\n'
+printf '      \033[1mrech setup\033[0m\n\n'
+printf '  Then drive it:  rech open <url>  |  rech screenshot  |  rech tab-list\n'
+printf '  Docs: https://github.com/snomiao/rechrome\n'
