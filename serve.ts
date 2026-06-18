@@ -8,6 +8,7 @@ import {
   getOrCreateUrl,
   authCheck,
   RECH_DIR,
+  HOME,
   PASSTHROUGH_ENV_KEYS,
 } from "./rech.ts";
 
@@ -64,7 +65,7 @@ export function isUnderDir(base: string, candidate: string): boolean {
 
 async function resolveProfileDirectory(nameOrEmail: string): Promise<string> {
   if (/^(Default|Profile \d+)$/i.test(nameOrEmail)) return nameOrEmail;
-  const home = process.env.HOME || "~";
+  const home = HOME || "~";
   const candidates = [
     join(home, "Library/Application Support/Google/Chrome/Local State"),
     join(home, ".config/google-chrome/Local State"),
@@ -203,7 +204,7 @@ export async function serve() {
             stdin: "ignore",
             stdout: "pipe",
             stderr: "pipe",
-            env: { PATH: process.env.PATH, HOME: process.env.HOME },
+            env: { PATH: process.env.PATH, HOME: HOME, USERPROFILE: process.env.USERPROFILE },
           });
           const [listStatus, listOut] = await Promise.race([
             Promise.all([listProc.exited, new Response(listProc.stdout).text()]),
@@ -248,7 +249,8 @@ export async function serve() {
 
       const childEnv: Record<string, string | undefined> = {
         PATH: process.env.PATH,
-        HOME: process.env.HOME,
+        HOME: HOME,
+        USERPROFILE: process.env.USERPROFILE,
         TMPDIR: process.env.TMPDIR,
         DISPLAY: process.env.DISPLAY,
         XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR,

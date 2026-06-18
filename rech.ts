@@ -3,7 +3,7 @@
 import { file } from "bun";
 import { randomBytes } from "crypto";
 import { mkdirSync, appendFileSync, existsSync, realpathSync, accessSync, cpSync, constants as fsConstants } from "fs";
-import { hostname } from "os";
+import { hostname, homedir } from "os";
 import { join, basename, dirname } from "path";
 
 export const ENV_KEY = "RECHROME_URL";
@@ -11,7 +11,10 @@ export const DEFAULT_PORT = 13775;
 export const RECH_DIR = join(import.meta.dir, ".rech");
 export const LOG_DIR = join(RECH_DIR, "logs");
 
-const RECH_HOME_DIR = join(process.env.HOME!, ".rechrome");
+// Home dir: HOME on POSIX, USERPROFILE on Windows (handled by os.homedir()).
+export const HOME = homedir();
+
+const RECH_HOME_DIR = join(HOME, ".rechrome");
 const TOKENS_FILE = join(RECH_HOME_DIR, "profiles.json");
 
 type TokenEntry = { extensionId: string; token: string; profileDir: string; userDataDir?: string };
@@ -29,7 +32,7 @@ async function saveTokenEntry(profileEmail: string, entry: TokenEntry): Promise<
 }
 
 const envFile = join(import.meta.dir, ".env.local");
-const globalEnvFile = join(process.env.HOME || "~", ".env.local");
+const globalEnvFile = join(HOME || "~", ".env.local");
 
 // Walk CWD→root loading env files nearest-first; per-key: closest file wins, farther files skip.
 // At each level .rechrome/.env.local is checked before .env.local (rechrome-specific overrides general).
@@ -214,7 +217,7 @@ async function getClientEnv(urlExtras?: { extensionId?: string; extensionToken?:
 }
 
 const CHROME_LOCAL_STATE_PATHS = () => {
-  const home = process.env.HOME || "~";
+  const home = HOME || "~";
   return [
     join(home, "Library/Application Support/Google/Chrome/Local State"),
     join(home, ".config/google-chrome/Local State"),
@@ -250,7 +253,7 @@ const LEGACY_EXTENSION_DIST_DIR = join(import.meta.dir, "lib/playwright-multi-ta
 
 // Stable per-user location: we copy the bundled dist here so Chrome's recorded install path survives
 // the ephemeral bunx temp dir being cleaned up between invocations.
-export const EXTENSION_DIST_DIR = join(process.env.HOME!, ".rechrome", "extension");
+export const EXTENSION_DIST_DIR = join(HOME, ".rechrome", "extension");
 
 // With the manifest `key` field set, Chrome derives this ID deterministically from the key (not the path),
 // so we can locate the extension by ID even when the on-disk path differs from what Chrome stored.
@@ -516,15 +519,35 @@ function buildSetupHtml(extDistDir: string, profileDisplay: string): string {
 </html>`;
 }
 
-const OXMGR_PROCESS_NAME = "rechrome-serve";
+const PM_PROCESS_NAME = "rechrome";
+// Pre-rename names to evict on (re)install/uninstall so a single `rech setup`
+// migrates an existing checkout cleanly.
+const LEGACY_PROCESS_NAMES = ["rechrome-serve"];
+// oxmgr everywhere, but it's unstable on Windows — fall back to pm2 there.
+const IS_WINDOWS = process.platform === "win32";
+const PM_BIN = IS_WINDOWS ? "pm2" : "oxmgr";
 
-async function runOxmgr(args: string[]): Promise<number> {
-  const proc = Bun.spawn(["bunx", "oxmgr", ...args], { stdout: "inherit", stderr: "inherit" });
+// Spawn the active process manager. `env` is merged over process.env for the
+// child: pm2 captures the CLI's environment for the managed process (it has no
+// per-var flag like oxmgr's --env), so install passes daemon env this way.
+async function runPm(args: string[], env?: Record<string, string>): Promise<number> {
+  const proc = Bun.spawn(["bunx", PM_BIN, ...args], {
+    stdout: "inherit",
+    stderr: "inherit",
+    ...(env ? { env: { ...process.env, ...env } } : {}),
+  });
   await proc.exited;
   return proc.exitCode ?? 1;
 }
 
-async function daemonInstall(serveUrl: string): Promise<void> {
+// Capture the process-manager's process list as text (oxmgr `list` / pm2 `jlist`).
+// Both render the process name verbatim, so callers can substring-match it.
+async function pmList(): Promise<string> {
+  const proc = Bun.spawn(["bunx", PM_BIN, IS_WINDOWS ? "jlist" : "list"], { stdout: "pipe", stderr: "ignore" });
+  return await new Response(proc.stdout).text();
+}
+
+export async function daemonInstall(serveUrl: string): Promise<void> {
   // Persist the URL to ~/.env.local before starting the daemon. The daemon's
   // loadEnv() walks CWD→root reading .env.local files and unconditionally
   // overwrites process.env.RECHROME_URL from whichever file it finds first.
@@ -536,7 +559,7 @@ async function daemonInstall(serveUrl: string): Promise<void> {
   const filtered = envRaw.trimEnd().split("\n").filter(l => !l.startsWith(`${ENV_KEY}=`));
   await Bun.write(globalEnvFile, [...filtered, `${ENV_KEY}=${serveUrl}`, ""].join("\n"));
 
-  const home = process.env.HOME!;
+  const home = HOME;
   const bunBin = Bun.which("bun") ?? process.execPath;
   const rechScript = import.meta.filename;
 
@@ -545,33 +568,52 @@ async function daemonInstall(serveUrl: string): Promise<void> {
   const resolvedPlaywrightCli = process.env.PLAYWRIGHT_CLI
     || (existsSync(bundledForkCli) ? bundledForkCli : "playwright-cli-multi-tab");
 
-  const envArgs: string[] = [
-    "--env", `HOME=${home}`,
-    "--env", `PATH=${process.env.PATH || "/usr/local/bin:/usr/bin:/bin"}`,
-    "--env", `${ENV_KEY}=${serveUrl}`,
-    "--env", `PWMCP_TEST_CONNECTION_TIMEOUT=${process.env.PWMCP_TEST_CONNECTION_TIMEOUT || "30000"}`,
-    "--env", `PLAYWRIGHT_CLI=${resolvedPlaywrightCli}`,
-  ];
-  if (process.env.RECH_HOST) envArgs.push("--env", `RECH_HOST=${process.env.RECH_HOST}`);
-  if (isReadable(process.env.RECH_TLS_CERT)) envArgs.push("--env", `RECH_TLS_CERT=${process.env.RECH_TLS_CERT}`);
-  if (isReadable(process.env.RECH_TLS_KEY)) envArgs.push("--env", `RECH_TLS_KEY=${process.env.RECH_TLS_KEY}`);
+  // Environment the managed `serve` process must run with.
+  const daemonEnv: Record<string, string> = {
+    HOME: home,
+    PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin",
+    [ENV_KEY]: serveUrl,
+    PWMCP_TEST_CONNECTION_TIMEOUT: process.env.PWMCP_TEST_CONNECTION_TIMEOUT || "30000",
+    PLAYWRIGHT_CLI: resolvedPlaywrightCli,
+  };
+  if (process.env.RECH_HOST) daemonEnv.RECH_HOST = process.env.RECH_HOST;
+  if (isReadable(process.env.RECH_TLS_CERT)) daemonEnv.RECH_TLS_CERT = process.env.RECH_TLS_CERT!;
+  if (isReadable(process.env.RECH_TLS_KEY)) daemonEnv.RECH_TLS_KEY = process.env.RECH_TLS_KEY!;
 
-  await runOxmgr(["delete", OXMGR_PROCESS_NAME]).catch(() => {});
-  await runOxmgr([
-    "start",
-    "--name", OXMGR_PROCESS_NAME,
-    "--restart", "always",
-    "--cwd", home,
-    ...envArgs,
-    `${bunBin} ${rechScript} serve`,
-  ]);
-  await runOxmgr(["service", "install"]);
+  // Drop any prior registration (current + legacy names) before re-adding.
+  for (const name of [PM_PROCESS_NAME, ...LEGACY_PROCESS_NAMES]) await runPm(["delete", name]);
+
+  if (IS_WINDOWS) {
+    // pm2 captures the CLI env (passed via runPm's env) for the managed process,
+    // autorestarts by default, and runs the bun binary directly with
+    // `--interpreter none` (so it isn't fed to node).
+    await runPm([
+      "start", bunBin,
+      "--name", PM_PROCESS_NAME,
+      "--interpreter", "none",
+      "--cwd", home,
+      "--", rechScript, "serve",
+    ], daemonEnv);
+    await runPm(["save"]); // persist process list for `pm2 resurrect` on reboot
+  } else {
+    const envArgs = Object.entries(daemonEnv).flatMap(([k, v]) => ["--env", `${k}=${v}`]);
+    await runPm([
+      "start",
+      "--name", PM_PROCESS_NAME,
+      "--restart", "always",
+      "--cwd", home,
+      ...envArgs,
+      `${bunBin} ${rechScript} serve`,
+    ]);
+    await runPm(["service", "install"]);
+  }
 }
 
 async function daemonUninstall(): Promise<void> {
-  await runOxmgr(["delete", OXMGR_PROCESS_NAME]);
-  await runOxmgr(["service", "uninstall"]);
-  console.log(`Removed oxmgr process: ${OXMGR_PROCESS_NAME}`);
+  for (const name of [PM_PROCESS_NAME, ...LEGACY_PROCESS_NAMES]) await runPm(["delete", name]);
+  if (IS_WINDOWS) await runPm(["save"]);
+  else await runPm(["service", "uninstall"]);
+  console.log(`Removed ${PM_BIN} process: ${PM_PROCESS_NAME}`);
 }
 
 async function setup(opts: { profile?: string } = {}): Promise<void> {
@@ -693,7 +735,7 @@ async function setup(opts: { profile?: string } = {}): Promise<void> {
     await waitForServe();
   } else {
     await daemonInstall(url);
-    console.log(`      Registered daemon: ${OXMGR_PROCESS_NAME}`);
+    console.log(`      Registered daemon: ${PM_PROCESS_NAME}`);
     await waitForServe();
   }
 
@@ -832,7 +874,7 @@ async function setup(opts: { profile?: string } = {}): Promise<void> {
 
   const pwdEnvPath = join(process.cwd(), ".env.local");
   const pwdRechPath = join(process.cwd(), ".rechrome", ".env.local");
-  const homeEnvPath = join(process.env.HOME!, ".env.local");
+  const homeEnvPath = join(HOME, ".env.local");
   // Show whether each target already exists so it's clear we'll update (merge) vs create.
   const tag = async (p: string) => (await file(p).exists()) ? "exists → will update" : "new file";
   const [pwdTag, pwdRechTag, homeTag] = await Promise.all([tag(pwdEnvPath), tag(pwdRechPath), tag(homeEnvPath)]);
@@ -896,10 +938,9 @@ async function status(): Promise<void> {
   const listenLine = lsofOut.split("\n").find(l => l.includes(`:${port}`));
   const listenAddr = listenLine?.match(/TCP\s+(\S+:\d+)/)?.[1] ?? (ping ? `${host}:${port}` : null);
   console.log(`serve:    ${ping ? `running  ${protocol}://${listenAddr ?? `${host}:${port}`}` : "not running"}`);
-  const oxmgrProc = Bun.spawn(["bunx", "oxmgr", "list"], { stdout: "pipe", stderr: "ignore" });
-  const oxmgrOut = await new Response(oxmgrProc.stdout).text();
-  const daemonRegistered = oxmgrOut.includes(OXMGR_PROCESS_NAME);
-  console.log(`daemon:   ${daemonRegistered ? `oxmgr (${OXMGR_PROCESS_NAME})` : "not installed"}`);
+  const pmOut = await pmList();
+  const daemonRegistered = pmOut.includes(PM_PROCESS_NAME);
+  console.log(`daemon:   ${daemonRegistered ? `${PM_BIN} (${PM_PROCESS_NAME})` : "not installed"}`);
   const registry = await readTokenRegistry();
   const entries = Object.entries(registry);
   if (entries.length) {
