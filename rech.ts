@@ -94,6 +94,34 @@ function isReadable(p?: string): boolean {
   try { accessSync(p, fsConstants.R_OK); return true; } catch { return false; }
 }
 
+// Open a file/URL in the OS default app/browser. `open` is macOS-only — Windows needs
+// `cmd /c start`, Linux needs `xdg-open`.
+function openInDefaultApp(target: string): void {
+  const cmd = process.platform === "darwin" ? ["open", target]
+    : process.platform === "win32" ? ["cmd", "/c", "start", "", target]
+    : ["xdg-open", target];
+  try { Bun.spawn(cmd, { stdout: "ignore", stderr: "ignore" }); } catch {}
+}
+
+// Best-effort path to the Chrome executable for the current platform (used to open a
+// specific profile at a chrome-extension:// URL). Returns null if not found.
+function findChromeBinary(): string | null {
+  const candidates = process.platform === "darwin"
+    ? ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]
+    : process.platform === "win32"
+      ? [
+          join(process.env.PROGRAMFILES || "C:\\Program Files", "Google/Chrome/Application/chrome.exe"),
+          join(process.env["PROGRAMFILES(X86)"] || "C:\\Program Files (x86)", "Google/Chrome/Application/chrome.exe"),
+          join(process.env.LOCALAPPDATA || join(HOME, "AppData/Local"), "Google/Chrome/Application/chrome.exe"),
+        ]
+      : ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser"];
+  for (const p of candidates) {
+    if (p.includes("/") || p.includes("\\")) { if (existsSync(p)) return p; }
+    else { const w = Bun.which(p); if (w) return w; }
+  }
+  return null;
+}
+
 export function log(msg: string) {
   mkdirSync(LOG_DIR, { recursive: true });
   const ts = new Date().toISOString();
@@ -461,7 +489,7 @@ async function run(url: string, args: string[]) {
   process.exit(status);
 }
 
-function buildSetupHtml(extDistDir: string, profileDisplay: string): string {
+export function buildSetupHtml(extDistDir: string, profileDisplay: string): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -563,10 +591,20 @@ export async function daemonInstall(serveUrl: string): Promise<void> {
   const bunBin = Bun.which("bun") ?? process.execPath;
   const rechScript = import.meta.filename;
 
-  // Resolve PLAYWRIGHT_CLI: env override > bundled fork (development checkout) > "playwright-cli-multi-tab"
+  // Resolve PLAYWRIGHT_CLI: env override > bundled fork (development checkout) > "playwright-cli-multi-tab".
+  // The fork is a .js script: POSIX execs it via its shebang (`#!/usr/bin/env node`), but Windows
+  // can't exec a .js directly, so it must be invoked through an interpreter. It MUST be node, not
+  // bun: the cliDaemon inherits its parent's runtime (spawned via process.execPath), and the
+  // extension-bridge relay's WebSocket handshake hangs under Bun (the extension WS connects but
+  // `extension.initialized` never completes) — under node it completes, matching the POSIX shebang.
+  // serve splits PLAYWRIGHT_CLI on spaces into argv, so we use bare `node` (the node path lives
+  // under "Program Files" and contains a space); node must be on the daemon's PATH, same as the
+  // shebang's `env node` assumption. The repo path contains no spaces.
   const bundledForkCli = join(import.meta.dir, "lib/playwright-cli/playwright-cli.js");
   const resolvedPlaywrightCli = process.env.PLAYWRIGHT_CLI
-    || (existsSync(bundledForkCli) ? bundledForkCli : "playwright-cli-multi-tab");
+    || (existsSync(bundledForkCli)
+        ? (IS_WINDOWS ? `node ${bundledForkCli}` : bundledForkCli)
+        : "playwright-cli-multi-tab");
 
   // Environment the managed `serve` process must run with.
   const daemonEnv: Record<string, string> = {
@@ -790,7 +828,7 @@ async function setup(opts: { profile?: string } = {}): Promise<void> {
       mkdirSync(RECH_HOME_DIR, { recursive: true });
       await Bun.write(setupHtmlPath, buildSetupHtml(EXTENSION_DIST_DIR, profileDisplay));
       console.log(`\n      Opening install guide in your browser...`);
-      Bun.spawn(["open", setupHtmlPath], { stdout: "ignore", stderr: "ignore" });
+      openInDefaultApp(setupHtmlPath);
       await ask("\n      Press Enter after loading the extension to retry...");
     }
     console.log(`      Extension found: ${extId}`);
@@ -813,11 +851,13 @@ async function setup(opts: { profile?: string } = {}): Promise<void> {
     console.log(`\n      Get auth token from the extension:`);
     console.log(`        ${statusUrl}`);
     if (isTTY) {
-      Bun.spawn(
-        ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-         `--profile-directory=${profileDir}`, statusUrl],
-        { stdout: "ignore", stderr: "ignore", detached: true },
-      );
+      const chromeBin = findChromeBinary();
+      if (chromeBin) {
+        Bun.spawn(
+          [chromeBin, `--profile-directory=${profileDir}`, statusUrl],
+          { stdout: "ignore", stderr: "ignore", detached: true },
+        );
+      }
       console.log(`\n      Or click the extension icon in the Chrome toolbar.`);
       console.log(`      Copy the token shown on the page (PLAYWRIGHT_MCP_EXTENSION_TOKEN=...).\n`);
     } else {
@@ -932,12 +972,16 @@ async function status(): Promise<void> {
   const { host, port, protocol } = parseUrl(url);
   const parsed = parseUrl(url);
   const ping = await fetch(`${protocol}://${host}:${port}/`, { signal: AbortSignal.timeout(2000) }).catch(() => null);
-  // Check actual socket binding via lsof (shows * for 0.0.0.0, or exact IP for loopback-only)
-  const lsofProc = Bun.spawn(["lsof", "-nP", `-iTCP:${port}`, "-sTCP:LISTEN"], { stdout: "pipe", stderr: "ignore" });
-  const lsofOut = await new Response(lsofProc.stdout).text();
-  const listenLine = lsofOut.split("\n").find(l => l.includes(`:${port}`));
-  const listenAddr = listenLine?.match(/TCP\s+(\S+:\d+)/)?.[1] ?? (ping ? `${host}:${port}` : null);
-  console.log(`serve:    ${ping ? `running  ${protocol}://${listenAddr ?? `${host}:${port}`}` : "not running"}`);
+  // Resolve the daemon's actual bind from its authenticated /ping (cross-platform; lsof is
+  // POSIX-only and absent on Windows). bind is "0.0.0.0" (all interfaces) or the loopback IP.
+  const bind = ping
+    ? await fetch(`${protocol}://${host}:${port}/ping`, {
+        headers: { Authorization: `Bearer ${parsed.key}` },
+        signal: AbortSignal.timeout(2000),
+      }).then(r => (r.ok ? r.json() : null)).then((b: { bind?: string } | null) => b?.bind).catch(() => undefined)
+    : undefined;
+  const listenAddr = bind ? `${bind}:${port}` : `${host}:${port}`;
+  console.log(`serve:    ${ping ? `running  ${protocol}://${listenAddr}` : "not running"}`);
   const pmOut = await pmList();
   const daemonRegistered = pmOut.includes(PM_PROCESS_NAME);
   console.log(`daemon:   ${daemonRegistered ? `${PM_BIN} (${PM_PROCESS_NAME})` : "not installed"}`);
