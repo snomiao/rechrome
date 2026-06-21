@@ -621,11 +621,12 @@ export async function daemonInstall(serveUrl: string): Promise<void> {
   // Drop any prior registration (current + legacy names) before re-adding.
   for (const name of [PM_PROCESS_NAME, ...LEGACY_PROCESS_NAMES]) await runPm(["delete", name]);
 
+  let startCode: number;
   if (IS_WINDOWS) {
     // pm2 captures the CLI env (passed via runPm's env) for the managed process,
     // autorestarts by default, and runs the bun binary directly with
     // `--interpreter none` (so it isn't fed to node).
-    await runPm([
+    startCode = await runPm([
       "start", bunBin,
       "--name", PM_PROCESS_NAME,
       "--interpreter", "none",
@@ -635,7 +636,7 @@ export async function daemonInstall(serveUrl: string): Promise<void> {
     await runPm(["save"]); // persist process list for `pm2 resurrect` on reboot
   } else {
     const envArgs = Object.entries(daemonEnv).flatMap(([k, v]) => ["--env", `${k}=${v}`]);
-    await runPm([
+    startCode = await runPm([
       "start",
       "--name", PM_PROCESS_NAME,
       "--restart", "always",
@@ -645,6 +646,9 @@ export async function daemonInstall(serveUrl: string): Promise<void> {
     ]);
     await runPm(["service", "install"]);
   }
+  // Surface a failed start instead of reporting a daemon that was never registered.
+  if (startCode !== 0)
+    throw new Error(`${PM_BIN} failed to start "${PM_PROCESS_NAME}" (exit ${startCode}). Check that ${PM_BIN} is installed and on PATH.`);
 }
 
 async function daemonUninstall(): Promise<void> {

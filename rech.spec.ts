@@ -1,5 +1,6 @@
 import { describe, test, expect } from "bun:test";
 import { parseUrl, authCheck, DEFAULT_PORT, ENV_KEY } from "./rech.ts";
+import { isUnderDir, splitCommand } from "./serve.ts";
 
 describe("parseUrl", () => {
   test("parses key, host, and port from an http URL", () => {
@@ -81,5 +82,35 @@ describe("constants", () => {
 
   test("DEFAULT_PORT is 13775", () => {
     expect(DEFAULT_PORT).toBe(13775);
+  });
+});
+
+describe("isUnderDir", () => {
+  test("relative file under base is contained", () => {
+    expect(isUnderDir("/work", "out/a.png")).toBe(true);
+  });
+  test("parent-escape is not contained", () => {
+    expect(isUnderDir("/work", "../etc/passwd")).toBe(false);
+  });
+  test("base itself is not 'under'", () => {
+    expect(isUnderDir("/work", ".")).toBe(false);
+  });
+  test("a different absolute path is not contained", () => {
+    // On POSIX an absolute candidate resolves outside; on Windows a different drive does too.
+    const other = process.platform === "win32" ? "D:/x.png" : "/other/x.png";
+    expect(isUnderDir("/work", other)).toBe(false);
+  });
+});
+
+describe("splitCommand", () => {
+  test("splits a plain command on spaces", () => {
+    expect(splitCommand("node /repo/cli.js")).toEqual(["node", "/repo/cli.js"]);
+  });
+  test("keeps a double-quoted path with spaces intact", () => {
+    expect(splitCommand('"C:\\Program Files\\nodejs\\node.exe" C:/repo/cli.js'))
+      .toEqual(["C:\\Program Files\\nodejs\\node.exe", "C:/repo/cli.js"]);
+  });
+  test("empty string yields no tokens", () => {
+    expect(splitCommand("")).toEqual([]);
   });
 });

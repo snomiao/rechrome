@@ -58,9 +58,20 @@ async function renewCertIfNeeded(certPath: string, keyPath: string): Promise<boo
 }
 
 export function isUnderDir(base: string, candidate: string): boolean {
-  const absBase = resolve(base) + "/";
-  const absCandidate = resolve(base, candidate);
-  return absCandidate.startsWith(absBase);
+  // Use path.relative rather than string-prefix: resolve() yields backslash paths on
+  // Windows, so a "absBase + '/'" prefix check never matched there (every file was
+  // rejected). A candidate is under base iff the relative path neither escapes (..) nor
+  // is absolute (different drive).
+  const rel = relative(resolve(base), resolve(base, candidate));
+  return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
+}
+
+// Tokenize a command string into argv, honoring double-quoted segments so an interpreter
+// path containing spaces (e.g. a quoted Windows "C:\Program Files\…\node.exe") survives.
+// PLAYWRIGHT_CLI is space-joined by the installer; a plain split(" ") would shatter such paths.
+export function splitCommand(cmd: string): string[] {
+  return (cmd.match(/"[^"]*"|\S+/g) ?? []).map(t =>
+    t.startsWith('"') && t.endsWith('"') ? t.slice(1, -1) : t);
 }
 
 async function resolveProfileDirectory(nameOrEmail: string): Promise<string> {
@@ -222,7 +233,7 @@ export async function serve() {
       });
       const namespacedSession = clientSession ? `${sessionId}-${clientSession}` : sessionId;
 
-      const [bin, ...binArgs] = (process.env.PLAYWRIGHT_CLI || "playwright-cli-multi-tab").split(" ");
+      const [bin, ...binArgs] = splitCommand(process.env.PLAYWRIGHT_CLI || "playwright-cli-multi-tab");
 
       if (filteredArgs.length === 0) {
         filteredArgs.push("--help");
@@ -235,8 +246,10 @@ export async function serve() {
       const isOpenNoUrl = isOpenCmd && filteredArgs.length === 1;
       if (isOpenNoUrl) filteredArgs.push("about:blank");
 
-      // bare `rech open` with no URL: warn if session already has tabs
-      if (isOpenCmd && filteredArgs.length === 1) {
+      // open against an existing session: bare `open` returns a tab-list hint; `open <url>`
+      // converts to `goto` to reuse the live browser. (Guarding on filteredArgs.length===1
+      // was dead — about:blank/<url> is already appended above, so length is always >=2.)
+      if (isOpenCmd) {
         try {
           const listProc = Bun.spawn([bin, ...binArgs, "tab-list", `-s=${namespacedSession}`], {
             cwd: workDir,
