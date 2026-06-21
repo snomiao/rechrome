@@ -84,6 +84,34 @@ async function resolveProfileDirectory(nameOrEmail: string): Promise<string> {
   return nameOrEmail;
 }
 
+// Free the listening port from stale daemon holders before retrying a failed bind.
+// On Windows the listening socket (created inheritable by Bun.serve) is swept into the
+// detached cliDaemon grandchild via bInheritHandles, so an orphaned cliDaemon from a
+// previous `serve` keeps the port in LISTEN after the old serve dies — the fresh serve
+// then crash-loops on EADDRINUSE. A clean restart releases the port, so a failed bind
+// only happens when such a stale holder exists; killing orphaned daemon holders here is
+// safe because a freshly-starting serve owns no live sessions of its own yet (the user's
+// Chrome tabs persist regardless — the cliDaemon only drives them).
+async function freeStalePort(port: number): Promise<void> {
+  try {
+    if (process.platform === "win32") {
+      const ps = [
+        "$ErrorActionPreference='SilentlyContinue';",
+        // kill the port's listed owner if it's still a live process
+        `$o=(Get-NetTCPConnection -LocalPort ${port} -State Listen).OwningProcess; if($o){ Stop-Process -Id $o -Force };`,
+        // kill orphaned cliDaemon holders that inherited the socket handle (the actual leak)
+        "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*cliDaemon.js*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }",
+      ].join(" ");
+      Bun.spawnSync(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps]);
+    } else {
+      Bun.spawnSync(["sh", "-c", `fuser -k ${port}/tcp 2>/dev/null || (lsof -ti tcp:${port} | xargs -r kill -9) 2>/dev/null || true`]);
+    }
+  } catch {
+    // best effort — the retry will surface a clear error if the port is still held
+  }
+  await new Promise(r => setTimeout(r, 800)); // let the OS release the socket before retry
+}
+
 export async function serve() {
   const url = await getOrCreateUrl();
   const { key, port } = parseUrl(url);
@@ -104,7 +132,7 @@ export async function serve() {
     }, 86_400_000);
   }
   const tls = certPath && keyPath ? { cert: Bun.file(certPath), key: Bun.file(keyPath) } : undefined;
-  const server = Bun.serve({
+  const startServer = () => Bun.serve({
     hostname: listenHost,
     port,
     tls,
@@ -254,6 +282,8 @@ export async function serve() {
         TMPDIR: process.env.TMPDIR,
         DISPLAY: process.env.DISPLAY,
         XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR,
+        DEBUG: process.env.DEBUG, // forward debug namespaces (e.g. pw:mcp:relay) for diagnostics
+        PWDEBUG: process.env.PWDEBUG,
         ...(clientName ? { PLAYWRIGHT_MCP_CLIENT_NAME: shortClientLabel(clientName) } : {}),
         ...passthroughEnv,
         // Enable extension bridge when credentials are present
@@ -340,6 +370,18 @@ export async function serve() {
       });
     },
   });
+
+  // A leaked listening-socket handle in an orphaned cliDaemon can keep the port held after a
+  // prior serve exits; on EADDRINUSE, clear stale holders once and retry rather than crash-loop.
+  let server: ReturnType<typeof startServer>;
+  try {
+    server = startServer();
+  } catch (e: any) {
+    if (!String(e?.code ?? e?.message ?? "").includes("EADDRINUSE")) throw e;
+    log(`port ${port} in use — clearing stale daemon holders and retrying`);
+    await freeStalePort(port);
+    server = startServer();
+  }
 
   log(`serving on ${tls ? "https" : "http"}://${server.hostname}:${server.port}`);
   log(`Connection URL set (use .env.local to view)`);
