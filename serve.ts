@@ -95,14 +95,25 @@ async function resolveProfileDirectory(nameOrEmail: string): Promise<string> {
 async function freeStalePort(port: number): Promise<void> {
   try {
     if (process.platform === "win32") {
+      // Two-phase, narrow-first: (1) kill the port's actual listed owner if it's a live
+      // process; (2) only if the port is STILL held — the inherited-handle case, where the
+      // socket lives in a child while netstat attributes it to a now-dead owner — fall back
+      // to killing orphaned cliDaemon holders. The fallback is the only recovery for that
+      // case (the live holder can't be mapped from the port), but it runs only when the
+      // precise kill failed, so the broad sweep is a logged last resort, not the default.
       const ps = [
         "$ErrorActionPreference='SilentlyContinue';",
-        // kill the port's listed owner if it's still a live process
-        `$o=(Get-NetTCPConnection -LocalPort ${port} -State Listen).OwningProcess; if($o){ Stop-Process -Id $o -Force };`,
-        // kill orphaned cliDaemon holders that inherited the socket handle (the actual leak)
-        "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*cliDaemon.js*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }",
+        `$o=(Get-NetTCPConnection -LocalPort ${port} -State Listen).OwningProcess;`,
+        "if($o -and (Get-Process -Id $o)){ Stop-Process -Id $o -Force; Start-Sleep -Milliseconds 400 };",
+        `if(Get-NetTCPConnection -LocalPort ${port} -State Listen){`,
+        "  $h=Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*cliDaemon.js*' };",
+        "  Write-Output (\"freeStalePort: port still held; killing cliDaemon holders: \" + ($h.ProcessId -join ','));",
+        "  $h | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }",
+        "}",
       ].join(" ");
-      Bun.spawnSync(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps]);
+      const r = Bun.spawnSync(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps]);
+      const out = r.stdout?.toString().trim();
+      if (out) log(out);
     } else {
       Bun.spawnSync(["sh", "-c", `fuser -k ${port}/tcp 2>/dev/null || (lsof -ti tcp:${port} | xargs -r kill -9) 2>/dev/null || true`]);
     }
