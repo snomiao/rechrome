@@ -2,7 +2,7 @@
 
 import { file } from "bun";
 import { randomBytes } from "crypto";
-import { mkdirSync, appendFileSync, existsSync, realpathSync, accessSync, cpSync, constants as fsConstants } from "fs";
+import { mkdirSync, appendFileSync, existsSync, realpathSync, accessSync, cpSync, unlinkSync, readFileSync, readdirSync, constants as fsConstants } from "fs";
 import { hostname, homedir } from "os";
 import { join, basename, dirname } from "path";
 
@@ -17,7 +17,7 @@ export const HOME = homedir();
 const RECH_HOME_DIR = join(HOME, ".rechrome");
 const TOKENS_FILE = join(RECH_HOME_DIR, "profiles.json");
 
-type TokenEntry = { extensionId: string; token: string; profileDir: string; userDataDir?: string };
+type TokenEntry = { extensionId: string; token: string; profileDir: string; userDataDir?: string; loadExtension?: string };
 
 async function readTokenRegistry(): Promise<Record<string, TokenEntry>> {
   const raw = await file(TOKENS_FILE).text().catch(() => "{}");
@@ -86,6 +86,9 @@ export const PASSTHROUGH_ENV_KEYS = [
   "PLAYWRIGHT_MCP_EXTENSION_TOKEN",
   "PLAYWRIGHT_MCP_PROFILE_DIRECTORY",
   "PLAYWRIGHT_MCP_USER_DATA_DIR",
+  // Managed (provisioned) profiles aren't persistently installed in Secure Preferences,
+  // so the relay must re-load the unpacked extension on every launch via --load-extension.
+  "PLAYWRIGHT_MCP_LOAD_EXTENSION",
   "PWMCP_TEST_CONNECTION_TIMEOUT",
 ] as const;
 
@@ -122,6 +125,26 @@ function findChromeBinary(): string | null {
   return null;
 }
 
+// Open a target (URL or local file) in a specific Chrome profile. This opens a new tab in
+// the user's running Chrome for that profile (or launches Chrome if it's not running) — it
+// does NOT restart Chrome or touch the live session. Note: `--profile-directory` only opens
+// a tab; flags like `--load-extension` are ignored when Chrome is already running for that
+// user-data-dir. Returns true if Chrome was spawned, false if it fell back to the OS default.
+function openInChromeProfile(profileDir: string, target: string): boolean {
+  const chromeBin = findChromeBinary();
+  if (!chromeBin) { openInDefaultApp(target); return false; }
+  try {
+    Bun.spawn(
+      [chromeBin, `--profile-directory=${profileDir}`, target],
+      { stdout: "ignore", stderr: "ignore", detached: true },
+    );
+    return true;
+  } catch {
+    openInDefaultApp(target);
+    return false;
+  }
+}
+
 export function log(msg: string) {
   mkdirSync(LOG_DIR, { recursive: true });
   const ts = new Date().toISOString();
@@ -145,6 +168,7 @@ export function parseUrl(raw: string) {
     extensionToken: u.searchParams.get("token") ?? undefined,
     profileDirectory: u.searchParams.get("profile") ?? undefined,
     userDataDir: u.searchParams.get("user_data_dir") ?? undefined,
+    loadExtension: u.searchParams.get("load_extension") ?? undefined,
   };
 }
 
@@ -213,7 +237,7 @@ async function getClientIdentity(): Promise<{ gitUrl?: string; hostname?: string
   return { hostname: hostname(), cwd };
 }
 
-async function getClientEnv(urlExtras?: { extensionId?: string; extensionToken?: string; profileDirectory?: string; userDataDir?: string }): Promise<Record<string, string>> {
+async function getClientEnv(urlExtras?: { extensionId?: string; extensionToken?: string; profileDirectory?: string; userDataDir?: string; loadExtension?: string }): Promise<Record<string, string>> {
   const env: Record<string, string> = {};
   for (const key of PASSTHROUGH_ENV_KEYS) {
     if (process.env[key]) env[key] = process.env[key];
@@ -224,6 +248,8 @@ async function getClientEnv(urlExtras?: { extensionId?: string; extensionToken?:
     env["PLAYWRIGHT_MCP_PROFILE_DIRECTORY"] = urlExtras.profileDirectory;
   if (urlExtras?.userDataDir)
     env["PLAYWRIGHT_MCP_USER_DATA_DIR"] = urlExtras.userDataDir;
+  if (urlExtras?.loadExtension)
+    env["PLAYWRIGHT_MCP_LOAD_EXTENSION"] = urlExtras.loadExtension;
   // Token: shell env wins (explicit override), registry is fallback, URL param is last resort
   const profileKey = urlExtras?.profileDirectory || process.env.PLAYWRIGHT_MCP_PROFILE_DIRECTORY;
   if (profileKey) {
@@ -232,6 +258,7 @@ async function getClientEnv(urlExtras?: { extensionId?: string; extensionToken?:
     if (entry) {
       if (!env["PLAYWRIGHT_MCP_EXTENSION_ID"]) env["PLAYWRIGHT_MCP_EXTENSION_ID"] = entry.extensionId;
       if (!env["PLAYWRIGHT_MCP_USER_DATA_DIR"] && entry.userDataDir) env["PLAYWRIGHT_MCP_USER_DATA_DIR"] = entry.userDataDir;
+      if (!env["PLAYWRIGHT_MCP_LOAD_EXTENSION"] && entry.loadExtension) env["PLAYWRIGHT_MCP_LOAD_EXTENSION"] = entry.loadExtension;
       if (!env["PLAYWRIGHT_MCP_EXTENSION_TOKEN"]) {
         env["PLAYWRIGHT_MCP_EXTENSION_TOKEN"] = entry.token;
       } else if (env["PLAYWRIGHT_MCP_EXTENSION_TOKEN"] !== entry.token) {
@@ -399,11 +426,11 @@ async function callServe(
   args: string[],
   overrideEnv?: Record<string, string>,
 ): Promise<{ status: number; stdout: string; stderr: string; files?: string[]; existingSession?: boolean }> {
-  const { key, host, port, protocol, extensionId, extensionToken, profileDirectory, userDataDir } = parseUrl(url);
+  const { key, host, port, protocol, extensionId, extensionToken, profileDirectory, userDataDir, loadExtension } = parseUrl(url);
   const identity = await getClientIdentity();
   const effectiveProfile = profileDirectory || process.env.PLAYWRIGHT_MCP_PROFILE_DIRECTORY;
   if (effectiveProfile) (identity as any).profile = effectiveProfile;
-  const env = { ...(await getClientEnv({ extensionId, extensionToken, profileDirectory, userDataDir })), ...overrideEnv };
+  const env = { ...(await getClientEnv({ extensionId, extensionToken, profileDirectory, userDataDir, loadExtension })), ...overrideEnv };
   const res = await fetch(`${protocol}://${host}:${port}/run`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
@@ -439,7 +466,7 @@ async function callServe(
 }
 
 async function run(url: string, args: string[]) {
-  const { host, port, protocol, extensionId, extensionToken, profileDirectory, userDataDir } = parseUrl(url);
+  const { host, port, protocol, extensionId, extensionToken, profileDirectory, userDataDir, loadExtension } = parseUrl(url);
   const effectiveProfile = profileDirectory || process.env.PLAYWRIGHT_MCP_PROFILE_DIRECTORY;
   const displayProfile = effectiveProfile ? await resolveProfileEmail(effectiveProfile) : undefined;
   const identity = await getClientIdentity();
@@ -448,7 +475,7 @@ async function run(url: string, args: string[]) {
     `[rech] connecting to ${host}:${port} (identity: ${identity.gitUrl || `${identity.hostname}:${identity.cwd}`}${profileSuffix})`,
   );
 
-  const resolvedEnv = await getClientEnv({ extensionId, extensionToken, profileDirectory, userDataDir });
+  const resolvedEnv = await getClientEnv({ extensionId, extensionToken, profileDirectory, userDataDir, loadExtension });
   const { status, stdout, stderr, files, existingSession } = await callServe(url, args);
 
   const isOpenWithUrl = args[0] === "open" && args.length > 1;
@@ -658,7 +685,220 @@ async function daemonUninstall(): Promise<void> {
   console.log(`Removed ${PM_BIN} process: ${PM_PROCESS_NAME}`);
 }
 
-async function setup(opts: { profile?: string } = {}): Promise<void> {
+// Read the extension's auth token straight from a profile's localStorage LevelDB. Read-only
+// (we never take LevelDB's lock), so it's safe while the user's Chrome is running. The token is
+// the value of the `auth-token` key under the extension origin, stored as a 0x01 (Latin-1)
+// encoding byte followed by the 43-char base64url token. LevelDB prefix-compression can split the
+// origin string across block-restart points, so we anchor on the `auth-token` marker + token shape
+// and (when possible) require the extension id to appear in the same file to avoid a collision
+// with another extension's `auth-token`. Returns the newest token found, or null.
+function readExtensionTokenFromProfile(userDataDir: string, profileDir: string): string | null {
+  const dir = join(userDataDir, profileDir, "Local Storage", "leveldb");
+  let files: string[];
+  try { files = readdirSync(dir).filter(f => f.endsWith(".ldb") || f.endsWith(".log")).sort(); }
+  catch { return null; }
+  const extIdChunk = EXTENSION_ID.slice(0, 20); // contiguous prefix survives the LevelDB split
+  const scan = (requireExtId: boolean): string | null => {
+    let found: string | null = null;
+    for (const f of files) {
+      let buf: Buffer;
+      try { buf = readFileSync(join(dir, f)); } catch { continue; }
+      if (requireExtId && !buf.includes(extIdChunk, 0, "latin1")) continue;
+      let idx = 0;
+      while (true) {
+        const j = buf.indexOf("auth-token", idx, "latin1");
+        if (j < 0) break;
+        idx = j + 1;
+        const win = buf.subarray(j, Math.min(buf.length, j + 200)).toString("latin1");
+        const m = win.match(/\x01([A-Za-z0-9_-]{43})(?![A-Za-z0-9_-])/);
+        if (m) found = m[1]; // newest file / newest occurrence wins
+      }
+    }
+    return found;
+  };
+  return scan(true) ?? scan(false);
+}
+
+// Resolve a Chromium / Chrome-for-Testing executable from the Playwright browsers cache.
+// Managed (provisioned) profiles must run on Chromium because branded Google Chrome 149+ rejects
+// --load-extension. Returns null if no Chromium is installed (`npx playwright install chromium`).
+function findChromiumForTesting(): string | null {
+  // Honor PLAYWRIGHT_BROWSERS_PATH (the user's convention) first, then the platform default —
+  // `playwright install` doesn't always write to the env path, so check both.
+  const bases = [
+    process.env.PLAYWRIGHT_BROWSERS_PATH,
+    process.platform === "win32" ? join(HOME, "AppData/Local/ms-playwright")
+      : process.platform === "darwin" ? join(HOME, "Library/Caches/ms-playwright")
+      : join(HOME, ".cache/ms-playwright"),
+  ].filter((b): b is string => !!b);
+  for (const base of bases) {
+    let revs: string[];
+    try { revs = readdirSync(base).filter(d => /^chromium-\d+$/.test(d)).sort((a, b) => parseInt(b.slice(9)) - parseInt(a.slice(9))); }
+    catch { continue; }
+    for (const rev of revs) {
+      const root = join(base, rev);
+      const candidates = process.platform === "darwin"
+        ? readdirSync(root).filter(d => d.startsWith("chrome-mac")).flatMap(d => {
+            const appsDir = join(root, d);
+            let apps: string[] = [];
+            try { apps = readdirSync(appsDir).filter(a => a.endsWith(".app")); } catch {}
+            return apps.map(a => join(appsDir, a, "Contents/MacOS", a.replace(/\.app$/, "")));
+          })
+        : process.platform === "win32"
+          ? [join(root, "chrome-win", "chrome.exe")]
+          : [join(root, "chrome-linux", "chrome")];
+      for (const c of candidates) if (existsSync(c)) return c;
+    }
+  }
+  return null;
+}
+
+// Minimal Chrome DevTools Protocol client over a WebSocket — just enough to create a
+// target, attach to it, and evaluate JS. Used to seed the auth token into a managed
+// profile's extension localStorage without pulling in the full Playwright dependency.
+class CDPClient {
+  private ws: WebSocket;
+  private nextId = 0;
+  private pending = new Map<number, { resolve: (v: any) => void; reject: (e: any) => void }>();
+  private opened: Promise<void>;
+  constructor(url: string) {
+    this.ws = new WebSocket(url);
+    this.opened = new Promise<void>((resolve, reject) => {
+      this.ws.addEventListener("open", () => resolve(), { once: true });
+      this.ws.addEventListener("error", () => reject(new Error("CDP WebSocket error")), { once: true });
+    });
+    this.ws.addEventListener("message", (ev: MessageEvent) => {
+      let msg: any;
+      try { msg = JSON.parse(typeof ev.data === "string" ? ev.data : ""); } catch { return; }
+      const p = msg.id != null ? this.pending.get(msg.id) : undefined;
+      if (!p) return;
+      this.pending.delete(msg.id);
+      if (msg.error) p.reject(new Error(msg.error.message || JSON.stringify(msg.error)));
+      else p.resolve(msg.result);
+    });
+  }
+  async open(): Promise<void> { await this.opened; }
+  send(method: string, params: Record<string, any> = {}, sessionId?: string): Promise<any> {
+    const id = ++this.nextId;
+    const payload: any = { id, method, params };
+    if (sessionId) payload.sessionId = sessionId;
+    return new Promise((resolve, reject) => {
+      this.pending.set(id, { resolve, reject });
+      this.ws.send(JSON.stringify(payload));
+      setTimeout(() => { if (this.pending.delete(id)) reject(new Error(`CDP ${method} timed out`)); }, 15_000);
+    });
+  }
+  close(): void { try { this.ws.close(); } catch {} }
+}
+
+// Launch a throwaway Chrome against a dedicated user-data-dir with the unpacked extension
+// loaded, then seed `token` into the extension's localStorage (the value `connect.html` checks
+// for token-bypass). Headless by default; never touches the user's real Chrome/profiles.
+async function provisionExtensionToken(opts: {
+  userDataDir: string; profileDir: string; dist: string; token: string; headed?: boolean;
+}): Promise<void> {
+  // Branded Google Chrome 149+ rejects --load-extension ("not allowed in Google Chrome"), so a
+  // managed profile must be seeded on Chromium / Chrome for Testing, which still honors the flag.
+  const chromeBin = findChromiumForTesting();
+  if (!chromeBin) throw new Error("Chromium / Chrome for Testing not found — run `npx playwright install chromium`");
+  const { userDataDir, profileDir, dist, token } = opts;
+  mkdirSync(userDataDir, { recursive: true });
+  const portFile = join(userDataDir, "DevToolsActivePort");
+  try { unlinkSync(portFile); } catch {}
+  const args = [
+    `--user-data-dir=${userDataDir}`,
+    `--profile-directory=${profileDir}`,
+    `--load-extension=${dist}`,
+    `--disable-extensions-except=${dist}`,
+    "--remote-debugging-port=0",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-background-timer-throttling",
+  ];
+  if (!opts.headed) args.push("--headless=new");
+  if (process.platform === "linux") args.push("--no-sandbox");
+  args.push("about:blank");
+  const proc = Bun.spawn([chromeBin, ...args], { stdout: "ignore", stderr: "ignore" });
+  let cdp: CDPClient | null = null;
+  try {
+    // Chrome writes the chosen port to DevToolsActivePort once the debug server is up.
+    let port: number | null = null;
+    for (let i = 0; i < 100; i++) {
+      await Bun.sleep(100);
+      const line = (await file(portFile).text().catch(() => "")).split("\n")[0]?.trim();
+      if (line && /^\d+$/.test(line)) { port = parseInt(line); break; }
+      if (proc.exitCode !== null) throw new Error("Chrome exited before opening the DevTools port");
+    }
+    if (!port) throw new Error("Chrome DevTools port not found (extension may have failed to load)");
+    const ver = await (await fetch(`http://127.0.0.1:${port}/json/version`)).json();
+    cdp = new CDPClient(ver.webSocketDebuggerUrl as string);
+    await cdp.open();
+    const { targetId } = await cdp.send("Target.createTarget", { url: `chrome-extension://${EXTENSION_ID}/status.html` });
+    const { sessionId } = await cdp.send("Target.attachToTarget", { targetId, flatten: true });
+    // The extension page may still be loading; retry the write until localStorage reflects it.
+    let ok = false;
+    const expr = `(()=>{try{localStorage.setItem('auth-token',${JSON.stringify(token)});return localStorage.getItem('auth-token');}catch(e){return 'ERR:'+e.message}})()`;
+    for (let i = 0; i < 50; i++) {
+      const r = await cdp.send("Runtime.evaluate", { expression: expr, returnByValue: true }, sessionId).catch(() => null);
+      if (r?.result?.value === token) { ok = true; break; }
+      await Bun.sleep(100);
+    }
+    if (!ok) throw new Error(`Could not seed auth token into chrome-extension://${EXTENSION_ID}/ (is the extension loading?)`);
+    // Graceful close flushes localStorage to the profile's leveldb before we kill Chrome.
+    await cdp.send("Browser.close").catch(() => {});
+  } finally {
+    cdp?.close();
+    try { proc.kill(); } catch {}
+    await proc.exited.catch(() => {});
+  }
+}
+
+async function provisionProfile(name: string, opts: { headed?: boolean } = {}): Promise<void> {
+  // The name doubles as the on-disk profile directory and the registry/URL key, so keep it a
+  // simple token and disallow the reserved real-Chrome names to avoid any cross-talk.
+  if (!name || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name) || /^(Default|Profile \d+)$/i.test(name)) {
+    console.error(`Invalid profile name: "${name ?? ""}". Use letters/digits/._- (not "Default"/"Profile N").`);
+    process.exit(1);
+  }
+  const dist = await ensureExtensionDistInstalled();
+  const userDataDir = join(RECH_HOME_DIR, "profiles", name);
+  const token = randomBytes(32).toString("base64url");
+
+  console.log(`\n[1/3] Provisioning managed profile "${name}"`);
+  console.log(`      user-data-dir: ${userDataDir}`);
+  console.log(`      extension:     ${dist}`);
+  console.log(`      Launching ${opts.headed ? "headed" : "headless"} Chrome to seed the auth token...`);
+  await provisionExtensionToken({ userDataDir, profileDir: name, dist, token, headed: opts.headed });
+  console.log(`      Token seeded (${token.slice(0, 6)}…)`);
+
+  // [2/3] Daemon URL — reuse the running daemon's key; warn (don't fail) if it isn't up yet.
+  console.log(`\n[2/3] Building RECHROME_URL`);
+  const url = await getOrCreateUrl();
+  const { host, port, protocol, key } = parseUrl(url);
+  const healthy = await fetch(`${protocol}://${host}:${port}/ping`, {
+    headers: { Authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(2000),
+  }).then(r => r.ok).catch(() => false);
+  if (!healthy) console.log(`      Note: daemon not reachable at ${host}:${port} — run \`rech setup\` once to start it.`);
+
+  const rechUrl = new URL(`${protocol}://${host}:${port}`);
+  rechUrl.username = key || randomBytes(12).toString("base64url");
+  rechUrl.searchParams.set("extension_id", EXTENSION_ID);
+  rechUrl.searchParams.set("token", token);
+  rechUrl.searchParams.set("profile", name);
+  rechUrl.searchParams.set("user_data_dir", userDataDir);
+  rechUrl.searchParams.set("load_extension", dist);
+  const newLine = `RECHROME_URL=${rechUrl.toString()}`;
+
+  // [3/3] Register in the token registry so `rech status` lists it and the daemon can resolve it.
+  await saveTokenEntry(name, { extensionId: EXTENSION_ID, token, profileDir: name, userDataDir, loadExtension: dist });
+  console.log(`\n[3/3] Registered "${name}" in ${TOKENS_FILE}`);
+
+  console.log(`\nDone! RECHROME_URL for "${name}":\n\n  ${newLine}\n`);
+  console.log(`Use it per-call:\n  ${newLine.replace("RECHROME_URL=", "RECHROME_URL='")}' rech open https://example.com\n`);
+  console.log(`Or save it to a project .env.local to make it the default.`);
+}
+
+async function setup(opts: { profile?: string; token?: string } = {}): Promise<void> {
   const { createInterface } = await import("readline");
   const isTTY = process.stdin.isTTY ?? false;
   let rl: ReturnType<typeof createInterface> | null = null;
@@ -812,7 +1052,7 @@ async function setup(opts: { profile?: string } = {}): Promise<void> {
     return available[idx];
   }
 
-  async function getExtAndToken(profileDir: string, profileDisplay: string, profileKey: string): Promise<{ extId: string; token: string } | null> {
+  async function getExtAndToken(profileDir: string, profileDisplay: string, profileKey: string, providedToken?: string): Promise<{ extId: string; token: string } | null> {
     // Extension check
     let extId: string | undefined;
     // Copy bundled dist to a stable per-user location so the install path survives bunx temp-dir cleanup.
@@ -822,20 +1062,57 @@ async function setup(opts: { profile?: string } = {}): Promise<void> {
       if (found) { extId = found.id; break; }
       console.log(`\n      Extension not found in profile: ${profileDisplay}`);
       console.log(`      Extension dist: ${EXTENSION_DIST_DIR}`);
-      // Non-TTY (agent/pipe) can't install an extension interactively, and `ask` doesn't block on an exhausted stdin queue —
-      // looping here would spawn `open` per iteration until the OS runs out of resources. Fail fast instead.
-      if (!isTTY) {
-        console.error(`      Non-TTY: cannot install extension interactively — aborting`);
-        return null;
-      }
       const setupHtmlPath = join(RECH_HOME_DIR, "setup.html");
       mkdirSync(RECH_HOME_DIR, { recursive: true });
       await Bun.write(setupHtmlPath, buildSetupHtml(EXTENSION_DIST_DIR, profileDisplay));
-      console.log(`\n      Opening install guide in your browser...`);
-      openInDefaultApp(setupHtmlPath);
+      // Open the install guide directly in the *target* profile (resolved from --profile), so
+      // "Load unpacked" lands in the right Chrome. This is a new tab, not a restart.
+      console.log(`\n      Opening install guide in Chrome profile: ${profileDisplay}`);
+      openInChromeProfile(profileDir, setupHtmlPath);
+      // Non-TTY (agent/pipe) can't block on a paste prompt, and `ask` returns immediately on an
+      // exhausted stdin queue — looping would respawn Chrome every iteration. Open the guide once,
+      // then stop with clear re-run instructions instead of spinning.
+      if (!isTTY) {
+        console.error(`\n      Non-TTY: load the extension once via chrome://extensions → "Load unpacked":`);
+        console.error(`        ${EXTENSION_DIST_DIR}`);
+        console.error(`      (open chrome://extensions in profile "${profileDisplay}" — see the guide just opened)`);
+        console.error(`      Then re-run:  rech setup --profile <num|email> [--token <tok>]`);
+        return null;
+      }
       await ask("\n      Press Enter after loading the extension to retry...");
     }
     console.log(`      Extension found: ${extId}`);
+
+    // Non-interactive token injection (--token / RECH_TOKEN). An explicitly supplied token wins
+    // over both the registry-keep prompt and the paste loop, so a non-TTY agent can register a
+    // profile in one shot. Accepts the bare token or a full `PLAYWRIGHT_MCP_EXTENSION_TOKEN=...`.
+    if (providedToken) {
+      const token = providedToken.replace(/^.*?=/, "").trim();
+      if (token.length < 20) {
+        console.error(`      Provided token too short (${token.length} chars) — pass the full PLAYWRIGHT_MCP_EXTENSION_TOKEN value`);
+        return null;
+      }
+      console.log(`      Using provided token: ${token.slice(0, 6)}…`);
+      return { extId, token };
+    }
+
+    // Default automation: read the auth token straight from the profile's localStorage LevelDB,
+    // so an installed extension needs no manual paste (works the same in TTY and non-TTY). The
+    // token is minted lazily the first time the status/connect page loads, so if it isn't there
+    // yet, open status.html in this profile to mint it (a new tab — never a restart) and re-scan.
+    if (userDataDir) {
+      let auto = readExtensionTokenFromProfile(userDataDir, profileDir);
+      if (!auto) {
+        console.log(`      No token in profile yet — minting via chrome-extension://${extId}/status.html …`);
+        openInChromeProfile(profileDir, `chrome-extension://${extId}/status.html`);
+        for (let i = 0; i < 10 && !auto; i++) { await Bun.sleep(500); auto = readExtensionTokenFromProfile(userDataDir, profileDir); }
+      }
+      if (auto) {
+        console.log(`      Auto-read token from profile localStorage: ${auto.slice(0, 6)}…`);
+        return { extId, token: auto };
+      }
+      console.log(`      Could not auto-read token from localStorage — falling back to manual entry`);
+    }
 
     // Check for existing token in registry
     const registry = await readTokenRegistry();
@@ -855,13 +1132,7 @@ async function setup(opts: { profile?: string } = {}): Promise<void> {
     console.log(`\n      Get auth token from the extension:`);
     console.log(`        ${statusUrl}`);
     if (isTTY) {
-      const chromeBin = findChromeBinary();
-      if (chromeBin) {
-        Bun.spawn(
-          [chromeBin, `--profile-directory=${profileDir}`, statusUrl],
-          { stdout: "ignore", stderr: "ignore", detached: true },
-        );
-      }
+      openInChromeProfile(profileDir, statusUrl);
       console.log(`\n      Or click the extension icon in the Chrome toolbar.`);
       console.log(`      Copy the token shown on the page (PLAYWRIGHT_MCP_EXTENSION_TOKEN=...).\n`);
     } else {
@@ -901,7 +1172,7 @@ async function setup(opts: { profile?: string } = {}): Promise<void> {
   // [3+4/4] Extension + token for primary profile
   console.log("\n[3/4] Checking extension...");
   const profileEmail = profileInfoSel.user_name || profileDir;
-  const primary = await getExtAndToken(profileDir, profileDisplay, profileEmail);
+  const primary = await getExtAndToken(profileDir, profileDisplay, profileEmail, opts.token);
   if (!primary) { rl?.close(); process.exit(1); }
   const { extId, token } = primary;
 
@@ -1010,7 +1281,16 @@ function printHelp(): void {
   console.log(`rechrome (rech) — drive Chrome via Playwright over HTTP
 
 Usage:
-  rech setup                   First-time setup: daemon + Chrome extension + config
+  rech setup [--profile <num|email>] [--token <tok>]
+                               First-time setup: daemon + Chrome extension + config
+                               --profile selects the Chrome profile non-interactively
+                               --token (or RECH_TOKEN) supplies the auth token for
+                               non-TTY/agent runs, skipping the interactive paste
+  rech provision-profile <name> --experimental [--headed]
+                               (experimental) Auto-provision a managed QA profile on
+                               Chrome for Testing — branded Chrome 149+ rejects
+                               --load-extension, so this is a clean browser, not your
+                               real Chrome. For your real Chrome, use \`rech setup\`
   rech status                  Show current configuration and serve health
   rech uninstall               Remove the serve daemon and clear config
   rech serve                   Start the serve server manually (foreground)
@@ -1019,9 +1299,11 @@ Usage:
 
 Environment:
   ${ENV_KEY}   Server URL set by \`rech setup\`
+  RECH_TOKEN     Auth token for \`rech setup\` (same as --token)
 
 Examples:
   rech setup
+  rech setup --profile 18 --token <PLAYWRIGHT_MCP_EXTENSION_TOKEN>
   rech eval "() => document.title"
   rech open https://example.com
   rech screenshot`);
@@ -1045,7 +1327,29 @@ if (import.meta.main) {
     const profile = profileIdx !== -1
       ? args[profileIdx + 1]
       : args.find(a => a.startsWith("--profile="))?.slice("--profile=".length);
-    await setup({ profile }); // setup closes envWatcher itself before printing Done
+    const tokenIdx = args.indexOf("--token");
+    const token = (tokenIdx !== -1
+      ? args[tokenIdx + 1]
+      : args.find(a => a.startsWith("--token="))?.slice("--token=".length))
+      ?? process.env.RECH_TOKEN;
+    await setup({ profile, token }); // setup closes envWatcher itself before printing Done
+  } else if (cmd === "provision-profile") {
+    const name = args.find((a, i) => i > 0 && !a.startsWith("-"));
+    const headed = args.includes("--headed");
+    const experimental = args.includes("--experimental");
+    if (!name) { console.error("Usage: rech provision-profile <name> --experimental [--headed]"); process.exit(1); }
+    // Experimental: a managed profile runs on Chrome for Testing, not the user's real Google Chrome
+    // (branded Chrome 149+ rejects --load-extension). It's a clean browser with no logins/cookies,
+    // so it's gated behind --experimental rather than offered as the default setup path.
+    if (!experimental) {
+      console.error(`provision-profile is experimental and creates a Chrome-for-Testing profile (not your`);
+      console.error(`real Chrome): branded Google Chrome 149+ rejects --load-extension, so a managed profile`);
+      console.error(`can't reuse your logged-in Chrome. For your real Chrome use:  rech setup --profile <N>`);
+      console.error(`To proceed anyway, re-run with --experimental.`);
+      process.exit(1);
+    }
+    await provisionProfile(name, { headed });
+    envWatcher?.close();
   } else if (cmd === "uninstall") {
     await daemonUninstall();
     envWatcher?.close();

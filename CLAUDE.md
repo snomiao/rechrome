@@ -25,6 +25,32 @@ If a `node_modules/.../playwright-core/lib/...` file appears to be the one actua
 
 If the consumer is the globally-installed `playwright-cli-multi-tab` binary, that binary points outside this repo — switch the daemon to invoke a CLI from this repo's `./lib/` instead.
 
+## `rech setup` & profile provisioning (token + extension)
+
+How a profile gets its auth token and extension, and the platform constraints behind the design:
+
+- **Token lives in the extension's `localStorage['auth-token']`** (per-profile, lazily minted on
+  first load of `status.html`/`connect.html`; random 32-byte base64url). The daemon's token-bypass
+  connect compares `?token=` against this value (`extension/src/ui/connect.tsx`).
+- **`rech setup` auto-reads the token** straight from the profile's `Local Storage/leveldb`
+  (`readExtensionTokenFromProfile` in `rech.ts`) — read-only, never takes LevelDB's lock, safe while
+  the user's Chrome runs. It anchors on the `auth-token` marker + `\x01`+43-char base64url value
+  shape (LevelDB prefix-compression can split the origin string, so don't match the full origin).
+  Verified to extract the exact registry token for every installed profile. So setup needs **no
+  manual paste**; `--token`/`RECH_TOKEN` still override for headless edge cases.
+- **Extension install still needs a one-time GUI "Load unpacked"** in the target profile. There is no
+  non-GUI install path for the user's real Chrome: Secure Preferences is HMAC-signed (can't forge an
+  install entry), and **branded Google Chrome 149+ rejects `--load-extension`** outright (stderr:
+  `--load-extension is not allowed in Google Chrome, ignoring`). setup opens the install guide in the
+  *correct* profile (`openInChromeProfile` via `--profile-directory`) — a new tab, never a restart.
+- **`rech provision-profile <name> --experimental`** is the only fully-automated path: it runs on
+  **Chromium / Chrome for Testing** (which still honors `--load-extension`), launches headless with
+  `--load-extension`, seeds the token into `localStorage` over CDP (`provisionExtensionToken`), and
+  registers it. Managed profiles carry `load_extension=<dist>` in `RECHROME_URL`; the daemon forwards
+  it as `PLAYWRIGHT_MCP_LOAD_EXTENSION`, and the patched `cdpRelay.ts` re-adds `--load-extension` and
+  **forces the Chromium executable** on every launch (branded Chrome would ignore the flag). This is
+  a clean browser (no logins) — gated behind `--experimental`, not the default.
+
 ## Building & verifying the vendored playwright / extension
 
 Hard-won notes — a source edit not taking effect at runtime is almost always one of these:

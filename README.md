@@ -37,6 +37,38 @@ Now `rechrome` (or `rech`) is available globally.
 
 ## Quick start
 
+### 0. One-command setup (recommended)
+
+`rech setup` configures the daemon, Chrome extension, and connection URL in one pass:
+
+```bash
+rech setup                          # interactive: pick a profile, follow the prompts
+rech setup --profile you@email.com  # non-interactive profile selection
+```
+
+What it does per Chrome profile:
+
+1. **Daemon** — installs/starts the `serve` daemon (skipped if already healthy).
+2. **Extension** — if the multi-tab extension isn't installed in the chosen profile, it opens an
+   install guide **in that exact profile**; load it once via `chrome://extensions → Load unpacked`
+   (a one-time manual click — Chrome only allows unpacked extensions through the GUI).
+3. **Token** — once the extension is present, the auth token is **read automatically** from the
+   profile's `localStorage` (no copy-paste). For headless/agent runs you can also pass it
+   explicitly:
+
+   ```bash
+   rech setup --profile 18 --token <PLAYWRIGHT_MCP_EXTENSION_TOKEN>   # or RECH_TOKEN=… rech setup …
+   ```
+
+`setup` is agent-friendly: it never blocks on a TTY, opens the guide in the right profile, and
+auto-reads the token, so a non-interactive run completes end-to-end once the extension is loaded.
+
+> **Managed QA profiles (experimental):** `rech provision-profile <name> --experimental` spins up a
+> fully isolated profile on **Chrome for Testing** (run `npx playwright install chromium` first) with
+> the extension auto-loaded and the token auto-seeded — zero GUI, zero TTY. It is *not* your real
+> Chrome (branded Google Chrome 149+ rejects `--load-extension`), so it has no logins/cookies; use it
+> for clean QA fixtures, and `rech setup` for your real, logged-in Chrome.
+
 ### 1. Start the server
 
 On the machine with a browser:
