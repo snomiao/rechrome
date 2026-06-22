@@ -69,7 +69,7 @@ async function loadEnv() {
 }
 // Shell-set passthrough vars survive .env.local loading
 const _shellPassthrough: Record<string, string> = {};
-for (const k of ["PLAYWRIGHT_MCP_EXTENSION_ID","PLAYWRIGHT_MCP_EXTENSION_TOKEN","PLAYWRIGHT_MCP_PROFILE_DIRECTORY","PLAYWRIGHT_MCP_USER_DATA_DIR"] as const) {
+for (const k of ["PLAYWRIGHT_MCP_EXTENSION_ID","PLAYWRIGHT_MCP_EXTENSION_TOKEN","PLAYWRIGHT_MCP_PROFILE_DIRECTORY","PLAYWRIGHT_MCP_USER_DATA_DIR","PLAYWRIGHT_MCP_LOAD_EXTENSION"] as const) {
   if (process.env[k]) _shellPassthrough[k] = process.env[k]!;
 }
 await loadEnv();

@@ -50,6 +50,16 @@ How a profile gets its auth token and extension, and the platform constraints be
   it as `PLAYWRIGHT_MCP_LOAD_EXTENSION`, and the patched `cdpRelay.ts` re-adds `--load-extension` and
   **forces the Chromium executable** on every launch (branded Chrome would ignore the flag). This is
   a clean browser (no logins) — gated behind `--experimental`, not the default.
+- **The relay-side `cdpRelay.ts` patch is NOT pinned on `main`.** It lives on the `lib/playwright`
+  submodule branch **`sno-dev`** (commit `9fd8e2dd5` re-adds `--load-extension` + forces Chromium for
+  `PLAYWRIGHT_MCP_LOAD_EXTENSION`); the pre-existing tip is preserved as tag `sno-dev-old-b6cc8dd`.
+  `main` keeps the submodule pinned at the upstream-fetchable commit so fresh clones / CI don't break
+  on an unpushed pin. So `rech setup` (the default real-Chrome flow) works from a clean checkout, but
+  **`--experimental` needs the relay patch applied first**: in `lib/playwright/`, `git checkout
+  sno-dev` then rebuild (`node utils/build/build.js`) so the patched `coreBundle.js` is what runs.
+  Without that, a managed profile is seeded fine but `rech open` launches without re-loading the
+  extension and the token-bypass connect fails. If the fork ever gets a pushed remote, pin `main` to
+  `sno-dev` and drop this caveat.
 
 ## Building & verifying the vendored playwright / extension
 
