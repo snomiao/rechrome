@@ -376,7 +376,9 @@ export async function serve() {
         } else {
           const basename = f.split("/").pop()!;
           for (const subdir of [".playwright-cli", ".rech-multi-tab"]) {
-            const subpath = join(subdir, basename);
+            // Forward-slash for the wire: join() would use "\" on the Windows daemon, which
+            // a POSIX client can't treat as a separator (it builds a literal-backslash path).
+            const subpath = `${subdir}/${basename}`;
             if (await file(join(workDir, subpath)).exists()) {
               outputFiles.push(subpath);
               break;
@@ -390,7 +392,9 @@ export async function serve() {
         status,
         stdout: rebrand(stdout),
         stderr: rebrand(stderr),
-        files: outputFiles,
+        // Normalize any platform separators to "/" so relative paths are portable across
+        // a cross-OS daemon↔client (e.g. Windows daemon serving a Linux container client).
+        files: outputFiles.map((p) => p.replaceAll("\\", "/")),
       });
     },
   });
