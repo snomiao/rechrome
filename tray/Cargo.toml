@@ -1,0 +1,22 @@
+[package]
+name = "rechrome-tray"
+version = "0.1.0"
+edition = "2021"
+description = "Native menu-bar / system-tray icon for the rechrome serve daemon"
+license = "MIT"
+
+[[bin]]
+name = "rechrome-tray"
+path = "src/main.rs"
+
+# Native tray on every desktop OS: NSStatusItem (macOS), Shell_NotifyIcon
+# (Windows), libayatana-appindicator (Linux). Linux builds require the GTK3 +
+# appindicator dev packages; any other target builds the no-op stub in main.rs.
+[target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
+tray-icon = "0.19"
+tao = "0.30"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

@@ -5,6 +5,7 @@ import { randomBytes } from "crypto";
 import { mkdirSync, appendFileSync, existsSync, realpathSync, accessSync, cpSync, unlinkSync, readFileSync, readdirSync, constants as fsConstants } from "fs";
 import { hostname, homedir } from "os";
 import { join, basename, dirname } from "path";
+import { spawn as cpSpawn } from "child_process";
 
 export const ENV_KEY = "RECHROME_URL";
 export const DEFAULT_PORT = 13775;
@@ -685,6 +686,98 @@ async function daemonUninstall(): Promise<void> {
   console.log(`Removed ${PM_BIN} process: ${PM_PROCESS_NAME}`);
 }
 
+// ── Native tray (menu-bar / system-tray) icon ───────────────────────────────
+// The tray is a small native binary (tray/, Rust). `rech` just supervises it:
+// locate the binary, launch it detached (singleton via a pidfile), and toggle
+// visibility through a shared flag file the running tray polls.
+const TRAY_PID_FILE = join(RECH_HOME_DIR, "tray.pid");
+const TRAY_HIDDEN_FILE = join(RECH_HOME_DIR, "tray.hidden");
+
+// A desktop GUI must be present. Linux needs an X11/Wayland display; a headless
+// box (SSH, CI, container) has neither, so the tray is skipped. macOS/Windows
+// desktop sessions effectively always have one (the binary bypasses if not).
+function trayGuiAvailable(): boolean {
+  if (process.platform === "linux")
+    return !!(process.env.DISPLAY || process.env.WAYLAND_DISPLAY);
+  return true;
+}
+
+// Resolve the tray binary: explicit override, then the copy shipped beside
+// `rech` (packaged installs), then the dev cargo build, then PATH.
+function findTrayBinary(): string | undefined {
+  const ext = IS_WINDOWS ? ".exe" : "";
+  const candidates = [
+    process.env.RECH_TRAY_BIN,
+    join(import.meta.dir, "tray", `rechrome-tray${ext}`),
+    join(import.meta.dir, "tray", "target", "release", `rechrome-tray${ext}`),
+    join(import.meta.dir, "tray", "target", "debug", `rechrome-tray${ext}`),
+  ].filter(Boolean) as string[];
+  for (const c of candidates) if (existsSync(c)) return c;
+  return Bun.which(`rechrome-tray${ext}`) ?? undefined;
+}
+
+function isTrayRunning(): boolean {
+  try {
+    const pid = parseInt(readFileSync(TRAY_PID_FILE, "utf8"), 10);
+    if (!Number.isFinite(pid)) return false;
+    process.kill(pid, 0); // signal 0 = liveness probe, doesn't actually signal
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Start (and "show") the tray. quiet=true is used by `rech setup` auto-start so
+// a missing binary / headless box stays silent rather than noisy.
+async function startTray({ quiet = false }: { quiet?: boolean } = {}): Promise<void> {
+  if (!trayGuiAvailable()) {
+    if (!quiet) console.log("tray: no desktop GUI session detected — skipped.");
+    return;
+  }
+  try { unlinkSync(TRAY_HIDDEN_FILE); } catch {} // showing clears any hidden flag
+  if (isTrayRunning()) {
+    if (!quiet) console.log("tray: already running.");
+    return;
+  }
+  const bin = findTrayBinary();
+  if (!bin) {
+    if (!quiet)
+      console.error("tray: binary not found. Build it with:  (cd tray && cargo build --release)");
+    return;
+  }
+  const child = cpSpawn(bin, [], { detached: true, stdio: "ignore" });
+  child.unref(); // outlive this CLI invocation
+  if (child.pid) await Bun.write(TRAY_PID_FILE, String(child.pid));
+  if (!quiet) console.log(`tray: started (pid ${child.pid}).`);
+}
+
+async function hideTray(): Promise<void> {
+  await Bun.write(TRAY_HIDDEN_FILE, "1");
+  console.log(
+    isTrayRunning()
+      ? "tray: hidden. Run `rech tray show` to restore."
+      : "tray: hidden flag set (applies when the tray is shown).",
+  );
+}
+
+function stopTray(): void {
+  if (!isTrayRunning()) { console.log("tray: not running."); return; }
+  try { process.kill(parseInt(readFileSync(TRAY_PID_FILE, "utf8"), 10)); } catch {}
+  try { unlinkSync(TRAY_PID_FILE); } catch {}
+  console.log("tray: stopped.");
+}
+
+async function trayCommand(sub?: string): Promise<void> {
+  switch (sub) {
+    case "hide": await hideTray(); break;
+    case "stop": case "quit": stopTray(); break;
+    case undefined: case "": case "show": case "start": await startTray(); break;
+    default:
+      console.error(`Unknown tray command: "${sub}". Usage: rech tray [show|hide|stop]`);
+      process.exit(1);
+  }
+}
+
 // Read the extension's auth token straight from a profile's localStorage LevelDB. Read-only
 // (we never take LevelDB's lock), so it's safe while the user's Chrome is running. The token is
 // the value of the `auth-token` key under the extension origin, stored as a 0x01 (Latin-1)
@@ -1292,6 +1385,9 @@ Usage:
                                --load-extension, so this is a clean browser, not your
                                real Chrome. For your real Chrome, use \`rech setup\`
   rech status                  Show current configuration and serve health
+  rech tray [show|hide|stop]   Native menu-bar/tray icon for the serve daemon
+                               (show=start, hide/show toggle, stop=quit). Auto-
+                               starts after \`rech setup\`; skipped with no GUI
   rech uninstall               Remove the serve daemon and clear config
   rech serve                   Start the serve server manually (foreground)
   rech profiles                List Chrome profiles
@@ -1333,6 +1429,11 @@ if (import.meta.main) {
       : args.find(a => a.startsWith("--token="))?.slice("--token=".length))
       ?? process.env.RECH_TOKEN;
     await setup({ profile, token }); // setup closes envWatcher itself before printing Done
+    // Auto-start the tray (best-effort, silent on headless / missing binary).
+    await startTray({ quiet: true }).catch(() => {});
+  } else if (cmd === "tray") {
+    await trayCommand(args[1]?.toLowerCase());
+    envWatcher?.close();
   } else if (cmd === "provision-profile") {
     const name = args.find((a, i) => i > 0 && !a.startsWith("-"));
     const headed = args.includes("--headed");
