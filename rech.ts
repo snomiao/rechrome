@@ -688,10 +688,10 @@ async function daemonUninstall(): Promise<void> {
 
 // ── Native tray (menu-bar / system-tray) icon ───────────────────────────────
 // The tray is a small native binary (tray/, Rust). `rech` just supervises it:
-// locate the binary, launch it detached (singleton via a pidfile), and toggle
-// visibility through a shared flag file the running tray polls.
+// locate the binary and launch it detached (singleton via a pidfile).
+// `rech tray hide` / the menu "Hide" item both kill the process;
+// `rech tray show` starts a fresh one.
 const TRAY_PID_FILE = join(RECH_HOME_DIR, "tray.pid");
-const TRAY_HIDDEN_FILE = join(RECH_HOME_DIR, "tray.hidden");
 
 // A desktop GUI must be present. Linux needs an X11/Wayland display; a headless
 // box (SSH, CI, container) has neither, so the tray is skipped. macOS/Windows
@@ -734,7 +734,6 @@ async function startTray({ quiet = false }: { quiet?: boolean } = {}): Promise<v
     if (!quiet) console.log("tray: no desktop GUI session detected — skipped.");
     return;
   }
-  try { unlinkSync(TRAY_HIDDEN_FILE); } catch {} // showing clears any hidden flag
   if (isTrayRunning()) {
     if (!quiet) console.log("tray: already running.");
     return;
@@ -751,26 +750,16 @@ async function startTray({ quiet = false }: { quiet?: boolean } = {}): Promise<v
   if (!quiet) console.log(`tray: started (pid ${child.pid}).`);
 }
 
-async function hideTray(): Promise<void> {
-  await Bun.write(TRAY_HIDDEN_FILE, "1");
-  console.log(
-    isTrayRunning()
-      ? "tray: hidden. Run `rech tray show` to restore."
-      : "tray: hidden flag set (applies when the tray is shown).",
-  );
-}
-
 function stopTray(): void {
   if (!isTrayRunning()) { console.log("tray: not running."); return; }
   try { process.kill(parseInt(readFileSync(TRAY_PID_FILE, "utf8"), 10)); } catch {}
   try { unlinkSync(TRAY_PID_FILE); } catch {}
-  console.log("tray: stopped.");
+  console.log("tray: stopped. Run `rech tray show` to restore.");
 }
 
 async function trayCommand(sub?: string): Promise<void> {
   switch (sub) {
-    case "hide": await hideTray(); break;
-    case "stop": case "quit": stopTray(); break;
+    case "hide": case "stop": case "quit": stopTray(); break;
     case undefined: case "": case "show": case "start": await startTray(); break;
     default:
       console.error(`Unknown tray command: "${sub}". Usage: rech tray [show|hide|stop]`);

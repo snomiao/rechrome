@@ -71,29 +71,6 @@ mod imp {
         }
     }
 
-    /// `~/.rechrome/tray.hidden` — a flag file the running tray polls so the
-    /// `rech tray hide` / `rech tray show` commands (separate processes) and the
-    /// in-menu "Hide" item all drive one shared visibility state.
-    fn hidden_flag_path() -> Option<std::path::PathBuf> {
-        let home = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .ok()?;
-        Some(std::path::PathBuf::from(home).join(".rechrome").join("tray.hidden"))
-    }
-
-    fn is_hidden() -> bool {
-        hidden_flag_path().map(|p| p.exists()).unwrap_or(false)
-    }
-
-    fn set_hidden_flag() {
-        if let Some(p) = hidden_flag_path() {
-            if let Some(parent) = p.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::write(&p, b"1");
-        }
-    }
-
     /// `RECHROME_URL` from the environment, falling back to the first matching
     /// line in `~/.env.local` (where `rech` persists it).
     fn read_rechrome_url() -> Option<String> {
@@ -293,16 +270,14 @@ mod imp {
         let restart_item = MenuItem::new("Restart daemon", true, None);
         let stop_item = MenuItem::new("Stop daemon", true, None);
         let copy_item = MenuItem::new("Copy RECHROME_URL", true, None);
-        let hide_item = MenuItem::new("Hide (run `rech tray show` to restore)", true, None);
-        let quit_item = MenuItem::new("Quit", true, None);
+        let hide_item = MenuItem::new("Hide  (run `rech tray show` to restore)", true, None);
 
-        let (open_id, restart_id, stop_id, copy_id, hide_id, quit_id) = (
+        let (open_id, restart_id, stop_id, copy_id, hide_id) = (
             open_item.id().clone(),
             restart_item.id().clone(),
             stop_item.id().clone(),
             copy_item.id().clone(),
             hide_item.id().clone(),
-            quit_item.id().clone(),
         );
 
         let menu = Menu::new();
@@ -315,14 +290,11 @@ mod imp {
             &copy_item,
             &PredefinedMenuItem::separator(),
             &hide_item,
-            &quit_item,
         ]);
 
         let mut tray: Option<TrayIcon> = None;
         let mut current: Option<Parsed> = None;
         let mut last_health: Option<Health> = None;
-        // Visibility is driven by the shared hidden-flag file (CLI + menu).
-        let mut visible = true;
         let menu_channel = MenuEvent::receiver();
 
         let refresh = |tray: &Option<TrayIcon>,
@@ -374,30 +346,15 @@ mod imp {
                     }
                     current = parsed;
                     last_health = Some(health);
-                    // Honour a pre-existing hidden flag on startup.
-                    visible = !is_hidden();
-                    if !visible {
-                        if let Some(t) = tray.as_ref() {
-                            let _ = t.set_visible(false);
-                        }
-                    }
                 }
                 Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
                     refresh(&tray, &status_item, &mut current, &mut last_health);
-                    // Reconcile visibility with the shared hidden flag.
-                    let want = !is_hidden();
-                    if want != visible {
-                        if let Some(t) = tray.as_ref() {
-                            let _ = t.set_visible(want);
-                        }
-                        visible = want;
-                    }
                 }
                 _ => {}
             }
 
             while let Ok(ev) = menu_channel.try_recv() {
-                if ev.id == quit_id {
+                if ev.id == hide_id {
                     std::process::exit(0);
                 } else if ev.id == restart_id {
                     pm_action("restart");
@@ -411,14 +368,6 @@ mod imp {
                     if let Some(p) = current.as_ref() {
                         copy_to_clipboard(&p.raw);
                     }
-                } else if ev.id == hide_id {
-                    // Persist the flag so the icon stays hidden across restarts
-                    // and `rech tray show` can bring it back.
-                    set_hidden_flag();
-                    if let Some(t) = tray.as_ref() {
-                        let _ = t.set_visible(false);
-                    }
-                    visible = false;
                 }
             }
         })
