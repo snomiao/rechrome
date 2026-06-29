@@ -10,6 +10,7 @@ import {
   RECH_DIR,
   HOME,
   PASSTHROUGH_ENV_KEYS,
+  resolvePlaywrightCli,
 } from "./rech.ts";
 
 const TAILSCALE_BIN = process.env.TAILSCALE_BIN || "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
@@ -233,7 +234,9 @@ export async function serve() {
       });
       const namespacedSession = clientSession ? `${sessionId}-${clientSession}` : sessionId;
 
-      const [bin, ...binArgs] = splitCommand(process.env.PLAYWRIGHT_CLI || "playwright-cli-multi-tab");
+      // daemonInstall bakes PLAYWRIGHT_CLI into the daemon env; resolvePlaywrightCli() is the
+      // fallback for a standalone `serve` (it re-runs the same env > fork > @playwright/cli > legacy chain).
+      const [bin, ...binArgs] = splitCommand(resolvePlaywrightCli());
 
       if (filteredArgs.length === 0) {
         filteredArgs.push("--help");

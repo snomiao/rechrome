@@ -603,6 +603,27 @@ async function pmList(): Promise<string> {
   return await new Response(proc.stdout).text();
 }
 
+// Resolve which playwright-cli the daemon runs to drive Chrome. Priority:
+//   1. PLAYWRIGHT_CLI env override — explicit, already a full command string.
+//   2. Vendored fork in a git checkout (lib/playwright-cli/playwright-cli.js) — the patched
+//      multi-tab CLI + patched playwright-core (PLAYWRIGHT_MCP_PROFILE_DIRECTORY etc.).
+//   3. The fork bundled into the npm tarball (vendor/playwright-cli/playwright-cli.js, produced by
+//      scripts/vendor-cli.sh at prepublish). This is the batteries-included default for
+//      `bun i -g rechrome`: self-contained, no @playwright/cli dep, no browser-binary download.
+//   4. Bare `playwright-cli-multi-tab` on PATH — legacy fallback for a pre-existing global link.
+// A resolved .js entry is run through `node` on Windows (which can't exec a .js by shebang) and
+// bare on POSIX (its `#!/usr/bin/env node` shebang runs it under node, which the relay handshake
+// needs — see daemonInstall). serve splits the result on spaces into argv.
+export function resolvePlaywrightCli(): string {
+  if (process.env.PLAYWRIGHT_CLI) return process.env.PLAYWRIGHT_CLI;
+  const jsEntry = [
+    join(import.meta.dir, "lib/playwright-cli/playwright-cli.js"),
+    join(import.meta.dir, "vendor/playwright-cli/playwright-cli.js"),
+  ].find(existsSync);
+  if (jsEntry) return IS_WINDOWS ? `node ${jsEntry}` : jsEntry;
+  return "playwright-cli-multi-tab";
+}
+
 export async function daemonInstall(serveUrl: string): Promise<void> {
   // Persist the URL to ~/.env.local before starting the daemon. The daemon's
   // loadEnv() walks CWD→root reading .env.local files and unconditionally
@@ -619,20 +640,14 @@ export async function daemonInstall(serveUrl: string): Promise<void> {
   const bunBin = Bun.which("bun") ?? process.execPath;
   const rechScript = import.meta.filename;
 
-  // Resolve PLAYWRIGHT_CLI: env override > bundled fork (development checkout) > "playwright-cli-multi-tab".
-  // The fork is a .js script: POSIX execs it via its shebang (`#!/usr/bin/env node`), but Windows
-  // can't exec a .js directly, so it must be invoked through an interpreter. It MUST be node, not
-  // bun: the cliDaemon inherits its parent's runtime (spawned via process.execPath), and the
+  // Resolve PLAYWRIGHT_CLI (see resolvePlaywrightCli). The resolved .js entry MUST run under node,
+  // not bun: the cliDaemon inherits its parent's runtime (spawned via process.execPath), and the
   // extension-bridge relay's WebSocket handshake hangs under Bun (the extension WS connects but
   // `extension.initialized` never completes) — under node it completes, matching the POSIX shebang.
-  // serve splits PLAYWRIGHT_CLI on spaces into argv, so we use bare `node` (the node path lives
-  // under "Program Files" and contains a space); node must be on the daemon's PATH, same as the
-  // shebang's `env node` assumption. The repo path contains no spaces.
-  const bundledForkCli = join(import.meta.dir, "lib/playwright-cli/playwright-cli.js");
-  const resolvedPlaywrightCli = process.env.PLAYWRIGHT_CLI
-    || (existsSync(bundledForkCli)
-        ? (IS_WINDOWS ? `node ${bundledForkCli}` : bundledForkCli)
-        : "playwright-cli-multi-tab");
+  // serve splits PLAYWRIGHT_CLI on spaces into argv, so on Windows we use bare `node` (the node
+  // path lives under "Program Files" and contains a space); node must be on the daemon's PATH, same
+  // as the shebang's `env node` assumption. The repo / install paths contain no spaces.
+  const resolvedPlaywrightCli = resolvePlaywrightCli();
 
   // Environment the managed `serve` process must run with.
   const daemonEnv: Record<string, string> = {

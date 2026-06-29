@@ -17,13 +17,15 @@
     "rech.js",
     "rech.ts",
     "serve.js",
-    "serve.ts"
+    "serve.ts",
+    "vendor"
   ],
   "type": "module",
   "scripts": {
     "serve": "bun run rech.ts serve",
     "test": "bun test",
-    "prepublishOnly": "sed 's/\\.ts/\\.js/g' rech.ts > rech.js && sed 's/\\.ts/\\.js/g' serve.ts > serve.js"
+    "vendor-cli": "bash scripts/vendor-cli.sh",
+    "prepublishOnly": "bash scripts/vendor-cli.sh && sed 's/\\.ts/\\.js/g' rech.ts > rech.js && sed 's/\\.ts/\\.js/g' serve.ts > serve.js"
   },
   "devDependencies": {
     "@types/bun": "latest"
