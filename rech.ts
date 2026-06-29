@@ -194,48 +194,116 @@ export function authCheck(req: Request, key: string): Response | null {
   return null;
 }
 
-async function getClientIdentity(): Promise<{ gitUrl?: string; hostname?: string; cwd?: string }> {
-  const cwd = process.cwd();
+function realpathSafe(p: string): string {
+  try { return realpathSync(p); } catch { return p; }
+}
+
+async function gitOutput(args: string[], cwd: string): Promise<string | null> {
   try {
-    const remoteProc = Bun.spawn(["git", "remote", "get-url", "origin"], {
-      cwd,
-      stdout: "pipe",
-      stderr: "ignore",
-    });
-    const remoteUrl = (await new Response(remoteProc.stdout).text()).trim();
-    await remoteProc.exited;
+    const proc = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "ignore" });
+    const out = (await new Response(proc.stdout).text()).trim();
+    await proc.exited;
+    return out || null;
+  } catch {
+    return null;
+  }
+}
 
-    const branchProc = Bun.spawn(["git", "rev-parse", "--abbrev-ref", "HEAD"], {
-      cwd,
-      stdout: "pipe",
-      stderr: "ignore",
-    });
-    const branch = (await new Response(branchProc.stdout).text()).trim();
-    await branchProc.exited;
+// Normalize a git remote URL to "host/owner/repo" — no scheme, no .git, no credentials.
+export function normalizeRemote(remoteUrl: string): string {
+  const sshMatch = remoteUrl.match(/^git@([^:]+):(.+?)(?:\.git)?$/);
+  const httpsMatch = remoteUrl.match(/^https?:\/\/(?:[^@/]+@)?([^/]+)\/(.+?)(?:\.git)?$/);
+  if (sshMatch) return `${sshMatch[1]}/${sshMatch[2]}`;
+  if (httpsMatch) return `${httpsMatch[1]}/${httpsMatch[2]}`;
+  return remoteUrl.replace(/^[^/]*:\/\//, "").replace(/^[^@]*@/, "").replace(/\.git$/, "");
+}
 
-    if (remoteUrl) {
-      let gitUrl: string;
-      const sshMatch = remoteUrl.match(/^git@([^:]+):(.+?)(?:\.git)?$/);
-      const httpsMatch = remoteUrl.match(/^https?:\/\/([^/]+)\/(.+?)(?:\.git)?$/);
-      if (sshMatch) {
-        gitUrl = `https://${sshMatch[1]}/${sshMatch[2]}`;
-      } else if (httpsMatch) {
-        gitUrl = `https://${httpsMatch[1]}/${httpsMatch[2]}`;
-      } else {
-        gitUrl = remoteUrl.replace(/\.git$/, "");
-      }
-      if (branch) gitUrl += `/tree/${branch}`;
-      // Strip any embedded credentials from the URL
-      try {
-        const u = new URL(gitUrl);
-        u.username = "";
-        u.password = "";
-        gitUrl = u.toString();
-      } catch {}
-      return { gitUrl };
+// Derive the session bucket KEY (what the server hashes) and a human LABEL (logs / tab group)
+// from already-gathered git facts. KEY and LABEL are deliberately decoupled: the key is keyed
+// on the *worktree root path* for predictability (a human can tell which browser they drive),
+// while the label renders a pretty <remote>#<basename>@<branch> for display only.
+//   - mode "worktree" (default): key = realpath(worktree root). Stable across `cd` within the
+//     project, distinct per worktree (no same-branch collisions), survives `git checkout`
+//     (no mutable-branch surprise), and has no branch so detached HEAD doesn't degrade it.
+//   - mode "branch": legacy opt-in — key = <remote>/tree/<branch> (the old behavior).
+//   - mode "cwd": key = realpath(cwd).
+// Pass realpath'd `cwd` and `root`.
+export function deriveIdentity(opts: {
+  mode: string;
+  cwd: string;
+  host: string;
+  root?: string | null;   // worktree root (already realpath'd), null when not in git
+  remote?: string | null; // normalized host/owner/repo
+  branch?: string | null; // branch name, or short SHA when detached
+}): { key: string; label: string } {
+  const { mode, cwd, host } = opts;
+  const root = opts.root || null;
+  const remote = opts.remote || null;
+  const branch = opts.branch || null;
+
+  let key: string;
+  if (mode === "branch") {
+    key = remote ? `https://${remote}${branch ? `/tree/${branch}` : ""}` : `${host}:${cwd}`;
+  } else if (mode === "cwd") {
+    key = `cwd:${cwd}`;
+  } else {
+    key = `worktree:${root || cwd}`;
+  }
+
+  let label: string;
+  if (root) {
+    label = `${remote ? `${remote}#` : ""}${basename(root)}${branch ? `@${branch}` : ""}`;
+  } else if (remote) {
+    label = `${remote}${branch ? `/tree/${branch}` : ""}`;
+  } else {
+    label = `${host}:${cwd}`;
+  }
+  return { key, label };
+}
+
+async function getClientIdentity(): Promise<{ key: string; label: string; profile?: string }> {
+  const cwd = realpathSafe(process.cwd());
+  const mode = (process.env.RECH_IDENTITY || "worktree").toLowerCase();
+  let root: string | null = null;
+  let remote: string | null = null;
+  let branch: string | null = null;
+
+  const top = await gitOutput(["rev-parse", "--show-toplevel"], cwd);
+  if (top) {
+    // Roll a submodule cwd up to the outermost superproject working tree, so submodule work
+    // shares the parent worktree's browser session (monorepo-friendly). Bounded loop guards
+    // against pathological nesting.
+    let superCwd = top;
+    for (let i = 0; i < 16; i++) {
+      const sup = await gitOutput(["rev-parse", "--show-superproject-working-tree"], superCwd);
+      if (!sup) break;
+      superCwd = sup;
     }
-  } catch {}
-  return { hostname: hostname(), cwd };
+    root = realpathSafe(superCwd);
+    branch = await gitOutput(["rev-parse", "--abbrev-ref", "HEAD"], root);
+    if (!branch || branch === "HEAD")
+      branch = await gitOutput(["rev-parse", "--short", "HEAD"], root); // detached HEAD
+    const remoteUrl = await gitOutput(["remote", "get-url", "origin"], root);
+    if (remoteUrl) remote = normalizeRemote(remoteUrl);
+  }
+
+  return deriveIdentity({ mode, cwd, host: hostname(), root, remote, branch });
+}
+
+// Profile precedence: an explicit `?profile=` in RECHROME_URL is authoritative; the
+// PLAYWRIGHT_MCP_PROFILE_DIRECTORY shell env is the fallback. When both are set and differ,
+// warn once — a silent mismatch here is how an OAuth/login flow can target the WRONG account.
+let _profileMismatchWarned = false;
+function resolveEffectiveProfile(urlProfile?: string): string | undefined {
+  const envProfile = process.env.PLAYWRIGHT_MCP_PROFILE_DIRECTORY;
+  if (urlProfile && envProfile && urlProfile !== envProfile && !_profileMismatchWarned) {
+    _profileMismatchWarned = true;
+    console.error(
+      `[rech] warning: profile mismatch — RECHROME_URL profile="${urlProfile}" wins over ` +
+      `PLAYWRIGHT_MCP_PROFILE_DIRECTORY="${envProfile}". Unset the env var to silence this.`,
+    );
+  }
+  return urlProfile || envProfile;
 }
 
 async function getClientEnv(urlExtras?: { extensionId?: string; extensionToken?: string; profileDirectory?: string; userDataDir?: string; loadExtension?: string }): Promise<Record<string, string>> {
@@ -429,8 +497,8 @@ async function callServe(
 ): Promise<{ status: number; stdout: string; stderr: string; files?: string[]; existingSession?: boolean }> {
   const { key, host, port, protocol, extensionId, extensionToken, profileDirectory, userDataDir, loadExtension } = parseUrl(url);
   const identity = await getClientIdentity();
-  const effectiveProfile = profileDirectory || process.env.PLAYWRIGHT_MCP_PROFILE_DIRECTORY;
-  if (effectiveProfile) (identity as any).profile = effectiveProfile;
+  const effectiveProfile = resolveEffectiveProfile(profileDirectory);
+  if (effectiveProfile) identity.profile = effectiveProfile;
   const env = { ...(await getClientEnv({ extensionId, extensionToken, profileDirectory, userDataDir, loadExtension })), ...overrideEnv };
   const res = await fetch(`${protocol}://${host}:${port}/run`, {
     method: "POST",
@@ -468,12 +536,12 @@ async function callServe(
 
 async function run(url: string, args: string[]) {
   const { host, port, protocol, extensionId, extensionToken, profileDirectory, userDataDir, loadExtension } = parseUrl(url);
-  const effectiveProfile = profileDirectory || process.env.PLAYWRIGHT_MCP_PROFILE_DIRECTORY;
+  const effectiveProfile = resolveEffectiveProfile(profileDirectory);
   const displayProfile = effectiveProfile ? await resolveProfileEmail(effectiveProfile) : undefined;
   const identity = await getClientIdentity();
   const profileSuffix = displayProfile ? ` profile:${displayProfile}` : "";
   console.error(
-    `[rech] connecting to ${host}:${port} (identity: ${identity.gitUrl || `${identity.hostname}:${identity.cwd}`}${profileSuffix})`,
+    `[rech] connecting to ${host}:${port} (identity: ${identity.label}${profileSuffix})`,
   );
 
   const resolvedEnv = await getClientEnv({ extensionId, extensionToken, profileDirectory, userDataDir, loadExtension });
@@ -1396,10 +1464,16 @@ Usage:
   rech serve                   Start the serve server manually (foreground)
   rech profiles                List Chrome profiles
   rech <playwright-args...>    Run Playwright CLI command (requires ${ENV_KEY})
+  rech --isolate <args...>     Run in a throwaway session (sugar for -s=<random>) so a
+                               fragile single-shot flow (OAuth/login) never shares tabs
+                               with the worktree's default session
 
 Environment:
   ${ENV_KEY}   Server URL set by \`rech setup\`
   RECH_TOKEN     Auth token for \`rech setup\` (same as --token)
+  RECH_IDENTITY  Session bucket mode: worktree (default) | branch | cwd. The session a
+                 client reuses is keyed on the worktree root path; \`branch\` restores the
+                 old <remote>/tree/<branch> keying, \`cwd\` keys on the exact directory
 
 Examples:
   rech setup
@@ -1467,6 +1541,15 @@ if (import.meta.main) {
       console.error(`${ENV_KEY} is not set. Run \`rech setup\` to configure.\n`);
       printHelp();
       process.exit(1);
+    }
+    // --isolate: ephemeral session isolation, sugar for -s=iso-<random>. For fragile single-shot
+    // flows (OAuth/login) that must not share tabs with the worktree's default session. The `iso-`
+    // marker lets the daemon reap these throwaway sessions on an idle TTL (see serve.ts), so an
+    // OAuth drive can't leak an orphaned browser context.
+    const isolateIdx = args.findIndex((a) => a === "--isolate" || a === "--isolated");
+    if (isolateIdx !== -1) {
+      args.splice(isolateIdx, 1);
+      args.push(`-s=iso-${randomBytes(8).toString("hex")}`);
     }
     await run(url, args);
     envWatcher?.close();

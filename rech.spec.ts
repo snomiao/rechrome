@@ -1,6 +1,6 @@
 import { describe, test, expect } from "bun:test";
-import { parseUrl, authCheck, DEFAULT_PORT, ENV_KEY } from "./rech.ts";
-import { isUnderDir, splitCommand } from "./serve.ts";
+import { parseUrl, authCheck, DEFAULT_PORT, ENV_KEY, deriveIdentity, normalizeRemote } from "./rech.ts";
+import { isUnderDir, splitCommand, shortClientLabel, isIsoSession } from "./serve.ts";
 
 describe("parseUrl", () => {
   test("parses key, host, and port from an http URL", () => {
@@ -112,5 +112,94 @@ describe("splitCommand", () => {
   });
   test("empty string yields no tokens", () => {
     expect(splitCommand("")).toEqual([]);
+  });
+});
+
+describe("normalizeRemote", () => {
+  test("ssh remote -> host/owner/repo", () => {
+    expect(normalizeRemote("git@github.com:snomiao/rechrome.git")).toBe("github.com/snomiao/rechrome");
+  });
+  test("https remote drops scheme/.git", () => {
+    expect(normalizeRemote("https://github.com/snomiao/rechrome.git")).toBe("github.com/snomiao/rechrome");
+  });
+  test("strips embedded credentials", () => {
+    expect(normalizeRemote("https://user:tok@github.com/snomiao/rechrome.git")).toBe("github.com/snomiao/rechrome");
+  });
+});
+
+describe("deriveIdentity", () => {
+  const base = { host: "mac", remote: "github.com/o/repo" };
+
+  test("worktree mode keys on the worktree root path, not the branch", () => {
+    const a = deriveIdentity({ ...base, mode: "worktree", cwd: "/wt/a", root: "/wt/a", branch: "main" });
+    const b = deriveIdentity({ ...base, mode: "worktree", cwd: "/wt/a/sub", root: "/wt/a", branch: "main" });
+    // cd-ing into a subdir keeps the same key (key is the worktree root, not cwd)
+    expect(a.key).toBe(b.key);
+    expect(a.key).toBe("worktree:/wt/a");
+  });
+
+  test("collision fix: two worktrees on the SAME branch get DIFFERENT keys", () => {
+    const a = deriveIdentity({ ...base, mode: "worktree", cwd: "/wt/a", root: "/wt/a", branch: "main" });
+    const b = deriveIdentity({ ...base, mode: "worktree", cwd: "/wt/b", root: "/wt/b", branch: "main" });
+    expect(a.key).not.toBe(b.key);
+  });
+
+  test("mutable fix: switching branch in the same worktree keeps the key", () => {
+    const before = deriveIdentity({ ...base, mode: "worktree", cwd: "/wt/a", root: "/wt/a", branch: "main" });
+    const after = deriveIdentity({ ...base, mode: "worktree", cwd: "/wt/a", root: "/wt/a", branch: "feature" });
+    expect(before.key).toBe(after.key);
+    // ...but the human label still reflects the current branch
+    expect(after.label).toBe("github.com/o/repo#a@feature");
+  });
+
+  test("detached HEAD does not degrade the key (no branch in key)", () => {
+    const detached = deriveIdentity({ ...base, mode: "worktree", cwd: "/wt/a", root: "/wt/a", branch: "a1b2c3d" });
+    expect(detached.key).toBe("worktree:/wt/a");
+  });
+
+  test("branch mode restores the legacy <remote>/tree/<branch> key", () => {
+    const id = deriveIdentity({ ...base, mode: "branch", cwd: "/wt/a", root: "/wt/a", branch: "main" });
+    expect(id.key).toBe("https://github.com/o/repo/tree/main");
+  });
+
+  test("cwd mode keys on the exact directory", () => {
+    const id = deriveIdentity({ ...base, mode: "cwd", cwd: "/wt/a/sub", root: "/wt/a", branch: "main" });
+    expect(id.key).toBe("cwd:/wt/a/sub");
+  });
+
+  test("non-git falls back to host:cwd for both key and label", () => {
+    const id = deriveIdentity({ host: "mac", mode: "worktree", cwd: "/tmp/x", root: null, remote: null, branch: null });
+    expect(id.key).toBe("worktree:/tmp/x");
+    expect(id.label).toBe("mac:/tmp/x");
+  });
+});
+
+describe("shortClientLabel", () => {
+  test("current label -> basename:branch", () => {
+    expect(shortClientLabel("github.com/o/repo#main@feature")).toBe("mai:fea");
+  });
+  test("current label without branch -> basename", () => {
+    expect(shortClientLabel("github.com/o/repo#repo")).toBe("repo");
+  });
+  test("legacy gitUrl still parses", () => {
+    expect(shortClientLabel("https://github.com/o/repo/tree/branch")).toBe("rep:bra");
+  });
+  test("host:cwd -> basename", () => {
+    expect(shortClientLabel("mac:/path/to/dir")).toBe("dir");
+  });
+});
+
+describe("isIsoSession", () => {
+  test("matches a namespaced --isolate session", () => {
+    expect(isIsoSession("a1b2c3d4-iso-deadbeefdeadbeef")).toBe(true);
+  });
+  test("matches a bare iso session", () => {
+    expect(isIsoSession("iso-deadbeef")).toBe(true);
+  });
+  test("does not match a normal session key hash", () => {
+    expect(isIsoSession("a1b2c3d4")).toBe(false);
+  });
+  test("does not match a non-iso named session", () => {
+    expect(isIsoSession("a1b2c3d4-myflow")).toBe(false);
   });
 });
