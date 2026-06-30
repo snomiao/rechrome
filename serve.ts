@@ -1,6 +1,6 @@
 import { file } from "bun";
 import { createHash, X509Certificate } from "crypto";
-import { mkdirSync, unlinkSync, accessSync, constants as fsConstants } from "fs";
+import { mkdirSync, unlinkSync, accessSync, readdirSync, constants as fsConstants } from "fs";
 import { join, resolve, relative, isAbsolute } from "path";
 import {
   log,
@@ -16,23 +16,89 @@ import {
 const TAILSCALE_BIN = process.env.TAILSCALE_BIN || "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
 const CERT_RENEW_THRESHOLD_DAYS = 7;
 
-// Short label for a client identity, used as the Chrome tab-group name (the tab
-// strip is space-constrained, so cap at 7 chars). gitUrl ".../owner/repo/tree/branch"
-// -> "rep:bra" (3+3); "host:/path/to/dir" -> "dir"; bare host/IP -> as-is. Strips a
-// trailing "@profile" suffix first.
-const MAX_GROUP_LABEL_LEN = 7;
-function shortClientLabel(raw: string): string {
+// Short label for a client identity, used as the Chrome tab-group name (the tab strip is
+// space-constrained, so cap at 7 chars). Handles the current label shape and the legacy gitUrl:
+//   "host/owner/repo#<basename>@<branch>" -> "bas:bra" (3+3)   (current)
+//   "host/owner/repo/tree/branch"         -> "rep:bra" (3+3)   (legacy gitUrl)
+//   "host:/path/to/dir"                   -> "dir"             (non-git)
+//   bare host/IP                          -> as-is
+export const MAX_GROUP_LABEL_LEN = 7;
+export function shortClientLabel(raw: string): string {
   if (!raw) return raw;
-  const baseId = raw.includes("@") ? raw.slice(0, raw.indexOf("@")) : raw;
-  const git = baseId.match(/^https?:\/\/[^/]+\/[^/]+\/([^/]+?)(?:\/tree\/(.+))?$/);
-  let label: string;
-  if (git)
-    label = git[2] ? `${git[1].slice(0, 3)}:${git[2].slice(0, 3)}` : git[1];
-  else {
-    const hostCwd = baseId.match(/^[^:]+:(.+)$/);
-    label = hostCwd ? (hostCwd[1].split("/").filter(Boolean).pop() || baseId) : baseId;
+  const join3 = (a: string, b?: string) => (b ? `${a.slice(0, 3)}:${b.slice(0, 3)}` : a);
+  // Current label: "[remote#]<worktree-basename>[@<branch>]"
+  if (raw.includes("#") || (raw.includes("@") && !raw.startsWith("http"))) {
+    const afterHash = raw.includes("#") ? raw.slice(raw.indexOf("#") + 1) : raw;
+    const [base, branch] = afterHash.split("@");
+    return join3(base, branch).slice(0, MAX_GROUP_LABEL_LEN);
   }
+  // Legacy gitUrl: ".../owner/repo/tree/branch"
+  const git = raw.match(/^https?:\/\/[^/]+\/[^/]+\/([^/]+?)(?:\/tree\/(.+))?$/);
+  if (git) return join3(git[1], git[2]).slice(0, MAX_GROUP_LABEL_LEN);
+  // "host:/path/to/dir" -> basename
+  const hostCwd = raw.match(/^[^:]+:(.+)$/);
+  const label = hostCwd ? (hostCwd[1].split("/").filter(Boolean).pop() || raw) : raw;
   return label.slice(0, MAX_GROUP_LABEL_LEN);
+}
+
+// --isolate sessions (`rech --isolate ...` -> `-s=iso-<rand>`) are throwaway, single-flow
+// buckets. We reap them on an idle TTL so an OAuth/login drive can't leak an orphaned browser
+// context. A TTL (not close-on-exit-per-command) is required because the flows are multi-step
+// (open -> click -> consent): closing after each command would break them. The reaper runs the
+// CLI's `close` for the specific iso session only — it never touches the user's other sessions
+// or quits Chrome.
+const ISO_SESSION_TTL_MS = Number(process.env.RECH_ISOLATE_TTL_MS) || 15 * 60_000;
+const ISO_REAP_INTERVAL_MS = 60_000;
+const isoLastUsed = new Map<string, number>();
+
+export function isIsoSession(namespacedSession: string): boolean {
+  return /(?:^|-)iso-[0-9a-f]+$/.test(namespacedSession);
+}
+
+function tmpSocketRoot(): string {
+  return `${(process.env.TMPDIR || "/tmp").replace(/\/$/, "")}/playwright-cli`;
+}
+
+// On startup, adopt any iso-* sessions a previous daemon left behind so they still get reaped
+// (in-memory tracking alone would miss pre-restart orphans). Best-effort: a mis-derived session
+// just yields a harmless no-op `close`. Socket files are named with the session as their prefix.
+function adoptOrphanedIsoSessions(): void {
+  try {
+    const root = tmpSocketRoot();
+    for (const sub of readdirSync(root)) {
+      let entries: string[];
+      try { entries = readdirSync(`${root}/${sub}`); } catch { continue; }
+      for (const f of entries) {
+        const m = f.match(/^([0-9a-f]+-iso-[0-9a-f]+)/) || f.match(/^(iso-[0-9a-f]+)/);
+        if (m && !isoLastUsed.has(m[1])) {
+          isoLastUsed.set(m[1], Date.now());
+          log(`adopted orphaned isolated session for reaping: ${m[1]}`);
+        }
+      }
+    }
+  } catch {
+    // socket dir may not exist yet — nothing to adopt
+  }
+}
+
+function reapIdleIsoSessions(bin: string, binArgs: string[], workDir: string): void {
+  const now = Date.now();
+  for (const [sess, last] of isoLastUsed) {
+    if (now - last < ISO_SESSION_TTL_MS) continue;
+    isoLastUsed.delete(sess);
+    try {
+      Bun.spawn([bin, ...binArgs, "close", `-s=${sess}`], {
+        cwd: workDir,
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "ignore",
+        env: { PATH: process.env.PATH, HOME: HOME, USERPROFILE: process.env.USERPROFILE },
+      });
+      log(`reaped idle isolated session (idle ${Math.round((now - last) / 1000)}s): ${sess}`);
+    } catch (e) {
+      log(`reap failed for ${sess}: ${e}`);
+    }
+  }
 }
 
 async function renewCertIfNeeded(certPath: string, keyPath: string): Promise<boolean> {
@@ -142,6 +208,13 @@ export async function serve() {
   const workDir = join(RECH_DIR, "output");
   mkdirSync(workDir, { recursive: true });
 
+  // Reap idle --isolate sessions so single-shot OAuth/login drives don't leak browser contexts.
+  adoptOrphanedIsoSessions();
+  setInterval(() => {
+    const [bin, ...binArgs] = splitCommand(resolvePlaywrightCli());
+    reapIdleIsoSessions(bin, binArgs, workDir);
+  }, ISO_REAP_INTERVAL_MS);
+
   const listenHost = process.env.RECH_HOST || "127.0.0.1";
   const canRead = (p?: string) => { try { accessSync(p!, fsConstants.R_OK); return true; } catch { return false; } };
   const certPath = canRead(process.env.RECH_TLS_CERT) ? process.env.RECH_TLS_CERT : undefined;
@@ -201,14 +274,19 @@ export async function serve() {
       } else {
         args = body.args;
         const id = body.identity as
-          | { gitUrl?: string; hostname?: string; cwd?: string; profile?: string }
+          | { key?: string; label?: string; gitUrl?: string; hostname?: string; cwd?: string; profile?: string }
           | undefined;
-        const baseId = id?.gitUrl || (id?.hostname && id?.cwd ? `${id.hostname}:${id.cwd}` : null);
-        const raw = baseId && id?.profile ? `${baseId}@${id.profile}` : baseId;
-        if (raw) {
-          sessionId = createHash("sha256").update(raw).digest("hex").slice(0, 8);
-          clientName = raw;
-          log(`session from identity: ${raw} -> ${sessionId}`);
+        // New clients send {key,label} (key = worktree-root-based, decoupled from the pretty
+        // label). Fall back to the legacy {gitUrl|hostname:cwd} shape for older clients.
+        const legacy = id?.gitUrl || (id?.hostname && id?.cwd ? `${id.hostname}:${id.cwd}` : null);
+        const keyBase = id?.key || legacy;
+        const labelBase = id?.label || legacy || keyBase;
+        if (keyBase) {
+          // Hash the key (+ profile via a NUL separator that never appears in a label).
+          const hashInput = id?.profile ? `${keyBase}\u0000${id.profile}` : keyBase;
+          sessionId = createHash("sha256").update(hashInput).digest("hex").slice(0, 8);
+          clientName = labelBase || keyBase;
+          log(`session from identity: ${clientName}${id?.profile ? ` profile:${id.profile}` : ""} [${keyBase}] -> ${sessionId}`);
         } else {
           const clientAddr = `${req.headers.get("x-forwarded-for") || server.requestIP(req)?.address || "unknown"}`;
           sessionId = createHash("sha256").update(clientAddr).digest("hex").slice(0, 8);
@@ -233,6 +311,8 @@ export async function serve() {
         return true;
       });
       const namespacedSession = clientSession ? `${sessionId}-${clientSession}` : sessionId;
+      // Track --isolate sessions so the idle-TTL reaper can close them later.
+      if (isIsoSession(namespacedSession)) isoLastUsed.set(namespacedSession, Date.now());
 
       // daemonInstall bakes PLAYWRIGHT_CLI into the daemon env; resolvePlaywrightCli() is the
       // fallback for a standalone `serve` (it re-runs the same env > fork > @playwright/cli > legacy chain).

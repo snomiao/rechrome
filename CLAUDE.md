@@ -8,6 +8,34 @@ reload the extension." If a patched unpacked extension needs to be reloaded, **a
 (chrome://extensions → reload, or the extension's own reload), or find a non-destructive path. Only quit/
 restart Chrome when the user has explicitly approved it in the current request.
 
+## Session identity — bucket by WORKTREE ROOT, decouple key from label
+
+Which browser session a client reuses is decided by a **session key**. The key is the realpath of the
+**git worktree root** (`getClientIdentity`/`deriveIdentity` in `rech.ts`), NOT the git branch. This is the
+predictability contract: a human can tell which browser they're driving from where they `cd`'d.
+
+- **Why not branch** (the old `<remote>/tree/<branch>` key): (1) two worktrees on the same branch
+  collided into one session; (2) `git checkout` silently swapped the session under you; (3) detached
+  HEAD (the submodule default) degraded the key. Path keying fixes all three.
+- **Why not raw cwd**: `cd repo/sub` would fragment the session. We normalize cwd → worktree root.
+- **Submodules roll up** to the outermost superproject (`git rev-parse --show-superproject-working-tree`,
+  looped) so submodule work shares the parent worktree's browser. This is deliberate (monorepo workflow).
+- **KEY is decoupled from LABEL.** The server hashes the *key* (path-based); the pretty
+  `<remote>#<basename>@<branch>` *label* is render-only (logs, `identity:` line, tab-group name via
+  `shortClientLabel`). Never key on the label. Profile is mixed into the hash via a NUL separator, kept
+  out of the label.
+- **`RECH_IDENTITY`** selects the mode: `worktree` (default) | `branch` (legacy opt-in, restores the old
+  key) | `cwd`. Don't hard-flip the default — changing the key orphans live sessions.
+- **`rech --isolate <args>`** is sugar for `-s=<random>` — a throwaway session for fragile single-shot
+  flows (OAuth/login) that must not share tabs with the worktree's default session.
+- **Profile precedence**: an explicit `?profile=` in `RECHROME_URL` wins over the
+  `PLAYWRIGHT_MCP_PROFILE_DIRECTORY` env var; a mismatch warns once (`resolveEffectiveProfile`). A silent
+  mismatch is how an OAuth flow can target the WRONG account.
+
+The `rech serve` daemon is **local** — sessions never cross machines, so a machine-independent/branch key
+buys nothing functional; the path key is strictly better. A `serve` change needs `oxmgr restart
+rechrome-serve` to take effect (see the build/verify section below).
+
 ## Never modify node_modules
 
 This repo has **vendored forks** in `./lib/`:
