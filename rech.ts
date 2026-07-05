@@ -104,7 +104,7 @@ function openInDefaultApp(target: string): void {
   const cmd = process.platform === "darwin" ? ["open", target]
     : process.platform === "win32" ? ["cmd", "/c", "start", "", target]
     : ["xdg-open", target];
-  try { Bun.spawn(cmd, { stdout: "ignore", stderr: "ignore" }); } catch {}
+  try { Bun.spawn(cmd, { stdout: "ignore", stderr: "ignore", windowsHide: true }); } catch {}
 }
 
 // Best-effort path to the Chrome executable for the current platform (used to open a
@@ -137,7 +137,7 @@ function openInChromeProfile(profileDir: string, target: string): boolean {
   try {
     Bun.spawn(
       [chromeBin, `--profile-directory=${profileDir}`, target],
-      { stdout: "ignore", stderr: "ignore", detached: true },
+      { stdout: "ignore", stderr: "ignore", detached: true, windowsHide: true },
     );
     return true;
   } catch {
@@ -200,7 +200,8 @@ function realpathSafe(p: string): string {
 
 async function gitOutput(args: string[], cwd: string): Promise<string | null> {
   try {
-    const proc = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "ignore" });
+    // windowsHide: don't flash a console window on Windows (git.exe is a console app)
+    const proc = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "ignore", windowsHide: true });
     const out = (await new Response(proc.stdout).text()).trim();
     await proc.exited;
     return out || null;
@@ -494,9 +495,13 @@ async function callServe(
   url: string,
   args: string[],
   overrideEnv?: Record<string, string>,
+  precomputedIdentity?: { key: string; label: string; profile?: string },
 ): Promise<{ status: number; stdout: string; stderr: string; files?: string[]; existingSession?: boolean }> {
   const { key, host, port, protocol, extensionId, extensionToken, profileDirectory, userDataDir, loadExtension } = parseUrl(url);
-  const identity = await getClientIdentity();
+  // Reuse the caller's identity when provided — computing it shells out to `git` several times,
+  // and run() has already done so for its log line. Recomputing here would double those git
+  // spawns (and, on Windows, the console-window flashes) on every `rech open`.
+  const identity = precomputedIdentity ?? await getClientIdentity();
   const effectiveProfile = resolveEffectiveProfile(profileDirectory);
   if (effectiveProfile) identity.profile = effectiveProfile;
   const env = { ...(await getClientEnv({ extensionId, extensionToken, profileDirectory, userDataDir, loadExtension })), ...overrideEnv };
@@ -545,7 +550,7 @@ async function run(url: string, args: string[]) {
   );
 
   const resolvedEnv = await getClientEnv({ extensionId, extensionToken, profileDirectory, userDataDir, loadExtension });
-  const { status, stdout, stderr, files, existingSession } = await callServe(url, args);
+  const { status, stdout, stderr, files, existingSession } = await callServe(url, args, undefined, identity);
 
   const isOpenWithUrl = args[0] === "open" && args.length > 1;
   if (existingSession && isOpenWithUrl) {
@@ -658,6 +663,7 @@ async function runPm(args: string[], env?: Record<string, string>): Promise<numb
   const proc = Bun.spawn(["bunx", PM_BIN, ...args], {
     stdout: "inherit",
     stderr: "inherit",
+    windowsHide: true, // no console-window flash for the bunx/pm2 child on Windows
     ...(env ? { env: { ...process.env, ...env } } : {}),
   });
   await proc.exited;
@@ -667,7 +673,7 @@ async function runPm(args: string[], env?: Record<string, string>): Promise<numb
 // Capture the process-manager's process list as text (oxmgr `list` / pm2 `jlist`).
 // Both render the process name verbatim, so callers can substring-match it.
 async function pmList(): Promise<string> {
-  const proc = Bun.spawn(["bunx", PM_BIN, IS_WINDOWS ? "jlist" : "list"], { stdout: "pipe", stderr: "ignore" });
+  const proc = Bun.spawn(["bunx", PM_BIN, IS_WINDOWS ? "jlist" : "list"], { stdout: "pipe", stderr: "ignore", windowsHide: true });
   return await new Response(proc.stdout).text();
 }
 
@@ -983,7 +989,7 @@ async function provisionExtensionToken(opts: {
   if (!opts.headed) args.push("--headless=new");
   if (process.platform === "linux") args.push("--no-sandbox");
   args.push("about:blank");
-  const proc = Bun.spawn([chromeBin, ...args], { stdout: "ignore", stderr: "ignore" });
+  const proc = Bun.spawn([chromeBin, ...args], { stdout: "ignore", stderr: "ignore", windowsHide: true });
   let cdp: CDPClient | null = null;
   try {
     // Chrome writes the chosen port to DevToolsActivePort once the debug server is up.

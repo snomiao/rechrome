@@ -92,6 +92,7 @@ function reapIdleIsoSessions(bin: string, binArgs: string[], workDir: string): v
         stdin: "ignore",
         stdout: "ignore",
         stderr: "ignore",
+        windowsHide: true, // hide the CLI child's console; the user's Chrome (a GUI grandchild) stays visible
         env: { PATH: process.env.PATH, HOME: HOME, USERPROFILE: process.env.USERPROFILE },
       });
       log(`reaped idle isolated session (idle ${Math.round((now - last) / 1000)}s): ${sess}`);
@@ -112,7 +113,7 @@ async function renewCertIfNeeded(certPath: string, keyPath: string): Promise<boo
     if (!domain) { log("TLS cert renewal: could not determine domain"); return false; }
     log(`TLS cert expires in ${Math.floor(daysLeft)} days, renewing ${domain}...`);
     const proc = Bun.spawn([TAILSCALE_BIN, "cert", "--cert-file", certPath, "--key-file", keyPath, domain], {
-      stdout: "pipe", stderr: "pipe",
+      stdout: "pipe", stderr: "pipe", windowsHide: true,
     });
     const [status, stderr] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
     if (status !== 0) { log(`TLS cert renewal failed: ${stderr.trim()}`); return false; }
@@ -189,7 +190,7 @@ async function freeStalePort(port: number): Promise<void> {
         "  $h | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }",
         "}",
       ].join(" ");
-      const r = Bun.spawnSync(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps]);
+      const r = Bun.spawnSync(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], { windowsHide: true });
       const out = r.stdout?.toString().trim();
       if (out) log(out);
     } else {
@@ -339,6 +340,7 @@ export async function serve() {
             stdin: "ignore",
             stdout: "pipe",
             stderr: "pipe",
+            windowsHide: true, // hide the CLI child's console; the user's Chrome (a GUI grandchild) stays visible
             env: { PATH: process.env.PATH, HOME: HOME, USERPROFILE: process.env.USERPROFILE },
           });
           const [listStatus, listOut] = await Promise.race([
@@ -421,6 +423,7 @@ export async function serve() {
         stdin: "ignore",
         stdout: "pipe",
         stderr: "pipe",
+        windowsHide: true, // hide the CLI child's console; the user's Chrome (a GUI grandchild) stays visible
         env: childEnv,
       });
 
