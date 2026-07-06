@@ -479,12 +479,18 @@ async function listProfiles(): Promise<void> {
     }
   }
 
-  const rows = Object.entries(cache).map(([dir, info]) => [
-    dir,
-    info.user_name || "",
-    info.name || "",
-    dir === currentDir ? "← current" : "",
-  ]);
+  // Header clarifies each column; email/nickname sit beside the profile dir so a bare
+  // "Profile N" is never shown alone. Only user_name (email) + name (nickname) are read
+  // from Local State — the gaia real name is deliberately never surfaced.
+  const rows = [
+    ["PROFILE", "EMAIL", "NICKNAME", ""],
+    ...Object.entries(cache).map(([dir, info]) => [
+      dir,
+      info.user_name || "",
+      info.name || "",
+      dir === currentDir ? "← current" : "",
+    ]),
+  ];
   const widths = rows.reduce((w, r) => r.map((c, i) => Math.max(w[i] ?? 0, c.length)), [] as number[]);
   for (const row of rows) {
     console.log(row.map((c, i) => c.padEnd(widths[i])).join("  ").trimEnd());
