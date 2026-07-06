@@ -229,9 +229,13 @@ export async function serve() {
     }, 86_400_000);
   }
   const tls = certPath && keyPath ? { cert: Bun.file(certPath), key: Bun.file(keyPath) } : undefined;
-  const startServer = () => Bun.serve({
+  const startServer = (reusePort = false) => Bun.serve({
     hostname: listenHost,
     port,
+    // reusePort is used only as a last-resort fallback (see the bind loop below): if an orphaned
+    // holder can't be killed, binding with SO_REUSEADDR keeps serve up (degraded, port-shared)
+    // instead of crash-looping on EADDRINUSE. The normal path binds a clean, exclusive socket.
+    reusePort,
     tls,
     error(err) {
       log(`unhandled error: ${err.message}`);
@@ -485,17 +489,34 @@ export async function serve() {
     },
   });
 
-  // A leaked listening-socket handle in an orphaned cliDaemon can keep the port held after a
-  // prior serve exits; on EADDRINUSE, clear stale holders once and retry rather than crash-loop.
-  let server: ReturnType<typeof startServer>;
-  try {
-    server = startServer();
-  } catch (e: any) {
-    if (!String(e?.code ?? e?.message ?? "").includes("EADDRINUSE")) throw e;
-    log(`port ${port} in use — clearing stale daemon holders and retrying`);
-    await freeStalePort(port);
-    server = startServer();
+  // A leaked listening-socket handle in an orphaned cliDaemon can keep the port in LISTEN after a
+  // prior serve exits: Bun.serve creates the socket inheritable and Bun.spawn sweeps it into the
+  // detached daemon grandchild via bInheritHandles, so the socket outlives its creating serve.
+  // netstat then attributes the port to the now-dead *creator*, not the live holder, so we can't
+  // map port -> killable PID — freeStalePort kills the orphan by its cliDaemon signature instead.
+  // Retry a bounded number of times: the old single retry crash-looped whenever the OS hadn't yet
+  // released the socket after the kill (pm2 then restarts serve into the same race). As an absolute
+  // last resort, bind with reusePort so a holder we genuinely can't kill degrades to "up but sharing
+  // the port" rather than a permanent EADDRINUSE crash-loop.
+  const isEaddrInUse = (e: any) => String(e?.code ?? e?.message ?? "").includes("EADDRINUSE");
+  const MAX_BIND_ATTEMPTS = 4;
+  let server: ReturnType<typeof startServer> | undefined;
+  for (let attempt = 1; attempt <= MAX_BIND_ATTEMPTS; attempt++) {
+    try {
+      server = startServer();
+      break;
+    } catch (e: any) {
+      if (!isEaddrInUse(e)) throw e;
+      if (attempt === MAX_BIND_ATTEMPTS) {
+        log(`port ${port} still held after ${attempt - 1} cleanup attempts — binding with reusePort (last resort)`);
+        server = startServer(true);
+        break;
+      }
+      log(`port ${port} in use — clearing stale daemon holders and retrying (attempt ${attempt}/${MAX_BIND_ATTEMPTS - 1})`);
+      await freeStalePort(port);
+    }
   }
+  if (!server) throw new Error(`failed to bind port ${port}`);
 
   log(`serving on ${tls ? "https" : "http"}://${server.hostname}:${server.port}`);
   log(`Connection URL set (use .env.local to view)`);
