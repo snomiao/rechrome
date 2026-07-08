@@ -1210,13 +1210,34 @@ async function setup(opts: { profile?: string; token?: string } = {}): Promise<v
     );
     if (opts.profile !== undefined) {
       const num = parseInt(opts.profile);
-      if (!isNaN(num) && String(num) === opts.profile.trim()) return available[num - 1] ?? null;
+      if (!isNaN(num) && String(num) === opts.profile.trim()) {
+        // A bare integer is a 1-based MENU INDEX, NOT the Chrome directory literally named
+        // "Profile <N>". The two collide in the user's head: `--profile 1` selects the first
+        // *listed* profile (usually Default), not the dir "Profile 1". When such a dir exists
+        // and differs from the indexed pick, warn so the mismatch is caught; echo the resolved
+        // selection either way. Email is the unambiguous selector — steer toward it.
+        const sel = available[num - 1] ?? null;
+        const dirNamed = available.find(([dir]) => dir.toLowerCase() === `profile ${num}`);
+        if (dirNamed && dirNamed[0] !== sel?.[0]) {
+          const hint = dirNamed[1].user_name || `"Profile ${num}"`;
+          console.error(
+            `      [warn] --profile ${num} = menu index ${num} → ` +
+            `${sel ? `${sel[1].user_name || sel[0]} [${sel[0]}]` : "(out of range)"}, ` +
+            `NOT the Chrome directory "Profile ${num}" (${dirNamed[1].user_name || dirNamed[0]}). ` +
+            `For an unambiguous match use the email or exact directory name, e.g. --profile ${hint}.`,
+          );
+        }
+        if (sel) console.log(`      selected: ${sel[1].user_name || "(no email)"} [${sel[0]}]`);
+        return sel;
+      }
       const needle = opts.profile.toLowerCase();
-      return available.find(([dir, info]) =>
+      const match = available.find(([dir, info]) =>
         dir.toLowerCase() === needle
         || (info.name ?? "").toLowerCase() === needle
         || (info.user_name ?? "").toLowerCase().includes(needle)
       ) ?? null;
+      if (match) console.log(`      selected: ${match[1].user_name || "(no email)"} [${match[0]}]`);
+      return match;
     }
     if (available.length === 1) {
       console.log(`      Only one profile available — selecting: ${available[0][1].user_name || available[0][0]}`);
@@ -1426,14 +1447,17 @@ async function status(): Promise<void> {
   const ping = await fetch(`${protocol}://${host}:${port}/`, { signal: AbortSignal.timeout(2000) }).catch(() => null);
   // Resolve the daemon's actual bind from its authenticated /ping (cross-platform; lsof is
   // POSIX-only and absent on Windows). bind is "0.0.0.0" (all interfaces) or the loopback IP.
-  const bind = ping
+  const pingBody = ping
     ? await fetch(`${protocol}://${host}:${port}/ping`, {
         headers: { Authorization: `Bearer ${parsed.key}` },
         signal: AbortSignal.timeout(2000),
-      }).then(r => (r.ok ? r.json() : null)).then((b: { bind?: string } | null) => b?.bind).catch(() => undefined)
-    : undefined;
+      }).then(r => (r.ok ? r.json() : null)).catch(() => null) as { bind?: string; degraded?: boolean; consecutiveTimeouts?: number } | null
+    : null;
+  const bind = pingBody?.bind;
   const listenAddr = bind ? `${bind}:${port}` : `${host}:${port}`;
   console.log(`serve:    ${ping ? `running  ${protocol}://${listenAddr}` : "not running"}`);
+  if (pingBody?.degraded)
+    console.log(`relay:    ⚠ degraded (${pingBody.consecutiveTimeouts} consecutive command timeouts) — if it persists, the daemon self-restarts; force it now with \`${PM_BIN} restart ${PM_PROCESS_NAME}\``);
   const pmOut = await pmList();
   const daemonRegistered = pmOut.includes(PM_PROCESS_NAME);
   console.log(`daemon:   ${daemonRegistered ? `${PM_BIN} (${PM_PROCESS_NAME})` : "not installed"}`);
@@ -1460,7 +1484,12 @@ function printHelp(): void {
 Usage:
   rech setup [--profile <num|email>] [--token <tok>]
                                First-time setup: daemon + Chrome extension + config
-                               --profile selects the Chrome profile non-interactively
+                               --profile selects the Chrome profile non-interactively.
+                               A bare number is the 1-based MENU INDEX (position in the
+                               listed order), NOT the Chrome directory "Profile N". For
+                               scripts prefer the email (e.g. --profile you@gmail.com) —
+                               it is the only unambiguous selector; an exact directory
+                               name ("Profile 1") also matches.
                                --token (or RECH_TOKEN) supplies the auth token for
                                non-TTY/agent runs, skipping the interactive paste
   rech provision-profile <name> --experimental [--headed]

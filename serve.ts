@@ -55,6 +55,35 @@ export function isIsoSession(namespacedSession: string): boolean {
   return /(?:^|-)iso-[0-9a-f]+$/.test(namespacedSession);
 }
 
+// --- Relay health / self-heal ---------------------------------------------------------
+// The daemon spawns a short-lived CLI child per command, but all commands share a long-lived
+// per-session cliDaemon and a single extension↔relay path. Under sustained multi-session load
+// the relay can wedge: navigations (`open`) hang to the 60s cap while cheap calls still return,
+// and — critically — the wedge PERSISTS (every later command reuses the same broken cliDaemon),
+// so historically only a manual `oxmgr restart rechrome` cleared it. We heal automatically on
+// two layers, driven by real command timeouts (no synthetic probe → Chrome is never touched):
+//   - per-session: after SESSION_CLOSE_TIMEOUTS consecutive timeouts on ONE session, run the
+//     CLI `close` for it so the next command respawns a clean cliDaemon.
+//   - global: after WATCHDOG_TIMEOUTS consecutive timeouts across ALL sessions with no success
+//     in between (= the shared relay is dead), exit(1); oxmgr's `--restart always` respawns us
+//     clean and the extension WS reconnects. Each timeout burns 60s of wall time, so this can't
+//     spin faster than ~once/minute even under concurrent load.
+const SESSION_CLOSE_TIMEOUTS = Number(process.env.RECH_SESSION_CLOSE_TIMEOUTS) || 2;
+const WATCHDOG_TIMEOUTS = Number(process.env.RECH_WATCHDOG_TIMEOUTS) || 3;
+let consecutiveTimeouts = 0;                       // global; reset on any non-timeout /run
+const sessionTimeouts = new Map<string, number>(); // per-session consecutive-timeout streak
+// Most-recently-used non-iso sessions, so the deep health probe can target something real
+// instead of spawning a fresh session (which could open a browser window).
+const recentSessions = new Map<string, number>();
+function noteSession(sess: string, now: number): void {
+  recentSessions.set(sess, now);
+  if (recentSessions.size > 64) {
+    let oldestKey: string | undefined, oldestAt = Infinity;
+    for (const [k, t] of recentSessions) if (t < oldestAt) { oldestAt = t; oldestKey = k; }
+    if (oldestKey) recentSessions.delete(oldestKey);
+  }
+}
+
 function tmpSocketRoot(): string {
   return `${(process.env.TMPDIR || "/tmp").replace(/\/$/, "")}/playwright-cli`;
 }
@@ -259,7 +288,32 @@ export async function serve() {
       if (reqUrl.pathname === "/ping") {
         const denied = authCheck(req, key);
         if (denied) return denied;
-        return Response.json({ ok: true, bind: listenHost });
+        // Shallow ping proves only that the HTTP listener is up (it stayed up through past
+        // relay wedges). `degraded` surfaces the passive timeout streak from real traffic so
+        // clients / `rech status` can see trouble without an active probe.
+        const degraded = consecutiveTimeouts > 0;
+        if (!reqUrl.searchParams.get("deep"))
+          return Response.json({ ok: true, bind: listenHost, consecutiveTimeouts, degraded });
+        // Deep probe: exercise the relay read-only via `tab-list` (opens nothing) against the
+        // most-recently-used session — never a fresh one, which could spawn a browser window.
+        const target = [...recentSessions.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
+        if (!target)
+          return Response.json({ ok: true, bind: listenHost, relay: "idle", consecutiveTimeouts, degraded });
+        const [pbin, ...pbinArgs] = splitCommand(resolvePlaywrightCli());
+        const probe = Bun.spawn([pbin, ...pbinArgs, "tab-list", `-s=${target}`], {
+          cwd: workDir, stdin: "ignore", stdout: "ignore", stderr: "ignore",
+          windowsHide: true,
+          env: { PATH: process.env.PATH, HOME: HOME, USERPROFILE: process.env.USERPROFILE },
+        });
+        const probeStatus = await Promise.race([
+          probe.exited,
+          new Promise<number>((r) => setTimeout(() => { probe.kill(); r(-1); }, 5000)),
+        ]);
+        const healthy = probeStatus !== -1;
+        return Response.json({
+          ok: healthy, bind: listenHost, relay: healthy ? "healthy" : "degraded",
+          consecutiveTimeouts, degraded: degraded || !healthy,
+        });
       }
       if (reqUrl.pathname !== "/run") return new Response("rech server\n");
       const denied = authCheck(req, key);
@@ -317,7 +371,9 @@ export async function serve() {
       });
       const namespacedSession = clientSession ? `${sessionId}-${clientSession}` : sessionId;
       // Track --isolate sessions so the idle-TTL reaper can close them later.
-      if (isIsoSession(namespacedSession)) isoLastUsed.set(namespacedSession, Date.now());
+      const nowMs = Date.now();
+      if (isIsoSession(namespacedSession)) isoLastUsed.set(namespacedSession, nowMs);
+      else noteSession(namespacedSession, nowMs); // for the deep health probe to target
 
       // daemonInstall bakes PLAYWRIGHT_CLI into the daemon env; resolvePlaywrightCli() is the
       // fallback for a standalone `serve` (it re-runs the same env > fork > @playwright/cli > legacy chain).
@@ -432,12 +488,15 @@ export async function serve() {
       });
 
       const TIMEOUT = 60_000;
-      const timeout = new Promise<never>((_, reject) =>
-        setTimeout(() => {
+      let timedOut = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          timedOut = true;
           proc.kill();
           reject(new Error("timeout"));
-        }, TIMEOUT),
-      );
+        }, TIMEOUT);
+      });
       const [status, stdout, stderr] = await Promise.race([
         Promise.all([
           proc.exited,
@@ -448,8 +507,36 @@ export async function serve() {
       ]).catch(
         () => [1, "", `Command timed out after ${TIMEOUT / 1000}s\n`] as [number, string, string],
       ) as [number, string, string];
+      clearTimeout(timer);
 
       log(`exit: ${status}${stdout.trim() ? ` | ${stdout.trim().slice(0, 200)}` : ""}`);
+
+      // Relay self-heal (see notes at SESSION_CLOSE_TIMEOUTS): a command that RETURNS — even
+      // non-zero — proves the relay answered, so clear the streaks; a TIMEOUT means it didn't.
+      if (timedOut) {
+        consecutiveTimeouts++;
+        const streak = (sessionTimeouts.get(namespacedSession) ?? 0) + 1;
+        sessionTimeouts.set(namespacedSession, streak);
+        log(`timeout: session=${namespacedSession} sessionStreak=${streak} globalStreak=${consecutiveTimeouts}`);
+        if (streak >= SESSION_CLOSE_TIMEOUTS) {
+          log(`session ${namespacedSession} wedged (${streak} consecutive timeouts) — closing so the next command respawns a clean cliDaemon`);
+          try {
+            Bun.spawn([bin, ...binArgs, "close", `-s=${namespacedSession}`], {
+              cwd: workDir, stdin: "ignore", stdout: "ignore", stderr: "ignore",
+              windowsHide: true,
+              env: { PATH: process.env.PATH, HOME: HOME, USERPROFILE: process.env.USERPROFILE },
+            });
+          } catch {}
+          sessionTimeouts.delete(namespacedSession);
+        }
+        if (consecutiveTimeouts >= WATCHDOG_TIMEOUTS) {
+          log(`relay wedged: ${consecutiveTimeouts} consecutive timeouts, no success between — exiting for oxmgr (--restart always) to respawn clean; extension WS will reconnect (Chrome untouched)`);
+          setTimeout(() => process.exit(1), 100); // brief delay to flush this response
+        }
+      } else {
+        consecutiveTimeouts = 0;
+        sessionTimeouts.delete(namespacedSession);
+      }
 
       // Detect files mentioned in output
       const filePattern = /[\w./-]+\.(?:png|jpe?g|pdf|json|yml)\b/gi;
