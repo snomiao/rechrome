@@ -6,6 +6,7 @@ import { mkdirSync, appendFileSync, existsSync, realpathSync, accessSync, cpSync
 import { hostname, homedir } from "os";
 import { join, basename, dirname } from "path";
 import { spawn as cpSpawn } from "child_process";
+import { pickDaemonManager, type DaemonManager } from "./daemon-manager.ts";
 
 export const ENV_KEY = "RECHROME_URL";
 export const DEFAULT_PORT = 13775;
@@ -658,28 +659,80 @@ const PM_PROCESS_NAME = "rechrome";
 // Pre-rename names to evict on (re)install/uninstall so a single `rech setup`
 // migrates an existing checkout cleanly.
 const LEGACY_PROCESS_NAMES = ["rechrome-serve"];
-// oxmgr everywhere, but it's unstable on Windows — fall back to pm2 there.
 const IS_WINDOWS = process.platform === "win32";
-const PM_BIN = IS_WINDOWS ? "pm2" : "oxmgr";
 
-// Spawn the active process manager. `env` is merged over process.env for the
-// child: pm2 captures the CLI's environment for the managed process (it has no
-// per-var flag like oxmgr's --env), so install passes daemon env this way.
-async function runPm(args: string[], env?: Record<string, string>): Promise<number> {
-  const proc = Bun.spawn(["bunx", PM_BIN, ...args], {
+// Read the installed oxmgr's version (e.g. "0.4.0+winfix"), or null if oxmgr
+// isn't on PATH / doesn't answer. Cached — daemonManager() sits on the hot path
+// of several subcommands (status, setup, install). Synchronous by design so the
+// selection has no await threading through call sites.
+let _oxmgrVersion: string | null | undefined;
+function oxmgrVersion(bin: string): string | null {
+  if (_oxmgrVersion !== undefined) return _oxmgrVersion;
+  try {
+    const p = Bun.spawnSync([bin, "--version"], { stdout: "pipe", stderr: "ignore", windowsHide: true });
+    const m = /(\d+\.\d+\.\d+[^\s]*)/.exec(p.stdout?.toString() ?? "");
+    _oxmgrVersion = m ? m[1]! : null;
+  } catch {
+    _oxmgrVersion = null;
+  }
+  return _oxmgrVersion;
+}
+
+// Resolve (and cache) the process manager that daemonizes `rech serve`. The
+// selection policy — oxmgr default, pm2 fallback, winfix-guarded on Windows,
+// RECH_DAEMON_MANAGER override — lives in ./daemon-manager.ts (pure + tested);
+// here we just supply the runtime inputs (what's on PATH, the oxmgr version).
+let _daemonMgr: DaemonManager | undefined;
+function daemonManager(): DaemonManager {
+  if (_daemonMgr) return _daemonMgr;
+  const oxmgrBin = Bun.which("oxmgr");
+  const pm2Bin = Bun.which("pm2");
+  _daemonMgr = pickDaemonManager({
+    oxmgrBin,
+    pm2Bin,
+    oxmgrVersion: oxmgrBin ? oxmgrVersion(oxmgrBin) : null,
+    isWindows: IS_WINDOWS,
+    override: process.env.RECH_DAEMON_MANAGER,
+  });
+  return _daemonMgr;
+}
+
+// Spawn the resolved process manager by its absolute path (Bun.which). `env` is
+// merged over process.env for the child: pm2 captures the CLI's environment for
+// the managed process (it has no per-var flag like oxmgr's --env), so install
+// passes daemon env this way.
+async function runPm(mgr: DaemonManager, args: string[], env?: Record<string, string>): Promise<number> {
+  const proc = Bun.spawn([mgr.bin, ...args], {
     stdout: "inherit",
     stderr: "inherit",
-    windowsHide: true, // no console-window flash for the bunx/pm2 child on Windows
+    windowsHide: true, // no console-window flash for the manager child on Windows
     ...(env ? { env: { ...process.env, ...env } } : {}),
   });
   await proc.exited;
   return proc.exitCode ?? 1;
 }
 
+// oxmgr boot/login autostart. `service install` wires the platform init
+// integration (Windows Task Scheduler, macOS launchd, or a systemd --user unit)
+// so the daemon — and the managed serve with it — returns at login/boot, the way
+// the pm2 path relied on `pm2 resurrect`. Skipped when already installed:
+// re-running `service install` re-bootstraps the oxmgr daemon, which restarts
+// every managed process (including the live serve). Best-effort — a failure
+// leaves serve crash-managed but not login-persistent.
+async function oxmgrEnsureAutostart(mgr: DaemonManager): Promise<void> {
+  let alreadyInstalled = false;
+  try {
+    alreadyInstalled =
+      Bun.spawnSync([mgr.bin, "service", "status"], { stdout: "ignore", stderr: "ignore", windowsHide: true }).exitCode === 0;
+  } catch { /* treat a probe failure as not-installed and attempt install */ }
+  if (alreadyInstalled) return;
+  await runPm(mgr, ["service", "install"]);
+}
+
 // Capture the process-manager's process list as text (oxmgr `list` / pm2 `jlist`).
 // Both render the process name verbatim, so callers can substring-match it.
-async function pmList(): Promise<string> {
-  const proc = Bun.spawn(["bunx", PM_BIN, IS_WINDOWS ? "jlist" : "list"], { stdout: "pipe", stderr: "ignore", windowsHide: true });
+async function pmList(mgr: DaemonManager = daemonManager()): Promise<string> {
+  const proc = Bun.spawn([mgr.bin, mgr.id === "pm2" ? "jlist" : "list"], { stdout: "pipe", stderr: "ignore", windowsHide: true });
   return await new Response(proc.stdout).text();
 }
 
@@ -741,25 +794,27 @@ export async function daemonInstall(serveUrl: string): Promise<void> {
   if (isReadable(process.env.RECH_TLS_CERT)) daemonEnv.RECH_TLS_CERT = process.env.RECH_TLS_CERT!;
   if (isReadable(process.env.RECH_TLS_KEY)) daemonEnv.RECH_TLS_KEY = process.env.RECH_TLS_KEY!;
 
+  const mgr = daemonManager();
+
   // Drop any prior registration (current + legacy names) before re-adding.
-  for (const name of [PM_PROCESS_NAME, ...LEGACY_PROCESS_NAMES]) await runPm(["delete", name]);
+  for (const name of [PM_PROCESS_NAME, ...LEGACY_PROCESS_NAMES]) await runPm(mgr, ["delete", name]);
 
   let startCode: number;
-  if (IS_WINDOWS) {
+  if (mgr.id === "pm2") {
     // pm2 captures the CLI env (passed via runPm's env) for the managed process,
     // autorestarts by default, and runs the bun binary directly with
     // `--interpreter none` (so it isn't fed to node).
-    startCode = await runPm([
+    startCode = await runPm(mgr, [
       "start", bunBin,
       "--name", PM_PROCESS_NAME,
       "--interpreter", "none",
       "--cwd", home,
       "--", rechScript, "serve",
     ], daemonEnv);
-    await runPm(["save"]); // persist process list for `pm2 resurrect` on reboot
+    await runPm(mgr, ["save"]); // persist process list for `pm2 resurrect` on reboot
   } else {
     const envArgs = Object.entries(daemonEnv).flatMap(([k, v]) => ["--env", `${k}=${v}`]);
-    startCode = await runPm([
+    startCode = await runPm(mgr, [
       "start",
       "--name", PM_PROCESS_NAME,
       "--restart", "always",
@@ -767,18 +822,23 @@ export async function daemonInstall(serveUrl: string): Promise<void> {
       ...envArgs,
       `${bunBin} ${rechScript} serve`,
     ]);
-    await runPm(["service", "install"]);
+    // Boot/login persistence: on Windows the winfix oxmgr wires Task Scheduler,
+    // on POSIX a systemd --user unit / launchd agent — the equivalent of the pm2
+    // path's `pm2 resurrect` at login. Guarded so a re-install doesn't bounce the
+    // live daemon.
+    await oxmgrEnsureAutostart(mgr);
   }
   // Surface a failed start instead of reporting a daemon that was never registered.
   if (startCode !== 0)
-    throw new Error(`${PM_BIN} failed to start "${PM_PROCESS_NAME}" (exit ${startCode}). Check that ${PM_BIN} is installed and on PATH.`);
+    throw new Error(`${mgr.id} failed to start "${PM_PROCESS_NAME}" (exit ${startCode}). Check that ${mgr.id} is installed and on PATH.`);
 }
 
 async function daemonUninstall(): Promise<void> {
-  for (const name of [PM_PROCESS_NAME, ...LEGACY_PROCESS_NAMES]) await runPm(["delete", name]);
-  if (IS_WINDOWS) await runPm(["save"]);
-  else await runPm(["service", "uninstall"]);
-  console.log(`Removed ${PM_BIN} process: ${PM_PROCESS_NAME}`);
+  const mgr = daemonManager();
+  for (const name of [PM_PROCESS_NAME, ...LEGACY_PROCESS_NAMES]) await runPm(mgr, ["delete", name]);
+  if (mgr.id === "pm2") await runPm(mgr, ["save"]);
+  else await runPm(mgr, ["service", "uninstall"]);
+  console.log(`Removed ${mgr.id} process: ${PM_PROCESS_NAME}`);
 }
 
 // ── Native tray (menu-bar / system-tray) icon ───────────────────────────────
@@ -1460,7 +1520,7 @@ async function status(): Promise<void> {
     console.log(`relay:    ⚠ degraded (${pingBody.consecutiveTimeouts} consecutive command timeouts) — if it persists, the daemon self-restarts; force it now with \`${PM_BIN} restart ${PM_PROCESS_NAME}\``);
   const pmOut = await pmList();
   const daemonRegistered = pmOut.includes(PM_PROCESS_NAME);
-  console.log(`daemon:   ${daemonRegistered ? `${PM_BIN} (${PM_PROCESS_NAME})` : "not installed"}`);
+  console.log(`daemon:   ${daemonRegistered ? `${daemonManager().id} (${PM_PROCESS_NAME})` : "not installed"}`);
   const registry = await readTokenRegistry();
   const entries = Object.entries(registry);
   if (entries.length) {
