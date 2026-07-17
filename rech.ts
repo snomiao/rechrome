@@ -546,7 +546,16 @@ async function callServe(
   return res.json();
 }
 
+export function normalizeCommandArgs(args: string[]): string[] {
+  const normalized = [...args];
+  if (normalized[0] === "tabs" || normalized[0] === "list") normalized[0] = "tab-list";
+  return normalized;
+}
+
 async function run(url: string, args: string[]) {
+  // Match the underlying CLI's command names while accepting the short forms humans
+  // naturally try. Keep this client-side so old and new serve daemons behave alike.
+  args = normalizeCommandArgs(args);
   const { host, port, protocol, extensionId, extensionToken, profileDirectory, userDataDir, loadExtension } = parseUrl(url);
   const effectiveProfile = resolveEffectiveProfile(profileDirectory);
   const displayProfile = effectiveProfile ? await resolveProfileEmail(effectiveProfile) : undefined;
@@ -570,9 +579,16 @@ async function run(url: string, args: string[]) {
     if (stderr.includes('Extension connection timeout')) {
       const hasToken = !!resolvedEnv["PLAYWRIGHT_MCP_EXTENSION_TOKEN"];
       const last = hasToken
-        ? `  -x: extension token rejected -> extension[unknown]`
+        ? `  -x: extension did not connect (reload it at chrome://extensions; then verify its token) -> extension[degraded]`
         : `  -> extension[not installed]  (run: rech setup)`;
       console.error(`[rech] rech-client -> rech-server[ok] -> playwright[ok]\n${last}`);
+    }
+    if (stderr.includes("Browser '") && stderr.includes("is not open")) {
+      console.error(
+        `[rech] the session id is derived from this worktree and profile; it is not a persisted stale id. ` +
+        `The preceding open did not finish. Retry \`rech open <url>\`; if it reports an extension timeout, ` +
+        `reload Playwright MCP Bridge at chrome://extensions and retry.`,
+      );
     }
     process.stderr.write(stderr);
   }

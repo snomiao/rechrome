@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { parseUrl, authCheck, DEFAULT_PORT, ENV_KEY, deriveIdentity, normalizeRemote } from "./rech.ts";
+import { parseUrl, authCheck, DEFAULT_PORT, ENV_KEY, deriveIdentity, normalizeRemote, normalizeCommandArgs } from "./rech.ts";
 import { isUnderDir, splitCommand, shortClientLabel, isIsoSession } from "./serve.ts";
 
 describe("parseUrl", () => {
@@ -82,6 +82,19 @@ describe("constants", () => {
 
   test("DEFAULT_PORT is 13775", () => {
     expect(DEFAULT_PORT).toBe(13775);
+  });
+});
+
+describe("normalizeCommandArgs", () => {
+  test("maps human-friendly tab aliases", () => {
+    expect(normalizeCommandArgs(["tabs"])).toEqual(["tab-list"]);
+    expect(normalizeCommandArgs(["list"])).toEqual(["tab-list"]);
+  });
+
+  test("does not mutate caller args or rewrite other commands", () => {
+    const args = ["open", "https://example.com"];
+    expect(normalizeCommandArgs(args)).toEqual(args);
+    expect(args).toEqual(["open", "https://example.com"]);
   });
 });
 
