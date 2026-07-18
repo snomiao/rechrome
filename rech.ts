@@ -351,7 +351,9 @@ const CHROME_LOCAL_STATE_PATHS = () => {
   ];
 };
 
-async function readChromeProfileCache(): Promise<Record<string, { user_name?: string; name?: string }> | null> {
+type ChromeProfileInfo = { user_name?: string; name?: string };
+
+async function readChromeProfileCache(): Promise<Record<string, ChromeProfileInfo> | null> {
   for (const statePath of CHROME_LOCAL_STATE_PATHS()) {
     const f = file(statePath);
     if (!(await f.exists())) continue;
@@ -361,6 +363,41 @@ async function readChromeProfileCache(): Promise<Record<string, { user_name?: st
     } catch {}
   }
   return null;
+}
+
+export function resolveChromeProfileSelector(
+  profiles: Array<[string, ChromeProfileInfo]>,
+  selector: string,
+): [string, ChromeProfileInfo] | null {
+  const value = selector.trim();
+  validateChromeProfileSelector(value);
+
+  const needle = value.toLowerCase();
+  const selectors: Array<{ label: string; value: (dir: string, info: ChromeProfileInfo) => string }> = [
+    { label: "email", value: (_dir, info) => info.user_name ?? "" },
+    { label: "Chrome profile name", value: (_dir, info) => info.name ?? "" },
+    { label: "profile folder name", value: (dir) => dir },
+  ];
+  for (const kind of selectors) {
+    const matches = profiles.filter(([dir, info]) => kind.value(dir, info).trim().toLowerCase() === needle);
+    if (matches.length > 1) {
+      throw new Error(
+        `--profile "${value}" matches multiple profiles by ${kind.label}. ` +
+        `Use a unique email or profile folder name from \`rech profiles\`.`,
+      );
+    }
+    if (matches.length === 1) return matches[0];
+  }
+  return null;
+}
+
+export function validateChromeProfileSelector(selector: string): void {
+  const value = selector.trim();
+  if (!/^\d+$/.test(value)) return;
+  throw new Error(
+    `--profile no longer accepts menu numbers (received "${value}"). ` +
+    `Use the profile email, Chrome profile name, or profile folder name from \`rech profiles\`.`,
+  );
 }
 
 async function findChromeUserDataDir(): Promise<string | null> {
@@ -480,15 +517,14 @@ async function listProfiles(): Promise<void> {
     }
   }
 
-  // Header clarifies each column; email/nickname sit beside the profile dir so a bare
-  // "Profile N" is never shown alone. Only user_name (email) + name (nickname) are read
+  // Columns mirror selector precedence. Only user_name (email) + name (profile name) are read
   // from Local State — the gaia real name is deliberately never surfaced.
   const rows = [
-    ["PROFILE", "EMAIL", "NICKNAME", ""],
+    ["EMAIL", "PROFILE NAME", "FOLDER", ""],
     ...Object.entries(cache).map(([dir, info]) => [
-      dir,
       info.user_name || "",
       info.name || "",
+      dir,
       dir === currentDir ? "← current" : "",
     ]),
   ];
@@ -1152,6 +1188,15 @@ async function provisionProfile(name: string, opts: { headed?: boolean } = {}): 
 }
 
 async function setup(opts: { profile?: string; token?: string } = {}): Promise<void> {
+  if (opts.profile !== undefined) {
+    try {
+      validateChromeProfileSelector(opts.profile);
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      envWatcher?.close();
+      process.exit(1);
+    }
+  }
   const { createInterface } = await import("readline");
   const isTTY = process.stdin.isTTY ?? false;
   let rl: ReturnType<typeof createInterface> | null = null;
@@ -1278,40 +1323,20 @@ async function setup(opts: { profile?: string; token?: string } = {}): Promise<v
   if (!cache) { console.error("      Chrome profiles not found"); rl?.close(); process.exit(1); }
   const userDataDir = await findChromeUserDataDir();
 
-  async function pickProfile(exclude: Set<string>): Promise<[string, { user_name?: string; name?: string }] | null> {
+  async function pickProfile(exclude: Set<string>): Promise<[string, ChromeProfileInfo] | null> {
     const available = Object.entries(cache!).filter(([dir]) => !exclude.has(dir));
     if (!available.length) return null;
     available.forEach(([dir, info], i) =>
       console.log(`        ${String(i + 1).padStart(2)}.  ${(info.user_name || "(no email)").padEnd(32)}  ${(info.name || "").padEnd(20)}  [${dir}]`)
     );
     if (opts.profile !== undefined) {
-      const num = parseInt(opts.profile);
-      if (!isNaN(num) && String(num) === opts.profile.trim()) {
-        // A bare integer is a 1-based MENU INDEX, NOT the Chrome directory literally named
-        // "Profile <N>". The two collide in the user's head: `--profile 1` selects the first
-        // *listed* profile (usually Default), not the dir "Profile 1". When such a dir exists
-        // and differs from the indexed pick, warn so the mismatch is caught; echo the resolved
-        // selection either way. Email is the unambiguous selector — steer toward it.
-        const sel = available[num - 1] ?? null;
-        const dirNamed = available.find(([dir]) => dir.toLowerCase() === `profile ${num}`);
-        if (dirNamed && dirNamed[0] !== sel?.[0]) {
-          const hint = dirNamed[1].user_name || `"Profile ${num}"`;
-          console.error(
-            `      [warn] --profile ${num} = menu index ${num} → ` +
-            `${sel ? `${sel[1].user_name || sel[0]} [${sel[0]}]` : "(out of range)"}, ` +
-            `NOT the Chrome directory "Profile ${num}" (${dirNamed[1].user_name || dirNamed[0]}). ` +
-            `For an unambiguous match use the email or exact directory name, e.g. --profile ${hint}.`,
-          );
-        }
-        if (sel) console.log(`      selected: ${sel[1].user_name || "(no email)"} [${sel[0]}]`);
-        return sel;
+      let match: [string, ChromeProfileInfo] | null;
+      try {
+        match = resolveChromeProfileSelector(available, opts.profile);
+      } catch (error) {
+        console.error(`      ${error instanceof Error ? error.message : String(error)}`);
+        return null;
       }
-      const needle = opts.profile.toLowerCase();
-      const match = available.find(([dir, info]) =>
-        dir.toLowerCase() === needle
-        || (info.name ?? "").toLowerCase() === needle
-        || (info.user_name ?? "").toLowerCase().includes(needle)
-      ) ?? null;
       if (match) console.log(`      selected: ${match[1].user_name || "(no email)"} [${match[0]}]`);
       return match;
     }
@@ -1319,7 +1344,7 @@ async function setup(opts: { profile?: string; token?: string } = {}): Promise<v
       console.log(`      Only one profile available — selecting: ${available[0][1].user_name || available[0][0]}`);
       return available[0];
     }
-    if (!isTTY) console.log("      [agent] Provide profile number on next stdin line, or rerun with --profile <num|email>");
+    if (!isTTY) console.log("      [agent] Provide profile number on next stdin line, or rerun with --profile <email|name|folder>");
     const answer = await ask("\n      Profile number: ");
     const idx = parseInt(answer.trim()) - 1;
     if (isNaN(idx) || idx < 0 || idx >= available.length) return null;
@@ -1350,7 +1375,7 @@ async function setup(opts: { profile?: string; token?: string } = {}): Promise<v
         console.error(`\n      Non-TTY: load the extension once via chrome://extensions → "Load unpacked":`);
         console.error(`        ${EXTENSION_DIST_DIR}`);
         console.error(`      (open chrome://extensions in profile "${profileDisplay}" — see the guide just opened)`);
-        console.error(`      Then re-run:  rech setup --profile <num|email> [--token <tok>]`);
+        console.error(`      Then re-run:  rech setup --profile <email|name|folder> [--token <tok>]`);
         return null;
       }
       await ask("\n      Press Enter after loading the extension to retry...");
@@ -1558,14 +1583,13 @@ function printHelp(): void {
   console.log(`rechrome (rech) — drive Chrome via Playwright over HTTP
 
 Usage:
-  rech setup [--profile <num|email>] [--token <tok>]
+  rech setup [--profile <email|name|folder>] [--token <tok>]
                                First-time setup: daemon + Chrome extension + config
                                --profile selects the Chrome profile non-interactively.
-                               A bare number is the 1-based MENU INDEX (position in the
-                               listed order), NOT the Chrome directory "Profile N". For
-                               scripts prefer the email (e.g. --profile you@gmail.com) —
-                               it is the only unambiguous selector; an exact directory
-                               name ("Profile 1") also matches.
+                               Menu numbers are not accepted. Resolution order is exact
+                               email (e.g. you@gmail.com), exact Chrome profile name,
+                               then exact profile folder name (e.g. "Profile 1"). See
+                               available values with \`rech profiles\`.
                                --token (or RECH_TOKEN) supplies the auth token for
                                non-TTY/agent runs, skipping the interactive paste
   rech provision-profile <name> --experimental [--headed]
@@ -1594,7 +1618,7 @@ Environment:
 
 Examples:
   rech setup
-  rech setup --profile 18 --token <PLAYWRIGHT_MCP_EXTENSION_TOKEN>
+  rech setup --profile you@gmail.com --token <PLAYWRIGHT_MCP_EXTENSION_TOKEN>
   rech eval "() => document.title"
   rech open https://example.com
   rech screenshot`);
@@ -1640,7 +1664,7 @@ if (import.meta.main) {
     if (!experimental) {
       console.error(`provision-profile is experimental and creates a Chrome-for-Testing profile (not your`);
       console.error(`real Chrome): branded Google Chrome 149+ rejects --load-extension, so a managed profile`);
-      console.error(`can't reuse your logged-in Chrome. For your real Chrome use:  rech setup --profile <N>`);
+      console.error(`can't reuse your logged-in Chrome. For your real Chrome use:  rech setup --profile <email|name|folder>`);
       console.error(`To proceed anyway, re-run with --experimental.`);
       process.exit(1);
     }

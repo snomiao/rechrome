@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { parseUrl, authCheck, DEFAULT_PORT, ENV_KEY, deriveIdentity, normalizeRemote, normalizeCommandArgs } from "./rech.ts";
+import { parseUrl, authCheck, DEFAULT_PORT, ENV_KEY, deriveIdentity, normalizeRemote, normalizeCommandArgs, resolveChromeProfileSelector } from "./rech.ts";
 import { isUnderDir, splitCommand, shortClientLabel, isIsoSession } from "./serve.ts";
 
 describe("parseUrl", () => {
@@ -95,6 +95,40 @@ describe("normalizeCommandArgs", () => {
     const args = ["open", "https://example.com"];
     expect(normalizeCommandArgs(args)).toEqual(args);
     expect(args).toEqual(["open", "https://example.com"]);
+  });
+});
+
+describe("resolveChromeProfileSelector", () => {
+  const profiles: Array<[string, { user_name?: string; name?: string }]> = [
+    ["Default", { user_name: "person@example.com", name: "Work" }],
+    ["Profile 1", { user_name: "other@example.com", name: "Personal" }],
+    ["Profile 2", { name: "Guest" }],
+  ];
+
+  test("resolves exact email before profile name and folder", () => {
+    const conflicting: typeof profiles = [
+      ["Default", { user_name: "work", name: "Default profile" }],
+      ["Profile 1", { user_name: "other@example.com", name: "work" }],
+      ["work", { name: "Folder match" }],
+    ];
+    expect(resolveChromeProfileSelector(conflicting, "WORK")?.[0]).toBe("Default");
+  });
+
+  test("falls back to exact profile name, then exact folder name", () => {
+    expect(resolveChromeProfileSelector(profiles, "personal")?.[0]).toBe("Profile 1");
+    expect(resolveChromeProfileSelector(profiles, "profile 2")?.[0]).toBe("Profile 2");
+  });
+
+  test("does not accept partial email matches", () => {
+    expect(resolveChromeProfileSelector(profiles, "person")).toBeNull();
+  });
+
+  test("rejects bare menu numbers", () => {
+    expect(() => resolveChromeProfileSelector(profiles, "1")).toThrow("no longer accepts menu numbers");
+  });
+
+  test("allows numbered profile folder names when written in full", () => {
+    expect(resolveChromeProfileSelector(profiles, "Profile 1")?.[0]).toBe("Profile 1");
   });
 });
 
