@@ -1218,8 +1218,8 @@ async function setup(opts: { profile?: string; token?: string } = {}): Promise<v
     return new Promise<string>(r => rl!.question("", ans => r(ans || def)));
   };
 
-  // [1/4] Daemon
-  console.log("\n[1/4] Checking serve daemon...");
+  // [1/5] Daemon
+  console.log("\n[1/5] Checking serve daemon...");
 
   // Bind address (persists to ~/.env.local as RECH_HOST).
   // Read the persisted value from ~/.env.local directly — process.env may be shadowed by nearer .env files.
@@ -1461,21 +1461,22 @@ async function setup(opts: { profile?: string; token?: string } = {}): Promise<v
     return null;
   }
 
-  // [2/4] Primary profile
-  console.log("\n[2/4] Select Chrome profile:");
+  // [2/5] Primary profile
+  console.log("\n[2/5] Select Chrome profile:");
   const picked = await pickProfile(new Set());
   if (!picked) { console.error("      Invalid selection"); rl?.close(); process.exit(1); }
   const [profileDir, profileInfoSel] = picked;
   const profileDisplay = profileInfoSel.user_name || profileInfoSel.name || profileDir;
 
-  // [3+4/4] Extension + token for primary profile
-  console.log("\n[3/4] Checking extension...");
+  // [3/5] Extension + token for primary profile
+  console.log("\n[3/5] Checking extension...");
   const profileEmail = profileInfoSel.user_name || profileDir;
   const primary = await getExtAndToken(profileDir, profileDisplay, profileEmail, opts.token);
   if (!primary) { rl?.close(); process.exit(1); }
   const { extId, token } = primary;
 
-  // Build RECHROME_URL and show it before asking where to save
+  // Build RECHROME_URL, verify the selected profile can complete a real extension
+  // handshake, then show it before asking where to save.
   const rechUrl = new URL(url);
   if (!rechUrl.username) rechUrl.username = randomBytes(12).toString("base64url");
   rechUrl.searchParams.set("extension_id", extId);
@@ -1483,7 +1484,39 @@ async function setup(opts: { profile?: string; token?: string } = {}): Promise<v
   rechUrl.searchParams.set("profile", profileEmail);
   if (userDataDir) rechUrl.searchParams.set("user_data_dir", userDataDir);
   const newLine = `RECHROME_URL=${rechUrl.toString()}`;
-  console.log(`\n[4/4] Your RECHROME_URL:\n\n  ${newLine}\n`);
+  console.log(`\n[4/5] Verifying extension bridge for ${profileDisplay}...`);
+  const probeSession = `iso-setup-${randomBytes(4).toString("hex")}`;
+  const probeIdentity = await getClientIdentity();
+  probeIdentity.profile = profileEmail;
+  const probeEnv: Record<string, string> = {
+    PLAYWRIGHT_MCP_EXTENSION_ID: extId,
+    PLAYWRIGHT_MCP_EXTENSION_TOKEN: token,
+    PLAYWRIGHT_MCP_PROFILE_DIRECTORY: profileEmail,
+    ...(userDataDir ? { PLAYWRIGHT_MCP_USER_DATA_DIR: userDataDir } : {}),
+  };
+  let bridgeVerified = false;
+  try {
+    const probe = await callServe(
+      rechUrl.toString(),
+      [`-s=${probeSession}`, "open", "about:blank", "--wait", "none"],
+      probeEnv,
+      probeIdentity,
+    );
+    bridgeVerified = probe.status === 0;
+    if (bridgeVerified) {
+      console.log("      Extension bridge connected successfully");
+    } else {
+      const diagnostic = probe.stderr.trim() || probe.stdout.trim() || `bridge probe exited ${probe.status}`;
+      console.error(`      Extension bridge verification failed: ${diagnostic}`);
+    }
+  } catch (error) {
+    console.error(`      Extension bridge verification failed: ${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    // The isolated probe must never claim or close an existing worktree session.
+    await callServe(rechUrl.toString(), [`-s=${probeSession}`, "close"], probeEnv, probeIdentity).catch(() => {});
+  }
+
+  console.log(`\n[5/5] Your RECHROME_URL:\n\n  ${newLine}\n`);
   if (!isTTY) console.log(`  [agent] Provide save destination on next stdin line: 1=cwd, 2=cwd rechrome-only, 3=home, 4=skip\n`);
 
   const pwdEnvPath = join(process.cwd(), ".env.local");
@@ -1534,7 +1567,10 @@ async function setup(opts: { profile?: string; token?: string } = {}): Promise<v
   }
   rl?.close();
   envWatcher?.close();
-  console.log(`\nDone! Test with:\n  rech open github.com/snomiao`);
+  if (bridgeVerified)
+    console.log(`\nDone! Test with:\n  rech open github.com/snomiao`);
+  else
+    console.error(`\nSetup was saved, but the selected profile did not pass the bridge check. Reload the extension at chrome://extensions and run \`rech setup --profile ${profileEmail}\` again.`);
 }
 
 async function status(): Promise<void> {

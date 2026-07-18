@@ -129,6 +129,7 @@ class RelayConnection {
     __publicField(this, "_hasEverAttached", false);
     __publicField(this, "_eventListeners", []);
     __publicField(this, "_closed", false);
+    __publicField(this, "_keepAliveInterval");
     __publicField(this, "onclose");
     __publicField(this, "ontabattached");
     __publicField(this, "ontabdetached");
@@ -143,6 +144,9 @@ class RelayConnection {
     this._installEventForwarders();
     this._ws.onmessage = this._onMessage.bind(this);
     this._ws.onclose = () => this._onClose();
+    this._keepAliveInterval = setInterval(() => {
+      this._sendMessage({ method: "extension.keepalive", params: [] });
+    }, 2e4);
   }
   get attachedTabs() {
     return this._attachedTabs;
@@ -203,6 +207,7 @@ class RelayConnection {
     if (this._closed)
       return;
     this._closed = true;
+    clearInterval(this._keepAliveInterval);
     for (const l of this._eventListeners)
       l.remove();
     this._eventListeners = [];
@@ -352,18 +357,23 @@ class PendingConnections {
   }
 }
 async function openRelayConnection(mcpRelayUrl, protocolVersion) {
+  let socket;
+  let timer;
   try {
-    const socket = new WebSocket(mcpRelayUrl);
+    socket = new WebSocket(mcpRelayUrl);
     await new Promise((resolve, reject) => {
       socket.onopen = () => resolve();
       socket.onerror = () => reject(new Error("WebSocket error"));
-      setTimeout(() => reject(new Error("Connection timeout")), 5e3);
+      timer = setTimeout(() => reject(new Error("Connection timeout")), 5e3);
     });
     return new RelayConnection(socket, protocolVersion);
   } catch (error) {
+    socket == null ? void 0 : socket.close();
     const message = `Failed to connect to MCP relay: ${error.message}`;
     debugLog(message);
     throw new Error(message);
+  } finally {
+    clearTimeout(timer);
   }
 }
 const PLAYWRIGHT_GROUP_TITLE = "pw";
@@ -595,7 +605,10 @@ class PlaywrightExtension {
   }
   async _connectTab(selectorTabId, tab, clientName) {
     try {
-      await this._cleanupPromise;
+      await Promise.race([
+        this._cleanupPromise,
+        new Promise((resolve) => setTimeout(resolve, 2e3))
+      ]);
       const connection = await this._pendingConnections.take(selectorTabId);
       if (!connection)
         throw new Error("Pending client connection closed");

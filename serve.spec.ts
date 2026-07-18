@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { isUnderDir } from "./serve.ts";
+import { inferSilentExtensionFailure, isUnderDir } from "./serve.ts";
 
 describe("isUnderDir", () => {
   test("allows simple relative file", () => {
@@ -46,5 +46,32 @@ describe("isUnderDir", () => {
   test("blocks percent-encoded traversal after decoding", () => {
     // The caller is responsible for decoding; test the resolved path
     expect(isUnderDir("/app/output", decodeURIComponent("..%2F..%2Fetc%2Fpasswd"))).toBe(false);
+  });
+});
+
+describe("inferSilentExtensionFailure", () => {
+  test("explains a silent open failure at the extension handshake deadline", () => {
+    expect(inferSilentExtensionFailure({
+      status: 1,
+      stdout: "",
+      stderr: "",
+      isOpenCommand: true,
+      hasExtensionCredentials: true,
+      elapsedMs: 30_200,
+      handshakeTimeoutMs: 30_000,
+    })).toContain("Automatic recovery retry failed");
+  });
+
+  test("preserves real stderr and unrelated fast failures", () => {
+    const base = {
+      status: 1,
+      stdout: "",
+      isOpenCommand: true,
+      hasExtensionCredentials: true,
+      elapsedMs: 30_200,
+      handshakeTimeoutMs: 30_000,
+    };
+    expect(inferSilentExtensionFailure({ ...base, stderr: "real error\n" })).toBe("real error\n");
+    expect(inferSilentExtensionFailure({ ...base, stderr: "", elapsedMs: 500 })).toBe("");
   });
 });

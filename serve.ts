@@ -84,6 +84,23 @@ function noteSession(sess: string, now: number): void {
   }
 }
 
+export function inferSilentExtensionFailure(options: {
+  status: number;
+  stdout: string;
+  stderr: string;
+  isOpenCommand: boolean;
+  hasExtensionCredentials: boolean;
+  elapsedMs: number;
+  handshakeTimeoutMs: number;
+}): string {
+  const { status, stdout, stderr, isOpenCommand, hasExtensionCredentials, elapsedMs, handshakeTimeoutMs } = options;
+  if (stderr || status === 0 || stdout.trim() || !isOpenCommand || !hasExtensionCredentials)
+    return stderr;
+  if (elapsedMs < Math.max(1_000, handshakeTimeoutMs - 1_000))
+    return stderr;
+  return `Extension connection timeout after ${handshakeTimeoutMs}ms. Automatic recovery retry failed; reload the Playwright MCP Bridge extension at chrome://extensions and retry.\n`;
+}
+
 function tmpSocketRoot(): string {
   return `${(process.env.TMPDIR || "/tmp").replace(/\/$/, "")}/playwright-cli`;
 }
@@ -478,6 +495,7 @@ export async function serve() {
         } catch {}
       }
 
+      const commandStartedAt = Date.now();
       const proc = Bun.spawn([bin, ...binArgs, ...filteredArgs, `-s=${namespacedSession}`], {
         cwd: workDir,
         stdin: "ignore",
@@ -497,7 +515,7 @@ export async function serve() {
           reject(new Error("timeout"));
         }, TIMEOUT);
       });
-      const [status, stdout, stderr] = await Promise.race([
+      const [status, stdout, rawStderr] = await Promise.race([
         Promise.all([
           proc.exited,
           new Response(proc.stdout).text(),
@@ -508,6 +526,20 @@ export async function serve() {
         () => [1, "", `Command timed out after ${TIMEOUT / 1000}s\n`] as [number, string, string],
       ) as [number, string, string];
       clearTimeout(timer);
+
+      const configuredHandshakeTimeout = Number(childEnv.PWMCP_TEST_CONNECTION_TIMEOUT);
+      const handshakeTimeoutMs = Number.isFinite(configuredHandshakeTimeout) && configuredHandshakeTimeout > 0
+        ? configuredHandshakeTimeout
+        : 30_000;
+      const stderr = inferSilentExtensionFailure({
+        status,
+        stdout,
+        stderr: rawStderr,
+        isOpenCommand: isOpenCmd,
+        hasExtensionCredentials: !!(passthroughEnv.PLAYWRIGHT_MCP_EXTENSION_ID && passthroughEnv.PLAYWRIGHT_MCP_EXTENSION_TOKEN),
+        elapsedMs: Date.now() - commandStartedAt,
+        handshakeTimeoutMs,
+      });
 
       log(`exit: ${status}${stdout.trim() ? ` | ${stdout.trim().slice(0, 200)}` : ""}`);
 

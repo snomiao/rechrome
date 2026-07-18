@@ -1,5 +1,20 @@
 import { c as clientExports, j as jsxRuntimeExports, r as reactExports, A as AuthTokenSection, T as TabItem, B as Button, g as getOrCreateAuthToken } from "./authToken.js";
 const SUPPORTED_PROTOCOL_VERSION = 2;
+const BACKGROUND_RESPONSE_TIMEOUT_MS = 1e4;
+async function sendMessageWithTimeout(message, simulateHang = false) {
+  let timer;
+  try {
+    return await Promise.race([
+      simulateHang ? new Promise(() => {
+      }) : chrome.runtime.sendMessage(message),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Extension service worker did not respond")), BACKGROUND_RESPONSE_TIMEOUT_MS);
+      })
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 const ConnectApp = () => {
   const [tabs, setTabs] = reactExports.useState([]);
   const [status, setStatus] = reactExports.useState(null);
@@ -13,6 +28,8 @@ const ConnectApp = () => {
     const runAsync = async () => {
       const params = new URLSearchParams(window.location.search);
       const relayUrl = params.get("mcpRelayUrl");
+      const recoveryAttempt = params.get("recoveryAttempt") === "1";
+      const hasAutomationToken = !!params.get("token");
       if (!relayUrl) {
         setError("Missing mcpRelayUrl parameter in URL.");
         return;
@@ -53,7 +70,20 @@ const ConnectApp = () => {
         });
         return;
       }
-      const response = await chrome.runtime.sendMessage({ type: "connectionRequested", mcpRelayUrl: relayUrl, protocolVersion: requestedVersion });
+      let response;
+      try {
+        response = await sendMessageWithTimeout(
+          { type: "connectionRequested", mcpRelayUrl: relayUrl, protocolVersion: requestedVersion },
+          params.get("testHangOnce") === "1" && !recoveryAttempt
+        );
+      } catch (error) {
+        if (hasAutomationToken && !recoveryAttempt) {
+          setError("Extension service worker is not responding. Retrying once…");
+          return;
+        }
+        setError(`Extension service worker did not recover: ${error.message}`);
+        return;
+      }
       if (!response.success) {
         setError(response.error);
         return;
@@ -90,7 +120,7 @@ const ConnectApp = () => {
   const handleConnectToTab = reactExports.useCallback(async (tab, clientName = clientInfo) => {
     setShowTabList(false);
     try {
-      const response = await chrome.runtime.sendMessage({
+      const response = await sendMessageWithTimeout({
         type: "connectToTab",
         tab,
         clientName
@@ -104,12 +134,18 @@ const ConnectApp = () => {
         });
       }
     } catch (e) {
+      const recoveryAttempt = new URLSearchParams(window.location.search).get("recoveryAttempt") === "1";
+      const hasAutomationToken = !!new URLSearchParams(window.location.search).get("token");
+      if (hasAutomationToken && !recoveryAttempt) {
+        setError("Extension service worker stopped during connection. Retrying once…");
+        return;
+      }
       setStatus({
         type: "error",
         message: `"${clientName}" failed to connect: ${e}`
       });
     }
-  }, [clientInfo]);
+  }, [clientInfo, setError]);
   reactExports.useEffect(() => {
     const listener = (message) => {
       if (message.type === "pendingConnectionClosed") {
