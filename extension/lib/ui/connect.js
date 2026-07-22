@@ -1,6 +1,19 @@
 import { c as clientExports, j as jsxRuntimeExports, r as reactExports, A as AuthTokenSection, T as TabItem, B as Button, g as getOrCreateAuthToken } from "./authToken.js";
 const SUPPORTED_PROTOCOL_VERSION = 2;
 const BACKGROUND_RESPONSE_TIMEOUT_MS = 1e4;
+const SELF_RELOAD_GUARD_KEY = "connect-self-reload-at";
+const SELF_RELOAD_MIN_INTERVAL_MS = 6e4;
+function attemptExtensionSelfReload() {
+  if (new URLSearchParams(window.location.search).get("selfReload") !== "1")
+    return false;
+  const last = Number(localStorage.getItem(SELF_RELOAD_GUARD_KEY) || 0);
+  const now = Date.now();
+  if (now - last < SELF_RELOAD_MIN_INTERVAL_MS)
+    return false;
+  localStorage.setItem(SELF_RELOAD_GUARD_KEY, String(now));
+  chrome.runtime.reload();
+  return true;
+}
 async function sendMessageWithTimeout(message, simulateHang = false) {
   let timer;
   try {
@@ -78,7 +91,8 @@ const ConnectApp = () => {
         );
       } catch (error) {
         if (hasAutomationToken && !recoveryAttempt) {
-          setError("Extension service worker is not responding. Retrying once…");
+          const reloading = attemptExtensionSelfReload();
+          setError(reloading ? "Extension service worker is not responding. Reloading extension and retrying…" : "Extension service worker is not responding. Retrying once…");
           return;
         }
         setError(`Extension service worker did not recover: ${error.message}`);
@@ -137,7 +151,8 @@ const ConnectApp = () => {
       const recoveryAttempt = new URLSearchParams(window.location.search).get("recoveryAttempt") === "1";
       const hasAutomationToken = !!new URLSearchParams(window.location.search).get("token");
       if (hasAutomationToken && !recoveryAttempt) {
-        setError("Extension service worker stopped during connection. Retrying once…");
+        const reloading = attemptExtensionSelfReload();
+        setError(reloading ? "Extension service worker stopped during connection. Reloading extension and retrying…" : "Extension service worker stopped during connection. Retrying once…");
         return;
       }
       setStatus({
