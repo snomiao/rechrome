@@ -1593,8 +1593,12 @@ async function status(): Promise<void> {
   const bind = pingBody?.bind;
   const listenAddr = bind ? `${bind}:${port}` : `${host}:${port}`;
   console.log(`serve:    ${ping ? `running  ${protocol}://${listenAddr}` : "not running"}`);
+  // daemonManager().id — there is no PM_BIN constant. Referencing one threw a
+  // ReferenceError that took down the whole of `rech status`, so the one command
+  // that reports "the relay is wedged" died exactly when the relay was wedged,
+  // printing a stack trace instead of the restart hint.
   if (pingBody?.degraded)
-    console.log(`relay:    ⚠ degraded (${pingBody.consecutiveTimeouts} consecutive command timeouts) — if it persists, the daemon self-restarts; force it now with \`${PM_BIN} restart ${PM_PROCESS_NAME}\``);
+    console.log(`relay:    ⚠ degraded (${pingBody.consecutiveTimeouts} consecutive command timeouts) — if it persists, the daemon self-restarts; force it now with \`${daemonManager().id} restart ${PM_PROCESS_NAME}\``);
   const pmOut = await pmList();
   const daemonRegistered = pmOut.includes(PM_PROCESS_NAME);
   console.log(`daemon:   ${daemonRegistered ? `${daemonManager().id} (${PM_PROCESS_NAME})` : "not installed"}`);
