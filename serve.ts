@@ -84,6 +84,36 @@ function noteSession(sess: string, now: number): void {
   }
 }
 
+/**
+ * Did this returned command actually prove the relay is answering?
+ *
+ * The watchdog above clears its streaks whenever a command returns instead of timing out,
+ * on the reasoning that a reply — even a failing one — means the relay is alive. That holds
+ * for errors produced BY the browser, but not for ones the CLI raises locally before it ever
+ * opens a connection. `Browser '<id>' is not open` is the important case: it is emitted the
+ * instant a session is missing, which is precisely the state the per-session heal CREATES by
+ * closing a wedged session. So the sequence was:
+ *
+ *   timeout, timeout      → per-session heal closes the session
+ *   "browser is not open" → returned fast, counted as success, globalStreak reset to 0
+ *   timeout, timeout      → heal again … forever
+ *
+ * WATCHDOG_TIMEOUTS (3) could therefore never be reached on a genuinely dead relay, and the
+ * daemon-level restart that exists to fix exactly that never fired — leaving `oxmgr restart
+ * rechrome` by hand as the only cure (observed 2026-08-05: three manual restarts in one
+ * session, each buying only a handful of commands).
+ *
+ * Returning false here does NOT count against the relay; it just refuses to forgive the
+ * timeouts already recorded.
+ */
+export function provesRelayAlive(o: { stdout: string; stderr: string }): boolean {
+  const out = `${o.stdout ?? ""}\n${o.stderr ?? ""}`;
+  // Both spellings the CLI uses for "no such session" (cli-client/output.ts).
+  if (/Browser '[^']*' is not open/i.test(out)) return false;
+  if (/is not open, please run open first/i.test(out)) return false;
+  return true;
+}
+
 export function inferSilentExtensionFailure(options: {
   status: number;
   stdout: string;
@@ -543,8 +573,10 @@ export async function serve() {
 
       log(`exit: ${status}${stdout.trim() ? ` | ${stdout.trim().slice(0, 200)}` : ""}`);
 
-      // Relay self-heal (see notes at SESSION_CLOSE_TIMEOUTS): a command that RETURNS — even
-      // non-zero — proves the relay answered, so clear the streaks; a TIMEOUT means it didn't.
+      // Relay self-heal (see notes at SESSION_CLOSE_TIMEOUTS). A command that RETURNS usually
+      // proves the relay answered — but NOT when the CLI short-circuited locally without ever
+      // reaching it (provesRelayAlive). Treating those as success reset the global streak on
+      // every per-session heal, so WATCHDOG_TIMEOUTS could never be reached. See that helper.
       if (timedOut) {
         consecutiveTimeouts++;
         const streak = (sessionTimeouts.get(namespacedSession) ?? 0) + 1;
@@ -565,9 +597,14 @@ export async function serve() {
           log(`relay wedged: ${consecutiveTimeouts} consecutive timeouts, no success between — exiting for oxmgr (--restart always) to respawn clean; extension WS will reconnect (Chrome untouched)`);
           setTimeout(() => process.exit(1), 100); // brief delay to flush this response
         }
-      } else {
+      } else if (provesRelayAlive({ stdout, stderr })) {
         consecutiveTimeouts = 0;
         sessionTimeouts.delete(namespacedSession);
+      } else {
+        // Returned, but proved nothing about the relay (local short-circuit). Leave BOTH
+        // streaks untouched: not a timeout, so don't punish it — but don't let it forgive
+        // the timeouts that came before, which is the bug this branch exists to fix.
+        log(`inconclusive: session=${namespacedSession} did not reach the relay — streaks kept (globalStreak=${consecutiveTimeouts})`);
       }
 
       // Detect files mentioned in output

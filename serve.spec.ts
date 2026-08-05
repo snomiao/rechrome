@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { inferSilentExtensionFailure, isUnderDir } from "./serve.ts";
+import { inferSilentExtensionFailure, isUnderDir, provesRelayAlive } from "./serve.ts";
 
 describe("isUnderDir", () => {
   test("allows simple relative file", () => {
@@ -73,5 +73,67 @@ describe("inferSilentExtensionFailure", () => {
     };
     expect(inferSilentExtensionFailure({ ...base, stderr: "real error\n" })).toBe("real error\n");
     expect(inferSilentExtensionFailure({ ...base, stderr: "", elapsedMs: 500 })).toBe("");
+  });
+});
+
+describe("provesRelayAlive", () => {
+  const no = (stdout: string, stderr = "") => provesRelayAlive({ stdout, stderr });
+
+  test("a real reply from the browser counts as proof", () => {
+    expect(no('{"title":"Example"}')).toBe(true);
+    expect(no("", "TimeoutError: locator.click: Timeout 5000ms exceeded.")).toBe(true);
+    expect(no("", 'Error: "#nope" does not match any elements.')).toBe(true);
+  });
+
+  test("a missing session does NOT count — the CLI never reached the relay", () => {
+    expect(no("", "Browser '48b8ed6c' is not open. Run\n\n  playwright-cli -s=48b8ed6c open")).toBe(false);
+    expect(no("The browser 'default' is not open, please run open first")).toBe(false);
+  });
+
+  test("either stream is enough to disqualify", () => {
+    expect(no("Browser 'x' is not open.", "")).toBe(false);
+    expect(no("", "Browser 'x' is not open.")).toBe(false);
+  });
+
+  test("tolerates empty/missing output", () => {
+    expect(no("", "")).toBe(true);
+  });
+});
+
+// The bug this guards, as a sequence rather than a predicate: a wedged relay must
+// eventually trip the global watchdog. Before the fix, the "browser is not open" reply
+// that the per-session heal itself provokes reset the streak, so the threshold was
+// unreachable and only a manual `oxmgr restart rechrome` recovered.
+describe("watchdog reaches its threshold on a wedged relay", () => {
+  const WATCHDOG = 3;
+  function run(replies: Array<{ timedOut: boolean; out?: string }>) {
+    let consecutive = 0;
+    let fired = false;
+    for (const r of replies) {
+      if (r.timedOut) {
+        consecutive++;
+        if (consecutive >= WATCHDOG) fired = true;
+      } else if (provesRelayAlive({ stdout: r.out ?? "", stderr: "" })) {
+        consecutive = 0;
+      }
+    }
+    return fired;
+  }
+  const NOT_OPEN = "Browser 'x' is not open.";
+
+  test("timeouts interleaved with session-heal noise still trip it", () => {
+    expect(run([
+      { timedOut: true }, { timedOut: true },
+      { timedOut: false, out: NOT_OPEN },  // the heal's own side effect
+      { timedOut: true },
+    ])).toBe(true);
+  });
+
+  test("a genuine success still forgives, so healthy relays never restart", () => {
+    expect(run([
+      { timedOut: true }, { timedOut: true },
+      { timedOut: false, out: '{"title":"ok"}' },
+      { timedOut: true }, { timedOut: true },
+    ])).toBe(false);
   });
 });
