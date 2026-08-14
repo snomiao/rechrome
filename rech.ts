@@ -400,6 +400,59 @@ export function validateChromeProfileSelector(selector: string): void {
   );
 }
 
+export async function resolveGlobalProfile(
+  registry: Record<string, TokenEntry>,
+  chromeProfiles: Record<string, ChromeProfileInfo> | null,
+  selector: string,
+): Promise<{ email: string; entry: TokenEntry }> {
+  const value = selector.trim();
+  if (!value) throw new Error("--profile requires a non-empty value");
+
+  const registryKey = Object.keys(registry).find(k => k.toLowerCase() === value.toLowerCase());
+  if (registryKey) return { email: registryKey, entry: registry[registryKey] };
+
+  if (!chromeProfiles) {
+    throw new Error(
+      `--profile "${value}" does not match any registered email, and Chrome profiles are not accessible. ` +
+      `Run \`rech setup --profile "${value}"\` to register this profile.`,
+    );
+  }
+
+  const profiles = Object.entries(chromeProfiles);
+  let match: [string, ChromeProfileInfo] | null;
+  try {
+    match = resolveChromeProfileSelector(profiles, value);
+  } catch (err) {
+    throw err;
+  }
+
+  if (!match) {
+    throw new Error(
+      `--profile "${value}" does not match any Chrome profile. ` +
+      `See available profiles with \`rech profiles\`.`,
+    );
+  }
+
+  const [dir, info] = match;
+  const email = info.user_name;
+  if (!email) {
+    throw new Error(
+      `Chrome profile "${value}" (folder: ${dir}) has no email associated. ` +
+      `Run \`rech setup --profile "${value}"\` to register it.`,
+    );
+  }
+
+  const entry = registry[email];
+  if (!entry) {
+    throw new Error(
+      `Profile "${email}" (${dir}) is not registered. ` +
+      `Run \`rech setup --profile "${value}"\` to register it.`,
+    );
+  }
+
+  return { email, entry };
+}
+
 async function findChromeUserDataDir(): Promise<string | null> {
   for (const statePath of CHROME_LOCAL_STATE_PATHS()) {
     if (!(await file(statePath).exists())) continue;
@@ -545,7 +598,10 @@ async function callServe(
   // and run() has already done so for its log line. Recomputing here would double those git
   // spawns (and, on Windows, the console-window flashes) on every `rech open`.
   const identity = precomputedIdentity ?? await getClientIdentity();
-  const effectiveProfile = resolveEffectiveProfile(profileDirectory);
+  // A global `--profile` override must win for the session key too: the daemon hashes
+  // identity.profile into the session id, so without this, `rech --profile other open` would
+  // reuse the default profile's session (and its browser) instead of opening its own.
+  const effectiveProfile = overrideEnv?.["PLAYWRIGHT_MCP_PROFILE_DIRECTORY"] || resolveEffectiveProfile(profileDirectory);
   if (effectiveProfile) identity.profile = effectiveProfile;
   const env = { ...(await getClientEnv({ extensionId, extensionToken, profileDirectory, userDataDir, loadExtension })), ...overrideEnv };
   const res = await fetch(`${protocol}://${host}:${port}/run`, {
@@ -588,12 +644,43 @@ export function normalizeCommandArgs(args: string[]): string[] {
   return normalized;
 }
 
-async function run(url: string, args: string[]) {
+// Pull a global `--profile <val>` / `--profile=<val>` out of the leading flags of an argv.
+// Only flags before the first positional (the playwright subcommand) are rech globals — a
+// --profile at/after the subcommand belongs to the forwarded CLI (e.g. playwright-cli's own
+// `open --profile <dir>`, a user-data-dir path) and must pass through untouched. Throws on a
+// missing value; accepts multiple occurrences (last one wins).
+export function extractGlobalProfileArg(args: string[]): { args: string[]; selector?: string } {
+  const rest = [...args];
+  let selector: string | undefined;
+  for (let i = 0; i < rest.length && rest[i].startsWith("-"); i++) {
+    const a = rest[i];
+    if (a === "--profile") {
+      const value = rest[i + 1];
+      if (!value || value.startsWith("--"))
+        throw new Error("--profile requires a value (e.g. --profile you@gmail.com)");
+      selector = value;
+      rest.splice(i, 2);
+      i--;
+      continue;
+    }
+    if (a.startsWith("--profile=")) {
+      const value = a.slice("--profile=".length);
+      if (!value) throw new Error("--profile requires a value (e.g. --profile you@gmail.com)");
+      selector = value;
+      rest.splice(i, 1);
+      i--;
+      continue;
+    }
+  }
+  return { args: rest, selector };
+}
+
+async function run(url: string, args: string[], overrideEnv?: Record<string, string>) {
   // Match the underlying CLI's command names while accepting the short forms humans
   // naturally try. Keep this client-side so old and new serve daemons behave alike.
   args = normalizeCommandArgs(args);
   const { host, port, protocol, extensionId, extensionToken, profileDirectory, userDataDir, loadExtension } = parseUrl(url);
-  const effectiveProfile = resolveEffectiveProfile(profileDirectory);
+  const effectiveProfile = overrideEnv?.["PLAYWRIGHT_MCP_PROFILE_DIRECTORY"] || resolveEffectiveProfile(profileDirectory);
   const displayProfile = effectiveProfile ? await resolveProfileEmail(effectiveProfile) : undefined;
   const identity = await getClientIdentity();
   const profileSuffix = displayProfile ? ` profile:${displayProfile}` : "";
@@ -602,18 +689,19 @@ async function run(url: string, args: string[]) {
   );
 
   const resolvedEnv = await getClientEnv({ extensionId, extensionToken, profileDirectory, userDataDir, loadExtension });
-  const { status, stdout, stderr, files, existingSession } = await callServe(url, args, undefined, identity);
+  const effectiveEnv = { ...resolvedEnv, ...overrideEnv };
+  const { status, stdout, stderr, files, existingSession } = await callServe(url, args, overrideEnv, identity);
 
   const isOpenWithUrl = args[0] === "open" && args.length > 1;
   if (existingSession && isOpenWithUrl) {
-    return run(url, ["goto", ...args.slice(1)]);
+    return run(url, ["goto", ...args.slice(1)], overrideEnv);
   }
 
   if (existingSession)
     console.error(`[rech] session already has open tabs — listing existing tabs instead of opening a new window`);
   if (stderr) {
     if (stderr.includes('Extension connection timeout')) {
-      const hasToken = !!resolvedEnv["PLAYWRIGHT_MCP_EXTENSION_TOKEN"];
+      const hasToken = !!effectiveEnv["PLAYWRIGHT_MCP_EXTENSION_TOKEN"];
       const last = hasToken
         ? `  -x: extension did not connect (reload it at chrome://extensions; then verify its token) -> extension[degraded]`
         : `  -> extension[not installed]  (run: rech setup)`;
@@ -1667,6 +1755,14 @@ function printHelp(): void {
   console.log(`rechrome (rech) — drive Chrome via Playwright over HTTP
 
 Usage:
+  rech [--profile <email|name|folder>] <playwright-args...>
+                               Run Playwright CLI command with the given registered
+                               Chrome profile. --profile selects the profile by exact
+                               registered email (e.g. you@gmail.com), exact Chrome
+                               profile name, or exact profile folder name. The profile
+                               must already be registered (see \`rech setup\`). Place
+                               --profile before the playwright subcommand. Requires
+                               ${ENV_KEY}.
   rech setup [--profile <email|name|folder>] [--token <tok>]
                                First-time setup: daemon + Chrome extension + config
                                --profile selects the Chrome profile non-interactively.
@@ -1703,13 +1799,14 @@ Environment:
 Examples:
   rech setup
   rech setup --profile you@gmail.com --token <PLAYWRIGHT_MCP_EXTENSION_TOKEN>
+  rech --profile you@gmail.com open https://example.com
   rech eval "() => document.title"
   rech open https://example.com
   rech screenshot`);
 }
 
 if (import.meta.main) {
-  const args = process.argv.slice(2);
+  let args = process.argv.slice(2);
   const cmd = args[0]?.toLowerCase();
 
   if (cmd === "serve") {
@@ -1767,6 +1864,41 @@ if (import.meta.main) {
       printHelp();
       process.exit(1);
     }
+    // --profile: target a registered Chrome profile globally (see extractGlobalProfileArg for
+    // the leading-flags-only rule that protects the forwarded CLI's own --profile).
+    let profileSelector: string | undefined;
+    let overrideEnv: Record<string, string> | undefined;
+    try {
+      const extracted = extractGlobalProfileArg(args);
+      profileSelector = extracted.selector;
+      args = extracted.args;
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      envWatcher?.close();
+      process.exit(1);
+    }
+    if (profileSelector !== undefined) {
+      try {
+        const registry = await readTokenRegistry();
+        const cache = await readChromeProfileCache();
+        const resolved = await resolveGlobalProfile(registry, cache, profileSelector);
+        // Use the registry key (email, or the managed profile name) as the profile identity:
+        // the daemon already resolves email/name → profile dir for the default URL-param path,
+        // so this keeps `--profile <email>` on the SAME session as the default path and only
+        // opens a separate session when the profile really differs.
+        overrideEnv = {
+          PLAYWRIGHT_MCP_PROFILE_DIRECTORY: resolved.email,
+          PLAYWRIGHT_MCP_EXTENSION_ID: resolved.entry.extensionId,
+          PLAYWRIGHT_MCP_EXTENSION_TOKEN: resolved.entry.token,
+        };
+        if (resolved.entry.userDataDir) overrideEnv.PLAYWRIGHT_MCP_USER_DATA_DIR = resolved.entry.userDataDir;
+        if (resolved.entry.loadExtension) overrideEnv.PLAYWRIGHT_MCP_LOAD_EXTENSION = resolved.entry.loadExtension;
+      } catch (err) {
+        console.error(err instanceof Error ? err.message : String(err));
+        envWatcher?.close();
+        process.exit(1);
+      }
+    }
     // --isolate: ephemeral session isolation, sugar for -s=iso-<random>. For fragile single-shot
     // flows (OAuth/login) that must not share tabs with the worktree's default session. The `iso-`
     // marker lets the daemon reap these throwaway sessions on an idle TTL (see serve.ts), so an
@@ -1776,7 +1908,7 @@ if (import.meta.main) {
       args.splice(isolateIdx, 1);
       args.push(`-s=iso-${randomBytes(8).toString("hex")}`);
     }
-    await run(url, args);
+    await run(url, args, overrideEnv);
     envWatcher?.close();
   }
 }
