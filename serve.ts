@@ -278,12 +278,48 @@ async function freeStalePort(port: number): Promise<void> {
   await new Promise(r => setTimeout(r, 800)); // let the OS release the socket before retry
 }
 
+// --- Foreground/orphan self-exit ---------------------------------------------------
+// A foreground `rech serve` (run directly by an agent, NOT under oxmgr/pm2) has no
+// process-manager safety net: when the agent that spawned it exits, the OS re-parents
+// the orphan to init (ppid 1) and it lives forever — the resource leak behind
+// PERFORMANCE-EVENT.md. The managed daemon (oxmgr `--restart always`) keeps the
+// process as its own child, so its ppid is stable and non-1 and it is never flagged.
+// Once a serve is orphaned AND has had no real /run for the idle timeout, it exits so
+// the leak self-heals. /ping is deliberately NOT activity (the tray polls it every 2s
+// and would otherwise keep an orphan alive forever).
+const ORPHAN_POLL_INTERVAL_MS = 15_000;
+const ORPHAN_IDLE_EXIT_MS = Number(process.env.RECH_SERVE_IDLE_TIMEOUT_MS) || 5 * 60_000;
+
+// Pure decision predicate (testable). idleTimeoutMs <= 0 disables orphan self-exit.
+export function shouldExitOrphanedServe(opts: {
+  orphaned: boolean;
+  idleMs: number;
+  idleTimeoutMs: number;
+}): boolean {
+  return opts.idleTimeoutMs > 0 && opts.orphaned && opts.idleMs >= opts.idleTimeoutMs;
+}
+
 export async function serve() {
   const url = await getOrCreateUrl();
   const { key, port } = parseUrl(url);
 
   const workDir = join(RECH_DIR, "output");
   mkdirSync(workDir, { recursive: true });
+
+  // Foreground/orphan self-exit: a serve whose parent has been re-parented to init
+  // (ppid 1) is a leaked foreground serve. Poll for that, track the last real /run,
+  // and exit once orphaned + idle so an agent that died without shutting us down
+  // doesn't leave a daemon behind.
+  let orphaned = false;
+  let idleSince = Date.now();
+  const markActivity = () => { idleSince = Date.now(); };
+  setInterval(() => {
+    if (process.ppid === 1) orphaned = true;
+    if (shouldExitOrphanedServe({ orphaned, idleMs: Date.now() - idleSince, idleTimeoutMs: ORPHAN_IDLE_EXIT_MS })) {
+      log(`orphaned foreground serve idle ${Math.round((Date.now() - idleSince) / 1000)}s — exiting (spawning agent is gone)`);
+      process.exit(0);
+    }
+  }, ORPHAN_POLL_INTERVAL_MS);
 
   // Reap idle --isolate sessions so single-shot OAuth/login drives don't leak browser contexts.
   adoptOrphanedIsoSessions();
@@ -365,6 +401,7 @@ export async function serve() {
       if (reqUrl.pathname !== "/run") return new Response("rech server\n");
       const denied = authCheck(req, key);
       if (denied) return denied;
+      markActivity(); // a real command: this serve is not idle
 
       const body = await req.json();
       let args: string[];

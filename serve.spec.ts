@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { inferSilentExtensionFailure, isUnderDir, provesRelayAlive } from "./serve.ts";
+import { inferSilentExtensionFailure, isUnderDir, provesRelayAlive, shouldExitOrphanedServe } from "./serve.ts";
 
 describe("isUnderDir", () => {
   test("allows simple relative file", () => {
@@ -135,5 +135,26 @@ describe("watchdog reaches its threshold on a wedged relay", () => {
       { timedOut: false, out: '{"title":"ok"}' },
       { timedOut: true }, { timedOut: true },
     ])).toBe(false);
+  });
+});
+
+// A foreground `rech serve` leaked by a dead agent must self-exit once orphaned AND
+// idle, but a serve that is still actively driving commands (or not orphaned) must not.
+describe("shouldExitOrphanedServe", () => {
+  test("exits only when orphaned and idle past the timeout", () => {
+    expect(shouldExitOrphanedServe({ orphaned: true, idleMs: 300_000, idleTimeoutMs: 300_000 })).toBe(true);
+    expect(shouldExitOrphanedServe({ orphaned: true, idleMs: 300_001, idleTimeoutMs: 300_000 })).toBe(true);
+  });
+
+  test("never exits while still serving commands (idle below timeout)", () => {
+    expect(shouldExitOrphanedServe({ orphaned: true, idleMs: 299_999, idleTimeoutMs: 300_000 })).toBe(false);
+  });
+
+  test("never exits a managed (non-orphaned) daemon regardless of idle", () => {
+    expect(shouldExitOrphanedServe({ orphaned: false, idleMs: 1_000_000, idleTimeoutMs: 300_000 })).toBe(false);
+  });
+
+  test("a non-positive timeout disables orphan self-exit entirely", () => {
+    expect(shouldExitOrphanedServe({ orphaned: true, idleMs: 1_000_000, idleTimeoutMs: 0 })).toBe(false);
   });
 });

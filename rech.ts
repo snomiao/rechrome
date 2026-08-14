@@ -923,12 +923,51 @@ function findTrayBinary(): string | undefined {
   return Bun.which(`rechrome-tray${ext}`) ?? undefined;
 }
 
+// Verify a PID is actually a rechrome-tray process, not an unrelated process that
+// happened to reuse the pid after the real tray died. POSIX only (`ps` isn't on stock
+// Windows); there we fall back to trusting the liveness probe alone (best-effort).
+function isPidRechromeTray(pid: number): boolean {
+  if (IS_WINDOWS) return true;
+  try {
+    const p = Bun.spawnSync(["ps", "-o", "comm=", "-p", String(pid)], { stdout: "pipe", stderr: "ignore", windowsHide: true });
+    return (p.stdout?.toString() ?? "").trim().includes("rechrome-tray");
+  } catch {
+    return false;
+  }
+}
+
+// PIDs of live rechrome-tray processes (POSIX). Catches untracked trays — ones launched
+// outside `rech tray show` that never touch the pidfile — so a singleton guard can't
+// spawn a second icon on top of them. Empty on Windows (no `ps`), where we rely on the
+// pidfile liveness check alone.
+function listTrayPids(): number[] {
+  if (IS_WINDOWS) return [];
+  try {
+    const p = Bun.spawnSync(["ps", "-axo", "pid=,comm="], { stdout: "pipe", stderr: "ignore", windowsHide: true });
+    const out = p.stdout?.toString() ?? "";
+    const pids: number[] = [];
+    for (const line of out.split("\n")) {
+      const m = line.trim().match(/^(\d+)\s+(.+)$/);
+      // macOS reports the full launch path in `comm`, so match the basename via a
+      // trailing "/rechrome-tray" or an exact bare name (Linux truncates to the name).
+      if (m && Number(m[1]) !== process.pid && m[2].includes("rechrome-tray")) pids.push(Number(m[1]));
+    }
+    return pids;
+  } catch {
+    return [];
+  }
+}
+
 function isTrayRunning(): boolean {
+  // Any live tray (tracked by the pidfile or not) means "already running" — the pidfile
+  // is a single slot that only ever records the most-recent spawn, so it cannot see
+  // earlier/untracked instances on its own.
+  if (listTrayPids().length > 0) return true;
   try {
     const pid = parseInt(readFileSync(TRAY_PID_FILE, "utf8"), 10);
     if (!Number.isFinite(pid)) return false;
     process.kill(pid, 0); // signal 0 = liveness probe, doesn't actually signal
-    return true;
+    return isPidRechromeTray(pid);
   } catch {
     return false;
   }
@@ -958,7 +997,12 @@ async function startTray({ quiet = false }: { quiet?: boolean } = {}): Promise<v
 }
 
 function stopTray(): void {
-  if (!isTrayRunning()) { console.log("tray: not running."); return; }
+  // Kill every live tray (tracked or untracked), then drop the pidfile. A singleton
+  // tray should never have more than one instance, but a crashed/overwritten pidfile
+  // can leave orphans the single-slot pidfile no longer points at — reap them too.
+  const pids = listTrayPids();
+  if (pids.length === 0 && !isTrayRunning()) { console.log("tray: not running."); return; }
+  for (const pid of pids) { try { process.kill(pid); } catch {} }
   try { process.kill(parseInt(readFileSync(TRAY_PID_FILE, "utf8"), 10)); } catch {}
   try { unlinkSync(TRAY_PID_FILE); } catch {}
   console.log("tray: stopped. Run `rech tray show` to restore.");
