@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Fail the publish if an entrypoint imports a local module the tarball does not ship.
+#
+# This exists because rechrome@1.24.0 shipped and then died at first run with
+#   Cannot find module './daemon-manager.ts'
+# rech.ts and serve.ts both import ./daemon-manager.ts, but package.json's files[] never listed
+# it, so npm packed an installable tarball that could not start. Nothing in the pipeline
+# compared "what we import" against "what we ship" — `npm publish` succeeded, and the breakage
+# was only observable by installing the published package.
+#
+# --ignore-scripts is required: `npm pack` would otherwise re-run prepublishOnly, which calls
+# this script, which calls npm pack... forever.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+
+PACKED="$(npm pack --dry-run --json --ignore-scripts 2>/dev/null)"
+
+node -e '
+const packed = JSON.parse(process.argv[1])[0].files.map(f => f.path);
+const fs = require("fs");
+const entries = ["rech.ts", "serve.ts", "rech.js", "serve.js", "daemon-manager.ts", "daemon-manager.js"]
+  .filter(f => fs.existsSync(f));
+let missing = [];
+for (const entry of entries) {
+  const src = fs.readFileSync(entry, "utf8");
+  for (const m of src.matchAll(/["'"'"'](\.\/[A-Za-z0-9._\/-]+)["'"'"']/g)) {
+    const rel = m[1].replace(/^\.\//, "");
+    // Only local MODULE imports matter here; a data file read at runtime is not resolved by Node.
+    if (!/\.(ts|js|mjs|cjs|json)$/.test(rel)) continue;
+    if (!packed.includes(rel)) missing.push(`${entry} imports ./${rel}, which the tarball does not contain`);
+  }
+}
+if (missing.length) {
+  console.error("check-pack: the tarball is missing modules its own entrypoints import:");
+  for (const m of missing) console.error("  - " + m);
+  console.error("Add them to package.json files[] (and emit the .js form in prepublishOnly).");
+  process.exit(1);
+}
+console.log(`check-pack: ok — every local import of ${entries.length} entrypoint(s) is present in the tarball.`);
+' "$PACKED"

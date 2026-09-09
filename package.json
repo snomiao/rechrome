@@ -13,6 +13,8 @@
     ".env.example",
     "LICENSE",
     "README.md",
+    "daemon-manager.js",
+    "daemon-manager.ts",
     "extension",
     "rech.js",
     "rech.ts",
@@ -25,7 +27,8 @@
     "serve": "bun run rech.ts serve",
     "test": "bun test",
     "vendor-cli": "bash scripts/vendor-cli.sh",
-    "prepublishOnly": "bash scripts/vendor-cli.sh && sed 's/\\.ts/\\.js/g' rech.ts > rech.js && sed 's/\\.ts/\\.js/g' serve.ts > serve.js"
+    "prepare": "bash scripts/vendor-cli.sh",
+    "prepublishOnly": "bash scripts/vendor-cli.sh && sed 's/\\.ts/\\.js/g' rech.ts > rech.js && sed 's/\\.ts/\\.js/g' serve.ts > serve.js && sed 's/\\.ts/\\.js/g' daemon-manager.ts > daemon-manager.js && bash scripts/check-pack.sh"
   },
   "devDependencies": {
     "@types/bun": "latest"

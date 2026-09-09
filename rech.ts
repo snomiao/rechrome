@@ -5,6 +5,7 @@ import { randomBytes } from "crypto";
 import { mkdirSync, appendFileSync, existsSync, realpathSync, accessSync, cpSync, unlinkSync, readFileSync, readdirSync, constants as fsConstants } from "fs";
 import { hostname, homedir } from "os";
 import { join, basename, dirname } from "path";
+import { createRequire } from "node:module";
 import { spawn as cpSpawn } from "child_process";
 import { pickDaemonManager, type DaemonManager } from "./daemon-manager.ts";
 
@@ -876,23 +877,45 @@ async function pmList(mgr: DaemonManager = daemonManager()): Promise<string> {
   return await new Response(proc.stdout).text();
 }
 
+// A candidate playwright-cli entry is only usable if the playwright-core it needs actually
+// resolves FROM that entry. The wrapper does `require('playwright-core/lib/tools/cli-client/program')`,
+// and that deep subpath is reachable only through the fork's patched `exports` map — stock
+// playwright-core blocks it. So test the real thing: run Node's own resolution from the entry's
+// location, exactly as the wrapper will.
+//
+// Checking that the .js file EXISTS is not the same check, and the difference is the whole bug.
+// `lib/playwright-cli/` is a git submodule: an uninitialised or half-built checkout leaves the
+// wrapper on disk with no resolvable core beside it, so an existence test picks a candidate that
+// cannot run, and the failure surfaces later as MODULE_NOT_FOUND from inside the daemon.
+function playwrightCliIsUsable(jsEntry: string): boolean {
+  try {
+    createRequire(jsEntry).resolve("playwright-core/lib/tools/cli-client/program");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // Resolve which playwright-cli the daemon runs to drive Chrome. Priority:
 //   1. PLAYWRIGHT_CLI env override — explicit, already a full command string.
-//   2. Vendored fork in a git checkout (lib/playwright-cli/playwright-cli.js) — the patched
-//      multi-tab CLI + patched playwright-core (PLAYWRIGHT_MCP_PROFILE_DIRECTORY etc.).
-//   3. The fork bundled into the npm tarball (vendor/playwright-cli/playwright-cli.js, produced by
-//      scripts/vendor-cli.sh at prepublish). This is the batteries-included default for
-//      `bun i -g rechrome`: self-contained, no @playwright/cli dep, no browser-binary download.
+//   2. The fork bundled by scripts/vendor-cli.sh (vendor/playwright-cli/playwright-cli.js), built
+//      from the committed vendor-src/ inputs. Self-contained — its patched playwright-core sits in
+//      its own node_modules — so it is the candidate most likely to actually work, which is why it
+//      is tried FIRST. This is also what `bun i -g rechrome` gets.
+//   3. The git-checkout submodule (lib/playwright-cli/playwright-cli.js) — a dev convenience that
+//      only works once the submodules are initialised AND built.
 //   4. Bare `playwright-cli-multi-tab` on PATH — legacy fallback for a pre-existing global link.
+// Candidates are filtered by playwrightCliIsUsable(), so a present-but-unusable one is skipped
+// rather than selected and failed on later.
 // A resolved .js entry is run through `node` on Windows (which can't exec a .js by shebang) and
 // bare on POSIX (its `#!/usr/bin/env node` shebang runs it under node, which the relay handshake
 // needs — see daemonInstall). serve splits the result on spaces into argv.
 export function resolvePlaywrightCli(): string {
   if (process.env.PLAYWRIGHT_CLI) return process.env.PLAYWRIGHT_CLI;
   const jsEntry = [
-    join(import.meta.dir, "lib/playwright-cli/playwright-cli.js"),
     join(import.meta.dir, "vendor/playwright-cli/playwright-cli.js"),
-  ].find(existsSync);
+    join(import.meta.dir, "lib/playwright-cli/playwright-cli.js"),
+  ].filter(existsSync).find(playwrightCliIsUsable);
   if (jsEntry) return IS_WINDOWS ? `node ${jsEntry}` : jsEntry;
   return "playwright-cli-multi-tab";
 }
