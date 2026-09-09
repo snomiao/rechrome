@@ -15,7 +15,26 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-PACKED="$(npm pack --dry-run --json --ignore-scripts 2>/dev/null)"
+# Take npm's exit status BEFORE anything summarises its output, and keep its stderr. Piping this
+# into a parser and discarding stderr made a failed pack indistinguishable from a successful one
+# except by an opaque JSON error: the guard still failed closed, but it failed SILENTLY, which is
+# only one step better than failing green.
+PACK_ERR="$(mktemp)"
+pack_rc=0
+PACKED="$(npm pack --dry-run --json --ignore-scripts 2>"$PACK_ERR")" || pack_rc=$?
+if [ "$pack_rc" -ne 0 ]; then
+  rc="$pack_rc"
+  echo "check-pack: \`npm pack\` failed (rc=$rc) — cannot determine what the tarball contains," >&2
+  echo "so this check cannot answer its question. Refusing to report a pass." >&2
+  sed "s/^/  npm: /" "$PACK_ERR" >&2
+  rm -f "$PACK_ERR"
+  exit 1
+fi
+rm -f "$PACK_ERR"
+if [ -z "$PACKED" ]; then
+  echo "check-pack: npm pack produced no output — refusing to report a pass on an empty result." >&2
+  exit 1
+fi
 
 node -e '
 const packed = JSON.parse(process.argv[1])[0].files.map(f => f.path);
