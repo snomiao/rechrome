@@ -25,8 +25,8 @@ const fs = require("fs");
 // and pass green — the failure this guard exists to catch, reintroduced by the guard itself.
 // bin[] is what actually runs; files[] catches modules shipped alongside them.
 const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
-const entries = [...new Set([...Object.values(pkg.bin ?? {}), ...(pkg.files ?? [])])]
-  .map(f => String(f).replace(/^\.\//, ""))
+const entries = [...new Set([...Object.values(pkg.bin ?? {}), ...(pkg.files ?? [])]
+  .map(f => String(f).replace(/^\.\//, "")))]
   .filter(f => /\.(ts|js|mjs|cjs)$/.test(f))
   .filter(f => fs.existsSync(f));
 if (!entries.length) {
