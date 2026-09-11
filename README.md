@@ -158,8 +158,44 @@ Clients can also pass `-s=name` to create named sub-sessions within their namesp
 ## Development
 
 ```bash
-bun install
+bun install   # `prepare` builds vendor/ from vendor-src/, so a fresh checkout has a working CLI
 bun test
+```
+
+### Verifying rech actually works
+
+**`rech --help` is not a check.** It answers from argument parsing alone and stays green while the
+browser path is completely broken — it passed throughout the 2026-09-09 outage. The daemon resolves
+its playwright-cli lazily, so a broken resolution shows up only when a command needs the browser.
+
+Verify with a command that must reach Chrome and return page content:
+
+```bash
+rech open https://example.com   # must print "Page Title: Example Domain" and a Snapshot path
+```
+
+Success is the page content, not the exit code. If it returns a title and snapshot, the whole path
+(daemon → playwright-cli → patched playwright-core → extension → Chrome) is working.
+
+To see which CLI was selected — and whether it is the vendored one:
+
+```bash
+bun -e 'import {resolvePlaywrightCli} from "./rech.ts"; console.log(resolvePlaywrightCli())'
+```
+
+`resolvePlaywrightCli()` prefers `vendor/` over the `lib/playwright-cli` submodule and skips any
+candidate whose `playwright-core` does not resolve, so a half-initialised submodule can no longer
+win the lookup and fail later inside the daemon. Set `PLAYWRIGHT_CLI` to override.
+
+### Before publishing
+
+`scripts/check-pack.sh` runs from `prepublishOnly` and fails the publish if an entrypoint imports a
+local module the tarball does not ship. This is not hypothetical: `rechrome@1.24.0` shipped without
+`daemon-manager.*` while both `rech.ts` and the generated `rech.js` import it, so every install died
+at startup with `Cannot find module './daemon-manager.ts'`. Run it directly with:
+
+```bash
+bash scripts/check-pack.sh
 ```
 
 ## Why we fork playwright
