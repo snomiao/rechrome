@@ -48,8 +48,7 @@ export function oxmgrHasWinfix(version: string | null | undefined): boolean {
 // runtime. `override` is RECH_DAEMON_MANAGER (case-insensitive) and, when set to
 // a known manager, wins outright — bypassing the winfix guard as an explicit
 // opt-in. The `*Bin` inputs are resolved executable paths (null when not on
-// PATH); the returned `bin` falls back to the bare command name so a downstream
-// "install a manager" error can still surface with a meaningful name.
+// PATH). Missing dependencies fail here, before callers mutate configuration.
 export function pickDaemonManager(opts: {
   oxmgrBin: string | null;
   pm2Bin: string | null;
@@ -57,10 +56,19 @@ export function pickDaemonManager(opts: {
   isWindows: boolean;
   override?: string | null;
 }): DaemonManager {
+  const override = opts.override?.toLowerCase();
+  if (override === "oxmgr" && !opts.oxmgrBin) {
+    throw new Error("RECH_DAEMON_MANAGER=oxmgr, but oxmgr is not on PATH. Install oxmgr and add it to PATH, or install pm2 with `bun add -g pm2` and set RECH_DAEMON_MANAGER=pm2.");
+  }
+  if (override === "pm2" && !opts.pm2Bin) {
+    throw new Error("RECH_DAEMON_MANAGER=pm2, but pm2 is not on PATH. Install it with `bun add -g pm2` and ensure the global bin directory is on PATH.");
+  }
+  if (!opts.oxmgrBin && !opts.pm2Bin) {
+    throw new Error("No daemon process manager found on PATH (oxmgr or pm2). Install pm2 with `bun add -g pm2`, ensure the global bin directory is on PATH, then rerun `bunx rechrome setup`.");
+  }
   const oxmgr: DaemonManager = { id: "oxmgr", bin: opts.oxmgrBin ?? "oxmgr" };
   const pm2: DaemonManager = { id: "pm2", bin: opts.pm2Bin ?? "pm2" };
 
-  const override = opts.override?.toLowerCase();
   if (override === "pm2") return pm2;
   if (override === "oxmgr") return oxmgr;
 
@@ -77,4 +85,15 @@ export function pickDaemonManager(opts: {
   if (opts.oxmgrBin) return oxmgr;
   if (opts.pm2Bin) return pm2;
   return oxmgr;
+}
+
+// npm/npx sets npm_config_user_agent even when the CLI's shebang runs Bun.
+// Prefer launcher metadata over the runtime, which is Bun for both launchers.
+export function oxmgrInstallCommand(env: { npm_config_user_agent?: string; npm_execpath?: string }): ["bun" | "npm", "i", "-g", "oxmgr"] {
+  const agent = env.npm_config_user_agent?.toLowerCase() ?? "";
+  if (agent.startsWith("npm/")) return ["npm", "i", "-g", "oxmgr"];
+  if (agent.startsWith("bun/")) return ["bun", "i", "-g", "oxmgr"];
+  const execPath = env.npm_execpath?.replace(/\\/g, "/") ?? "";
+  if (/(^|\/)(npm|npx)(-cli\.js|\.cmd|\.exe)?$/i.test(execPath)) return ["npm", "i", "-g", "oxmgr"];
+  return ["bun", "i", "-g", "oxmgr"];
 }

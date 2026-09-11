@@ -6,7 +6,7 @@ import { mkdirSync, appendFileSync, existsSync, realpathSync, accessSync, cpSync
 import { hostname, homedir } from "os";
 import { join, basename, dirname } from "path";
 import { spawn as cpSpawn } from "child_process";
-import { pickDaemonManager, type DaemonManager } from "./daemon-manager.ts";
+import { oxmgrInstallCommand, pickDaemonManager, type DaemonManager } from "./daemon-manager.ts";
 
 export const ENV_KEY = "RECHROME_URL";
 export const DEFAULT_PORT = 13775;
@@ -174,17 +174,19 @@ export function parseUrl(raw: string) {
   };
 }
 
-export async function getOrCreateUrl(): Promise<string> {
+export async function getOrCreateUrl(persist = true): Promise<string> {
   // Treat a URL without a bearer key as missing — it cannot authenticate
   try { if (process.env[ENV_KEY] && new URL(process.env[ENV_KEY]!).username) return process.env[ENV_KEY]!; } catch {}
   const key = randomBytes(12).toString("base64url"); // 16 chars
   const url = `http://${key}@127.0.0.1:${DEFAULT_PORT}`;
-  const newLine = `${ENV_KEY}=${url}`;
-  // Write to ~/.env.local so it's not shadowed by project .env.local
-  const envRaw = await file(globalEnvFile).text().catch(() => "");
-  const lines = envRaw.trimEnd().split("\n").filter(l => !l.startsWith(`${ENV_KEY}=`));
-  const content = [...lines, newLine, ""].join("\n");
-  Bun.write(globalEnvFile, content);
+  if (persist) {
+    const newLine = `${ENV_KEY}=${url}`;
+    // Write to ~/.env.local so it's not shadowed by project .env.local
+    const envRaw = await file(globalEnvFile).text().catch(() => "");
+    const lines = envRaw.trimEnd().split("\n").filter(l => !l.startsWith(`${ENV_KEY}=`));
+    const content = [...lines, newLine, ""].join("\n");
+    await Bun.write(globalEnvFile, content);
+  }
   process.env[ENV_KEY] = url;
   return url;
 }
@@ -898,6 +900,7 @@ export function resolvePlaywrightCli(): string {
 }
 
 export async function daemonInstall(serveUrl: string): Promise<void> {
+  const mgr = daemonManager();
   // Persist the URL to ~/.env.local before starting the daemon. The daemon's
   // loadEnv() walks CWD→root reading .env.local files and unconditionally
   // overwrites process.env.RECHROME_URL from whichever file it finds first.
@@ -933,8 +936,6 @@ export async function daemonInstall(serveUrl: string): Promise<void> {
   if (process.env.RECH_HOST) daemonEnv.RECH_HOST = process.env.RECH_HOST;
   if (isReadable(process.env.RECH_TLS_CERT)) daemonEnv.RECH_TLS_CERT = process.env.RECH_TLS_CERT!;
   if (isReadable(process.env.RECH_TLS_KEY)) daemonEnv.RECH_TLS_KEY = process.env.RECH_TLS_KEY!;
-
-  const mgr = daemonManager();
 
   // Drop any prior registration (current + legacy names) before re-adding.
   for (const name of [PM_PROCESS_NAME, ...LEGACY_PROCESS_NAMES]) await runPm(mgr, ["delete", name]);
@@ -1319,7 +1320,7 @@ async function provisionProfile(name: string, opts: { headed?: boolean } = {}): 
   console.log(`Or save it to a project .env.local to make it the default.`);
 }
 
-async function setup(opts: { profile?: string; token?: string } = {}): Promise<void> {
+async function setup(opts: { profile?: string; token?: string; yes?: boolean } = {}): Promise<void> {
   if (opts.profile !== undefined) {
     try {
       validateChromeProfileSelector(opts.profile);
@@ -1366,7 +1367,8 @@ async function setup(opts: { profile?: string; token?: string } = {}): Promise<v
       if (!["127.0.0.1", "localhost"].includes(u.hostname)) delete process.env[ENV_KEY];
     } catch {}
   }
-  const url = await getOrCreateUrl();
+  // Defer persistence until daemon prerequisites have passed.
+  const url = await getOrCreateUrl(false);
   const { host, port, protocol } = parseUrl(url);
 
   const { key: serveKey } = parseUrl(url);
@@ -1404,6 +1406,40 @@ async function setup(opts: { profile?: string; token?: string } = {}): Promise<v
     console.log(`      Daemon already running at ${protocol}://${host}:${port} (bind: ${currentBind}) — skipping daemon setup`);
   }
   const bindChanged = desiredBind !== currentBind;
+  if (!daemonHealthy || bindChanged) {
+    try {
+      try {
+        daemonManager();
+      } catch (error) {
+        // Respect an explicit pm2 choice; installing oxmgr would not satisfy it.
+        if (process.env.RECH_DAEMON_MANAGER?.toLowerCase() === "pm2") throw error;
+        const command = oxmgrInstallCommand(process.env);
+        const answer = opts.yes ? "yes" : (await ask(`      oxmgr is missing. Install globally with \`${command.join(" ")}\`? [y/N]: `)).trim();
+        if (!/^(y|yes)$/i.test(answer)) {
+          throw new Error(`Setup cancelled. To install oxmgr, run \`${command.join(" ")}\`, then rerun setup.`);
+        }
+        console.log(`      Installing oxmgr: ${command.join(" ")}`);
+        const installer = Bun.which(command[0]) ?? (command[0] === "bun" ? process.execPath : null);
+        if (!installer) throw new Error(`${command[0]} is not on PATH. Install it or run \`${command.join(" ")}\` in your terminal, then rerun setup.`);
+        const proc = Bun.spawn([installer, ...command.slice(1)], {
+          stdin: "inherit", stdout: "inherit", stderr: "inherit", windowsHide: true,
+        });
+        const code = await proc.exited;
+        if (code !== 0) throw new Error(`\`${command.join(" ")}\` failed (exit code ${code}). Resolve the installation error, then rerun setup.`);
+        if (!Bun.which("oxmgr")) {
+          throw new Error("oxmgr was installed but is not on PATH. Add the package manager's global bin directory to PATH, then rerun setup.");
+        }
+        _daemonMgr = undefined;
+        _oxmgrVersion = undefined;
+        daemonManager();
+      }
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      rl?.close();
+      envWatcher?.close();
+      process.exit(1);
+    }
+  }
   const persistedChanged = desiredBind !== persistedBind;
   if (persistedChanged) {
     const lines = globalEnvRaw.trimEnd().split("\n").filter(l => !/^\s*RECH_HOST\s*=/.test(l));
@@ -1763,8 +1799,10 @@ Usage:
                                must already be registered (see \`rech setup\`). Place
                                --profile before the playwright subcommand. Requires
                                ${ENV_KEY}.
-  rech setup [--profile <email|name|folder>] [--token <tok>]
+  rech setup [--profile <email|name|folder>] [--token <tok>] [--yes]
                                First-time setup: daemon + Chrome extension + config
+                               Offers to install missing oxmgr globally (y/N).
+                               --yes approves installation without prompting.
                                --profile selects the Chrome profile non-interactively.
                                Menu numbers are not accepted. Resolution order is exact
                                email (e.g. you@gmail.com), exact Chrome profile name,
@@ -1828,7 +1866,7 @@ if (import.meta.main) {
       ? args[tokenIdx + 1]
       : args.find(a => a.startsWith("--token="))?.slice("--token=".length))
       ?? process.env.RECH_TOKEN;
-    await setup({ profile, token }); // setup closes envWatcher itself before printing Done
+    await setup({ profile, token, yes: args.includes("--yes") }); // setup closes envWatcher itself before printing Done
     // Auto-start the tray (best-effort, silent on headless / missing binary).
     await startTray({ quiet: true }).catch(() => {});
   } else if (cmd === "tray") {
