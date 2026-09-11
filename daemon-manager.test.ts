@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { compareVersion, oxmgrHasWinfix, pickDaemonManager } from "./daemon-manager.ts";
+import { compareVersion, oxmgrHasWinfix, oxmgrInstallCommand, pickDaemonManager } from "./daemon-manager.ts";
 
 describe("oxmgrHasWinfix", () => {
   test("accepts the winfix build tag", () => {
@@ -48,10 +48,23 @@ describe("pickDaemonManager", () => {
     expect(pickDaemonManager({ oxmgrBin: OX, pm2Bin: PM, oxmgrVersion: "0.4.0", isWindows: true, override: "OXMGR" }).id).toBe("oxmgr");
   });
 
-  test("returns the resolved bin, or the bare name as a fallback", () => {
+  test("returns the resolved bin", () => {
     expect(pickDaemonManager({ oxmgrBin: OX, pm2Bin: PM, oxmgrVersion: "0.4.0+winfix", isWindows: true }).bin).toBe(OX);
-    expect(pickDaemonManager({ oxmgrBin: null, pm2Bin: null, oxmgrVersion: null, isWindows: false }).bin).toBe("oxmgr");
+
   });
+  for (const isWindows of [false, true]) {
+    test(`missing managers give installation instructions (Windows: ${isWindows})`, () => {
+      expect(() => pickDaemonManager({ oxmgrBin: null, pm2Bin: null, oxmgrVersion: null, isWindows }))
+        .toThrow("bun add -g pm2");
+    });
+  }
+  test("an unavailable explicit manager does not silently fall back", () => {
+    expect(() => pickDaemonManager({ oxmgrBin: null, pm2Bin: PM, oxmgrVersion: null, isWindows: false, override: "OXMGR" }))
+      .toThrow("RECH_DAEMON_MANAGER=oxmgr");
+    expect(() => pickDaemonManager({ oxmgrBin: OX, pm2Bin: null, oxmgrVersion: null, isWindows: false, override: "pm2" }))
+      .toThrow("RECH_DAEMON_MANAGER=pm2");
+  });
+
 });
 
 describe("compareVersion", () => {
@@ -60,5 +73,17 @@ describe("compareVersion", () => {
     expect(compareVersion("0.4.1", "0.4.0")).toBeGreaterThan(0);
     expect(compareVersion("0.3.9", "0.4.0")).toBeLessThan(0);
     expect(compareVersion("1.0.0", "0.9.9")).toBeGreaterThan(0);
+  });
+});
+
+describe("oxmgrInstallCommand", () => {
+  test("uses npm for npx even though rechrome runs under Bun", () => {
+    expect(oxmgrInstallCommand({ npm_config_user_agent: "npm/11.0.0 node/v22.0.0" })).toEqual(["npm", "i", "-g", "oxmgr"]);
+    expect(oxmgrInstallCommand({ npm_execpath: "/usr/lib/node_modules/npm/bin/npm-cli.js" })[0]).toBe("npm");
+    expect(oxmgrInstallCommand({ npm_execpath: "C:\\npm\\bin\\npx-cli.js" })[0]).toBe("npm");
+  });
+  test("uses bun for bunx or direct invocation", () => {
+    expect(oxmgrInstallCommand({ npm_config_user_agent: "bun/1.4.2", npm_execpath: "/bin/npm" })).toEqual(["bun", "i", "-g", "oxmgr"]);
+    expect(oxmgrInstallCommand({})).toEqual(["bun", "i", "-g", "oxmgr"]);
   });
 });
