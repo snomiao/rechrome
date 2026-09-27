@@ -1,9 +1,12 @@
 node_modules/
 .rech/
 *.local
+.env.tailscale
 .playwright-cli-multi-tab/
 bun.lock
-rech.js
+rechrome.js
+daemon-manager.js
+extension-token.js
 serve.js
 .playwright-cli/
 

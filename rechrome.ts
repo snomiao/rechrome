@@ -1,11 +1,16 @@
 #!/usr/bin/env bun
+import { readListeners, writeListeners, listenerAddress, isLoopback, normalizePrefix, serviceUrl, type Listener } from "./listeners.ts";
 
 import { file } from "bun";
+import { readExtensionTokenFromProfile } from "./extension-token.ts";
 import { randomBytes } from "crypto";
 import { mkdirSync, appendFileSync, existsSync, realpathSync, accessSync, cpSync, unlinkSync, readFileSync, readdirSync, constants as fsConstants } from "fs";
-import { hostname, homedir } from "os";
+import { hostname, homedir, networkInterfaces } from "os";
+import { isIPv4 } from "net";
 import { join, basename, dirname } from "path";
+import { pathToFileURL } from "url";
 import { spawn as cpSpawn } from "child_process";
+import { readFile, writeFile, rename, chmod, mkdir } from "node:fs/promises";
 import { pickDaemonManager, type DaemonManager } from "./daemon-manager.ts";
 
 export const ENV_KEY = "RECHROME_URL";
@@ -17,29 +22,74 @@ export const LOG_DIR = join(RECH_DIR, "logs");
 export const HOME = homedir();
 
 const RECH_HOME_DIR = join(HOME, ".rechrome");
-const TOKENS_FILE = join(RECH_HOME_DIR, "profiles.json");
+const TOKENS_FILE = join(RECH_HOME_DIR, "profiles.yaml");
 
 type TokenEntry = { extensionId: string; token: string; profileDir: string; userDataDir?: string; loadExtension?: string };
 
-async function readTokenRegistry(): Promise<Record<string, TokenEntry>> {
-  const raw = await file(TOKENS_FILE).text().catch(() => "{}");
-  try { return JSON.parse(raw); } catch { return {}; }
+function validateTokenRegistry(value: unknown): Record<string, TokenEntry> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid profile registry: expected a mapping");
+  for (const entry of Object.values(value)) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry) ||
+        !["extensionId", "token", "profileDir"].every(k => typeof entry[k] === "string" && entry[k].length > 0) ||
+        !["userDataDir", "loadExtension"].every(k => entry[k] === undefined || typeof entry[k] === "string"))
+      throw new Error("Invalid profile registry entry");
+  }
+  return value as Record<string, TokenEntry>;
+}
+
+export async function writeTokenRegistry(registry: Record<string, TokenEntry>, directory = RECH_HOME_DIR): Promise<void> {
+  validateTokenRegistry(registry);
+  await mkdir(directory, { recursive: true });
+  const path = join(directory, "profiles.yaml");
+  const temporary = `${path}.${randomBytes(6).toString("hex")}.tmp`;
+  try {
+    await writeFile(temporary, Bun.YAML.stringify(registry, null, 2) + "\n", { mode: 0o600, flag: "wx" });
+    await rename(temporary, path);
+  } finally {
+    try { unlinkSync(temporary); } catch {}
+  }
+}
+
+export async function readTokenRegistry(directory = RECH_HOME_DIR): Promise<Record<string, TokenEntry>> {
+  const path = join(directory, "profiles.yaml");
+  let raw: string;
+  try { raw = await readFile(path, "utf8"); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    const legacyPath = join(directory, "profiles.json");
+    let legacy: string;
+    try { legacy = await readFile(legacyPath, "utf8"); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+      throw error;
+    }
+    const registry = validateTokenRegistry(JSON.parse(legacy));
+    await writeTokenRegistry(registry, directory);
+    // Retain the original as a private migration backup; YAML is authoritative.
+    await chmod(legacyPath, 0o600);
+    return registry;
+  }
+  return validateTokenRegistry(Bun.YAML.parse(raw));
 }
 
 async function saveTokenEntry(profileEmail: string, entry: TokenEntry): Promise<void> {
   mkdirSync(RECH_HOME_DIR, { recursive: true });
   const registry = await readTokenRegistry();
   registry[profileEmail] = entry;
-  await Bun.write(TOKENS_FILE, JSON.stringify(registry, null, 2) + "\n");
+  await writeTokenRegistry(registry);
 }
 
 const envFile = join(import.meta.dir, ".env.local");
 const globalEnvFile = join(HOME || "~", ".env.local");
 
-// Walk CWD→root loading env files nearest-first; per-key: closest file wins, farther files skip.
+// Capture inherited values once so explicit environment overrides survive reloads,
+// while values loaded from files can still change when those files are edited.
+const inheritedEnvKeys = new Set(Object.keys(process.env));
+
+// Walk CWD→root loading env files nearest-first; inherited environment wins over files.
 // At each level .rechrome/.env.local is checked before .env.local (rechrome-specific overrides general).
 export async function loadNearestEnv(extraFallbacks: string[] = []) {
-  const seen = new Set<string>();
+  const seen = new Set<string>(inheritedEnvKeys);
   const applyFile = async (path: string) => {
     const raw = await file(path).text().catch(() => "");
     for (const line of raw.split("\n")) {
@@ -69,13 +119,7 @@ export async function loadNearestEnv(extraFallbacks: string[] = []) {
 async function loadEnv() {
   await loadNearestEnv();
 }
-// Shell-set passthrough vars survive .env.local loading
-const _shellPassthrough: Record<string, string> = {};
-for (const k of ["PLAYWRIGHT_MCP_EXTENSION_ID","PLAYWRIGHT_MCP_EXTENSION_TOKEN","PLAYWRIGHT_MCP_PROFILE_DIRECTORY","PLAYWRIGHT_MCP_USER_DATA_DIR","PLAYWRIGHT_MCP_LOAD_EXTENSION"] as const) {
-  if (process.env[k]) _shellPassthrough[k] = process.env[k]!;
-}
 await loadEnv();
-Object.assign(process.env, _shellPassthrough);
 
 import { watch } from "node:fs";
 const envWatcher = existsSync(envFile)
@@ -147,6 +191,46 @@ function openInChromeProfile(profileDir: string, target: string): boolean {
   }
 }
 
+export async function openSetupGuide(profileDir: string, setupHtmlPath: string): Promise<boolean> {
+  // A unique URL identifies the window opened in the requested profile, even if
+  // other profiles have an older copy of the setup guide open.
+  const guideUrl = /^https?:\/\//.test(setupHtmlPath) ? new URL(setupHtmlPath) : pathToFileURL(setupHtmlPath);
+  guideUrl.hash = `setup-${randomBytes(6).toString("hex")}`;
+  if (!openInChromeProfile(profileDir, guideUrl.toString())) return false;
+  if (process.platform !== "darwin") {
+    openInChromeProfile(profileDir, "chrome://extensions/");
+    return openInChromeProfile(profileDir, guideUrl.toString());
+  }
+  // Chrome may discard chrome:// URLs passed on its command line. AppleScript
+  // can create an internal-page tab in the specific window containing our guide.
+  const script = `on run argv
+    repeat 30 times
+      tell application "Google Chrome"
+        repeat with w in windows
+          repeat with tabNumber from 1 to count of tabs of w
+            set t to tab tabNumber of w
+            if URL of t is item 1 of argv then
+              make new tab at end of tabs of w with properties {URL:"chrome://extensions/"}
+              make new tab at end of tabs of w with properties {URL:item 1 of argv}
+              close t
+              set active tab index of w to count of tabs of w
+              set index of w to 1
+              return "opened"
+            end if
+          end repeat
+        end repeat
+      end tell
+      delay 0.1
+    end repeat
+    return "guide not found"
+  end run`;
+  try {
+    const proc = Bun.spawn(["osascript", "-e", script, guideUrl.toString()], { stdout: "pipe", stderr: "ignore" });
+    const output = await new Response(proc.stdout).text();
+    return await proc.exited === 0 && output.trim() === "opened";
+  } catch { return false; }
+}
+
 export function log(msg: string) {
   mkdirSync(LOG_DIR, { recursive: true });
   const ts = new Date().toISOString();
@@ -158,25 +242,108 @@ export function log(msg: string) {
 
 export function parseUrl(raw: string) {
   const u = new URL(raw);
+  const fragment = new URLSearchParams(u.hash.slice(1).replace(/^\?/, ""));
+  const param = (name: string) => fragment.get(name) ?? u.searchParams.get(name) ?? undefined;
   const scheme = u.protocol.replace(":", "");
   const protocol = scheme === "https" ? "https" : "http";
   const defaultPort = scheme === "https" ? 443 : scheme === "http" ? 80 : DEFAULT_PORT;
   return {
-    key: u.username,
+    key: fragment.get("key") ?? u.username,
+    prefix: normalizePrefix(u.pathname),
     host: u.hostname,
     port: parseInt(u.port) || defaultPort,
     protocol,
-    extensionId: u.searchParams.get("extension_id") ?? undefined,
-    extensionToken: u.searchParams.get("token") ?? undefined,
-    profileDirectory: u.searchParams.get("profile") ?? undefined,
-    userDataDir: u.searchParams.get("user_data_dir") ?? undefined,
-    loadExtension: u.searchParams.get("load_extension") ?? undefined,
+    extensionId: param("extension_id"),
+    extensionToken: param("token"),
+    profileDirectory: param("profile"),
+    userDataDir: param("user_data_dir"),
+    loadExtension: param("load_extension"),
   };
+}
+
+// URLs for registered profiles need only the endpoint, profile selector and daemon
+// key. Bridge credentials and local browser paths stay in the server registry.
+export function registeredProfileUrl(raw: string): string {
+  const parsed = parseUrl(raw);
+  const url = new URL(serviceUrl(raw));
+  if (parsed.profileDirectory) url.searchParams.set("profile", parsed.profileDirectory);
+  url.hash = new URLSearchParams({ key: parsed.key }).toString();
+  return url.toString();
+}
+
+// Setup edits parameters while probing before registration. Fold fragments into
+// the legacy fields first so an old fragment cannot override the new selection.
+function editableConnectionUrl(raw: string): URL {
+  const url = new URL(raw);
+  const parsed = parseUrl(raw);
+  url.username = parsed.key;
+  for (const [name, value] of Object.entries({ extension_id: parsed.extensionId, token: parsed.extensionToken, profile: parsed.profileDirectory, user_data_dir: parsed.userDataDir, load_extension: parsed.loadExtension })) {
+    if (value !== undefined) url.searchParams.set(name, value);
+  }
+  url.hash = "";
+  return url;
+}
+
+export type ListenChoice = { kind: "local" | "lan" | "tailscale" | "other"; address: string; label: string };
+
+export function buildListenChoices(interfaces: ReturnType<typeof networkInterfaces>, tailscaleIPs: string[] = []): ListenChoice[] {
+  const choices: ListenChoice[] = [{ kind: "local", address: "127.0.0.1", label: "Local — this computer only" }];
+  const seen = new Set(["127.0.0.1"]);
+  for (const [name, entries] of Object.entries(interfaces).sort(([a], [b]) => a.localeCompare(b))) {
+    for (const entry of entries ?? []) {
+      const address = entry.address;
+      if (entry.internal || !isIPv4(address) || address.startsWith("169.254.") || seen.has(address)) continue;
+      seen.add(address);
+      const tunnel = /^(utun|tun|tap|wg|zt|tailscale)|wireguard|zerotier|vpn/i.test(name);
+      if (tailscaleIPs.includes(address) || /^tailscale/i.test(name)) {
+        choices.push({ kind: "tailscale", address, label: `Tailscale — ${name}` });
+      } else if (tunnel) {
+        const provider = /^wg|wireguard/i.test(name) ? "WireGuard" : /^zt|zerotier/i.test(name) ? "ZeroTier" : "VPN / tunnel";
+        choices.push({ kind: "other", address, label: `${provider} — ${name}` });
+      } else {
+        const local = /^10\.|^192\.168\.|^172\.(1[6-9]|2\d|3[01])\./.test(address);
+        const virtual = /^(docker|veth|virbr|br-|bridge|vmnet|vbox)/i.test(name);
+        choices.push({ kind: local && !virtual ? "lan" : "other", address, label: `${virtual ? "Virtual network" : local ? "LAN" : "Network interface"} — ${name}` });
+      }
+    }
+  }
+  const rank = { local: 0, lan: 1, tailscale: 2, other: 3 };
+  return choices.sort((a, b) => rank[a.kind] - rank[b.kind]);
+}
+
+export async function detectListenChoices(): Promise<ListenChoice[]> {
+  const binary = Bun.which("tailscale") || (existsSync("/Applications/Tailscale.app/Contents/MacOS/Tailscale") ? "/Applications/Tailscale.app/Contents/MacOS/Tailscale" : null);
+  let ips: string[] = [];
+  if (binary) {
+    try {
+      const proc = Bun.spawn([binary, "ip", "-4"], { stdout: "pipe", stderr: "ignore" });
+      const timeout = setTimeout(() => proc.kill(), 2000);
+      try {
+        const output = await new Response(proc.stdout).text();
+        if (await proc.exited === 0) ips = output.trim().split(/\s+/).filter(isIPv4);
+      } finally { clearTimeout(timeout); }
+    } catch { /* No connected Tailscale CLI; still show detected interfaces. */ }
+  }
+  return buildListenChoices(networkInterfaces(), ips);
+}
+
+export function chooseListenAddress(choices: ListenChoice[], selector: string): string {
+  const matches = choices.filter(choice => choice.address === selector || choice.kind === selector.toLowerCase());
+  if (matches.length === 1) return matches[0].address;
+  if (matches.length > 1) throw new Error(`Multiple ${selector} addresses detected. Use --listen with one of: ${matches.map(c => c.address).join(", ")}`);
+  throw new Error(`Listen network "${selector}" was not detected. Choose local or a detected interface address.`);
+}
+
+export function listenUrl(rawUrl: string, address: string): string {
+  const url = new URL(rawUrl);
+  const connectAddress = address === "0.0.0.0" ? "127.0.0.1" : address === "::" ? "[::1]" : address;
+  url.hostname = connectAddress.includes(":") && !connectAddress.startsWith("[") ? `[${connectAddress}]` : connectAddress;
+  return url.toString();
 }
 
 export async function getOrCreateUrl(): Promise<string> {
   // Treat a URL without a bearer key as missing — it cannot authenticate
-  try { if (process.env[ENV_KEY] && new URL(process.env[ENV_KEY]!).username) return process.env[ENV_KEY]!; } catch {}
+  try { if (process.env[ENV_KEY] && parseUrl(process.env[ENV_KEY]!).key) return process.env[ENV_KEY]!; } catch {}
   const key = randomBytes(12).toString("base64url"); // 16 chars
   const url = `http://${key}@127.0.0.1:${DEFAULT_PORT}`;
   const newLine = `${ENV_KEY}=${url}`;
@@ -339,7 +506,7 @@ async function getClientEnv(urlExtras?: { extensionId?: string; extensionToken?:
       // same <userDataDir>/<profileDir>/Local Storage layout — so they heal here too.
       if (entry.userDataDir) {
         const profileDir = entry.profileDir; // the folder name ("Profile 2"), not the email key
-        const live = profileDir ? readExtensionTokenFromProfile(entry.userDataDir, profileDir) : null;
+        const live = profileDir ? readExtensionTokenFromProfile(entry.userDataDir, profileDir, entry.extensionId) : null;
         if (live && live !== entry.token) {
           console.error(`[rech] extension token for "${profileKey}" changed — refreshing registry`);
           entry.token = live;
@@ -399,7 +566,7 @@ export function resolveChromeProfileSelector(
     if (matches.length > 1) {
       throw new Error(
         `--profile "${value}" matches multiple profiles by ${kind.label}. ` +
-        `Use a unique email or profile folder name from \`rech profiles\`.`,
+        `Use a unique email or profile folder name from \`rech profile\`.`,
       );
     }
     if (matches.length === 1) return matches[0];
@@ -412,7 +579,7 @@ export function validateChromeProfileSelector(selector: string): void {
   if (!/^\d+$/.test(value)) return;
   throw new Error(
     `--profile no longer accepts menu numbers (received "${value}"). ` +
-    `Use the profile email, Chrome profile name, or profile folder name from \`rech profiles\`.`,
+    `Use the profile email, Chrome profile name, or profile folder name from \`rech profile\`.`,
   );
 }
 
@@ -445,12 +612,12 @@ export async function resolveGlobalProfile(
   if (!match) {
     throw new Error(
       `--profile "${value}" does not match any Chrome profile. ` +
-      `See available profiles with \`rech profiles\`.`,
+      `See available profiles with \`rech profile\`.`,
     );
   }
 
   const [dir, info] = match;
-  const email = info.user_name;
+  const email = info.user_name || (registry[dir]?.profileDir === dir && !registry[dir].loadExtension ? dir : undefined);
   if (!email) {
     throw new Error(
       `Chrome profile "${value}" (folder: ${dir}) has no email associated. ` +
@@ -573,34 +740,107 @@ async function resolveProfileEmail(dir: string): Promise<string> {
   return dir;
 }
 
+export function buildProfileRows(cache: Record<string, ChromeProfileInfo> | null, registry: Record<string, TokenEntry>, chromeRoot: string | null) {
+  const entries = Object.entries(registry);
+  const used = new Set<string>();
+  const rows = Object.entries(cache ?? {}).map(([dir, info]) => {
+    const registrations = entries.filter(([, e]) => e.profileDir === dir && !e.loadExtension && (!e.userDataDir || e.userDataDir === chromeRoot));
+    registrations.forEach(([key]) => used.add(key));
+    return { selector: registrations[0]?.[0] || info.user_name || dir, name: info.name || "", email: info.user_name || "", dir,
+      kind: "Chrome", registered: registrations.length > 0 };
+  });
+  for (const [key, entry] of entries) {
+    if (used.has(key)) continue;
+    rows.push({ selector: key, name: key, email: "", dir: entry.profileDir,
+      kind: entry.loadExtension ? "Managed test" : "Registered", registered: true });
+  }
+  return rows;
+}
+
 async function listProfiles(): Promise<void> {
-  const cache = await readChromeProfileCache();
-  if (!cache) { console.error("Chrome Local State not found"); process.exit(1); }
-
-  const current = process.env.PLAYWRIGHT_MCP_PROFILE_DIRECTORY;
-  // Resolve email/name → dir for current marker
-  let currentDir = current;
-  if (current && !/^(Default|Profile \d+)$/i.test(current)) {
-    for (const [dir, info] of Object.entries(cache)) {
-      if (info.user_name === current || info.name === current) { currentDir = dir; break; }
-    }
-  }
-
-  // Columns mirror selector precedence. Only user_name (email) + name (profile name) are read
-  // from Local State — the gaia real name is deliberately never surfaced.
-  const rows = [
-    ["EMAIL", "PROFILE NAME", "FOLDER", ""],
-    ...Object.entries(cache).map(([dir, info]) => [
-      info.user_name || "",
-      info.name || "",
-      dir,
-      dir === currentDir ? "← current" : "",
-    ]),
-  ];
+  const [cache, registry, root] = await Promise.all([readChromeProfileCache(), readTokenRegistry(), findChromeUserDataDir()]);
+  const profiles = buildProfileRows(cache, registry, root);
+  const listeners = await readListeners();
+  const url = process.env[ENV_KEY];
+  const current = url ? resolveEffectiveProfile(parseUrl(url).profileDirectory) : process.env.PLAYWRIGHT_MCP_PROFILE_DIRECTORY;
+  const identity = await getClientIdentity();
+  const states = await Promise.all(profiles.map(async p => {
+    if (!p.registered) return "Not set up";
+    if (!url) return "Registered / unknown";
+    try {
+      const { key, protocol, host, port } = parseUrl(url);
+      // tab-list only inspects this worktree's existing session; never opens Chrome.
+      const response = await fetch(serviceUrl(url, "run"), {
+        method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+        body: JSON.stringify({ args: ["tab-list"], identity: { ...identity, profile: p.selector }, env: {} }),
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!response.ok) return "Registered / unknown";
+      const result = await response.json() as { status: number; stdout: string; stderr: string };
+      if (result.status === 0 && !/### Error|not open|not connected/i.test(result.stdout + result.stderr)) return "Connected";
+      if (/not open|not connected/i.test(result.stdout + result.stderr)) return "Registered / idle";
+      return "Registered / unknown";
+    } catch { return "Registered / unknown"; }
+  }));
+  const rows = [["TYPE", "EMAIL / SELECTOR", "PROFILE NAME", "FOLDER", "CONNECTION", "ACCESS", ""], ...profiles.map((p, i) => [
+    p.kind, p.selector, p.name, p.dir, states[i],
+    listeners ? listeners.listeners.filter(l => l.profiles === "*" || l.profiles.includes(p.selector)).map(l => (listenerAddress(l) + normalizePrefix(l.prefix))).join(", ") || "none" : "legacy daemon",
+    current && [p.selector, p.dir, p.name, p.email].some(v => v.toLowerCase() === current.toLowerCase()) ? "← current" : "",
+  ])];
   const widths = rows.reduce((w, r) => r.map((c, i) => Math.max(w[i] ?? 0, c.length)), [] as number[]);
-  for (const row of rows) {
-    console.log(row.map((c, i) => c.padEnd(widths[i])).join("  ").trimEnd());
+  for (const row of rows) console.log(row.map((c, i) => c.padEnd(widths[i])).join("  ").trimEnd());
+  console.log("\nConnection checks this worktree's default session; other sessions may also be open.");
+}
+
+export function profileConnectionUri(profile: string, configuredUrl: string | undefined, listeners: Listener[], listenerName?: string): string {
+  let url = configuredUrl;
+  if (listenerName || !url) {
+    const candidates = listeners.filter(l => (l.profiles === "*" || l.profiles.includes(profile)) && (!listenerName || l.name === listenerName));
+    if (candidates.length !== 1) throw new Error("Choose a listener with --listener <name>, or set RECHROME_URL to the desired endpoint.");
+    const listener = candidates[0];
+    url = `http://${listener.key}@${listenerAddress(listener)}${normalizePrefix(listener.prefix)}`;
   }
+  const parsed = parseUrl(url);
+  if (!parsed.key) throw new Error("The connection URL has no daemon key. Run rech setup or select --listener <name>.");
+  const listener = listeners.find(l => l.key === parsed.key);
+  if (listener && listener.profiles !== "*" && !listener.profiles.includes(profile)) throw new Error(`This listener does not allow profile "${profile}". Choose a different --listener.`);
+  const result = new URL(serviceUrl(url));
+  result.searchParams.set("profile", profile);
+  result.hash = new URLSearchParams({ key: parsed.key }).toString();
+  return result.toString();
+}
+
+async function printProfileUri(args: string[]): Promise<void> {
+  let selector: string | undefined;
+  let listener: string | undefined;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === "--print-uri") continue;
+    if (arg === "--listener") {
+      listener = args[++i];
+      if (!listener || listener.startsWith("-")) throw new Error("--listener requires a name");
+    } else if (arg.startsWith("--listener=")) {
+      listener = arg.slice("--listener=".length);
+      if (!listener) throw new Error("--listener requires a name");
+    } else if (!arg.startsWith("-") && !selector) selector = arg;
+    else throw new Error("Usage: rech profile [name] --print-uri [--listener <name>]");
+  }
+  const url = process.env[ENV_KEY];
+  selector ??= url ? parseUrl(url).profileDirectory : undefined;
+  if (!selector) throw new Error("Specify a profile: rech profile <name> --print-uri");
+  const registry = await readTokenRegistry();
+  const cache = await readChromeProfileCache();
+  // A configured remote profile may not exist in this machine's local registry.
+  const profile = url && parseUrl(url).profileDirectory === selector && !listener
+    ? selector : (await resolveGlobalProfile(registry, cache, selector)).email;
+  console.log(profileConnectionUri(profile, url, (await readListeners())?.listeners ?? [], listener));
+}
+
+export function sandboxConnectionWarning(env: Record<string, string | undefined> = process.env): string | null {
+  if (env.CODEX_SANDBOX_NETWORK_DISABLED !== "1" && !env.CODEX_SANDBOX) return null;
+  return "[rech] warning: running inside a sandbox; network restrictions may block access to the rechrome daemon, even on localhost. " +
+    "Retry this command outside the sandbox (with approval in your coding agent). " +
+    "If it still fails, check that the daemon is running and the host/port are correct.";
 }
 
 async function callServe(
@@ -608,6 +848,7 @@ async function callServe(
   args: string[],
   overrideEnv?: Record<string, string>,
   precomputedIdentity?: { key: string; label: string; profile?: string },
+  throwOnFailure = false,
 ): Promise<{ status: number; stdout: string; stderr: string; files?: string[]; existingSession?: boolean }> {
   const { key, host, port, protocol, extensionId, extensionToken, profileDirectory, userDataDir, loadExtension } = parseUrl(url);
   // Reuse the caller's identity when provided — computing it shells out to `git` several times,
@@ -619,14 +860,17 @@ async function callServe(
   // reuse the default profile's session (and its browser) instead of opening its own.
   const effectiveProfile = overrideEnv?.["PLAYWRIGHT_MCP_PROFILE_DIRECTORY"] || resolveEffectiveProfile(profileDirectory);
   if (effectiveProfile) identity.profile = effectiveProfile;
-  const env = { ...(await getClientEnv({ extensionId, extensionToken, profileDirectory, userDataDir, loadExtension })), ...overrideEnv };
-  const res = await fetch(`${protocol}://${host}:${port}/run`, {
+  const env = { ...(await getClientEnv({ extensionId, extensionToken, profileDirectory: effectiveProfile, userDataDir, loadExtension })), ...overrideEnv };
+  const res = await fetch(serviceUrl(url, "run"), {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
     body: JSON.stringify({ args, identity, env }),
     signal: AbortSignal.timeout(70_000),
   }).catch(async (e) => {
+    if (throwOnFailure) throw new Error("Cannot reach the rechrome daemon. Check that it is running.");
     console.error(`[rech] ${e.message}`);
+    const sandboxWarning = sandboxConnectionWarning();
+    if (sandboxWarning) console.error(sandboxWarning);
     const dnsResult = await import("dns/promises").then(m => m.lookup(host)).catch(() => null);
     if (!dnsResult) {
       console.error(`[rech] rech-client\n  -x: DNS failed -> ${host}[unknown] -> rech-server[unknown]`);
@@ -648,6 +892,7 @@ async function callServe(
     process.exit(1);
   });
   if (res.status === 401) {
+    if (throwOnFailure) throw new Error("The daemon rejected its connection key. Run setup again to refresh it.");
     console.error(`[rech] rech-client -> rech-server[ok]\n  -x: bearer key rejected (used: ${key.slice(0, 4)}...) -> playwright[unknown]`);
     process.exit(1);
   }
@@ -704,7 +949,7 @@ async function run(url: string, args: string[], overrideEnv?: Record<string, str
     `[rech] connecting to ${host}:${port} (identity: ${identity.label}${profileSuffix})`,
   );
 
-  const resolvedEnv = await getClientEnv({ extensionId, extensionToken, profileDirectory, userDataDir, loadExtension });
+  const resolvedEnv = await getClientEnv({ extensionId, extensionToken, profileDirectory: effectiveProfile, userDataDir, loadExtension });
   const effectiveEnv = { ...resolvedEnv, ...overrideEnv };
   const { status, stdout, stderr, files, existingSession } = await callServe(url, args, overrideEnv, identity);
 
@@ -740,7 +985,7 @@ async function run(url: string, args: string[], overrideEnv?: Record<string, str
     const gitignorePath = join(dlDir, ".gitignore");
     if (!existsSync(gitignorePath)) await Bun.write(gitignorePath, "*\n");
     for (const name of files) {
-      const fileRes = await fetch(`${protocol}://${host}:${port}/files/${name}`, {
+      const fileRes = await fetch(serviceUrl(url, `files/${name}`), {
         headers: { Authorization: `Bearer ${parseUrl(url).key}` },
       });
       if (!fileRes.ok) continue;
@@ -753,60 +998,214 @@ async function run(url: string, args: string[], overrideEnv?: Record<string, str
   process.exit(status);
 }
 
-export function buildSetupHtml(extDistDir: string, profileDisplay: string): string {
+export type SetupPhase = "extension" | "token" | "bridge" | "error" | "save" | "ready";
+
+export function createSetupGuide(extDistDir: string, profileDisplay: string) {
+  const route = `/setup/${randomBytes(24).toString("hex")}`;
+  let state: { phase: SetupPhase; message: string; statusUrl?: string } = { phase: "extension", message: "Waiting for the extension in this profile…" };
+  let manualToken: string | undefined;
+  let retry = false;
+  let readyDelivered = false;
+  let checks = { extension: false, token: false, bridge: false, registration: false };
+  const server = Bun.serve({
+    hostname: "127.0.0.1", port: 0, maxRequestBodySize: 4096,
+    async fetch(request) {
+      const url = new URL(request.url);
+      const headers = { "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" };
+      if (url.host !== `127.0.0.1:${server.port}`) return new Response("Invalid host", { status: 403 });
+      if (url.pathname === route && request.method === "GET")
+        return new Response(buildSetupHtml(extDistDir, profileDisplay, `${route}/status`), { headers: { ...headers, "Content-Type": "text/html; charset=utf-8" } });
+      if (url.pathname !== `${route}/status`) return new Response("Not found", { status: 404 });
+      if (request.method === "POST") {
+        if (request.headers.get("Origin") !== url.origin) return new Response("Invalid origin", { status: 403 });
+        if (Number(request.headers.get("Content-Length")) > 4096) return new Response("Too large", { status: 413 });
+        try {
+          const body = await request.json() as { token?: string; retry?: boolean };
+          if (body.token !== undefined) {
+            const value = body.token.replace(/^PLAYWRIGHT_MCP_EXTENSION_TOKEN=/, "").trim();
+            if (!/^[A-Za-z0-9_-]{20,256}$/.test(value)) return new Response("Invalid token", { status: 400 });
+            manualToken = value;
+          }
+          if (body.retry || body.token) retry = true;
+        } catch { return new Response("Invalid request", { status: 400 }); }
+      } else if (request.method !== "GET") return new Response("Method not allowed", { status: 405 });
+      if (state.phase === "ready") readyDelivered = true;
+      return Response.json({ ...state, checks }, { headers });
+    },
+  });
+  return {
+    url: `http://127.0.0.1:${server.port}${route}`,
+    update(phase: SetupPhase, message: string) {
+      state = { ...state, phase, message };
+      if (phase !== "error") {
+        const rank = ["extension", "token", "bridge", "save", "ready"].indexOf(phase);
+        checks = { extension: rank >= 1, token: rank >= 2, bridge: rank >= 3, registration: rank >= 4 };
+      }
+    },
+    setExtensionId(id: string) {
+      if (!/^[a-p]{32}$/.test(id)) throw new Error("Invalid extension ID");
+      state.statusUrl = `chrome-extension://${id}/status.html`;
+    },
+    takeToken() { const value = manualToken; manualToken = undefined; return value; },
+    markRegistered() { checks.registration = true; },
+    takeRetry() { const value = retry; retry = false; return value; },
+    async deliverSuccess() {
+      const deadline = Date.now() + 10_000;
+      while (!readyDelivered && Date.now() < deadline) await Bun.sleep(100);
+      await Bun.sleep(250);
+    },
+    close() { manualToken = undefined; server.stop(); },
+  };
+}
+
+export function buildSetupHtml(extDistDir: string, profileDisplay: string, checkUrl?: string): string {
+  const escapeHtml = (value: string) => value.replace(/[&<>"']/g, char => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  })[char]!);
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>rechrome — Extension Setup</title>
 <style>
-  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 40px auto; padding: 0 20px; color: #222; }
-  h1 { color: #1a73e8; }
-  .step { background: #f8f9fa; border-left: 4px solid #1a73e8; padding: 12px 16px; margin: 16px 0; border-radius: 0 8px 8px 0; }
-  .step h3 { margin: 0 0 8px; }
+  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 40px auto; padding: 0 20px; color: #222; line-height: 1.6; }
+  h1, a { color: #1a73e8; }
+  .step { background: #f8f9fa; border-left: 4px solid #1a73e8; padding: 16px; margin: 16px 0; border-radius: 0 8px 8px 0; }
+  .step h2 { margin: 0 0 8px; font-size: 1.2rem; }
   code { background: #e8eaed; padding: 2px 6px; border-radius: 4px; font-size: 0.95em; word-break: break-all; }
-  .path { display: flex; align-items: center; gap: 8px; }
-  button { background: #1a73e8; color: white; border: none; padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 0.9em; }
-  button:active { background: #1558b0; }
+  .path { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
+  button, .button { display: inline-block; background: #1a73e8; color: white; border: none; padding: 10px 16px; border-radius: 6px; cursor: pointer; font: inherit; text-decoration: none; }
+  button:active, .button:active { background: #1558b0; }
   .note { color: #666; font-size: 0.9em; }
+  details.step > summary { cursor: pointer; font-size: 1.2rem; font-weight: 600; }
+  details.step[data-complete="true"] > summary { color: #28743e; }
+  details.step[data-complete="true"] > summary::after { content: " ✓"; }
 </style>
 </head>
 <body>
 <h1>rechrome — Extension Setup</h1>
-<p>Install the multi-tab extension in Chrome profile: <strong>${profileDisplay}</strong></p>
+<p>Chrome profile: <strong>${escapeHtml(profileDisplay)}</strong></p>
+<p>The previous tab is <strong>Chrome Extensions</strong>. Keep this guide open while you install.</p>
+${checkUrl ? '<div class="step"><h2>Connection status</h2><p id="liveStatus" role="status" aria-live="polite">Connecting to setup…</p><ul id="verifiedChecks"><li>○ Extension detected — pending</li><li>○ Token detected — pending</li><li>○ Browser connection verified — pending</li><li>○ Profile registered — pending</li></ul></div>' : ''}
 
-<div class="step">
-  <h3>Step 1 — Open Chrome Extensions</h3>
-  <p>In the Chrome profile <strong>${profileDisplay}</strong>, navigate to:</p>
-  <code>chrome://extensions/</code>
-  <p class="note">Make sure you are in the correct profile (check the avatar in the top-right corner).</p>
-</div>
+<main id="start">
+  <details class="step" data-check="extension" open>
+    <summary>Step 1 — Install the extension</summary>
+    <p>Copy the extension path:</p>
+    <div class="path">
+      <code id="extPath">${escapeHtml(extDistDir)}</code>
+      <button type="button" id="copyPath">Copy path</button>
+    </div>
+    <p id="copyStatus" class="note" role="status" aria-live="polite"></p>
+    <ol>
+      <li>Switch to the <strong>Extensions</strong> tab immediately to the left, or press <strong>Ctrl+Shift+Tab</strong>.</li>
+      <li>Enable <strong>Developer mode</strong>, then click <strong>Load unpacked</strong>.</li>
+      <li>Paste the path into the folder picker and select the folder. On macOS, press <strong>⌘⇧G</strong>, paste, press <strong>Enter</strong>, then click <strong>Select</strong>. On Windows or Linux, use the location field.</li>
+      <li>Return to this guide. Installation is detected automatically.</li>
+    </ol>
+    <p class="note">If the Extensions tab did not open, type <code>chrome://extensions/</code> into a new tab’s address bar and press Enter.</p>
+  </details>
 
-<div class="step">
-  <h3>Step 2 — Enable Developer Mode</h3>
-  <p>Toggle <strong>Developer mode</strong> on (top-right of the extensions page).</p>
-</div>
+  <details class="step" data-check="bridge" open>
+    <summary>Step 2 — Verify the connection</summary>
+    <p>Switch back here. Setup watches for the extension and token automatically, then tests the connection.</p>
+    ${checkUrl ? `<button type="button" id="revalidate" data-url="${escapeHtml(checkUrl)}">Revalidate installation</button>` : '<p>Run your setup command again in the terminal to revalidate the installation.</p>'}
+    <p id="validationStatus" role="status" aria-live="polite"></p>
+    <p class="note">After installation is detected, setup continues in the terminal to read the token and verify the browser connection.</p>
+    <p><a id="extensionStatusLink" href="chrome-extension://${EXTENSION_ID}/status.html" target="_blank" rel="noopener">Open extension status ↗</a></p>
+    <p class="note">If Chrome blocks the link, copy this URL into the address bar of a new tab:</p>
+    <div class="path"><code id="extensionStatusUrl">chrome-extension://${EXTENSION_ID}/status.html</code><button type="button" id="copyStatusUrl">Copy status URL</button></div>
+    ${checkUrl ? `<details><summary>Token not detected? Paste it manually</summary><p>Open the extension status page above, copy its auth token, and paste it here.</p><input id="manualToken" type="password" autocomplete="off" aria-label="Extension auth token"><button type="button" id="submitToken">Use token</button></details>` : ''}
+  </details>
 
-<div class="step">
-  <h3>Step 3 — Load the extension</h3>
-  <p>Click <strong>Load unpacked</strong> and select this directory:</p>
-  <div class="path">
-    <code id="extPath">${extDistDir}</code>
-    <button onclick="navigator.clipboard.writeText(document.getElementById('extPath').textContent).then(()=>{this.textContent='Copied!';setTimeout(()=>this.textContent='Copy path',1500)})">Copy path</button>
-  </div>
-</div>
-
-<div class="step">
-  <h3>Step 4 — Return to terminal</h3>
-  <p>Press <strong>Enter</strong> in the terminal to continue setup.</p>
-</div>
-
-<div class="step">
-  <h3>Step 5 — Copy auth token</h3>
-  <p>Click the extension icon in the Chrome toolbar (or open the URL below):</p>
-  <code id="statusUrl">chrome-extension://(detected after install)/status.html</code>
-  <p>The page shows <strong>PLAYWRIGHT_MCP_EXTENSION_TOKEN=...</strong> — paste that into the terminal when prompted.</p>
-</div>
+  <details class="step" data-check="registration" open>
+    <summary>Step 3 — Finish setup</summary>
+    <p>Once the browser connection is verified, return to the terminal and choose where to save your connection URL. You can also skip saving the URL and just register the profile.</p>
+    <p>This guide confirms when the profile is registered. You can then close the setup tabs.</p>
+  </details>
+</main>
+<script>
+  const checkButton = document.getElementById('revalidate');
+  let finished = false;
+  async function checkSetup(payload) {
+    const status = document.getElementById('validationStatus');
+    try {
+      const response = await fetch(checkButton.dataset.url, payload ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) } : {});
+      if (response.status === 400) {
+        status.textContent = 'That token looks incomplete. Copy the full token from the extension and try again.';
+        return;
+      }
+      if (!response.ok) throw new Error('Check failed');
+      const result = await response.json();
+      document.getElementById('liveStatus').textContent = result.message;
+      const checks = document.getElementById('verifiedChecks');
+      checks.replaceChildren(...Object.entries({ extension: 'Extension detected', token: 'Token detected', bridge: 'Browser connection verified', registration: 'Profile registered' }).map(([key, label]) => {
+        const item = document.createElement('li');
+        item.textContent = (result.checks?.[key] ? '✓ ' : '○ ') + label + (result.checks?.[key] ? ' — verified' : ' — pending');
+        return item;
+      }));
+      for (const step of document.querySelectorAll('details.step[data-check]')) {
+        const complete = !!result.checks?.[step.dataset.check];
+        // Collapse only on completion, preserving manual expansion on later polls.
+        if (complete && step.dataset.complete !== 'true') step.open = false;
+        if (!complete && step.dataset.complete === 'true') step.open = true;
+        step.dataset.complete = String(complete);
+      }
+      if (result.statusUrl) {
+        document.getElementById('extensionStatusLink').href = result.statusUrl;
+        document.getElementById('extensionStatusUrl').textContent = result.statusUrl;
+      }
+      checkButton.textContent = result.phase === 'error' ? 'Retry connection' : 'Revalidate installation';
+      finished = result.phase === 'ready';
+      checkButton.disabled = finished;
+      status.textContent = finished ? 'Setup complete. You can close these setup tabs.' : '';
+    } catch {
+      status.textContent = 'Cannot reach the setup process. This page works while rech setup is running, including with piped input. If setup was stopped or finished, run it again and use the new guide tab. Retrying…';
+    }
+  }
+  checkButton?.addEventListener('click', () => checkSetup({ retry: true }));
+  document.getElementById('submitToken')?.addEventListener('click', async () => {
+    const input = document.getElementById('manualToken');
+    const token = input.value;
+    input.value = '';
+    await checkSetup({ token });
+  });
+  if (checkButton) {
+    const poll = async () => { await checkSetup(); if (!finished) setTimeout(poll, 1000); };
+    poll();
+  }
+  document.getElementById('copyStatusUrl').addEventListener('click', async function () {
+    const url = document.getElementById('extensionStatusUrl');
+    try {
+      await navigator.clipboard.writeText(url.textContent);
+      this.textContent = 'Copied!';
+    } catch {
+      const range = document.createRange();
+      range.selectNodeContents(url);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      this.textContent = 'Press ⌘C / Ctrl+C';
+    }
+  });
+  document.getElementById('copyPath').addEventListener('click', async function () {
+    const path = document.getElementById('extPath');
+    const status = document.getElementById('copyStatus');
+    try {
+      await navigator.clipboard.writeText(path.textContent);
+      this.textContent = 'Copied!';
+      status.textContent = 'Path copied. Switch to the Extensions tab.';
+    } catch {
+      const range = document.createRange();
+      range.selectNodeContents(path);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      status.textContent = 'Press ⌘C on Mac or Ctrl+C on Windows/Linux to copy the selected path, then switch to the Extensions tab.';
+    }
+  });
+</script>
 </body>
 </html>`;
 }
@@ -914,13 +1313,8 @@ export function resolvePlaywrightCli(): string {
 }
 
 export async function daemonInstall(serveUrl: string): Promise<void> {
-  // Persist the URL to ~/.env.local before starting the daemon. The daemon's
-  // loadEnv() walks CWD→root reading .env.local files and unconditionally
-  // overwrites process.env.RECHROME_URL from whichever file it finds first.
-  // Without this write, oxmgr's --env RECHROME_URL=... gets clobbered by a
-  // stale ~/.env.local entry — the daemon then listens on a different bearer
-  // key than the one daemonInstall was called with, and every client request
-  // is rejected with "bearer key rejected".
+  // Persist the URL for future clients without an explicit environment override.
+  // The daemon's explicit environment takes precedence over this saved default.
   const envRaw = await file(globalEnvFile).text().catch(() => "");
   const filtered = envRaw.trimEnd().split("\n").filter(l => !l.startsWith(`${ENV_KEY}=`));
   await Bun.write(globalEnvFile, [...filtered, `${ENV_KEY}=${serveUrl}`, ""].join("\n"));
@@ -1122,40 +1516,6 @@ async function trayCommand(sub?: string): Promise<void> {
   }
 }
 
-// Read the extension's auth token straight from a profile's localStorage LevelDB. Read-only
-// (we never take LevelDB's lock), so it's safe while the user's Chrome is running. The token is
-// the value of the `auth-token` key under the extension origin, stored as a 0x01 (Latin-1)
-// encoding byte followed by the 43-char base64url token. LevelDB prefix-compression can split the
-// origin string across block-restart points, so we anchor on the `auth-token` marker + token shape
-// and (when possible) require the extension id to appear in the same file to avoid a collision
-// with another extension's `auth-token`. Returns the newest token found, or null.
-function readExtensionTokenFromProfile(userDataDir: string, profileDir: string): string | null {
-  const dir = join(userDataDir, profileDir, "Local Storage", "leveldb");
-  let files: string[];
-  try { files = readdirSync(dir).filter(f => f.endsWith(".ldb") || f.endsWith(".log")).sort(); }
-  catch { return null; }
-  const extIdChunk = EXTENSION_ID.slice(0, 20); // contiguous prefix survives the LevelDB split
-  const scan = (requireExtId: boolean): string | null => {
-    let found: string | null = null;
-    for (const f of files) {
-      let buf: Buffer;
-      try { buf = readFileSync(join(dir, f)); } catch { continue; }
-      if (requireExtId && !buf.includes(extIdChunk, 0, "latin1")) continue;
-      let idx = 0;
-      while (true) {
-        const j = buf.indexOf("auth-token", idx, "latin1");
-        if (j < 0) break;
-        idx = j + 1;
-        const win = buf.subarray(j, Math.min(buf.length, j + 200)).toString("latin1");
-        const m = win.match(/\x01([A-Za-z0-9_-]{43})(?![A-Za-z0-9_-])/);
-        if (m) found = m[1]; // newest file / newest occurrence wins
-      }
-    }
-    return found;
-  };
-  return scan(true) ?? scan(false);
-}
-
 // Resolve a Chromium / Chrome-for-Testing executable from the Playwright browsers cache.
 // Managed (provisioned) profiles must run on Chromium because branded Google Chrome 149+ rejects
 // --load-extension. Returns null if no Chromium is installed (`npx playwright install chromium`).
@@ -1312,19 +1672,21 @@ async function provisionProfile(name: string, opts: { headed?: boolean } = {}): 
   console.log(`\n[2/3] Building RECHROME_URL`);
   const url = await getOrCreateUrl();
   const { host, port, protocol, key } = parseUrl(url);
-  const healthy = await fetch(`${protocol}://${host}:${port}/ping`, {
+  const healthy = await fetch(serviceUrl(url, "ping"), {
     headers: { Authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(2000),
   }).then(r => r.ok).catch(() => false);
   if (!healthy) console.log(`      Note: daemon not reachable at ${host}:${port} — run \`rech setup\` once to start it.`);
 
-  const rechUrl = new URL(`${protocol}://${host}:${port}`);
+  const rechUrl = new URL(serviceUrl(url));
   rechUrl.username = key || randomBytes(12).toString("base64url");
   rechUrl.searchParams.set("extension_id", EXTENSION_ID);
   rechUrl.searchParams.set("token", token);
   rechUrl.searchParams.set("profile", name);
   rechUrl.searchParams.set("user_data_dir", userDataDir);
   rechUrl.searchParams.set("load_extension", dist);
-  const newLine = `RECHROME_URL=${rechUrl.toString()}`;
+
+
+  const newLine = `RECHROME_URL=${registeredProfileUrl(rechUrl.toString())}`;
 
   // [3/3] Register in the token registry so `rech status` lists it and the daemon can resolve it.
   await saveTokenEntry(name, { extensionId: EXTENSION_ID, token, profileDir: name, userDataDir, loadExtension: dist });
@@ -1335,7 +1697,95 @@ async function provisionProfile(name: string, opts: { headed?: boolean } = {}): 
   console.log(`Or save it to a project .env.local to make it the default.`);
 }
 
-async function setup(opts: { profile?: string; token?: string } = {}): Promise<void> {
+async function exposeProfile(profile: string, host: string, port: number, prefix = "/"): Promise<Listener> {
+  const config = await readListeners();
+  if (!config) throw new Error("Run rech setup once to initialize listeners");
+  // Setup selects this profile's exposure, not the daemon's global bind. Remove
+  // only this profile from other scoped listeners; retain all other profiles.
+  config.listeners = config.listeners.filter(l => {
+    if (l.profiles === "*" || (l.host === host && l.port === port)) return true;
+    l.profiles = l.profiles.filter(p => p !== profile);
+    return l.profiles.length > 0;
+  });
+  let listener = config.listeners.find(l => l.host === host && l.port === port);
+  if (listener && normalizePrefix(listener.prefix) !== prefix) throw new Error("This port already uses a different prefix; choose --port with a separate port");
+  if (prefix !== "/" && listener?.profiles === "*") throw new Error("A prefixed proxy requires a separate scoped listener port");
+  if (listener) {
+    if (listener.profiles !== "*" && !listener.profiles.includes(profile)) listener.profiles.push(profile);
+  } else {
+    listener = { name: `listen-${randomBytes(4).toString("hex")}`, host, port, prefix, key: randomBytes(24).toString("base64url"), profiles: [profile] };
+    config.listeners.push(listener);
+  }
+  await writeListeners(config);
+  return listener;
+}
+
+async function listenerCommand(args: string[]): Promise<void> {
+  const config = await readListeners();
+  if (!config) throw new Error("No listener configuration yet. Run rech setup to migrate the daemon.");
+  if (!args.length || ["ls", "list"].includes(args[0])) {
+    for (const l of config.listeners) console.log(`${l.name}  ${listenerAddress(l)}${normalizePrefix(l.prefix)}  ${l.profiles === "*" ? "local management (all profiles)" : l.profiles.join(", ")}`);
+    return;
+  }
+  if (args[0] === "remove" && args.length === 2) {
+    const listener = config.listeners.find(l => l.name === args[1]);
+    if (!listener) throw new Error("Unknown listener");
+    if (listener.profiles === "*") throw new Error("Keep the local management listener for setup and recovery");
+    config.listeners = config.listeners.filter(l => l !== listener);
+    await writeListeners(config);
+    console.log("Listener removed from configuration; daemon reloads automatically.");
+    return;
+  }
+  if (args[0] !== "add" || !args[1]) throw new Error("Usage: rech listener add <name> --listen <local|lan|tailscale|IP> --profile <selector> [--port <port>] [--prefix <path>]; rech listener remove <name>");
+  const values: Record<string, string[]> = {};
+  for (let i = 2; i < args.length; i += 2) {
+    if (!["--listen", "--profile", "--port", "--prefix"].includes(args[i]) || !args[i + 1] || args[i + 1].startsWith("--")) throw new Error("Invalid listener option");
+    (values[args[i]] ??= []).push(args[i + 1]);
+  }
+  if (!values["--listen"]?.length || !values["--profile"]?.length) throw new Error("--listen and --profile are required; repeat --profile to allow multiple profiles");
+  const registry = await readTokenRegistry(), cache = await readChromeProfileCache();
+  const profiles: string[] = [];
+  for (const selector of values["--profile"]) profiles.push((await resolveGlobalProfile(registry, cache, selector)).email);
+  const host = chooseListenAddress(await detectListenChoices(), values["--listen"][0]);
+  const port = Number(values["--port"]?.[0] ?? DEFAULT_PORT);
+  if (config.listeners.some(l => l.name === args[1])) throw new Error("Listener name already exists; edit listeners.json to change its allowlist");
+  config.listeners.push({ name: args[1], host, port, prefix: normalizePrefix(values["--prefix"]?.[0]), key: randomBytes(24).toString("base64url"), profiles: [...new Set(profiles)] });
+  await writeListeners(config);
+  console.log(`Listener saved for ${host}:${port}; daemon reloads automatically. Credentials are in ~/.rechrome/listeners.json (keep private).`);
+}
+
+export function detectSetupAgent(env: Record<string, string | undefined> = process.env): "Codex" | "Claude Code" | null {
+  // These are hints, not proof of identity or permission to automate the desktop.
+  if (env.RECH_SETUP_AGENT === "none") return null;
+  if (env.RECH_SETUP_AGENT === "codex") return "Codex";
+  if (env.RECH_SETUP_AGENT === "claude") return "Claude Code";
+  const enabled = (value: string | undefined) => !!value && !["0", "false"].includes(value.toLowerCase());
+  if (enabled(env.CODEX_THREAD_ID) || enabled(env.CODEX_CI) || enabled(env.CODEX_SANDBOX)) return "Codex";
+  if (enabled(env.CLAUDECODE) || enabled(env.CLAUDE_CODE_ENTRYPOINT)) return "Claude Code";
+  return null;
+}
+
+export function setupAgentGuidance(agent: "Codex" | "Claude Code", platform = process.platform): string {
+  const skillPath = join(import.meta.dir, "skills", "rechrome-setup", "SKILL.md");
+  return [
+    `[rech] ${agent} environment detected — setup guidance:`,
+    `  Read the setup skill: ${skillPath}`,
+    "  Keep this setup process alive while installing; retain and poll its terminal session.",
+    "  Piped stdin is supported: supply prompt answers and close stdin so setup can start.",
+    "  Use the available Computer Use skill for the selected profile's Load unpacked flow; follow its approval rules.",
+    ...(platform === "darwin" ? ["  macOS: in the folder picker, use Command+Shift+G and the extension path shown in the guide."] : []),
+    "  If desktop control is unavailable, leave setup running and give the user the exact remaining step.",
+    "  Never restart the user's Chrome. Let setup detect the token; do not print credentials.",
+    "  Wait for bridge verification and registration before reporting success; preserve the default profile unless asked to change it.",
+    "  Agent detection does not grant permissions. Set RECH_SETUP_AGENT=none to hide these hints.",
+  ].join("\n");
+}
+
+async function setup(opts: { profile?: string; token?: string; listen?: string; prefix?: string; port?: number } = {}): Promise<void> {
+  const prefix = normalizePrefix(opts.prefix);
+  if (opts.port !== undefined && (!Number.isInteger(opts.port) || opts.port < 1 || opts.port > 65535)) throw new Error("--port must be between 1 and 65535");
+  const agent = detectSetupAgent();
+  if (agent) console.error(setupAgentGuidance(agent));
   if (opts.profile !== undefined) {
     try {
       validateChromeProfileSelector(opts.profile);
@@ -1351,6 +1801,7 @@ async function setup(opts: { profile?: string; token?: string } = {}): Promise<v
   let stdinQueue: string[] | null = null;
   if (isTTY) {
     rl = createInterface({ input: process.stdin, output: process.stdout });
+    rl.on("SIGINT", () => { rl?.close(); envWatcher?.close(); process.exit(130); });
   } else {
     // Pre-read all piped stdin lines so readline close doesn't block later prompts
     stdinQueue = await new Promise<string[]>(resolve => {
@@ -1367,105 +1818,56 @@ async function setup(opts: { profile?: string; token?: string } = {}): Promise<v
   };
 
   // [1/5] Daemon
-  console.log("\n[1/5] Checking serve daemon...");
+  console.log("\n○ [1/5] Detecting networks and configuring the daemon...");
+  const listenChoices = await detectListenChoices();
 
-  // Bind address (persists to ~/.env.local as RECH_HOST).
-  // Read the persisted value from ~/.env.local directly — process.env may be shadowed by nearer .env files.
-  const globalEnvRaw = await file(globalEnvFile).text().catch(() => "");
-  const persistedBindMatch = globalEnvRaw.match(/^\s*RECH_HOST\s*=\s*(.*?)\s*$/m);
-  const persistedBind = persistedBindMatch?.[1].replace(/^["']|["']$/g, "") || "127.0.0.1";
-
-  // Clear stale hostname-based URL so we always use 127.0.0.1 locally
-  if (process.env[ENV_KEY]) {
-    try {
-      const u = new URL(process.env[ENV_KEY]);
-      if (!["127.0.0.1", "localhost"].includes(u.hostname)) delete process.env[ENV_KEY];
-    } catch {}
+  const currentUrl = await getOrCreateUrl();
+  const previous = parseUrl(currentUrl);
+  let config = await readListeners();
+  if (!config) {
+    const previousHost = process.env.RECH_HOST || "127.0.0.1";
+    const local: Listener = { name: "local", host: "127.0.0.1", port: previous.port, key: previous.key, profiles: "*" };
+    config = { version: 1, listeners: [local] };
+    const registered = Object.keys(await readTokenRegistry());
+    if (!isLoopback(previousHost) && registered.length && previousHost !== "0.0.0.0" && previousHost !== "::") {
+      config.listeners.push({ name: "existing-remote", host: previousHost, port: previous.port, key: randomBytes(24).toString("base64url"), profiles: registered });
+      console.log("      Existing remote exposure retained for registered profiles with a new scoped listener key.");
+    }
+    await writeListeners(config);
   }
-  const url = await getOrCreateUrl();
-  const { host, port, protocol } = parseUrl(url);
-
-  const { key: serveKey } = parseUrl(url);
-  // First check if server is up at all (unauthenticated root), then verify our key matches
-  const anonPing = await fetch(`${protocol}://${host}:${port}/`, { signal: AbortSignal.timeout(2000) }).catch(() => null);
-  const authPing = anonPing ? await fetch(`${protocol}://${host}:${port}/ping`, {
-    headers: { Authorization: `Bearer ${serveKey}` },
-    signal: AbortSignal.timeout(2000),
-  }).catch(() => null) : null;
-  // The daemon's *live* bind (from /ping) is authoritative — persisted RECH_HOST may diverge if the user edited it manually.
-  const liveBind = authPing?.ok
-    ? await authPing.clone().json().then((b: { bind?: string }) => b?.bind).catch(() => undefined)
-    : undefined;
-  // Pre-patch daemons return plain "ok" with no bind info — we can't trust persisted/env values to match their live bind, so force reinstall to be safe.
-  const liveBindUnknown = !!authPing?.ok && !liveBind;
-  const currentBind = liveBind || persistedBind;
-
-  // A healthy daemon already answering on our key needs no reinstall — don't re-prompt for it.
-  const daemonHealthy = !!(anonPing && authPing?.ok && !liveBindUnknown);
-  // An explicit RECH_HOST override that differs from the live bind is a deliberate rebind request.
-  const explicitRebind = !!process.env.RECH_HOST && process.env.RECH_HOST !== currentBind;
-
-  // Non-TTY honors explicit process.env.RECH_HOST (shell or merged env stack) — matches the documented `RECH_HOST=0.0.0.0 rech setup` flow.
-  let desiredBind = process.env.RECH_HOST || currentBind;
-  // Only prompt to (re)configure the bind when we actually need to set up the daemon. A running
-  // daemon is left alone unless the user explicitly asks for a different bind via RECH_HOST.
-  if (isTTY && (!daemonHealthy || explicitRebind)) {
-    console.log(`\n      Bind address (current: ${currentBind}):`);
-    console.log(`        1.  127.0.0.1  (localhost only)`);
-    console.log(`        2.  0.0.0.0    (all interfaces — HTTP plaintext, trust your network)`);
-    const defaultBindChoice = currentBind === "0.0.0.0" ? "2" : "1";
-    const bindAns = (await ask(`      Choice [${defaultBindChoice}]: `, defaultBindChoice)).trim();
-    desiredBind = bindAns === "2" || bindAns === "0.0.0.0" ? "0.0.0.0" : "127.0.0.1";
-  } else if (daemonHealthy) {
-    console.log(`      Daemon already running at ${protocol}://${host}:${port} (bind: ${currentBind}) — skipping daemon setup`);
+  const management = config.listeners.find(l => l.profiles === "*" && isLoopback(l.host));
+  if (!management) throw new Error("Setup requires a loopback management listener in ~/.rechrome/listeners.json");
+  const scheme = previous.protocol;
+  let url = `${scheme}://${management.key}@${listenerAddress(management)}${normalizePrefix(management.prefix)}`;
+  const { host, port, protocol, key: serveKey } = parseUrl(url);
+  let desiredBind = management.host;
+  if (opts.listen) desiredBind = chooseListenAddress(listenChoices, opts.listen);
+  else if (isTTY) {
+    console.log("\n      Where should this profile be accessible? (Other profiles keep their listeners.)");
+    listenChoices.forEach((choice, index) => console.log(`        ${index + 1}. ${choice.label} — ${choice.address}`));
+    while (true) {
+      const answer = (await ask("      Choice [1]: ", "1")).trim();
+      const choice = /^\d+$/.test(answer) ? listenChoices[Number(answer) - 1] : undefined;
+      if (choice) { desiredBind = choice.address; break; }
+      console.log("      Enter one of the numbers shown above.");
+    }
   }
-  const bindChanged = desiredBind !== currentBind;
-  const persistedChanged = desiredBind !== persistedBind;
-  if (persistedChanged) {
-    const lines = globalEnvRaw.trimEnd().split("\n").filter(l => !/^\s*RECH_HOST\s*=/.test(l));
-    await Bun.write(globalEnvFile, [...lines, `RECH_HOST=${desiredBind}`, ""].join("\n"));
-    console.log(`      Saved RECH_HOST=${desiredBind} to ~/.env.local`);
-  }
-  // Always align process.env with the desired bind — a nearer .env.local may have shadowed it.
-  process.env.RECH_HOST = desiredBind;
-
-  const waitForServe = async () => {
-    process.stdout.write("      Starting");
-    let ping = null;
+  const pingManagement = () => fetch(serviceUrl(url, "ping"), {
+    headers: { Authorization: `Bearer ${serveKey}` }, signal: AbortSignal.timeout(2000),
+  }).then(async r => r.ok && (await r.json()).multiListener === true).catch(() => false);
+  if (!await pingManagement()) {
+    // A one-time source upgrade restarts only the daemon, never Chrome. Subsequent
+    // listener changes are reloaded in place by the running daemon.
+    process.env.RECH_HOST = management.host;
+    await daemonInstall(url);
+    let ready = false;
     for (let i = 0; i < 15; i++) {
       await Bun.sleep(1000);
-      ping = await fetch(`${protocol}://${host}:${port}/`, { signal: AbortSignal.timeout(2000) }).catch(() => null);
-      if (ping) break;
-      process.stdout.write(".");
+      if (await pingManagement()) { ready = true; break; }
     }
-    process.stdout.write("\n");
-    if (!ping) {
-      console.error(`      Failed to start serve at ${host}:${port}`);
-      rl?.close();
-      process.exit(1);
-    }
-    console.log(`      Serve running at ${protocol}://${host}:${port}`);
-  };
-
-  if (anonPing && authPing?.ok && !bindChanged && !liveBindUnknown) {
-    console.log(`      Already running at ${protocol}://${host}:${port} — skipping reinstall`);
-  } else if (anonPing && authPing?.ok && liveBindUnknown) {
-    console.log(`      Pre-patch daemon detected (no live bind info) — reinstalling to verify bind`);
-    await daemonInstall(url);
-    await waitForServe();
-  } else if (anonPing && bindChanged) {
-    console.log(`      Bind changed (${currentBind} → ${desiredBind}) — reinstalling`);
-    await daemonInstall(url);
-    await waitForServe();
-  } else if (anonPing && !authPing?.ok) {
-    console.log(`      Server running but key mismatch — reinstalling with new key`);
-    await daemonInstall(url);
-    await waitForServe();
-  } else {
-    await daemonInstall(url);
-    console.log(`      Registered daemon: ${PM_PROCESS_NAME}`);
-    await waitForServe();
+    if (!ready) throw new Error("Local management listener did not start; inspect rech status and daemon logs");
   }
+  console.log(`✓ [1/5] Local management daemon verified; requested profile access: ${desiredBind}`);
 
   const cache = await readChromeProfileCache();
   if (!cache) { console.error("      Chrome profiles not found"); rl?.close(); process.exit(1); }
@@ -1499,141 +1901,86 @@ async function setup(opts: { profile?: string; token?: string } = {}): Promise<v
     return available[idx];
   }
 
-  async function getExtAndToken(profileDir: string, profileDisplay: string, profileKey: string, providedToken?: string): Promise<{ extId: string; token: string } | null> {
-    // Extension check
-    let extId: string | undefined;
-    // Copy bundled dist to a stable per-user location so the install path survives bunx temp-dir cleanup.
+  let guide: ReturnType<typeof createSetupGuide> | undefined;
+  async function getExtAndToken(profileDir: string, profileDisplay: string, _profileKey: string, providedToken?: string): Promise<{ extId: string; token: string } | null> {
     await ensureExtensionDistInstalled();
-    while (true) {
-      const found = await findInstalledExtension(profileDir);
-      if (found) { extId = found.id; break; }
-      console.log(`\n      Extension not found in profile: ${profileDisplay}`);
-      console.log(`      Extension dist: ${EXTENSION_DIST_DIR}`);
-      const setupHtmlPath = join(RECH_HOME_DIR, "setup.html");
-      mkdirSync(RECH_HOME_DIR, { recursive: true });
-      await Bun.write(setupHtmlPath, buildSetupHtml(EXTENSION_DIST_DIR, profileDisplay));
-      // Open the install guide directly in the *target* profile (resolved from --profile), so
-      // "Load unpacked" lands in the right Chrome. This is a new tab, not a restart.
-      console.log(`\n      Opening install guide in Chrome profile: ${profileDisplay}`);
-      openInChromeProfile(profileDir, setupHtmlPath);
-      // Non-TTY (agent/pipe) can't block on a paste prompt, and `ask` returns immediately on an
-      // exhausted stdin queue — looping would respawn Chrome every iteration. Open the guide once,
-      // then stop with clear re-run instructions instead of spinning.
-      if (!isTTY) {
-        console.error(`\n      Non-TTY: load the extension once via chrome://extensions → "Load unpacked":`);
-        console.error(`        ${EXTENSION_DIST_DIR}`);
-        console.error(`      (open chrome://extensions in profile "${profileDisplay}" — see the guide just opened)`);
-        console.error(`      Then re-run:  rech setup --profile <email|name|folder> [--token <tok>]`);
-        return null;
+    guide?.close();
+    guide = createSetupGuide(EXTENSION_DIST_DIR, profileDisplay);
+    console.log(`      Live setup guide: ${guide.url}`);
+    if (!await openSetupGuide(profileDir, guide.url))
+      console.log("      Open chrome://extensions/ in the selected profile if the tab did not open.");
+    const deadline = Date.now() + 15 * 60_000;
+    let statusOpenedFor: string | undefined;
+    let terminalToken: string | undefined;
+    let manualPromptStarted = false;
+    const promptAbort = new AbortController();
+    try {
+      while (Date.now() < deadline) {
+        const found = await findInstalledExtension(profileDir);
+        if (!found) {
+          guide.update("extension", "Waiting for the extension. Load it in the previous tab; this page updates automatically.");
+          await Bun.sleep(1000);
+          continue;
+        }
+        const extId = found.id;
+        guide.setExtensionId(extId);
+        const manual = guide.takeToken() || terminalToken || providedToken;
+        const candidate = manual?.replace(/^PLAYWRIGHT_MCP_EXTENSION_TOKEN=/, "").trim();
+        const automatic = userDataDir ? readExtensionTokenFromProfile(userDataDir, profileDir, extId) : null;
+        const token = candidate && /^[A-Za-z0-9_-]{20,256}$/.test(candidate) ? candidate : automatic;
+        if (token) {
+          guide.update("bridge", "Extension and token detected. Testing the browser connection…");
+          console.log(`      Extension ${extId} and auth token detected${candidate ? " (provided token)" : " automatically"}`);
+          return { extId, token };
+        }
+        guide.update("token", "Extension installed. Waiting for its auth token. Open the extension status page using the link below to initialize it, or paste a token manually.");
+        if (statusOpenedFor !== extId) {
+          statusOpenedFor = extId;
+          openInChromeProfile(profileDir, `chrome-extension://${extId}/status.html`);
+          console.log("      Watching for the token automatically. You can also paste it in the live guide.");
+        }
+        if (rl && !manualPromptStarted) {
+          manualPromptStarted = true;
+          rl.question("      Optional fallback — paste token here (automatic detection continues): ", { signal: promptAbort.signal }, answer => { terminalToken = answer.trim(); });
+        }
+        await Bun.sleep(1000);
       }
-      await ask("\n      Press Enter after loading the extension to retry...");
+      guide.update("error", "Setup timed out after 15 minutes. Run setup again to resume.");
+      console.error("      Extension/token detection timed out; run setup again to resume.");
+      return null;
+    } finally {
+      promptAbort.abort();
     }
-    console.log(`      Extension found: ${extId}`);
-
-    // Non-interactive token injection (--token / RECH_TOKEN). An explicitly supplied token wins
-    // over both the registry-keep prompt and the paste loop, so a non-TTY agent can register a
-    // profile in one shot. Accepts the bare token or a full `PLAYWRIGHT_MCP_EXTENSION_TOKEN=...`.
-    if (providedToken) {
-      const token = providedToken.replace(/^.*?=/, "").trim();
-      if (token.length < 20) {
-        console.error(`      Provided token too short (${token.length} chars) — pass the full PLAYWRIGHT_MCP_EXTENSION_TOKEN value`);
-        return null;
-      }
-      console.log(`      Using provided token: ${token.slice(0, 6)}…`);
-      return { extId, token };
-    }
-
-    // Default automation: read the auth token straight from the profile's localStorage LevelDB,
-    // so an installed extension needs no manual paste (works the same in TTY and non-TTY). The
-    // token is minted lazily the first time the status/connect page loads, so if it isn't there
-    // yet, open status.html in this profile to mint it (a new tab — never a restart) and re-scan.
-    if (userDataDir) {
-      let auto = readExtensionTokenFromProfile(userDataDir, profileDir);
-      if (!auto) {
-        console.log(`      No token in profile yet — minting via chrome-extension://${extId}/status.html …`);
-        openInChromeProfile(profileDir, `chrome-extension://${extId}/status.html`);
-        for (let i = 0; i < 10 && !auto; i++) { await Bun.sleep(500); auto = readExtensionTokenFromProfile(userDataDir, profileDir); }
-      }
-      if (auto) {
-        console.log(`      Auto-read token from profile localStorage: ${auto.slice(0, 6)}…`);
-        return { extId, token: auto };
-      }
-      console.log(`      Could not auto-read token from localStorage — falling back to manual entry`);
-    }
-
-    // Check for existing token in registry
-    const registry = await readTokenRegistry();
-    const existing = registry[profileKey];
-    if (existing && existing.extensionId === extId && existing.token) {
-      console.log(`      Existing token found: ${existing.token.slice(0, 6)}…`);
-      if (!isTTY) console.log(`      [agent] Provide y to keep existing token, n to refresh on next stdin line`);
-      const keep = (await ask("      Keep existing token? [Y/n]: ")).trim().toLowerCase();
-      if (keep !== "n") {
-        console.log("      Keeping existing token");
-        return { extId, token: existing.token };
-      }
-    }
-
-    // Token
-    const statusUrl = `chrome-extension://${extId}/status.html`;
-    console.log(`\n      Get auth token from the extension:`);
-    console.log(`        ${statusUrl}`);
-    if (isTTY) {
-      openInChromeProfile(profileDir, statusUrl);
-      console.log(`\n      Or click the extension icon in the Chrome toolbar.`);
-      console.log(`      Copy the token shown on the page (PLAYWRIGHT_MCP_EXTENSION_TOKEN=...).\n`);
-    } else {
-      console.log(`\n      [agent] Open the URL above in Chrome (profile: ${profileDisplay})`);
-      console.log(`      [agent] Find PLAYWRIGHT_MCP_EXTENSION_TOKEN=... on that page`);
-      console.log(`      [agent] Provide the token value on next stdin line:\n`);
-    }
-    // Retry on empty/too-short paste — a truncated copy or a stale token shouldn't
-    // abort the whole setup. Bounded so a non-TTY agent with exhausted stdin can't spin.
-    const maxTries = isTTY ? 5 : 3;
-    for (let attempt = 1; attempt <= maxTries; attempt++) {
-      const tokenInput = (await ask("      Paste token: ")).trim();
-      const token = tokenInput.replace(/^.*?=/, "").trim();
-      const retriesLeft = maxTries - attempt;
-      if (!token) {
-        console.error(`      No token entered.${retriesLeft ? " Copy the full PLAYWRIGHT_MCP_EXTENSION_TOKEN value and try again." : ""}`);
-      } else if (token.length < 20) {
-        console.error(`      Token too short (${token.length} chars) — likely truncated when copying.${retriesLeft ? " Re-copy the full value and try again." : ""}`);
-      } else {
-        console.log("      Token accepted");
-        return { extId, token };
-      }
-      // Non-TTY with no input left: ask() won't block, so stop instead of burning retries on empty reads.
-      if (!isTTY && !tokenInput) break;
-    }
-    console.error("      No valid token provided — aborting");
-    return null;
   }
 
   // [2/5] Primary profile
-  console.log("\n[2/5] Select Chrome profile:");
+  console.log("\n○ [2/5] Select Chrome profile:");
   const picked = await pickProfile(new Set());
   if (!picked) { console.error("      Invalid selection"); rl?.close(); process.exit(1); }
   const [profileDir, profileInfoSel] = picked;
   const profileDisplay = profileInfoSel.user_name || profileInfoSel.name || profileDir;
+  console.log(`✓ [2/5] Profile resolved: ${profileDisplay} [${profileDir}]`);
 
   // [3/5] Extension + token for primary profile
-  console.log("\n[3/5] Checking extension...");
+  console.log("\n○ [3/5] Checking extension...");
   const profileEmail = profileInfoSel.user_name || profileDir;
   const primary = await getExtAndToken(profileDir, profileDisplay, profileEmail, opts.token);
-  if (!primary) { rl?.close(); process.exit(1); }
-  const { extId, token } = primary;
+  if (!primary) { await Bun.sleep(1500); guide?.close(); rl?.close(); process.exit(1); }
+  const { extId } = primary;
+  let token = primary.token;
+  console.log("✓ [3/5] Extension and token detected");
 
   // Build RECHROME_URL, verify the selected profile can complete a real extension
   // handshake, then show it before asking where to save.
-  const rechUrl = new URL(url);
+  const rechUrl = editableConnectionUrl(url);
   if (!rechUrl.username) rechUrl.username = randomBytes(12).toString("base64url");
   rechUrl.searchParams.set("extension_id", extId);
   rechUrl.searchParams.set("token", token);
   rechUrl.searchParams.set("profile", profileEmail);
   if (userDataDir) rechUrl.searchParams.set("user_data_dir", userDataDir);
-  const newLine = `RECHROME_URL=${rechUrl.toString()}`;
-  console.log(`\n[4/5] Verifying extension bridge for ${profileDisplay}...`);
-  const probeSession = `iso-setup-${randomBytes(4).toString("hex")}`;
+
+  console.log(`\n○ [4/5] Verifying extension bridge for ${profileDisplay}...`);
+  const probeSession = `s${randomBytes(3).toString("hex")}`;
   const probeIdentity = await getClientIdentity();
   probeIdentity.profile = profileEmail;
   const probeEnv: Record<string, string> = {
@@ -1643,28 +1990,80 @@ async function setup(opts: { profile?: string; token?: string } = {}): Promise<v
     ...(userDataDir ? { PLAYWRIGHT_MCP_USER_DATA_DIR: userDataDir } : {}),
   };
   let bridgeVerified = false;
-  try {
-    const probe = await callServe(
-      rechUrl.toString(),
-      [`-s=${probeSession}`, "open", "about:blank", "--wait", "none"],
-      probeEnv,
-      probeIdentity,
-    );
-    bridgeVerified = probe.status === 0;
-    if (bridgeVerified) {
-      console.log("      Extension bridge connected successfully");
-    } else {
-      const diagnostic = probe.stderr.trim() || probe.stdout.trim() || `bridge probe exited ${probe.status}`;
-      console.error(`      Extension bridge verification failed: ${diagnostic}`);
+  let bridgeError = "";
+  const bridgeDeadline = Date.now() + 15 * 60_000;
+  do {
+    guide?.takeRetry();
+    guide?.update("bridge", "Extension and token detected. Testing the browser connection…");
+    try {
+      const probe = await callServe(
+        rechUrl.toString(),
+        [`-s=${probeSession}`, "open", "about:blank", "--wait", "none"],
+        probeEnv,
+        probeIdentity,
+        true,
+      );
+      bridgeVerified = probe.status === 0;
+      if (bridgeVerified) {
+        console.log("✓ [4/5] Extension bridge connected successfully");
+      } else {
+        const diagnostic = probe.stderr.trim() || probe.stdout.trim() || `bridge probe exited ${probe.status}`;
+        bridgeError = diagnostic;
+        console.error(`      Extension bridge verification failed: ${diagnostic}`);
+      }
+    } catch (error) {
+      bridgeError = error instanceof Error ? error.message : String(error);
+      console.error(`      Extension bridge verification failed: ${bridgeError}`);
+    } finally {
+      // The isolated probe must never claim or close an existing worktree session.
+      await callServe(rechUrl.toString(), [`-s=${probeSession}`, "close"], probeEnv, probeIdentity, true).catch(() => {});
     }
-  } catch (error) {
-    console.error(`      Extension bridge verification failed: ${error instanceof Error ? error.message : String(error)}`);
-  } finally {
-    // The isolated probe must never claim or close an existing worktree session.
-    await callServe(rechUrl.toString(), [`-s=${probeSession}`, "close"], probeEnv, probeIdentity).catch(() => {});
-  }
 
-  console.log(`\n[5/5] Your RECHROME_URL:\n\n  ${newLine}\n`);
+    if (bridgeVerified) break;
+    const safeError = bridgeError.replaceAll(token, "[redacted]").replaceAll(serveKey, "[redacted]").slice(0, 700);
+    guide?.update("error", `Connection failed: ${safeError}. Check the daemon and reload the extension if needed, then click Retry connection. A replacement token can also be pasted below.`);
+    while (Date.now() < bridgeDeadline && !guide?.takeRetry()) await Bun.sleep(500);
+    const replacement = guide?.takeToken() || (userDataDir ? readExtensionTokenFromProfile(userDataDir, profileDir, extId) : null);
+    if (replacement) {
+      token = replacement;
+      rechUrl.searchParams.set("token", token);
+      probeEnv.PLAYWRIGHT_MCP_EXTENSION_TOKEN = token;
+    }
+  } while (Date.now() < bridgeDeadline);
+  if (!bridgeVerified) {
+    guide?.update("error", "Connection check timed out. Run setup again after reloading the extension.");
+    await Bun.sleep(1500);
+    guide?.close();
+    rl?.close();
+    envWatcher?.close();
+    process.exitCode = 1;
+    return;
+  }
+  guide?.update("save", "Browser connection verified! Finish the configuration prompts in the terminal.");
+  await saveTokenEntry(profileEmail, { extensionId: extId, token, profileDir, userDataDir: userDataDir ?? undefined });
+  const existingPrefix = prefix !== "/" ? (await readListeners())?.listeners.find(l => l.host === desiredBind && l.profiles !== "*" && normalizePrefix(l.prefix) === prefix) : undefined;
+  const exposurePort = opts.port ?? existingPrefix?.port ?? (prefix !== "/" ? port + 1 : port);
+  const exposure = await exposeProfile(profileEmail, desiredBind, exposurePort, prefix);
+  rechUrl.hostname = exposure.host;
+  rechUrl.port = String(exposure.port);
+  rechUrl.username = exposure.key;
+  rechUrl.pathname = prefix;
+  // Ensure the newly bound listener is live before offering its connection URL.
+  let exposed = false;
+  for (let i = 0; i < 20; i++) {
+    const response = await fetch(serviceUrl(rechUrl.toString(), "ping"), { headers: { Authorization: `Bearer ${exposure.key}` }, signal: AbortSignal.timeout(1000) }).catch(() => null);
+    if (response?.ok) { exposed = true; break; }
+    await Bun.sleep(250);
+  }
+  if (!exposed) throw new Error("Profile registered, but its listener did not become reachable. Check for an occupied port or an unavailable interface.");
+  if (prefix !== "/" && exposure.host === "127.0.0.1") {
+    console.log(`      Tailscale Serve command (run separately): tailscale serve --bg --https=443 --set-path=${prefix.slice(0, -1)} ${protocol}://${listenerAddress(exposure)}${prefix.slice(0, -1)}`);
+    console.log(`      For remote clients, use https://<your-machine-tailnet-name>${prefix} with this listener's bearer key and profile query.`);
+  }
+  const newLine = `RECHROME_URL=${registeredProfileUrl(rechUrl.toString())}`;
+
+  console.log("\n○ [5/5] Connection verified. Save connection configuration:");
+  console.log(`\n${newLine}\n`);
   if (!isTTY) console.log(`  [agent] Provide save destination on next stdin line: 1=cwd, 2=cwd rechrome-only, 3=home, 4=skip\n`);
 
   const pwdEnvPath = join(process.cwd(), ".env.local");
@@ -1674,7 +2073,7 @@ async function setup(opts: { profile?: string; token?: string } = {}): Promise<v
   const tag = async (p: string) => (await file(p).exists()) ? "exists → will update" : "new file";
   const [pwdTag, pwdRechTag, homeTag] = await Promise.all([tag(pwdEnvPath), tag(pwdRechPath), tag(homeEnvPath)]);
   const saveChoice = (await ask(
-    `Save to:\n  1. ${pwdEnvPath} (current dir) [${pwdTag}] [default]\n  2. ${pwdRechPath} (current dir, rechrome-only) [${pwdRechTag}]\n  3. ${homeEnvPath} (user home) [${homeTag}]\n  4. Skip (already copied)\n\n  Choice [1]: `
+    `Save to:\n  1. ${pwdEnvPath} (current dir) [${pwdTag}] [default]\n  2. ${pwdRechPath} (current dir, rechrome-only) [${pwdRechTag}]\n  3. ${homeEnvPath} (user home) [${homeTag}]\n  4. Skip saving URL (register profile only)\n\n  Choice [1]: `
   )).trim();
   if (saveChoice !== "4") {
     const globalEnvPath = saveChoice === "3" ? homeEnvPath : saveChoice === "2" ? pwdRechPath : pwdEnvPath;
@@ -1693,6 +2092,11 @@ async function setup(opts: { profile?: string; token?: string } = {}): Promise<v
   // Save primary to token registry
   await saveTokenEntry(profileEmail, { extensionId: extId, token, profileDir, userDataDir: userDataDir ?? undefined });
 
+  console.log("✓ [5/5] Profile registration saved");
+  guide?.update("ready", "Success — extension installed, token detected, browser connected, and profile registered.");
+  await guide?.deliverSuccess();
+  guide?.close();
+
   // Additional profiles
   const configured = new Set([profileDir]);
   while (true) {
@@ -1708,9 +2112,13 @@ async function setup(opts: { profile?: string; token?: string } = {}): Promise<v
     const extraEmail = extraInfo.user_name || extraDir;
     console.log(`\n      Setting up: ${extraDisplay}`);
     const result = await getExtAndToken(extraDir, extraDisplay, extraEmail);
-    if (!result) { console.log("      Skipped."); continue; }
+    if (!result) { guide?.close(); console.log("      Skipped."); continue; }
     await saveTokenEntry(extraEmail, { extensionId: result.extId, token: result.token, profileDir: extraDir, userDataDir: userDataDir ?? undefined });
     configured.add(extraDir);
+    guide?.update("bridge", "Token registered. Run setup for this profile to verify its browser connection.");
+    guide?.markRegistered();
+    await Bun.sleep(1500);
+    guide?.close();
     console.log(`      Saved token for ${extraDisplay}`);
   }
   rl?.close();
@@ -1729,11 +2137,11 @@ async function status(): Promise<void> {
   }
   const { host, port, protocol } = parseUrl(url);
   const parsed = parseUrl(url);
-  const ping = await fetch(`${protocol}://${host}:${port}/`, { signal: AbortSignal.timeout(2000) }).catch(() => null);
+  const ping = await fetch(serviceUrl(url), { signal: AbortSignal.timeout(2000) }).catch(() => null);
   // Resolve the daemon's actual bind from its authenticated /ping (cross-platform; lsof is
   // POSIX-only and absent on Windows). bind is "0.0.0.0" (all interfaces) or the loopback IP.
   const pingBody = ping
-    ? await fetch(`${protocol}://${host}:${port}/ping`, {
+    ? await fetch(serviceUrl(url, "ping"), {
         headers: { Authorization: `Bearer ${parsed.key}` },
         signal: AbortSignal.timeout(2000),
       }).then(r => (r.ok ? r.json() : null)).catch(() => null) as { bind?: string; degraded?: boolean; consecutiveTimeouts?: number } | null
@@ -1779,13 +2187,15 @@ Usage:
                                must already be registered (see \`rech setup\`). Place
                                --profile before the playwright subcommand. Requires
                                ${ENV_KEY}.
-  rech setup [--profile <email|name|folder>] [--token <tok>]
+  rech setup [--listen <local|lan|tailscale|IP>] [--profile <email|name|folder>] [--token <tok>] [--prefix <path>] [--port <port>]
                                First-time setup: daemon + Chrome extension + config
+                               --prefix=rechrome mounts at /rechrome/ on a scoped listener.
+                               Prefixed setup defaults to the management port + 1; override with --port.
                                --profile selects the Chrome profile non-interactively.
                                Menu numbers are not accepted. Resolution order is exact
                                email (e.g. you@gmail.com), exact Chrome profile name,
                                then exact profile folder name (e.g. "Profile 1"). See
-                               available values with \`rech profiles\`.
+                               available values with \`rech profile\`.
                                --token (or RECH_TOKEN) supplies the auth token for
                                non-TTY/agent runs, skipping the interactive paste
   rech provision-profile <name> --experimental [--headed]
@@ -1799,7 +2209,12 @@ Usage:
                                starts after \`rech setup\`; skipped with no GUI
   rech uninstall               Remove the serve daemon and clear config
   rech serve                   Start the serve server manually (foreground)
-  rech profiles                List Chrome profiles
+  rech listener [ls|add|remove]  Manage daemon listener addresses and allowed profiles
+  rech profile [ls|list]
+                               List Chrome + managed test profiles and connection status
+  rech profile [name] --print-uri [--listener <name>]
+                               Print a connection URI (includes the daemon key).
+                               Uses RECHROME_URL, or an explicitly selected local listener.
   rech <playwright-args...>    Run Playwright CLI command (requires ${ENV_KEY})
   rech --isolate <args...>     Run in a throwaway session (sugar for -s=<random>) so a
                                fragile single-shot flow (OAuth/login) never shares tabs
@@ -1811,6 +2226,7 @@ Environment:
   RECH_IDENTITY  Session bucket mode: worktree (default) | branch | cwd. The session a
                  client reuses is keyed on the worktree root path; \`branch\` restores the
                  old <remote>/tree/<branch> keying, \`cwd\` keys on the exact directory
+  RECH_SETUP_AGENT  Setup hints: codex | claude | none (otherwise auto-detected)
 
 Examples:
   rech setup
@@ -1831,8 +2247,20 @@ if (import.meta.main) {
   } else if (cmd === "status") {
     await status();
     envWatcher?.close();
-  } else if (cmd === "profiles") {
-    await listProfiles();
+  } else if (cmd === "listener" || cmd === "listeners") {
+    try { await listenerCommand(args.slice(1)); }
+    catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+    finally { envWatcher?.close(); }
+  } else if (cmd === "profile" || cmd === "profiles") {
+    if (args.includes("--print-uri")) {
+      try { await printProfileUri(args.slice(1)); }
+      catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+    } else if (args.length > 2 || (args.length === 2 && !["ls", "list"].includes(args[1]))) {
+      console.error("Usage: rech profile [ls|list]. Create, rename, and delete subcommands are not implemented.");
+      process.exitCode = 1;
+    } else {
+      await listProfiles();
+    }
     envWatcher?.close();
   } else if (cmd === "setup") {
     const profileIdx = args.indexOf("--profile");
@@ -1844,7 +2272,23 @@ if (import.meta.main) {
       ? args[tokenIdx + 1]
       : args.find(a => a.startsWith("--token="))?.slice("--token=".length))
       ?? process.env.RECH_TOKEN;
-    await setup({ profile, token }); // setup closes envWatcher itself before printing Done
+    const listenIdx = args.indexOf("--listen");
+    const listen = listenIdx !== -1 ? args[listenIdx + 1] : args.find(a => a.startsWith("--listen="))?.slice("--listen=".length);
+    if (listenIdx !== -1 && (!listen || listen.startsWith("--"))) {
+      console.error("--listen requires local, lan, tailscale, or a detected interface address");
+      envWatcher?.close(); process.exit(1);
+    }
+    const option = (name: string) => {
+      const i = args.indexOf(name);
+      if (i !== -1) {
+        if (!args[i + 1] || args[i + 1].startsWith("--")) throw new Error(`${name} requires a value`);
+        return args[i + 1];
+      }
+      return args.find(a => a.startsWith(name + "="))?.slice(name.length + 1);
+    };
+    const prefix = option("--prefix");
+    const portArg = option("--port");
+    await setup({ profile, token, listen, prefix, port: portArg === undefined ? undefined : Number(portArg) }); // setup closes envWatcher itself before printing Done
     // Auto-start the tray (best-effort, silent on headless / missing binary).
     await startTray({ quiet: true }).catch(() => {});
   } else if (cmd === "tray") {
@@ -1905,7 +2349,6 @@ if (import.meta.main) {
         overrideEnv = {
           PLAYWRIGHT_MCP_PROFILE_DIRECTORY: resolved.email,
           PLAYWRIGHT_MCP_EXTENSION_ID: resolved.entry.extensionId,
-          PLAYWRIGHT_MCP_EXTENSION_TOKEN: resolved.entry.token,
         };
         if (resolved.entry.userDataDir) overrideEnv.PLAYWRIGHT_MCP_USER_DATA_DIR = resolved.entry.userDataDir;
         if (resolved.entry.loadExtension) overrideEnv.PLAYWRIGHT_MCP_LOAD_EXTENSION = resolved.entry.loadExtension;

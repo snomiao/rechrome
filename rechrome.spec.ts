@@ -1,6 +1,28 @@
 import { describe, test, expect } from "bun:test";
 import { parseUrl, authCheck, DEFAULT_PORT, ENV_KEY, deriveIdentity, normalizeRemote, normalizeCommandArgs, resolveChromeProfileSelector, resolveGlobalProfile, extractGlobalProfileArg } from "./rechrome.ts";
 import { isUnderDir, splitCommand, shortClientLabel, isIsoSession } from "./serve.ts";
+import { sandboxConnectionWarning } from "./rechrome.ts";
+
+describe("sandbox connection warning", () => {
+  test("explains restricted network access including localhost", () => {
+    const warning = sandboxConnectionWarning({ CODEX_SANDBOX_NETWORK_DISABLED: "1" });
+    expect(warning).toContain("even on localhost");
+    expect(warning).toContain("outside the sandbox");
+    expect(warning).toContain("with approval");
+  });
+
+  test("treats a detected sandbox as a possible cause, not proof", () => {
+    const warning = sandboxConnectionWarning({ CODEX_SANDBOX: "seatbelt" });
+    expect(warning).toContain("may block");
+    expect(warning).toContain("check that the daemon is running");
+  });
+
+  test("does not warn for ordinary clients or disabled restriction flags", () => {
+    expect(sandboxConnectionWarning({})).toBeNull();
+    expect(sandboxConnectionWarning({ CODEX_CI: "1" })).toBeNull();
+    expect(sandboxConnectionWarning({ CODEX_SANDBOX_NETWORK_DISABLED: "0" })).toBeNull();
+  });
+});
 
 describe("parseUrl", () => {
   test("parses key, host, and port from an http URL", () => {
