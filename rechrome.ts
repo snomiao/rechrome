@@ -509,7 +509,15 @@ export function deriveIdentity(opts: {
   return { key, label };
 }
 
-async function getClientIdentity(): Promise<{ key: string; label: string; profile?: string }> {
+/**
+ * A project's own rechrome folder: <root>/.rechrome, where root is the same one the session
+ * key uses (the worktree root, submodules rolled up), or cwd in `cwd` mode / outside git.
+ */
+export function projectDataDir(opts: { mode: string; cwd: string; root?: string | null }): string {
+  return join(opts.mode === "cwd" ? opts.cwd : opts.root || opts.cwd, ".rechrome");
+}
+
+async function getClientIdentity(): Promise<{ key: string; label: string; dataDir: string; profile?: string }> {
   const cwd = realpathSafe(process.cwd());
   const mode = (process.env.RECH_IDENTITY || "worktree").toLowerCase();
   let root: string | null = null;
@@ -535,7 +543,7 @@ async function getClientIdentity(): Promise<{ key: string; label: string; profil
     if (remoteUrl) remote = normalizeRemote(remoteUrl);
   }
 
-  return deriveIdentity({ mode, cwd, host: hostname(), root, remote, branch });
+  return { ...deriveIdentity({ mode, cwd, host: hostname(), root, remote, branch }), dataDir: projectDataDir({ mode, cwd, root }) };
 }
 
 // Profile precedence: an explicit `?profile=` in RECHROME_URL is authoritative; the
@@ -929,7 +937,8 @@ async function callServe(
   const res = await fetch(serviceUrl(url, "run"), {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
-    body: JSON.stringify({ args, identity, env }),
+    // dataDir is a client-local path; the daemon (possibly remote) only needs the session identity.
+    body: JSON.stringify({ args, identity: { key: identity.key, label: identity.label, profile: identity.profile }, env }),
     signal: AbortSignal.timeout(70_000),
   }).catch(async (e) => {
     if (throwOnFailure) throw new Error("Cannot reach the rechrome daemon. Check that it is running.");
@@ -1045,9 +1054,11 @@ async function run(url: string, args: string[], overrideEnv?: Record<string, str
   if (stdout) process.stdout.write(stdout);
 
   if (files?.length) {
-    const dlDir = join(process.cwd(), ".playwright-cli-multi-tab");
+    // Saved files belong to the project: <project>/.rechrome/output. The folder also holds
+    // .env.local (secrets), so it is git-ignored as a whole when first created.
+    const dlDir = join(identity.dataDir, "output");
     mkdirSync(dlDir, { recursive: true });
-    const gitignorePath = join(dlDir, ".gitignore");
+    const gitignorePath = join(identity.dataDir, ".gitignore");
     if (!existsSync(gitignorePath)) await Bun.write(gitignorePath, "*\n");
     for (const name of files) {
       const fileRes = await fetch(serviceUrl(url, `files/${name}`), {
