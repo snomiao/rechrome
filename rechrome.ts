@@ -906,16 +906,39 @@ export function buildProfileRows(cache: Record<string, ChromeProfileInfo> | null
 }
 
 /**
- * The `--user-data-dir` a process command line names, or null. Windows command lines keep
- * quotes: `--user-data-dir="C:\a b"`, `"--user-data-dir=C:\a b"`, or unquoted up to a space.
- * POSIX `ps` output has no quotes, so there the value runs to the next ` -flag` or the end;
- * an ambiguous value then fails the exact comparison (a miss, never the wrong browser).
+ * Split a Windows command line into arguments the way the C runtime does (CommandLineToArgvW
+ * rules): whitespace separates outside quotes; quotes toggle and may sit mid-argument
+ * (`--x="C:\a"b` is `--x=C:\ab`); 2n backslashes before a quote are n backslashes and the quote
+ * toggles, 2n+1 are n and a literal quote; `""` inside quotes is a literal quote.
  */
-export function userDataDirOf(commandLine: string, windows = process.platform === "win32"): string | null {
-  const m = windows
-    ? /(?:^|\s)"--user-data-dir=([^"]*)"|(?:^|\s)--user-data-dir="([^"]*)"|(?:^|\s)--user-data-dir=([^\s"]+)/.exec(commandLine)
-    : /(?:^|\s)--user-data-dir=(.+?)(?=\s+-|\s*$)/.exec(commandLine);
-  return m ? (m[1] ?? m[2] ?? m[3] ?? null) : null;
+export function splitWindowsCommandLine(commandLine: string): string[] {
+  const args: string[] = [];
+  let current = "", quoted = false, started = false;
+  for (let i = 0; i < commandLine.length; i++) {
+    const c = commandLine[i];
+    if (c === "\\") {
+      let n = 0;
+      while (commandLine[i] === "\\") { n++; i++; }
+      if (commandLine[i] === '"') {
+        current += "\\".repeat(n >> 1);
+        if (n % 2) current += '"'; else quoted = !quoted;
+      } else { current += "\\".repeat(n); i--; }
+      started = true;
+    } else if (c === '"') {
+      if (quoted && commandLine[i + 1] === '"') { current += '"'; i++; } else quoted = !quoted;
+      started = true;
+    } else if (!quoted && (c === " " || c === "\t")) {
+      if (started) { args.push(current); current = ""; started = false; }
+    } else { current += c; started = true; }
+  }
+  if (started) args.push(current);
+  return args;
+}
+
+/** The `--user-data-dir` value among exact arguments, or null. */
+export function userDataDirArg(args: string[]): string | null {
+  const arg = args.find(a => a.startsWith("--user-data-dir="));
+  return arg === undefined ? null : arg.slice("--user-data-dir=".length);
 }
 
 /** Same folder: exact path, ignoring trailing separators (and case on Windows). */
@@ -924,19 +947,58 @@ export function sameDataDir(a: string, b: string, windows = process.platform ===
   return norm(a) === norm(b);
 }
 
-/** PIDs of browser processes (not helpers) running on exactly this Chrome user-data dir. */
-function browsersUsing(userDataDir: string): number[] {
-  const rows = process.platform === "win32"
-    ? Bun.spawnSync(["powershell", "-NoProfile", "-NonInteractive", "-Command",
-        "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId)`t$($_.CommandLine)\" }"], { windowsHide: true })
-        .stdout.toString().split(/\r?\n/).map(line => { const tab = line.indexOf("\t"); return { pid: Number(line.slice(0, tab)), command: line.slice(tab + 1) }; })
-    : Bun.spawnSync(["ps", "ax", "-o", "pid=,command="]).stdout.toString().split("\n")
-        .map(line => { const m = /^\s*(\d+)\s+(.*)$/.exec(line); return { pid: m ? Number(m[1]) : 0, command: m?.[2] ?? "" }; });
-  return rows.filter(p => {
-    if (!p.pid || p.pid === process.pid || /(?:^|\s)"?--type=/.test(p.command)) return false;
-    const dir = userDataDirOf(p.command);
-    return !!dir && sameDataDir(dir, userDataDir);
-  }).map(p => p.pid);
+/**
+ * Match a flattened POSIX `ps` command line (no quotes, argument boundaries lost) against a
+ * user-data dir: "exact" only when the path is the last thing on the line; "ambiguous" when
+ * more text follows (another flag, or a sibling folder like `qa -backup`); else "none".
+ */
+export function flatUserDataDirMatch(command: string, userDataDir: string): "exact" | "ambiguous" | "none" {
+  const flag = `--user-data-dir=${userDataDir.replace(/\/+$/, "")}`;
+  const at = command.indexOf(flag);
+  if (at < 0 || (at > 0 && !/\s/.test(command[at - 1]))) return "none";
+  const rest = command.slice(at + flag.length);
+  if (/^\/*\s*$/.test(rest)) return "exact";
+  return /^\/*\s/.test(rest) ? "ambiguous" : "none";   // `qa2` / `qa-x` are other folders
+}
+
+/**
+ * Browser processes (not helpers) on this Chrome user-data dir. `exact`: certainly this folder
+ * (Windows command lines are split with the C runtime's rules; Linux reads argv from /proc).
+ * `ambiguous`: flattened `ps` output that may name a sibling folder — never killed.
+ */
+function browsersUsing(userDataDir: string): { exact: number[]; ambiguous: number[] } {
+  const exact: number[] = [], ambiguous: number[] = [];
+  const isHelper = (args: string[]) => args.some(a => a.startsWith("--type="));
+  if (process.platform === "win32") {
+    const out = Bun.spawnSync(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+      "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId)`t$($_.CommandLine)\" }"], { windowsHide: true }).stdout.toString();
+    for (const line of out.split(/\r?\n/)) {
+      const tab = line.indexOf("\t"), pid = Number(line.slice(0, tab));
+      if (!pid || pid === process.pid) continue;
+      const args = splitWindowsCommandLine(line.slice(tab + 1));
+      const dir = userDataDirArg(args);
+      if (dir !== null && !isHelper(args) && sameDataDir(dir, userDataDir)) exact.push(pid);
+    }
+    return { exact, ambiguous };
+  }
+  const ps = Bun.spawnSync(["ps", "ax", "-o", "pid=,command="]).stdout.toString();
+  for (const line of ps.split("\n")) {
+    const m = /^\s*(\d+)\s+(.*)$/.exec(line);
+    if (!m || Number(m[1]) === process.pid || !m[2].includes("--user-data-dir=")) continue;
+    const pid = Number(m[1]);
+    let argv: string[] | null = null;
+    try { argv = readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").filter(Boolean); } catch { /* not Linux, or gone */ }
+    if (argv) {
+      const dir = userDataDirArg(argv);
+      if (dir !== null && !isHelper(argv) && sameDataDir(dir, userDataDir, false)) exact.push(pid);
+      continue;
+    }
+    if (/(?:^|\s)--type=/.test(m[2])) continue;
+    const match = flatUserDataDirMatch(m[2], userDataDir);
+    if (match === "exact") exact.push(pid);
+    else if (match === "ambiguous") ambiguous.push(pid);
+  }
+  return { exact, ambiguous };
 }
 
 /** Move a folder to the user's Trash (recoverable). Returns where it went, or null if unsupported here. */
@@ -991,13 +1053,17 @@ async function removeProfile(selector: string, opts: { yes?: boolean; close?: bo
   const key = (await resolveGlobalProfile(registry, cache, selector)).email;
   const config = await readListeners();
   const plan = planProfileRemoval(key, registry, config?.listeners ?? [], join(RECH_DIR, "profiles"));
-  const running = plan.dataDir ? browsersUsing(plan.dataDir) : [];
+  const using = plan.dataDir ? browsersUsing(plan.dataDir) : { exact: [], ambiguous: [] };
+  const running = using.exact;
   console.log(`Remove profile "${key}"${plan.keys.length > 1 ? ` (registered as ${plan.keys.join(", ")})` : ""}:`);
   for (const edit of plan.listeners) console.log(edit.drop ? `  - remove listener "${edit.name}" (it serves only this profile)` : `  - stop sharing it on listener "${edit.name}"`);
   console.log(`  - unregister it from rech (~/.rechrome/profiles.yaml)`);
   if (plan.dataDir) console.log(`  - move its data folder to the Trash: ${plan.dataDir}`);
   else console.log(`  - its Chrome data is left alone (this only unregisters it from rech)`);
   if (running.length) console.log(`  - close its browser window, which is running now (pid ${running.join(", ")})`);
+  // A process that may be on this folder or on a sibling one: never killed, and nothing changes.
+  if (using.ambiguous.length)
+    throw new Error(`A process that may be using ${plan.dataDir} is running (pid ${using.ambiguous.join(", ")}), and rech can't tell it from one on a similarly named folder. Close it yourself, then run this again. Nothing changed.`);
   const interactive = isInteractive();
   if (!opts.yes) {
     if (!interactive) throw new Error("Not removed. Re-run with --yes to confirm" + (running.length ? " and --close to close its running window." : "."));
@@ -1008,8 +1074,8 @@ async function removeProfile(selector: string, opts: { yes?: boolean; close?: bo
     // In a terminal, confirming the plan above (which lists closing it) is the consent; otherwise --close.
     if (!interactive && !opts.close) throw new Error("Its window is running; re-run with --close to close it, or close it yourself first.");
     for (const pid of running) process.kill(pid, "SIGTERM");
-    for (let i = 0; i < 40 && browsersUsing(plan.dataDir!).length; i++) await Bun.sleep(250);
-    if (browsersUsing(plan.dataDir!).length) throw new Error("Its window did not close; close it and run this again. Nothing else changed.");
+    for (let i = 0; i < 40 && browsersUsing(plan.dataDir!).exact.length; i++) await Bun.sleep(250);
+    if (browsersUsing(plan.dataDir!).exact.length) throw new Error("Its window did not close; close it and run this again. Nothing else changed.");
   }
   if (config && plan.listeners.length) {
     for (const edit of plan.listeners) {
