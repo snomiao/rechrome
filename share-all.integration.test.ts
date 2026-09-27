@@ -44,6 +44,19 @@ test("share --all: one snapshot link, profiles picked on the host, never the man
     expect(refused.stderr).toContain("never shared");
     expect((await rech(["share", "--all", "--listener", "local"], hostEnv)).stderr).toContain("never shared");
 
+    // One profile that no listener allows: without a terminal, `share` gives it its own link
+    // (loopback, own key) instead of stopping with instructions.
+    const own = await rech(["share", "personal"], hostEnv);
+    expect(own.code).toBe(0);
+    expect(own.stdout.trim()).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/rechrome\/personal\/\?profile=personal#key=[\w-]{20,}$/);
+    let ownConfig = JSON.parse(await readFile(listenersPath, "utf8"));
+    const ownListener = ownConfig.listeners.find((l: any) => l.name === "personal");
+    expect(ownListener.host).toBe("127.0.0.1");
+    expect(ownListener.key).not.toBe(one.key);
+    expect((await rech(["share", "personal"], hostEnv)).stdout.trim()).toBe(own.stdout.trim());   // now shared: same link
+    ownConfig.listeners = ownConfig.listeners.filter((l: any) => l !== ownListener && l.name !== ownListener.name);
+    await writeFile(listenersPath, JSON.stringify(ownConfig));   // keep the rest of this test's setup unchanged
+
     // share --all: a snapshot of every registered profile (aliases collapse) on its own listener.
     const shared = await rech(["share", "--all"], hostEnv);
     expect(shared.code).toBe(0);

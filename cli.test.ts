@@ -254,7 +254,7 @@ test("share picks the scoped listener that allows the profile, never the managem
   expect(chooseShareListener("a@x", [local, L("lan", ["a@x"]), L("proxy", ["a@x"], "https://h/")])).toBe("proxy");
   expect(() => chooseShareListener("a@x", [local, L("one", ["a@x"]), L("two", ["a@x"])])).toThrow(/several listeners \(one, two\)/);
   expect(() => chooseShareListener("a@x", [local, L("share", ["b@x"])])).toThrow(/rech listener allow share "a@x"/);
-  expect(() => chooseShareListener("a@x", [local])).toThrow(/rech listener add share/);
+  expect(() => chooseShareListener("a@x", [local])).toThrow(/Give it its own link:  rech share "a@x"/);
 });
 
 test("a loose profile match (email name, or 3+ char prefix) is accepted only when unique", () => {
@@ -304,4 +304,32 @@ test("profile rm <name> removes a profile; flags pass through", async () => {
   expect(await run(["profile", "remove", "qa", "--yes", "--close"])).toEqual([["removeProfile", "qa", { yes: true, close: true }]]);
   await expect(run(["profile", "rm"])).rejects.toThrow(/rech profile rm <name>/);
   await expect(run(["profile", "qa", "extra"])).rejects.toThrow(/rech profile rm/);
+});
+
+test("a new share link is named after its profile, not a hash", async () => {
+  const { profileSlug, uniqueShareName } = await import("./rechrome.ts");
+  expect(profileSlug("snomiao@gmail.com")).toBe("snomiao");
+  expect(profileSlug("Taku.Y@corp.jp")).toBe("taku-y");
+  expect(profileSlug("Profile 25")).toBe("profile-25");
+  expect(profileSlug("@@@")).toBe("profile");
+  const taken = [L("snomiao", ["a@x"]), { ...L("other", ["b@x"]), prefix: "/rechrome/snomiao-2/" }];
+  expect(uniqueShareName("snomiao", taken)).toBe("snomiao-3");
+  expect(uniqueShareName("taku", taken)).toBe("taku");
+});
+
+test("a new link never takes a reserved name or a mount a proxy already serves", async () => {
+  const { uniqueShareName, serveMountsAndFunnel } = await import("./rechrome.ts");
+  // share --all / share a b rewrite their listeners' allowlists; a one-profile link must not sit there.
+  expect(uniqueShareName("share-all", [])).toBe("share-all-2");
+  expect(uniqueShareName("local", [])).toBe("local-2");
+  expect(uniqueShareName("share-abc123", [])).toBe("share-abc123-2");
+  expect(uniqueShareName("personal", [], ["/rechrome/personal", "/webcode"])).toBe("personal-2");
+  const status = {
+    Web: { "node.ts.net:443": { Handlers: { "/webcode/": { Proxy: "http://127.0.0.1:4390/webcode/" }, "/rechrome/personal": { Proxy: "http://127.0.0.1:9/x" } } } },
+    AllowFunnel: { "node.ts.net:443": true },
+  };
+  expect(serveMountsAndFunnel(status, "node.ts.net")).toEqual({ mounts: ["/webcode", "/rechrome/personal"], funnel: true });
+  expect(serveMountsAndFunnel(status, "other.ts.net").funnel).toBe(false);
+  expect(serveMountsAndFunnel({ ...status, AllowFunnel: { "node.ts.net:443": false } }, "node.ts.net").funnel).toBe(false);
+  expect(serveMountsAndFunnel(null, "node.ts.net")).toEqual({ mounts: [], funnel: false });
 });
