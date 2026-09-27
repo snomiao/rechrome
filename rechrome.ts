@@ -2,6 +2,7 @@
 import { readListeners, writeListeners, listenerAddress, isLoopback, normalizePrefix, serviceUrl, type Listener } from "./listeners.ts";
 
 import { file } from "bun";
+import yargs from "yargs";
 import { readExtensionTokenFromProfile } from "./extension-token.ts";
 import { randomBytes } from "crypto";
 import { mkdirSync, appendFileSync, existsSync, realpathSync, accessSync, cpSync, unlinkSync, readFileSync, readdirSync, constants as fsConstants } from "fs";
@@ -859,21 +860,7 @@ export function profileConnectionUri(profile: string, configuredUrl: string | un
   return result.toString();
 }
 
-async function printProfileUri(args: string[]): Promise<void> {
-  let selector: string | undefined;
-  let listener: string | undefined;
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i];
-    if (arg === "--print-uri") continue;
-    if (arg === "--listener") {
-      listener = args[++i];
-      if (!listener || listener.startsWith("-")) throw new Error("--listener requires a name");
-    } else if (arg.startsWith("--listener=")) {
-      listener = arg.slice("--listener=".length);
-      if (!listener) throw new Error("--listener requires a name");
-    } else if (!arg.startsWith("-") && !selector) selector = arg;
-    else throw new Error("Usage: rech profile [name] --print-uri [--listener <name>]");
-  }
+async function printProfileUri(selector?: string, listener?: string): Promise<void> {
   const url = process.env[ENV_KEY];
   selector ??= url ? parseUrl(url).profileDirectory : undefined;
   if (!selector) throw new Error("Specify a profile: rech profile <name> --print-uri");
@@ -1769,36 +1756,35 @@ async function exposeProfile(profile: string, host: string, port: number, prefix
   return listener;
 }
 
-async function listenerCommand(args: string[]): Promise<void> {
+async function requireListeners() {
   const config = await readListeners();
   if (!config) throw new Error("No listener configuration yet. Run rech setup to migrate the daemon.");
-  if (!args.length || ["ls", "list"].includes(args[0])) {
-    for (const l of config.listeners) console.log(`${l.name}  ${listenerAddress(l)}${normalizePrefix(l.prefix)}  ${l.profiles === "*" ? "local management (all profiles)" : l.profiles.join(", ")}`);
-    return;
-  }
-  if (args[0] === "remove" && args.length === 2) {
-    const listener = config.listeners.find(l => l.name === args[1]);
-    if (!listener) throw new Error("Unknown listener");
-    if (listener.profiles === "*") throw new Error("Keep the local management listener for setup and recovery");
-    config.listeners = config.listeners.filter(l => l !== listener);
-    await writeListeners(config);
-    console.log("Listener removed from configuration; daemon reloads automatically.");
-    return;
-  }
-  if (args[0] !== "add" || !args[1]) throw new Error("Usage: rech listener add <name> --listen <local|lan|tailscale|IP> --profile <selector> [--port <port>] [--prefix <path>]; rech listener remove <name>");
-  const values: Record<string, string[]> = {};
-  for (let i = 2; i < args.length; i += 2) {
-    if (!["--listen", "--profile", "--port", "--prefix"].includes(args[i]) || !args[i + 1] || args[i + 1].startsWith("--")) throw new Error("Invalid listener option");
-    (values[args[i]] ??= []).push(args[i + 1]);
-  }
-  if (!values["--listen"]?.length || !values["--profile"]?.length) throw new Error("--listen and --profile are required; repeat --profile to allow multiple profiles");
+  return config;
+}
+
+async function listListeners(): Promise<void> {
+  for (const l of (await requireListeners()).listeners) console.log(`${l.name}  ${listenerAddress(l)}${normalizePrefix(l.prefix)}  ${l.profiles === "*" ? "local management (all profiles)" : l.profiles.join(", ")}`);
+}
+
+async function removeListener(name: string): Promise<void> {
+  const config = await requireListeners();
+  const listener = config.listeners.find(l => l.name === name);
+  if (!listener) throw new Error("Unknown listener");
+  if (listener.profiles === "*") throw new Error("Keep the local management listener for setup and recovery");
+  config.listeners = config.listeners.filter(l => l !== listener);
+  await writeListeners(config);
+  console.log("Listener removed from configuration; daemon reloads automatically.");
+}
+
+async function addListener(name: string, opts: { listen: string; profile: string[]; port?: number; prefix?: string }): Promise<void> {
+  const config = await requireListeners();
   const registry = await readTokenRegistry(), cache = await readChromeProfileCache();
   const profiles: string[] = [];
-  for (const selector of values["--profile"]) profiles.push((await resolveGlobalProfile(registry, cache, selector)).email);
-  const host = chooseListenAddress(await detectListenChoices(), values["--listen"][0]);
-  const port = Number(values["--port"]?.[0] ?? DEFAULT_PORT);
-  if (config.listeners.some(l => l.name === args[1])) throw new Error("Listener name already exists; edit listeners.json to change its allowlist");
-  config.listeners.push({ name: args[1], host, port, prefix: normalizePrefix(values["--prefix"]?.[0]), key: randomBytes(24).toString("base64url"), profiles: [...new Set(profiles)] });
+  for (const selector of opts.profile) profiles.push((await resolveGlobalProfile(registry, cache, selector)).email);
+  const host = chooseListenAddress(await detectListenChoices(), opts.listen);
+  const port = opts.port ?? DEFAULT_PORT;
+  if (config.listeners.some(l => l.name === name)) throw new Error("Listener name already exists; edit listeners.json to change its allowlist");
+  config.listeners.push({ name, host, port, prefix: normalizePrefix(opts.prefix), key: randomBytes(24).toString("base64url"), profiles: [...new Set(profiles)] });
   await writeListeners(config);
   console.log(`Listener saved for ${host}:${port}; daemon reloads automatically. Credentials are in ~/.rechrome/listeners.json (keep private).`);
 }
@@ -2300,83 +2286,113 @@ Examples:
   rech screenshot`);
 }
 
+export type SetupOptions = { profile?: string; token?: string; listen?: string; prefix?: string; port?: number };
+export type RechHandlers = {
+  serve(): Promise<void> | void;
+  status(): Promise<void>;
+  listListeners(): Promise<void>;
+  addListener(name: string, opts: { listen: string; profile: string[]; port?: number; prefix?: string }): Promise<void>;
+  removeListener(name: string): Promise<void>;
+  listProfiles(): Promise<void>;
+  printProfileUri(selector?: string, listener?: string): Promise<void>;
+  setup(opts: SetupOptions): Promise<void>;
+  tray(action?: string): Promise<void>;
+  provisionProfile(name: string, opts: { headed: boolean; experimental: boolean }): Promise<void>;
+  uninstall(): Promise<void>;
+};
+
+/** Commands rech handles itself; anything else is forwarded verbatim to playwright-cli. */
+export const RECH_COMMANDS = new Set(["serve", "status", "listener", "listeners", "profile", "profiles", "setup", "tray", "provision-profile", "uninstall"]);
+
+const portOption = { type: "number", requiresArg: true, describe: "Listener port (1-65535)" } as const;
+
+export function rechCli(argv: string[], handlers: RechHandlers) {
+  return yargs(argv)
+    .scriptName("rech")
+    .parserConfiguration({ "parse-numbers": false, "parse-positional-numbers": false })
+    .command("serve", "Run the rechrome daemon in the foreground", {}, () => handlers.serve())
+    .command("status", "Show daemon, relay and profile connection status", {}, () => handlers.status())
+    .command(["listener", "listeners"], "Manage network listeners", y => y
+      .command(["ls", "list", "$0"], "List listeners (credentials hidden)", {}, () => handlers.listListeners())
+      .command("add <name>", "Expose registered profiles on a network", y => y
+        .positional("name", { type: "string", demandOption: true })
+        .option("listen", { type: "string", requiresArg: true, demandOption: true, describe: "local | lan | tailscale | <detected IP>" })
+        .option("profile", { type: "string", array: true, requiresArg: true, demandOption: true, describe: "Allowed profile; repeat for several" })
+        .option("port", portOption)
+        .option("prefix", { type: "string", requiresArg: true, describe: "URL path prefix, e.g. rechrome" }),
+        a => handlers.addListener(a.name, { listen: a.listen, profile: a.profile, port: a.port, prefix: a.prefix }))
+      .command("remove <name>", "Remove a listener", y => y.positional("name", { type: "string", demandOption: true }),
+        a => handlers.removeListener(a.name))
+      .demandCommand(1).strict())
+    .command(["profile [name]", "profiles [name]"], "List profiles, or print a profile's connection URI", y => y
+      .positional("name", { type: "string", describe: "Profile (email, name or folder); ls/list lists all" })
+      .option("print-uri", { type: "boolean", describe: "Print the profile's connection URI (contains a secret key)" })
+      .option("listener", { type: "string", requiresArg: true, implies: "print-uri", describe: "Listener to build the URI for" }),
+      a => {
+        if (a.printUri) return handlers.printProfileUri(a.name, a.listener);
+        if (a.name === undefined || ["ls", "list"].includes(a.name)) return handlers.listProfiles();
+        throw new Error("Usage: rech profile [ls|list] | rech profile [name] --print-uri. Create, rename, and delete are not implemented.");
+      })
+    .command("setup", "Install the daemon and connect a Chrome profile", y => y
+      .option("profile", { type: "string", requiresArg: true, describe: "Chrome profile: email, name or folder" })
+      .option("token", { type: "string", requiresArg: true, describe: "Extension token (default: read from the profile, or RECH_TOKEN)" })
+      .option("listen", { type: "string", requiresArg: true, describe: "local | lan | tailscale | <detected IP>" })
+      .option("prefix", { type: "string", requiresArg: true, describe: "URL path prefix for a scoped listener, e.g. rechrome" })
+      .option("port", portOption),
+      a => handlers.setup({ profile: a.profile, token: a.token ?? process.env.RECH_TOKEN, listen: a.listen, prefix: a.prefix, port: a.port }))
+    .command("tray [action]", "Show or hide the tray icon", y => y
+      .positional("action", { type: "string", choices: ["show", "start", "hide", "stop", "quit"] }),
+      a => handlers.tray(a.action))
+    .command("provision-profile <name>", "Create a managed Chrome-for-Testing profile (experimental)", y => y
+      .positional("name", { type: "string", demandOption: true })
+      .option("experimental", { type: "boolean", default: false })
+      .option("headed", { type: "boolean", default: false }),
+      a => handlers.provisionProfile(a.name, { headed: a.headed, experimental: a.experimental }))
+    .command("uninstall", "Stop and remove the rechrome daemon", {}, () => handlers.uninstall())
+    .demandCommand(1)
+    .strict()
+    .help()
+    .version(false)
+    .fail((message, error) => { throw error ?? new Error(message); });
+}
+
 if (import.meta.main) {
   let args = process.argv.slice(2);
   const cmd = args[0]?.toLowerCase();
 
-  if (cmd === "serve") {
-    const { serve } = await import("./serve.ts");
-    serve(); // long-lived; watcher intentionally kept alive
-  } else if (cmd === "status") {
-    await status();
-    envWatcher?.close();
-  } else if (cmd === "listener" || cmd === "listeners") {
-    try { await listenerCommand(args.slice(1)); }
-    catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
-    finally { envWatcher?.close(); }
-  } else if (cmd === "profile" || cmd === "profiles") {
-    if (args.includes("--print-uri")) {
-      try { await printProfileUri(args.slice(1)); }
-      catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
-    } else if (args.length > 2 || (args.length === 2 && !["ls", "list"].includes(args[1]))) {
-      console.error("Usage: rech profile [ls|list]. Create, rename, and delete subcommands are not implemented.");
-      process.exitCode = 1;
-    } else {
-      await listProfiles();
-    }
-    envWatcher?.close();
-  } else if (cmd === "setup") {
-    const profileIdx = args.indexOf("--profile");
-    const profile = profileIdx !== -1
-      ? args[profileIdx + 1]
-      : args.find(a => a.startsWith("--profile="))?.slice("--profile=".length);
-    const tokenIdx = args.indexOf("--token");
-    const token = (tokenIdx !== -1
-      ? args[tokenIdx + 1]
-      : args.find(a => a.startsWith("--token="))?.slice("--token=".length))
-      ?? process.env.RECH_TOKEN;
-    const listenIdx = args.indexOf("--listen");
-    const listen = listenIdx !== -1 ? args[listenIdx + 1] : args.find(a => a.startsWith("--listen="))?.slice("--listen=".length);
-    if (listenIdx !== -1 && (!listen || listen.startsWith("--"))) {
-      console.error("--listen requires local, lan, tailscale, or a detected interface address");
-      envWatcher?.close(); process.exit(1);
-    }
-    const option = (name: string) => {
-      const i = args.indexOf(name);
-      if (i !== -1) {
-        if (!args[i + 1] || args[i + 1].startsWith("--")) throw new Error(`${name} requires a value`);
-        return args[i + 1];
-      }
-      return args.find(a => a.startsWith(name + "="))?.slice(name.length + 1);
+  if (cmd && RECH_COMMANDS.has(cmd)) {
+    const handlers: RechHandlers = {
+      serve: async () => { const { serve } = await import("./serve.ts"); serve(); }, // long-lived; watcher intentionally kept alive
+      status,
+      listListeners, addListener, removeListener, listProfiles, printProfileUri,
+      setup: async (opts) => {
+        await setup(opts); // setup closes envWatcher itself before printing Done
+        // Auto-start the tray (best-effort, silent on headless / missing binary).
+        await startTray({ quiet: true }).catch(() => {});
+      },
+      tray: trayCommand,
+      provisionProfile: async (name, { headed, experimental }) => {
+        // Experimental: a managed profile runs on Chrome for Testing, not the user's real Google Chrome
+        // (branded Chrome 149+ rejects --load-extension). It's a clean browser with no logins/cookies,
+        // so it's gated behind --experimental rather than offered as the default setup path.
+        if (!experimental) throw new Error([
+          `provision-profile is experimental and creates a Chrome-for-Testing profile (not your`,
+          `real Chrome): branded Google Chrome 149+ rejects --load-extension, so a managed profile`,
+          `can't reuse your logged-in Chrome. For your real Chrome use:  rech setup --profile <email|name|folder>`,
+          `To proceed anyway, re-run with --experimental.`,
+        ].join("\n"));
+        await provisionProfile(name, { headed });
+      },
+      uninstall: daemonUninstall,
     };
-    const prefix = option("--prefix");
-    const portArg = option("--port");
-    await setup({ profile, token, listen, prefix, port: portArg === undefined ? undefined : Number(portArg) }); // setup closes envWatcher itself before printing Done
-    // Auto-start the tray (best-effort, silent on headless / missing binary).
-    await startTray({ quiet: true }).catch(() => {});
-  } else if (cmd === "tray") {
-    await trayCommand(args[1]?.toLowerCase());
-    envWatcher?.close();
-  } else if (cmd === "provision-profile") {
-    const name = args.find((a, i) => i > 0 && !a.startsWith("-"));
-    const headed = args.includes("--headed");
-    const experimental = args.includes("--experimental");
-    if (!name) { console.error("Usage: rech provision-profile <name> --experimental [--headed]"); process.exit(1); }
-    // Experimental: a managed profile runs on Chrome for Testing, not the user's real Google Chrome
-    // (branded Chrome 149+ rejects --load-extension). It's a clean browser with no logins/cookies,
-    // so it's gated behind --experimental rather than offered as the default setup path.
-    if (!experimental) {
-      console.error(`provision-profile is experimental and creates a Chrome-for-Testing profile (not your`);
-      console.error(`real Chrome): branded Google Chrome 149+ rejects --load-extension, so a managed profile`);
-      console.error(`can't reuse your logged-in Chrome. For your real Chrome use:  rech setup --profile <email|name|folder>`);
-      console.error(`To proceed anyway, re-run with --experimental.`);
-      process.exit(1);
+    try {
+      await rechCli([cmd, ...args.slice(1)], handlers).parseAsync();
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    } finally {
+      if (cmd !== "serve") envWatcher?.close();
     }
-    await provisionProfile(name, { headed });
-    envWatcher?.close();
-  } else if (cmd === "uninstall") {
-    await daemonUninstall();
-    envWatcher?.close();
   } else if (cmd === "help" || cmd === "--help" || cmd === "-h" || args.length === 0) {
     printHelp();
     envWatcher?.close();
