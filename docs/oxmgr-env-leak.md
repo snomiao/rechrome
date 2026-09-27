@@ -111,4 +111,4 @@ ps eww -p "$(pgrep -f 'oxmgr.*daemon run')" \
   invoking it from a clean shell (`env -i …`) so the daemon's persistent env
   matches what's declared in oxmgr's `state.json`.
 - Consider having `serve.ts` log every env var it actually reads on startup
-  so the leak surfaces in `rechrome-serve.err.log` instead of going silent.
+  so the leak surfaces in `rechrome.err.log` instead of going silent.
