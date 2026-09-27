@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdtemp, mkdir, copyFile, writeFile, rm, symlink, unlink } from "fs/promises";
+import { mkdtemp, mkdir, copyFile, writeFile, rm, symlink, unlink, stat } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
 import { profileOutputPrefix, serviceUrl } from "./listeners.ts";
@@ -45,8 +45,12 @@ test("multiple sockets enforce profile/file policies and reload without browser 
   };
   try {
     await waitFor(async () => (await get(qa)).ok && (await get(personal)).ok);
-    for (const path of ["/ping", "/run", "/rechrome-other/ping"])
-      expect((await fetch(`http://127.0.0.1:${portA}${path}`, { headers: { Authorization: `Bearer ${qa.key}` } })).status).toBe(404);
+    // A prefixed listener also answers unprefixed paths (a proxy that strips the mount), still behind the key.
+    const direct = (path: string, key = qa.key) => fetch(`http://127.0.0.1:${portA}${path}`, { headers: { Authorization: `Bearer ${key}` } });
+    expect((await direct("/ping")).ok).toBe(true);
+    expect((await direct("/ping", personal.key)).status).toBe(401);
+    // A look-alike prefix is not stripped, so it misses /ping and gets only the unauthenticated banner.
+    expect(await (await direct("/rechrome-other/ping")).text()).toBe("rech server\n");
     expect((await get({ ...qa, key: personal.key })).status).toBe(401);
     expect((await run(qa, "personal", ["tab-list"])).status).toBe(403);
     expect((await run(qa, "qa", ["run-code", "async page => {}"])).status).toBe(403);
@@ -78,6 +82,30 @@ test("multiple sockets enforce profile/file policies and reload without browser 
       // Not a git repo, so the project folder is cwd: <root>/.rechrome/output, git-ignored as a whole.
       expect(await Bun.file(join(root, ".rechrome", "output", "probe.png")).text()).toBe("fixture");
       expect(await Bun.file(join(root, ".rechrome", ".gitignore")).text()).toBe("*\n");
+      // `rech connect` checks a shared URL through the proxy, then saves it for the project it runs in.
+      const project = join(root, "client-project");
+      await mkdir(project);
+      const connect = async (url: string) => {
+        const proc = Bun.spawn([process.execPath, join(root, "rechrome.ts"), "connect", url], {
+          cwd: project, env: { ...process.env, HOME: root, RECHROME_URL: "" }, stdin: "ignore", stdout: "pipe", stderr: "pipe",
+        });
+        const [code, stdout, stderr] = await Promise.all([proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+        return { code, output: stdout + stderr };
+      };
+      const shared = `http://127.0.0.1:${proxy.port}/rechrome/?profile=qa#key=${qa.key}`;
+      const saved = join(project, ".rechrome", ".env.local");
+      const badKey = await connect(shared.replace(qa.key, "z".repeat(24)));
+      expect(badKey.code).toBe(1);
+      expect(badKey.output).toContain("rejected this key");
+      const wrongProfile = await connect(shared.replace("profile=qa", "profile=personal"));
+      expect(wrongProfile.code).toBe(1);
+      expect(wrongProfile.output).toContain("does not allow profile");
+      expect(await Bun.file(saved).exists()).toBe(false);
+      const ok = await connect(shared);
+      expect(ok.code).toBe(0);
+      expect(await Bun.file(saved).text()).toBe(`RECHROME_URL=${shared}\n`);
+      expect((await stat(saved)).mode & 0o777).toBe(0o600);
+      expect(await Bun.file(join(project, ".rechrome", ".gitignore")).text()).toBe("*\n");
     } finally { proxy.stop(true); }
     await writeFile(join(root, ".rechrome", "output", "secret.png"), "private");
     const link = profileOutputPrefix("qa") + "link.png";

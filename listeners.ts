@@ -4,7 +4,8 @@ import { homedir } from "os";
 import { join } from "path";
 import { mkdir, readFile, rename, writeFile } from "fs/promises";
 
-export type Listener = { name: string; host: string; port: number; key: string; profiles: string[] | "*"; prefix?: string };
+// publicUrl: where a reverse proxy (Tailscale Serve, Caddy, nginx, ...) exposes this listener.
+export type Listener = { name: string; host: string; port: number; key: string; profiles: string[] | "*"; prefix?: string; publicUrl?: string };
 export type ListenerConfig = { version: 1; listeners: Listener[] };
 export const LISTENERS_FILE = join(homedir(), ".rechrome", "listeners.json");
 export const isLoopback = (host: string) => host === "::1" || /^127\./.test(host);
@@ -28,6 +29,16 @@ export function serviceUrl(raw: string, route = ""): string {
   return result.toString();
 }
 
+/** A public base URL: http(s), no credentials, query or fragment (the key never lives here). */
+export function normalizePublicUrl(value: unknown): string {
+  let url: URL;
+  try { url = new URL(String(value)); } catch { throw new Error(`Public URL must be an absolute http(s) URL, e.g. https://host.example.ts.net/rechrome/`); }
+  if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash)
+    throw new Error("Public URL must be plain http(s), without credentials, query, or fragment");
+  url.pathname = normalizePrefix(url.pathname);
+  return url.toString();
+}
+
 export function validateListeners(value: unknown): ListenerConfig {
   const config = value as ListenerConfig;
   if (config?.version !== 1 || !Array.isArray(config.listeners) || !config.listeners.length) throw new Error("listeners.json requires version 1 and at least one listener");
@@ -37,6 +48,7 @@ export function validateListeners(value: unknown): ListenerConfig {
       || !Number.isInteger(l.port) || l.port < 1 || l.port > 65535 || typeof l.key !== "string" || l.key.length < 16)
       throw new Error("Each listener needs a name, concrete IP, valid port, and bearer key of at least 16 characters");
     l.prefix = normalizePrefix(l.prefix);
+    if (l.publicUrl !== undefined) l.publicUrl = normalizePublicUrl(l.publicUrl);
     if (l.profiles === "*") {
       if (!isLoopback(l.host)) throw new Error("Unrestricted management listeners must bind to loopback");
     } else if (!Array.isArray(l.profiles) || !l.profiles.length || l.profiles.some(p => typeof p !== "string" || !p.trim() || p.includes("\0") || p === "*")) {
@@ -81,4 +93,45 @@ export function authorizeProfileRequest(listener: Listener, body: any): string {
 
 export function canReadProfileFile(listener: Listener, path: string): boolean {
   return listener.profiles === "*" || listener.profiles.some(p => path.startsWith(profileOutputPrefix(p)));
+}
+
+function scopedListener(config: ListenerConfig, name: string): Listener & { profiles: string[] } {
+  const listener = config.listeners.find(l => l.name === name);
+  if (!listener) throw new Error(`Unknown listener "${name}". See rech listener ls.`);
+  if (listener.profiles === "*") throw new Error(`"${name}" is the local management listener; it already serves every profile and its key is the daemon's own.`);
+  return listener as Listener & { profiles: string[] };
+}
+
+/** Add profiles to a scoped listener's allowlist. Returns the profiles newly added. */
+export function allowProfiles(config: ListenerConfig, name: string, profiles: string[]): string[] {
+  const listener = scopedListener(config, name);
+  const added = [...new Set(profiles)].filter(p => !listener.profiles.includes(p));
+  listener.profiles.push(...added);
+  return added;
+}
+
+/** Remove profiles from a scoped listener's allowlist. Returns the profiles removed. */
+export function denyProfiles(config: ListenerConfig, name: string, profiles: string[]): string[] {
+  const listener = scopedListener(config, name);
+  const removed = listener.profiles.filter(p => profiles.includes(p));
+  const remaining = listener.profiles.filter(p => !profiles.includes(p));
+  if (!remaining.length) throw new Error(`That would leave "${name}" with no profiles; remove it instead: rech listener remove ${name}`);
+  listener.profiles = remaining;
+  return removed;
+}
+
+/** Give a scoped listener a new bearer key; URLs carrying the old key stop working. */
+export function rotateListenerKey(config: ListenerConfig, name: string): string {
+  const listener = scopedListener(config, name);
+  listener.key = randomBytes(24).toString("base64url");
+  return listener.key;
+}
+
+/** Record (or with null, forget) where a proxy exposes a listener. */
+export function setPublicUrl(config: ListenerConfig, name: string, publicUrl: string | null): Listener {
+  const listener = config.listeners.find(l => l.name === name);
+  if (!listener) throw new Error(`Unknown listener "${name}". See rech listener ls.`);
+  if (publicUrl === null) delete listener.publicUrl;
+  else listener.publicUrl = normalizePublicUrl(publicUrl);
+  return listener;
 }

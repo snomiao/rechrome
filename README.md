@@ -153,7 +153,7 @@ Connection parameters also accept URL fragments:
 RECHROME_URL='https://your-host.ts.net/rechrome/?profile=qa#key=DAEMON_KEY' rech status
 ```
 
-`rech setup` prints and saves this URI format. Retrieve it later with `rech profile qa --print-uri`, or omit `qa` to use the configured profile. `profiles` remains an alias. The command prints only the URI to stdout, using the configured `RECHROME_URL` endpoint; `--listener local` selects a local listener instead. For example: `rech profile qa --print-uri --listener local`. The output contains a secret daemon key.
+`rech setup` prints and saves this URI format. Retrieve it later with `rech url qa` (alias: `rech profile qa --print-uri`), or omit `qa` to use the configured profile. `profiles` remains an alias. The command prints only the URI to stdout, using the configured `RECHROME_URL` endpoint; `--listener local` selects a local listener instead. For example: `rech profile qa --print-uri --listener local`. The output contains a secret daemon key.
 
 Direct connections use the root path, such as `http://127.0.0.1:13775/?profile=qa#key=DAEMON_KEY`. A prefix is optional and only added when explicitly configured with `--prefix`, for example for a proxy mounted at `/rechrome/`. Tailscale can also serve at the root without a prefix.
 
@@ -199,8 +199,9 @@ rech listener remove qa
 ```
 
 Repeat `--profile` to allow several registered profiles. A profile may appear on
-multiple listeners; `setup --listen` selects its exposure afresh. Edit the protected
-JSON file to update an existing listener's allowlist or key. Changes do not terminate
+multiple listeners; `setup --listen` selects its exposure afresh. Change an existing
+listener with `rech listener allow|deny <name> <profile...>`, and replace its key with
+`rech listener rotate-key <name>` (URLs carrying the old key stop working). Changes do not terminate
 browser sessions; removed listeners reject further requests. An occupied or unavailable
 address causes reload to retain the old configuration, so verify reachability after editing.
 
@@ -215,25 +216,45 @@ proxy or tunnel to clients that should have restricted access.
 LAN traffic is plain HTTP unless TLS is configured. Tailscale provides its private transport;
 binding an address does not configure Tailscale ACLs, port forwarding, or public tunnels.
 
-To mount rechrome under a Tailscale Serve path, use a separate scoped loopback listener:
+#### Sharing a profile through a reverse proxy
+
+rechrome does not depend on a particular proxy. Put a scoped **loopback** listener behind
+any reverse proxy (Tailscale Serve, Caddy, nginx, cloudflared…), record where it is
+reachable, and share the printed URL. The commands are the same in bash, PowerShell and
+`cmd.exe`: you choose the port, so there is nothing to substitute.
+
+On the host (the machine with Chrome):
 
 ```bash
-rech setup --profile taku3 --listen local --prefix=rechrome --port=13776
-tailscale serve --bg --https=443 --set-path=/rechrome http://127.0.0.1:13776/rechrome
+rech listener add share --listen local --prefix=rechrome --port 13776 --profile you@example.com
+tailscale serve --bg --set-path=/rechrome 13776          # or any proxy to 127.0.0.1:13776
+rech listener set share --public-url https://host.example.ts.net/rechrome/
+rech url you@example.com --listener share                # prints the URL to share (secret)
 ```
 
-`--prefix=rechrome` and `--prefix=/rechrome/` both normalize to `/rechrome/`.
-Without `--port`, prefixed setup reuses a matching scoped listener or defaults to
-the management port plus one. Existing profiles can also use
-`rech listener add qa-proxy --listen local --profile <profile> --port 13776 --prefix=rechrome`.
-Setup prints the matching Serve command but does not run it or change existing Serve routes.
-Include the path in the proxy target: Serve strips the mount path and the target restores it.
+`rech listener add` prints these next steps with your port filled in, and
+`rech listener port share` prints the port for scripts, e.g. in bash or PowerShell
+`tailscale serve --bg --set-path=/rechrome $(rech listener port share)`.
+A prefixed listener accepts requests with or without the prefix, so the proxy may strip
+the mount path (bare port target) or keep it (`http://127.0.0.1:13776/rechrome`).
 
-For remote clients, change the saved connection URL's origin to
-`https://<machine>.<tailnet>.ts.net`, retaining `/rechrome/`, the listener's bearer
-userinfo, and the profile query. Health checks, commands, and file downloads honor
-that base path. The setup guide remains a temporary local page owned by the setup
-process; it is not published through Serve. Never proxy the unrestricted management listener.
+On a client:
+
+```bash
+rech connect 'https://host.example.ts.net/rechrome/?profile=you%40example.com#key=…'
+rech open https://example.com
+```
+
+`rech connect` checks that the URL answers and allows the profile, then saves it as
+`RECHROME_URL` in the project's `.rechrome/.env.local` (git-ignored). `rech url ls` lists
+every listener and profile with local and public URLs, keys hidden. `rech status` shows the
+URL in use and which listener answered.
+
+`--prefix=rechrome` and `--prefix=/rechrome/` both normalize to `/rechrome/`. `rech setup
+--listen local --prefix=rechrome` also creates such a listener; when a Tailscale Serve route
+for it already exists, setup prints the remote URL. Never proxy the unrestricted management
+listener. The setup guide remains a temporary local page owned by the setup process; it is
+not published through a proxy.
 
 Existing installations retain the legacy listener until `rech setup` initializes the new
 configuration. The first migration restarts only the daemon to load the new source. Existing
