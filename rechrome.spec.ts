@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { parseUrl, authCheck, DEFAULT_PORT, ENV_KEY, deriveIdentity, normalizeRemote, normalizeCommandArgs, resolveChromeProfileSelector, resolveGlobalProfile, extractGlobalProfileArg } from "./rechrome.ts";
+import { parseUrl, authCheck, DEFAULT_PORT, ENV_KEY, deriveIdentity, normalizeRemote, normalizeCommandArgs, withDefaultScheme, resolveChromeProfileSelector, resolveGlobalProfile, extractGlobalProfileArg } from "./rechrome.ts";
 import { isUnderDir, splitCommand, shortClientLabel, isIsoSession } from "./serve.ts";
 import { sandboxConnectionWarning } from "./rechrome.ts";
 
@@ -117,6 +117,36 @@ describe("normalizeCommandArgs", () => {
     const args = ["open", "https://example.com"];
     expect(normalizeCommandArgs(args)).toEqual(args);
     expect(args).toEqual(["open", "https://example.com"]);
+  });
+
+  test("gives a bare navigation target a scheme (open/goto/tab-new only)", () => {
+    expect(normalizeCommandArgs(["open", "hello.com"])).toEqual(["open", "https://hello.com"]);
+    expect(normalizeCommandArgs(["goto", "--headed", "a.io/x?y=1"])).toEqual(["goto", "--headed", "https://a.io/x?y=1"]);
+    // A value-taking flag's value is not the target (Codex review of #22).
+    expect(normalizeCommandArgs(["open", "--profile", "my-profile", "hello.com"])).toEqual(["open", "--profile", "my-profile", "https://hello.com"]);
+    expect(normalizeCommandArgs(["open", "--browser=chrome", "hello.com"])).toEqual(["open", "--browser=chrome", "https://hello.com"]);
+    expect(normalizeCommandArgs(["tab-new", "localhost:3000"])).toEqual(["tab-new", "http://localhost:3000"]);
+    expect(normalizeCommandArgs(["open"])).toEqual(["open"]);
+    expect(normalizeCommandArgs(["eval", "hello.com"])).toEqual(["eval", "hello.com"]);
+  });
+});
+
+describe("withDefaultScheme", () => {
+  test("adds https:// to a bare host and http:// to loopback", () => {
+    expect(withDefaultScheme("hello.com")).toBe("https://hello.com");
+    expect(withDefaultScheme("example.com:8443/a")).toBe("https://example.com:8443/a");
+    expect(withDefaultScheme("127.0.0.1:8080/x")).toBe("http://127.0.0.1:8080/x");
+    expect(withDefaultScheme("[::1]:8080")).toBe("http://[::1]:8080");
+    // Loopback is matched by exact hostname, not prefix (Codex review of #22).
+    expect(withDefaultScheme("localhost.example.com")).toBe("https://localhost.example.com");
+    expect(withDefaultScheme("127.example.com/x")).toBe("https://127.example.com/x");
+    expect(withDefaultScheme("localhost")).toBe("http://localhost");
+    expect(withDefaultScheme("127.0.0.1")).toBe("http://127.0.0.1");
+  });
+
+  test("leaves URLs with a scheme and file paths alone", () => {
+    for (const u of ["https://a.com", "http://a.com", "about:blank", "file:///tmp/x", "data:text/html,hi", "./page.html", "/tmp/x.html", "C:\\x.html"])
+      expect(withDefaultScheme(u)).toBe(u);
   });
 });
 

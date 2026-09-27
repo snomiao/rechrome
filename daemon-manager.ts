@@ -58,13 +58,18 @@ export function pickDaemonManager(opts: {
 }): DaemonManager {
   const override = opts.override?.toLowerCase();
   if (override === "oxmgr" && !opts.oxmgrBin) {
-    throw new Error("RECH_DAEMON_MANAGER=oxmgr, but oxmgr is not on PATH. Install oxmgr and add it to PATH, or install pm2 with `bun add -g pm2` and set RECH_DAEMON_MANAGER=pm2.");
+    throw new Error("RECH_DAEMON_MANAGER=oxmgr, but oxmgr is not on PATH. Install it with `bun i -g oxmgr` and ensure the global bin directory is on PATH.");
   }
   if (override === "pm2" && !opts.pm2Bin) {
     throw new Error("RECH_DAEMON_MANAGER=pm2, but pm2 is not on PATH. Install it with `bun add -g pm2` and ensure the global bin directory is on PATH.");
   }
   if (!opts.oxmgrBin && !opts.pm2Bin) {
-    throw new Error("No daemon process manager found on PATH (oxmgr or pm2). Install pm2 with `bun add -g pm2`, ensure the global bin directory is on PATH, then rerun `bunx rechrome setup`.");
+    // oxmgr is the recommended manager. On Windows stock oxmgr is only used when pm2 is
+    // absent (see below), so pm2 stays a documented alternative there.
+    const install = opts.isWindows
+      ? "Install oxmgr with `bun i -g oxmgr` (on Windows, pm2 via `bun add -g pm2` is preferred unless oxmgr is the +winfix build)"
+      : "Install oxmgr with `bun i -g oxmgr`";
+    throw new Error(`No daemon process manager found on PATH (oxmgr or pm2). ${install}, ensure the global bin directory is on PATH, then rerun \`bunx rechrome setup\`.`);
   }
   const oxmgr: DaemonManager = { id: "oxmgr", bin: opts.oxmgrBin ?? "oxmgr" };
   const pm2: DaemonManager = { id: "pm2", bin: opts.pm2Bin ?? "pm2" };
@@ -96,4 +101,30 @@ export function oxmgrInstallCommand(env: { npm_config_user_agent?: string; npm_e
   const execPath = env.npm_execpath?.replace(/\\/g, "/") ?? "";
   if (/(^|\/)(npm|npx)(-cli\.js|\.cmd|\.exe)?$/i.test(execPath)) return ["npm", "i", "-g", "oxmgr"];
   return ["bun", "i", "-g", "oxmgr"];
+}
+
+export const PM2_DEPRECATION =
+  "pm2 is deprecated as the rech daemon manager; install oxmgr (`bun i -g oxmgr`) and rerun `rech setup` to migrate.";
+
+// Whether `mgr` is pm2 only as a stopgap because oxmgr is missing: the case where the user
+// should be nudged to oxmgr. Never on Windows, where pm2 is the deliberate choice over stock
+// (non-winfix) oxmgr and installing oxmgr would not change the pick, and never for an explicit
+// RECH_DAEMON_MANAGER=pm2.
+export function isDeprecatedPm2Fallback(mgr: DaemonManager, opts: { isWindows: boolean; override?: string | null }): boolean {
+  return mgr.id === "pm2" && !opts.isWindows && !opts.override;
+}
+
+// Whether a manager's process list (pm2 `jlist` JSON / oxmgr `list` table) registers exactly
+// `name`. A substring test false-positives on other processes whose names, paths or args
+// mention it (a pm2 app running from a `.../rechrome/...` checkout, or legacy `rechrome-serve`).
+export function listsProcess(id: DaemonManager["id"], output: string, name: string): boolean {
+  if (id === "pm2") {
+    try {
+      const list = JSON.parse(output);
+      return Array.isArray(list) && list.some((p: { name?: unknown } | null) => p?.name === name);
+    } catch {
+      return false;
+    }
+  }
+  return output.split(/[\s│|┃]+/).includes(name);
 }

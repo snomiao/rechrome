@@ -13,7 +13,7 @@ import { pathToFileURL } from "url";
 import { createRequire } from "node:module";
 import { spawn as cpSpawn } from "child_process";
 import { readFile, writeFile, rename, chmod, mkdir } from "node:fs/promises";
-import { oxmgrInstallCommand, pickDaemonManager, type DaemonManager } from "./daemon-manager.ts";
+import { isDeprecatedPm2Fallback, listsProcess, oxmgrInstallCommand, pickDaemonManager, PM2_DEPRECATION, type DaemonManager } from "./daemon-manager.ts";
 
 export const ENV_KEY = "RECHROME_URL";
 export const DEFAULT_PORT = 13775;
@@ -977,13 +977,43 @@ async function callServe(
     console.error(`[rech] rech-client -> rech-server[ok]\n  -x: bearer key rejected (used: ${key.slice(0, 4)}...) -> playwright[unknown]`);
     process.exit(1);
   }
-  return res.json();
+  const text = await res.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    // Not the daemon answering, e.g. a reverse proxy's 404 because the URL's path prefix is wrong.
+    const detail = `HTTP ${res.status} from ${serviceUrl(url, "run")} is not a rechrome daemon response: ${text.slice(0, 200).trim()}`;
+    if (throwOnFailure) throw new Error(detail);
+    console.error(`[rech] rech-client -> ${serviceUrl(url, "run")}\n  -x: ${detail}`);
+    process.exit(1);
+  }
 }
+
+const BOOLEAN_OPEN_FLAGS = new Set(["--headed", "--persistent", "--in-memory", "--extension"]);
 
 export function normalizeCommandArgs(args: string[]): string[] {
   const normalized = [...args];
   if (normalized[0] === "tabs" || normalized[0] === "list") normalized[0] = "tab-list";
+  // `rech open hello.com`: profile-scoped listeners accept only HTTP(S)/about:blank targets, so
+  // give a bare host an https:// scheme the way a browser address bar would.
+  if (["open", "goto", "tab-new"].includes(normalized[0])) {
+    // The target is the first positional. A token after a `--flag` without `=` is that flag's
+    // value (`open --profile my-profile url`), unless the flag is a known boolean.
+    const takesValue = (flag: string) => flag.startsWith("-") && !flag.includes("=") && !BOOLEAN_OPEN_FLAGS.has(flag);
+    const i = normalized.findIndex((a, idx) => idx > 0 && !a.startsWith("-") && !takesValue(normalized[idx - 1]!));
+    if (i > 0) normalized[i] = withDefaultScheme(normalized[i]!);
+  }
   return normalized;
+}
+
+/** `hello.com` -> `https://hello.com`, `localhost:3000` -> `http://localhost:3000`; URLs with a scheme and paths are unchanged. */
+export function withDefaultScheme(target: string): string {
+  if (/^[./\\~]/.test(target) || /^[a-z]:[\\/]/i.test(target)) return target; // a file path, not a host
+  if (/^[a-z][a-z0-9+.-]*:/i.test(target) && !/^[^/:]+:\d+(\/|$|[?#])/.test(target)) return target;
+  // Loopback by exact hostname: `localhost.example.com` / `127.example.com` are public hosts.
+  const host = (target.match(/^(\[[^\]]*\]|[^/:?#]*)/)?.[1] ?? "").toLowerCase();
+  const loopback = host === "localhost" || host === "[::1]" || /^127(\.\d{1,3}){3}$/.test(host);
+  return loopback ? `http://${target}` : `https://${target}`;
 }
 
 // Pull a global `--profile <val>` / `--profile=<val>` out of the leading flags of an argv.
@@ -1116,7 +1146,9 @@ async function run(url: string, args: string[], overrideEnv?: Record<string, str
   }
   if (stderr) {
     if (stderr.includes('Extension connection timeout')) {
-      const hasToken = !!effectiveEnv["PLAYWRIGHT_MCP_EXTENSION_TOKEN"];
+      // The daemon resolves registered profiles' bridge tokens itself and then asks for a reload;
+      // only blame a missing install when neither side had credentials.
+      const hasToken = !!effectiveEnv["PLAYWRIGHT_MCP_EXTENSION_TOKEN"] || /reload the .*extension/i.test(stderr);
       const last = hasToken
         ? `  -x: extension did not connect (reload it at chrome://extensions; then verify its token) -> extension[degraded]`
         : `  -> extension[not installed]  (run: rech setup)`;
@@ -1405,6 +1437,8 @@ function daemonManager(): DaemonManager {
     isWindows: IS_WINDOWS,
     override: process.env.RECH_DAEMON_MANAGER,
   });
+  if (isDeprecatedPm2Fallback(_daemonMgr, { isWindows: IS_WINDOWS, override: process.env.RECH_DAEMON_MANAGER }))
+    console.error(`[rech] warning: using pm2 because oxmgr is not on PATH. ${PM2_DEPRECATION}`);
   return _daemonMgr;
 }
 
@@ -1441,7 +1475,7 @@ async function oxmgrEnsureAutostart(mgr: DaemonManager): Promise<void> {
 }
 
 // Capture the process-manager's process list as text (oxmgr `list` / pm2 `jlist`).
-// Both render the process name verbatim, so callers can substring-match it.
+// Match a name in it with listsProcess, not a substring test.
 async function pmList(mgr: DaemonManager = daemonManager()): Promise<string> {
   const proc = Bun.spawn([mgr.bin, mgr.id === "pm2" ? "jlist" : "list"], { stdout: "pipe", stderr: "ignore", windowsHide: true });
   return await new Response(proc.stdout).text();
@@ -1489,18 +1523,22 @@ export function resolvePlaywrightCli(root: string = import.meta.dir): string {
 /**
  * Make sure a daemon process manager is available, offering to install oxmgr
  * (default No; --yes approves). An explicit RECH_DAEMON_MANAGER=pm2 is respected,
- * since installing oxmgr would not satisfy it.
+ * since installing oxmgr would not satisfy it. When only the deprecated pm2 fallback
+ * is available (POSIX without oxmgr), the offer is made too, but declining keeps pm2.
  */
 async function ensureDaemonManager(ask: (q: string, def?: string) => Promise<string>, yes = false): Promise<void> {
+  let fallback: DaemonManager | undefined;
   try {
-    daemonManager();
-    return;
+    fallback = daemonManager();
+    if (!isDeprecatedPm2Fallback(fallback, { isWindows: IS_WINDOWS, override: process.env.RECH_DAEMON_MANAGER })) return;
   } catch (error) {
     if (process.env.RECH_DAEMON_MANAGER?.toLowerCase() === "pm2") throw error;
   }
   const command = oxmgrInstallCommand(process.env);
-  const answer = yes ? "yes" : (await ask(`      oxmgr is missing. Install globally with \`${command.join(" ")}\`? [y/N]: `)).trim();
+  const reason = fallback ? "Only the deprecated pm2 is available" : "oxmgr is missing";
+  const answer = yes ? "yes" : (await ask(`      ${reason}. Install oxmgr globally with \`${command.join(" ")}\`? [y/N]: `)).trim();
   if (!/^(y|yes)$/i.test(answer)) {
+    if (fallback) return; // keep the working pm2 setup
     throw new Error(`Setup cancelled. To install oxmgr, run \`${command.join(" ")}\`, then rerun setup.`);
   }
   console.log(`      Installing oxmgr: ${command.join(" ")}`);
@@ -1555,6 +1593,22 @@ export async function daemonInstall(serveUrl: string): Promise<void> {
 
   // Drop any prior registration (current + legacy names) before re-adding.
   for (const name of [PM_PROCESS_NAME, ...LEGACY_PROCESS_NAMES]) await runPm(mgr, ["delete", name]);
+  // Migrating from pm2 to oxmgr: a serve still registered in pm2 would hold the port and be
+  // resurrected at login, fighting the oxmgr-managed one. Remove it from pm2 too.
+  const pm2Bin = mgr.id === "oxmgr" ? Bun.which("pm2") : null;
+  if (pm2Bin) {
+    const pm2: DaemonManager = { id: "pm2", bin: pm2Bin };
+    const listed = await pmList(pm2).catch(() => "");
+    const stale = [PM_PROCESS_NAME, ...LEGACY_PROCESS_NAMES].filter(name => listsProcess("pm2", listed, name));
+    if (stale.length) {
+      console.log(`      Migrating from pm2: removing ${stale.join(", ")}`);
+      for (const name of stale) await runPm(pm2, ["delete", name]);
+      // --force: pm2 won't save an empty list otherwise, keeping the old dump that `pm2 resurrect`
+      // would bring back at login to fight the oxmgr-managed serve over the port.
+      if (await runPm(pm2, ["save", "--force"]) !== 0)
+        console.warn("      pm2 save failed; run `pm2 save --force` so pm2 doesn't resurrect the old serve at login.");
+    }
+  }
 
   let startCode: number;
   if (mgr.id === "pm2") {
@@ -1593,7 +1647,7 @@ export async function daemonInstall(serveUrl: string): Promise<void> {
 async function daemonUninstall(): Promise<void> {
   const mgr = daemonManager();
   for (const name of [PM_PROCESS_NAME, ...LEGACY_PROCESS_NAMES]) await runPm(mgr, ["delete", name]);
-  if (mgr.id === "pm2") await runPm(mgr, ["save"]);
+  if (mgr.id === "pm2") await runPm(mgr, ["save", "--force"]); // an emptied list must still overwrite the dump
   else await runPm(mgr, ["service", "uninstall"]);
   console.log(`Removed ${mgr.id} process: ${PM_PROCESS_NAME}`);
 }
@@ -2497,13 +2551,16 @@ async function status(): Promise<void> {
   // ReferenceError that took down the whole of `rech status`, so the one command
   // that reports "the relay is wedged" died exactly when the relay was wedged,
   // printing a stack trace instead of the restart hint.
-  if (pingBody?.degraded)
-    console.log(`relay:    ⚠ degraded (${pingBody.consecutiveTimeouts} consecutive command timeouts) — if it persists, the daemon self-restarts; force it now with \`${daemonManager().id} restart ${PM_PROCESS_NAME}\``);
   // The daemon line is about this machine; a client of a remote host has no local daemon to report.
   const isHost = !!(await readListeners().catch(() => null));
+  // No oxmgr/pm2 on PATH must not take down `rech status`: report it instead of throwing.
+  let mgr: DaemonManager | undefined;
+  if (isHost) try { mgr = daemonManager(); } catch { /* reported below */ }
+  if (pingBody?.degraded)
+    console.log(`relay:    ⚠ degraded (${pingBody.consecutiveTimeouts} consecutive command timeouts) — if it persists, the daemon self-restarts; ${isHost ? `force it now with \`${mgr?.id ?? "oxmgr"} restart ${PM_PROCESS_NAME}\`` : "the daemon host can restart it"}`);
   if (isHost) {
-    const daemonRegistered = (await pmList()).includes(PM_PROCESS_NAME);
-    console.log(`daemon:   ${daemonRegistered ? `${daemonManager().id} (${PM_PROCESS_NAME})` : "not installed"}`);
+    const daemonRegistered = mgr ? listsProcess(mgr.id, await pmList(mgr).catch(() => ""), PM_PROCESS_NAME) : false;
+    console.log(`daemon:   ${daemonRegistered ? `${mgr!.id} (${PM_PROCESS_NAME})` : mgr ? "not installed" : "not installed (no oxmgr or pm2 on PATH)"}`);
   }
   // Same resolution as a command: ?profile= in the URL, else PLAYWRIGHT_MCP_PROFILE_DIRECTORY.
   const effective = resolveEffectiveProfile(parsed.profileDirectory);
