@@ -1,5 +1,34 @@
 import { describe, expect, test } from "bun:test";
-import { compareVersion, oxmgrHasWinfix, oxmgrInstallCommand, pickDaemonManager } from "./daemon-manager.ts";
+import { compareVersion, isDeprecatedPm2Fallback, listsProcess, oxmgrHasWinfix, oxmgrInstallCommand, pickDaemonManager } from "./daemon-manager.ts";
+
+describe("listsProcess", () => {
+  const jlist = JSON.stringify([{ name: "rech-local-shim", pm2_env: { pm_cwd: "/home/u/ws/rechrome/tree/main", args: ["rechrome"] } }]);
+  test("pm2: matches the process name exactly, not paths/args mentioning it", () => {
+    expect(listsProcess("pm2", jlist, "rechrome")).toBe(false);
+    expect(listsProcess("pm2", JSON.stringify([{ name: "rechrome-serve" }]), "rechrome")).toBe(false);
+    expect(listsProcess("pm2", JSON.stringify([...JSON.parse(jlist), { name: "rechrome" }]), "rechrome")).toBe(true);
+    expect(listsProcess("pm2", "not json", "rechrome")).toBe(false);
+    expect(listsProcess("pm2", "", "rechrome")).toBe(false);
+  });
+  test("oxmgr: matches a table cell exactly", () => {
+    expect(listsProcess("oxmgr", "│ 0 │ rechrome │ running │", "rechrome")).toBe(true);
+    expect(listsProcess("oxmgr", "│ 0 │ rechrome-serve │ /x/rechrome/rechrome.ts │", "rechrome")).toBe(false);
+  });
+});
+
+describe("isDeprecatedPm2Fallback", () => {
+  const pm2 = { id: "pm2", bin: "/bin/pm2" } as const;
+  test("nudges only a POSIX pm2 fallback", () => {
+    expect(isDeprecatedPm2Fallback(pm2, { isWindows: false })).toBe(true);
+    expect(isDeprecatedPm2Fallback({ id: "oxmgr", bin: "/bin/oxmgr" }, { isWindows: false })).toBe(false);
+  });
+  test("never on Windows, where pm2 is the deliberate pick over stock oxmgr", () => {
+    expect(isDeprecatedPm2Fallback(pm2, { isWindows: true })).toBe(false);
+  });
+  test("never for an explicit RECH_DAEMON_MANAGER=pm2", () => {
+    expect(isDeprecatedPm2Fallback(pm2, { isWindows: false, override: "pm2" })).toBe(false);
+  });
+});
 
 describe("oxmgrHasWinfix", () => {
   test("accepts the winfix build tag", () => {
@@ -53,11 +82,15 @@ describe("pickDaemonManager", () => {
 
   });
   for (const isWindows of [false, true]) {
-    test(`missing managers give installation instructions (Windows: ${isWindows})`, () => {
+    test(`missing managers recommend oxmgr (Windows: ${isWindows})`, () => {
       expect(() => pickDaemonManager({ oxmgrBin: null, pm2Bin: null, oxmgrVersion: null, isWindows }))
-        .toThrow("bun add -g pm2");
+        .toThrow("bun i -g oxmgr");
     });
   }
+  test("on Windows, the missing-manager hint keeps pm2 as the non-winfix alternative", () => {
+    expect(() => pickDaemonManager({ oxmgrBin: null, pm2Bin: null, oxmgrVersion: null, isWindows: true })).toThrow("bun add -g pm2");
+    expect(() => pickDaemonManager({ oxmgrBin: null, pm2Bin: null, oxmgrVersion: null, isWindows: false })).not.toThrow("pm2 via");
+  });
   test("an unavailable explicit manager does not silently fall back", () => {
     expect(() => pickDaemonManager({ oxmgrBin: null, pm2Bin: PM, oxmgrVersion: null, isWindows: false, override: "OXMGR" }))
       .toThrow("RECH_DAEMON_MANAGER=oxmgr");

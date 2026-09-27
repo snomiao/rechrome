@@ -202,8 +202,51 @@ mod imp {
         }
     }
 
+    /// Whether `pm` (oxmgr `list` / pm2 `jlist`) has exactly `rechrome` registered. Exact match:
+    /// other processes' names and paths often contain "rechrome" too (e.g. `rechrome-serve`).
+    fn pm_registers_rechrome(pm: &str, list: &str) -> bool {
+        // npm-installed managers are `.cmd` shims on Windows, which only cmd.exe resolves.
+        let mut cmd = if cfg!(target_os = "windows") {
+            let mut c = Command::new("cmd");
+            c.args(["/C", pm]);
+            c
+        } else {
+            Command::new(pm)
+        };
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: no console flash
+        }
+        cmd.arg(list)
+            .output()
+            .map(|o| {
+                let out = String::from_utf8_lossy(&o.stdout);
+                out.contains("\"name\":\"rechrome\"")
+                    || out
+                        .split(|c: char| c.is_whitespace() || "│|┃".contains(c))
+                        .any(|t| t == "rechrome")
+            })
+            .unwrap_or(false)
+    }
+
+    /// The manager that owns the daemon, mirroring `rech`'s choice: RECH_DAEMON_MANAGER if set,
+    /// else whichever manager has `rechrome` registered, else the platform default (pm2 on
+    /// Windows, where rech prefers it over stock non-winfix oxmgr; oxmgr elsewhere).
     fn pm_bin() -> &'static str {
-        if cfg!(target_os = "windows") {
+        match std::env::var("RECH_DAEMON_MANAGER")
+            .map(|v| v.to_lowercase())
+            .as_deref()
+        {
+            Ok("pm2") => return "pm2",
+            Ok("oxmgr") => return "oxmgr",
+            _ => {}
+        }
+        if pm_registers_rechrome("oxmgr", "list") {
+            "oxmgr"
+        } else if pm_registers_rechrome("pm2", "jlist") {
+            "pm2"
+        } else if cfg!(target_os = "windows") {
             "pm2"
         } else {
             "oxmgr"

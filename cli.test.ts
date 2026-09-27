@@ -1,4 +1,7 @@
 import { test, expect } from "bun:test";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import { rechCli, listenerNextSteps, unknownCommandHint, notConnectedMessage, type RechHandlers } from "./rechrome.ts";
 
 async function run(argv: string[]) {
@@ -189,4 +192,38 @@ test("a typo'd command through a daemon shows the rech hint, not playwright's us
     expect(stderr).toContain(`Did you mean "listener"?`);
     expect(stdout + stderr).not.toContain("Usage: playwright-cli");
   } finally { server.stop(true); }
+});
+
+test("a non-daemon reply (e.g. a proxy 404 under the URL's path prefix) is reported, not JSON-parsed", async () => {
+  const seen: string[] = [];
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch(req) {
+    seen.push(new URL(req.url).pathname);
+    return new Response("404 page not found\n", { status: 404 });
+  } });
+  try {
+    const { code, stderr } = await runRech(["pw", "--version"], { RECHROME_URL: `http://127.0.0.1:${server.port}/rechrome/?profile=p#key=stub-key-0123456789` });
+    expect(code).toBe(1);
+    expect(seen).toContain("/rechrome/run");
+    expect(stderr).toContain("HTTP 404");
+    expect(stderr).toContain("404 page not found");
+    expect(stderr).not.toContain("JSON Parse error");
+  } finally { server.stop(true); }
+});
+
+test("status on a daemon host without oxmgr or pm2 reports it instead of throwing", async () => {
+  const home = mkdtempSync(join(tmpdir(), "rech-status-"));
+  const emptyPath = join(home, "bin");
+  mkdirSync(join(home, ".rechrome"), { recursive: true });
+  mkdirSync(emptyPath);
+  writeFileSync(join(home, ".rechrome", "listeners.json"), JSON.stringify({ version: 1, listeners: [{ name: "local", host: "127.0.0.1", port: 1, key: "k".repeat(20), profiles: "*" }] }));
+  try {
+    const proc = Bun.spawn([process.execPath, `${import.meta.dir}/rechrome.ts`, "status"], {
+      cwd: home, stdout: "pipe", stderr: "pipe",
+      env: { HOME: home, USERPROFILE: home, PATH: emptyPath, SYSTEMROOT: process.env.SYSTEMROOT ?? "", RECHROME_URL: "http://k@127.0.0.1:1/" },
+    });
+    const [code, stdout, stderr] = await Promise.all([proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+    expect(stderr).not.toContain("No daemon process manager found");
+    expect(code).toBe(0);
+    expect(stdout).toContain("daemon:   not installed (no oxmgr or pm2 on PATH)");
+  } finally { rmSync(home, { recursive: true, force: true }); }
 });
