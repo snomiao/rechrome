@@ -10,6 +10,7 @@ import { hostname, homedir, networkInterfaces } from "os";
 import { isIPv4 } from "net";
 import { join, basename, dirname } from "path";
 import { pathToFileURL } from "url";
+import { createRequire } from "node:module";
 import { spawn as cpSpawn } from "child_process";
 import { readFile, writeFile, rename, chmod, mkdir } from "node:fs/promises";
 import { isDeprecatedPm2Fallback, listsProcess, oxmgrInstallCommand, pickDaemonManager, PM2_DEPRECATION, type DaemonManager } from "./daemon-manager.ts";
@@ -1480,23 +1481,41 @@ async function pmList(mgr: DaemonManager = daemonManager()): Promise<string> {
   return await new Response(proc.stdout).text();
 }
 
+// A candidate playwright-cli entry is usable only if the playwright-core it requires actually
+// resolves FROM that entry — the wrapper does `require('playwright-core/lib/tools/cli-client/program')`,
+// a deep subpath reachable only through the fork's patched `exports` map. existsSync on the .js is
+// not the same check: an uninitialised/half-built lib/playwright-cli submodule leaves the wrapper on
+// disk with no resolvable core, and the failure surfaces later as MODULE_NOT_FOUND inside the daemon.
+export function playwrightCliIsUsable(jsEntry: string): boolean {
+  try {
+    createRequire(jsEntry).resolve("playwright-core/lib/tools/cli-client/program");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // Resolve which playwright-cli the daemon runs to drive Chrome. Priority:
 //   1. PLAYWRIGHT_CLI env override — explicit, already a full command string.
 //   2. Vendored fork in a git checkout (lib/playwright-cli/playwright-cli.js) — the patched
 //      multi-tab CLI + patched playwright-core (PLAYWRIGHT_MCP_PROFILE_DIRECTORY etc.).
 //   3. The fork bundled into the npm tarball (vendor/playwright-cli/playwright-cli.js, produced by
-//      scripts/vendor-cli.sh at prepublish). This is the batteries-included default for
-//      `bun i -g rechrome`: self-contained, no @playwright/cli dep, no browser-binary download.
+//      scripts/vendor-cli.sh at prepublish, and by `prepare` on `bun install` in a checkout). This
+//      is the batteries-included default for `bun i -g rechrome`: self-contained, no
+//      @playwright/cli dep, no browser-binary download.
 //   4. Bare `playwright-cli-multi-tab` on PATH — legacy fallback for a pre-existing global link.
+// Candidates 2–3 must also pass playwrightCliIsUsable(), so a present-but-broken one falls through.
+// lib/ stays ahead of vendor/ on purpose: a dev who built the fork wants their patched core, not
+// the (possibly older) vendor-src snapshot that `prepare` unpacks into vendor/.
 // A resolved .js entry is run through `node` on Windows (which can't exec a .js by shebang) and
 // bare on POSIX (its `#!/usr/bin/env node` shebang runs it under node, which the relay handshake
 // needs — see daemonInstall). serve splits the result on spaces into argv.
-export function resolvePlaywrightCli(): string {
+export function resolvePlaywrightCli(root: string = import.meta.dir): string {
   if (process.env.PLAYWRIGHT_CLI) return process.env.PLAYWRIGHT_CLI;
   const jsEntry = [
-    join(import.meta.dir, "lib/playwright-cli/playwright-cli.js"),
-    join(import.meta.dir, "vendor/playwright-cli/playwright-cli.js"),
-  ].find(existsSync);
+    join(root, "lib/playwright-cli/playwright-cli.js"),
+    join(root, "vendor/playwright-cli/playwright-cli.js"),
+  ].filter(existsSync).find(playwrightCliIsUsable);
   if (jsEntry) return IS_WINDOWS ? `node ${jsEntry}` : jsEntry;
   return "playwright-cli-multi-tab";
 }
@@ -2643,7 +2662,8 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
         ? handlers.urlList()
         : handlers.printProfileUri(a.profile, a.listener, { local: a.local, save: a.save }))
     .command("connect <url>", "Use a URL from another machine in this project (checks it first)", y => y
-      .positional("url", { type: "string", demandOption: true }),
+      .positional("url", { type: "string", demandOption: true, describe: "The URL printed by `rech url <profile>` on the machine with Chrome. Quote it: it contains #" })
+      .example("rech connect 'https://host.example.ts.net/rechrome/?profile=you%40example.com#key=…'", ""),
       a => handlers.connect(a.url))
     .command(["listener", "listeners"], "Control who can connect: listeners, allowed profiles, keys, public URLs", y => y
       .command(["ls", "list", "$0"], "List listeners (keys hidden)", {}, () => handlers.listListeners())
@@ -2687,8 +2707,16 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
     .demandCommand(1)
     .strict()
     .help()
+    .alias("help", "h")
     .version(false)
-    .fail((message, error) => { throw error ?? new Error(message); });
+    // A parse error (missing argument, unknown option…) shows that command's help above the
+    // error, so the fix is visible. Errors thrown by a command's own handler pass through.
+    .fail((message, error, y) => {
+      if (error) throw error;
+      // Straight to stderr: Bun's console.error would paint the whole help red.
+      y.showHelp((help: string) => process.stderr.write(`${help}\n\n`));
+      throw new Error(`rech: ${/^Not enough non-option arguments/.test(message) ? "missing a required argument; see the usage line above" : message}`);
+    });
 }
 
 if (import.meta.main) {

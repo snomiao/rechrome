@@ -285,7 +285,7 @@ directory. Pass `-s=<name>` for a named sub-session, or `--isolate` for a throwa
 ```bash
 git clone https://github.com/snomiao/rechrome.git
 cd rechrome
-bun install
+bun install       # `prepare` also builds vendor/ from vendor-src/, so the checkout has a working CLI
 bun link          # makes this checkout the global rechrome / rech
 bun test ./*.test.ts ./*.spec.ts ./scripts/*.test.ts   # rechrome's own tests (plain `bun test` also finds the vendored forks' suites)
 ```

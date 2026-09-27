@@ -3,6 +3,27 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+const IS_WINDOWS = process.platform === "win32";
+// Windows can't exec shebang scripts, and resolving/spawning a .cmd shim needs these vars.
+const WINDOWS_ENV = IS_WINDOWS
+  ? { SystemRoot: process.env.SystemRoot, ComSpec: process.env.ComSpec, PATHEXT: process.env.PATHEXT }
+  : {};
+
+// Source that writes an executable stub `name` into `dir` running `body` under bun: a shebang
+// script on POSIX, a .mjs script plus a .cmd shim on Windows. Returned as code so a stub
+// installer can create a stub binary itself.
+function stubWriterSource(dir: string, name: string, body: string): string {
+  const file = (n: string) => JSON.stringify(join(dir, n));
+  return IS_WINDOWS
+    ? `writeFileSync(${file(`${name}.mjs`)}, ${JSON.stringify(body)});\n`
+      + `writeFileSync(${file(`${name}.cmd`)}, ${JSON.stringify(`@"${process.execPath}" "%~dp0${name}.mjs" %*\r\n`)});\n`
+    : `writeFileSync(${file(name)}, ${JSON.stringify(`#!${process.execPath}\n${body}`)}, { mode: 0o755 });\n`;
+}
+
+function writeStub(dir: string, name: string, body: string): void {
+  new Function("writeFileSync", stubWriterSource(dir, name, body))(writeFileSync);
+}
+
 for (const existingConfig of [false, true]) {
   test(`setup without a manager leaves configuration untouched (existing: ${existingConfig})`, async () => {
     const taskHome = mkdtempSync(join(tmpdir(), "rechrome-setup-test-"));
@@ -13,6 +34,7 @@ for (const existingConfig of [false, true]) {
       const proc = Bun.spawn([process.execPath, join(import.meta.dir, "rechrome.ts"), "setup", "--profile", "Default"], {
         cwd: taskHome,
         env: {
+          ...WINDOWS_ENV,
           HOME: taskHome,
           USERPROFILE: taskHome,
           PATH: "",
@@ -44,12 +66,12 @@ for (const launcher of ["bun", "npm"] as const) {
     test(`${launcher}: ${consent} controls global installation`, async () => {
       const taskHome = mkdtempSync(join(tmpdir(), "rechrome-install-test-"));
       const marker = join(taskHome, "installer-args.json");
-      const installer = join(taskHome, launcher);
-      writeFileSync(installer, `#!${process.execPath}\nawait Bun.write(${JSON.stringify(marker)}, JSON.stringify(process.argv.slice(2)));\nprocess.exit(23);\n`, { mode: 0o755 });
+      writeStub(taskHome, launcher, `await Bun.write(${JSON.stringify(marker)}, JSON.stringify(process.argv.slice(2)));\nprocess.exit(23);\n`);
       try {
         const proc = Bun.spawn([process.execPath, join(import.meta.dir, "rechrome.ts"), "setup", "--profile", "Default", ...(consent === "--yes" ? [consent] : [])], {
           cwd: taskHome,
           env: {
+            ...WINDOWS_ENV,
             HOME: taskHome, USERPROFILE: taskHome, PATH: taskHome,
             npm_config_user_agent: `${launcher}/1.0.0`,
             RECHROME_URL: "http://test-key-0123456789@127.0.0.1:1", RECH_HOST: "0.0.0.0",
@@ -79,13 +101,13 @@ for (const exposesBinary of [false, true]) {
   test(`successful installer checks oxmgr availability and resumes setup (binary: ${exposesBinary})`, async () => {
     const taskHome = mkdtempSync(join(tmpdir(), "rechrome-installed-test-"));
     const marker = join(taskHome, "manager-called");
-    const oxmgr = join(taskHome, "oxmgr");
-    const managerScript = `#!${process.execPath}\nawait Bun.write(${JSON.stringify(marker)}, "called");\nprocess.exit(23);\n`;
-    writeFileSync(join(taskHome, "npm"), `#!${process.execPath}\nimport { writeFileSync } from "node:fs";\n${exposesBinary ? `writeFileSync(${JSON.stringify(oxmgr)}, ${JSON.stringify(managerScript)}, { mode: 0o755 });` : ""}\n`, { mode: 0o755 });
+    const managerScript = `await Bun.write(${JSON.stringify(marker)}, "called");\nprocess.exit(23);\n`;
+    writeStub(taskHome, "npm", `import { writeFileSync } from "node:fs";\n${exposesBinary ? stubWriterSource(taskHome, "oxmgr", managerScript) : ""}`);
     try {
       const proc = Bun.spawn([process.execPath, join(import.meta.dir, "rechrome.ts"), "setup", "--profile", "Default", "--yes"], {
         cwd: taskHome,
         env: {
+          ...WINDOWS_ENV,
           HOME: taskHome, USERPROFILE: taskHome, PATH: taskHome,
           npm_config_user_agent: "npm/11.0.0",
           RECHROME_URL: "http://test-key-0123456789@127.0.0.1:1", RECH_HOST: "0.0.0.0",
