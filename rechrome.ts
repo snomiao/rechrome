@@ -399,7 +399,18 @@ export async function detectListenChoices(): Promise<ListenChoice[]> {
   return buildListenChoices(networkInterfaces(), ips);
 }
 
-export type TailscaleServe = { dnsName: string | null; routeUrl: string | null };
+/**
+ * `funnel`: Funnel (public internet) is on for the host that serves — or would serve — this
+ * node's routes, so a route there is not tailnet-only. `mounts`: every Serve path in use.
+ */
+export type TailscaleServe = { dnsName: string | null; routeUrl: string | null; funnel: boolean; mounts: string[] };
+
+export function serveMountsAndFunnel(serveStatus: unknown, host: string | null): { mounts: string[]; funnel: boolean } {
+  const status = serveStatus as { Web?: Record<string, { Handlers?: Record<string, unknown> }>; AllowFunnel?: Record<string, boolean> } | null;
+  const mounts = Object.values(status?.Web ?? {}).flatMap(config => Object.keys(config.Handlers ?? {}).map(path => path.replace(/\/+$/, "") || "/"));
+  const funnel = Object.entries(status?.AllowFunnel ?? {}).some(([hostPort, on]) => on && (!host || hostPort.split(/:(?=\d+$)/)[0] === host));
+  return { mounts: [...new Set(mounts)], funnel };
+}
 
 /**
  * Find the HTTPS Serve route that forwards `prefix` to a loopback listener on `port`,
@@ -430,7 +441,8 @@ export async function detectTailscaleServe(port: number, prefix: string): Promis
   let serveStatus: unknown = null;
   try { dnsName = (JSON.parse(status ?? "null")?.Self?.DNSName as string | undefined)?.replace(/\.$/, "") || null; } catch { /* not connected */ }
   try { serveStatus = JSON.parse(serve ?? "null"); } catch { /* no Serve config */ }
-  return { dnsName, routeUrl: findTailscaleServeRoute(dnsName, serveStatus, port, prefix) };
+  const routeUrl = findTailscaleServeRoute(dnsName, serveStatus, port, prefix);
+  return { dnsName, routeUrl, ...serveMountsAndFunnel(serveStatus, routeUrl ? new URL(routeUrl).hostname : dnsName) };
 }
 
 /** The same connection (key and profile) at another base URL, e.g. where a proxy exposes the listener. */
@@ -1128,7 +1140,7 @@ export function chooseShareListener(profile: string, listeners: Listener[]): str
   throw new ShareListenerError([
     `"${profile}" isn't shared on any listener yet.`,
     scoped.length ? `  Allow it on one:  rech listener allow ${scoped[0].name} ${JSON.stringify(profile)}   (listeners: ${scoped.map(l => l.name).join(", ")})` : "",
-    `  Or create one:    rech listener add share --listen local --prefix=rechrome --port 13776 --profile ${JSON.stringify(profile)}`,
+    `  ${scoped.length ? "Or give" : "Give"} it its own link:  rech share ${JSON.stringify(profile)}   (in a terminal it asks who should connect)`,
   ].filter(Boolean).join("\n"), "none", scoped);
 }
 
@@ -1179,7 +1191,7 @@ async function shareProfiles(selectors: string[], opts: { listener?: string; loc
 }
 
 /** Put exactly `snapshot` on one scoped listener (created if missing) and print its link. */
-async function shareSet(snapshot: string[], opts: { listener?: string; local?: boolean; save?: boolean; defaultName: string; prefix: string; again: string }): Promise<void> {
+async function shareSet(snapshot: string[], opts: { listener?: string; local?: boolean; save?: boolean; defaultName: string; prefix: string; again: string; host?: string; tailscaleServe?: boolean }): Promise<void> {
   const config = await requireListeners();
   const name = opts.listener ?? opts.defaultName;
   let listener = config.listeners.find(l => l.name === name);
@@ -1188,7 +1200,7 @@ async function shareSet(snapshot: string[], opts: { listener?: string; local?: b
   let changes = "";
   if (!listener) {
     if (opts.listener) throw new Error(`Unknown listener "${name}". See rech listener ls.`);
-    listener = { name, host: "127.0.0.1", port: freeListenerPort(config.listeners), prefix: opts.prefix, key: randomBytes(24).toString("base64url"), profiles: snapshot };
+    listener = { name, host: opts.host ?? "127.0.0.1", port: freeListenerPort(config.listeners), prefix: opts.prefix, key: randomBytes(24).toString("base64url"), profiles: snapshot };
     config.listeners.push(listener);
     changes = `created listener "${name}" on ${listenerAddress(listener)}${listener.prefix}`;
   } else {
@@ -1198,22 +1210,98 @@ async function shareSet(snapshot: string[], opts: { listener?: string; local?: b
     changes = added.length || removed.length ? [added.length && `added ${added.join(", ")}`, removed.length && `removed ${removed.join(", ")}`].filter(Boolean).join("; ") : "no changes";
   }
   await writeListeners(config);
-  console.error(`[rech] sharing ${snapshot.length} profiles through "${name}" (${changes}): ${snapshot.join(", ")}`);
+  if (changes.startsWith("created") && snapshot.length === 1) console.error(`New link "${name}" for ${snapshot[0]}.`);
+  else console.error(`[rech] sharing ${snapshot.length} profiles through "${name}" (${changes}): ${snapshot.join(", ")}`);
   if (opts.defaultName === "share-all") console.error(`[rech] this is a snapshot: after registering another profile, run ${opts.again} again.`);
   else if (changes !== "no changes" && !changes.startsWith("created")) console.error(`[rech] links already given out for "${name}" now reach exactly these profiles too (same key). For a fresh key: rech listener rotate-key ${name}`);
   // The daemon reloads listeners.json about every second: confirm this listener answers before handing out its URL.
-  const local = `http://${listener.key}@${listenerAddress(listener)}${normalizePrefix(listener.prefix)}`;
+  // A one-profile link names its profile, so the other machine needs no --profile.
+  const only = snapshot.length === 1 ? `?profile=${encodeURIComponent(snapshot[0])}` : "";
+  const local = `http://${listener.key}@${listenerAddress(listener)}${normalizePrefix(listener.prefix)}${only}`;
   let ready = false;
   for (let i = 0; i < 20 && !ready; i++) {
     ready = await fetch(serviceUrl(local, "ping"), { headers: { Authorization: `Bearer ${listener.key}` }, signal: AbortSignal.timeout(1000) }).then(r => r.ok).catch(() => false);
     if (!ready) await Bun.sleep(250);
   }
   if (!ready) console.error(`[rech] warning: listener "${name}" is not answering yet; check the daemon with rech status.`);
+  if (opts.tailscaleServe && !listener.publicUrl) {
+    const publicUrl = await exposeWithTailscaleServe(listener);
+    if (publicUrl) {
+      listener.publicUrl = publicUrl;
+      await writeListeners(config);
+    }
+  }
   const uri = listener.publicUrl && !opts.local ? rebaseConnectionUrl(listener.publicUrl, local) : registeredProfileUrl(local);
-  if (!listener.publicUrl) for (const line of listenerNextSteps(listener, undefined, opts.again)) console.error(line);
+  if (!listener.publicUrl && isLoopback(listener.host)) for (const line of listenerNextSteps(listener, undefined, opts.again)) console.error(line);
   console.log(uri);
-  console.error(`[rech] on the other machine: rech connect '<url>', then rech --profile <name> open https://example.com`);
+  console.error(snapshot.length === 1 ? `On the other machine: rech connect '<this link>'` : `On the other machine: rech connect '<this link>', then rech --profile <name> open <url>`);
   if (opts.save) console.error(`Saved RECHROME_URL to ${await saveProjectUrl(uri)}`);
+}
+
+/** A readable, URL-safe name for a profile's link: the email's local part or the profile name. */
+export function profileSlug(profile: string): string {
+  const slug = profile.split("@")[0].toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 32);
+  return slug || "profile";
+}
+
+/**
+ * `base`, or `base-2`, `base-3`… — the first name whose listener and path are free. Never a
+ * reserved name (`share --all` and `share a b` reuse theirs and rewrite their allowlists, so a
+ * one-profile link under such a name would later grant its key more profiles), and never a
+ * mount a proxy already serves (Tailscale Serve would replace that route).
+ */
+export function uniqueShareName(base: string, listeners: Listener[], servedMounts: string[] = []): string {
+  const reserved = (name: string) => name === "local" || name === "share-all" || /^share-[0-9a-f]{6}$/.test(name);
+  const taken = (name: string) => reserved(name) || servedMounts.includes(`/rechrome/${name}`)
+    || listeners.some(l => l.name === name || normalizePrefix(l.prefix) === `/rechrome/${name}/`);
+  for (let i = 1; ; i++) { const name = i === 1 ? base : `${base}-${i}`; if (!taken(name)) return name; }
+}
+
+/** Route a loopback listener through Tailscale Serve (HTTPS, tailnet only); returns its public URL. */
+async function exposeWithTailscaleServe(listener: Listener): Promise<string | null> {
+  const prefix = normalizePrefix(listener.prefix);
+  const existing = await detectTailscaleServe(listener.port, prefix);
+  if (existing.funnel) {
+    console.error("Tailscale Funnel is on for this machine, so a Serve route here would be public, not tailnet-only. Not exposing it.\n  Turn Funnel off (tailscale funnel reset), then rech share again.");
+    return null;
+  }
+  if (existing.routeUrl) return existing.routeUrl;
+  const binary = tailscaleBinary();
+  if (!binary) return null;
+  const mount = prefix === "/" ? "/" : prefix.slice(0, -1);
+  const args = ["serve", "--bg", `--set-path=${mount}`, `http://127.0.0.1:${listener.port}${mount === "/" ? "" : mount}`];
+  console.error(`Running: tailscale ${args.join(" ")}`);
+  const proc = Bun.spawn([binary, ...args], { stdout: "ignore", stderr: "inherit", windowsHide: true });
+  if (await proc.exited !== 0) {
+    console.error(`tailscale serve failed. Run it yourself, then rech share again:\n  tailscale ${args.join(" ")}`);
+    return null;
+  }
+  return (await detectTailscaleServe(listener.port, prefix)).routeUrl;
+}
+
+/**
+ * Give one profile its own link. In a terminal, ask how the other machines will reach it
+ * (Tailscale Serve, a detected network, or the user's own proxy); without one, create a
+ * loopback link, like `rech share a b`.
+ */
+async function shareNewLink(profile: string, opts: { local?: boolean; save?: boolean }): Promise<void> {
+  const served = tailscaleBinary() ? (await detectTailscaleServe(0, "/")).mounts : [];
+  const name = uniqueShareName(profileSlug(profile), (await requireListeners()).listeners, served);
+  let host = "127.0.0.1", tailscaleServe = false;
+  if (isInteractive()) {
+    const serve = !!tailscaleBinary();
+    // With Tailscale Serve on offer, a plain-HTTP Tailscale IP would only be a worse duplicate.
+    const networks = (await detectListenChoices()).filter(c => c.kind !== "local" && !(serve && c.kind === "tailscale"));
+    const how = await promptChoice(`How will your other machines reach it?`, [
+      ...(serve ? [{ label: "Tailscale: HTTPS, only your tailnet", value: "tailscale-serve" }] : []),
+      ...networks.map(c => ({ label: `${c.label.split(" — ")[0]} network: http://${c.address}, plain HTTP`, value: c.address })),
+      { label: "My own reverse proxy", value: "127.0.0.1" },
+    ], 0);
+    if (!how) throw new Error("Cancelled; nothing shared.");
+    tailscaleServe = how === "tailscale-serve";
+    host = tailscaleServe ? "127.0.0.1" : how;
+  }
+  return shareSet([profile], { ...opts, host, tailscaleServe, defaultName: name, prefix: `/rechrome/${name}/`, again: `rech share ${JSON.stringify(profile)}` });
 }
 
 async function printProfileUri(selector?: string, listener?: string, opts: { local?: boolean; save?: boolean; all?: boolean } = {}): Promise<void> {
@@ -1262,17 +1350,24 @@ async function printProfileUri(selector?: string, listener?: string, opts: { loc
   if (!listener && config) {
     try { listener = chooseShareListener(profile, listeners); }
     catch (error) {
-      if (!interactive || !(error instanceof ShareListenerError)) throw error;
+      if (!(error instanceof ShareListenerError)) throw error;
+      // Not shared yet: give it its own link rather than stopping with instructions.
+      if (!interactive) { if (error.kind === "none") return shareNewLink(profile, opts); throw error; }
       const describe = (l: Listener) => `${l.name}  ${l.publicUrl ?? `${listenerAddress(l)}${normalizePrefix(l.prefix)}`}`;
       if (error.kind === "several") {
         listener = (await promptChoice(`"${profile}" is on several listeners. Share through which?`, error.listeners.map(l => ({ label: describe(l), value: l.name })))) ?? undefined;
         if (!listener) throw cancelled();
       } else {
-        if (!error.listeners.length) throw error; // nothing to allow it on: the error names `rech listener add`
-        // Allowing is a config change, so the default is to cancel.
-        const target = await promptChoice(`"${profile}" isn't shared on any listener yet. Allow it on:`,
-          [...error.listeners.map(l => ({ label: describe(l), value: l.name as string | null })), { label: "Cancel (change nothing)", value: null }], error.listeners.length);
+        // Keep going until there is a URL (or the user cancels): a new link of its own is the
+        // default, since allowing it on an existing listener hands it to that listener's key holders.
+        const NEW_LINK = "\0new";
+        const target = error.listeners.length ? await promptChoice(`${profile} isn't shared yet.`, [
+          { label: "Create a new link for it", value: NEW_LINK as string | null },
+          ...error.listeners.map(l => ({ label: `Add it to link "${l.name}" (its existing key)`, value: l.name as string | null })),
+          { label: "Cancel", value: null },
+        ], 0) : NEW_LINK;
         if (!target) throw cancelled();
+        if (target === NEW_LINK) return shareNewLink(profile, opts);
         allowProfiles(config, target, [profile]);
         await writeListeners(config);
         console.error(`[rech] allowed "${profile}" on ${target}`);
@@ -1287,7 +1382,14 @@ async function printProfileUri(selector?: string, listener?: string, opts: { loc
     console.error(`[rech] note: this link's key works for every profile on listener "${chosen.name}" (${chosen.profiles.join(", ")}); ?profile= only picks the default. For a one-profile link, give that profile its own listener.`);
   let uri = profileConnectionUri(profile, url, listeners, listener);
   // Prefer where a proxy exposes the listener, when it has been recorded.
-  const publicUrl = listeners.find(l => l.key === parseUrl(uri).key)?.publicUrl;
+  // A link whose proxy was set up by hand since (e.g. after `tailscale serve` failed here):
+  // record the tailnet-only route so this and later shares print it.
+  const pending = listeners.find(l => l.key === parseUrl(uri).key);
+  if (config && pending && pending.profiles !== "*" && !pending.publicUrl && isLoopback(pending.host) && tailscaleBinary()) {
+    const serve = await detectTailscaleServe(pending.port, normalizePrefix(pending.prefix));
+    if (serve.routeUrl && !serve.funnel) { pending.publicUrl = serve.routeUrl; await writeListeners(config); }
+  }
+  const publicUrl = pending?.publicUrl;
   if (publicUrl && !opts.local) uri = rebaseConnectionUrl(publicUrl, uri);
   console.log(uri);
   if (opts.save) console.error(`Saved RECHROME_URL to ${await saveProjectUrl(uri)}`);
@@ -1959,14 +2061,31 @@ async function ensureDaemonManager(ask: (q: string, def?: string) => Promise<str
   daemonManager();
 }
 
+/**
+ * Rewriting RECHROME_URL for a new daemon key must not drop the saved `?profile=`: without it
+ * every client loses its Chrome profile (and a setup aborted before its final save step used
+ * to leave it that way).
+ */
+export function keepProfileParam(next: string, previous?: string): string {
+  try {
+    const url = new URL(next);
+    // A .env.local value may be quoted: RECHROME_URL="http://…/?profile=work".
+    const raw = previous?.trim().replace(/^(['"])(.*)\1$/, "$2");
+    const profile = raw ? new URL(raw).searchParams.get("profile") : null;
+    if (profile && !url.searchParams.has("profile")) url.searchParams.set("profile", profile);
+    return url.toString();
+  } catch { return next; }
+}
+
 export async function daemonInstall(serveUrl: string): Promise<void> {
   // Resolve the manager first so a missing dependency fails before config is mutated.
   const mgr = daemonManager();
   // Persist the URL for future clients without an explicit environment override.
   // The daemon's explicit environment takes precedence over this saved default.
   const envRaw = await file(globalEnvFile).text().catch(() => "");
-  const filtered = envRaw.trimEnd().split("\n").filter(l => !l.startsWith(`${ENV_KEY}=`));
-  await Bun.write(globalEnvFile, [...filtered, envAssignment(ENV_KEY, serveUrl), ""].join("\n"));
+  const lines = envRaw.trimEnd().split("\n");
+  const filtered = lines.filter(l => !l.startsWith(`${ENV_KEY}=`));
+  await Bun.write(globalEnvFile, [...filtered, envAssignment(ENV_KEY, keepProfileParam(serveUrl, lines.find(l => l.startsWith(`${ENV_KEY}=`))?.slice(ENV_KEY.length + 1))), ""].join("\n"));
 
   const home = HOME;
   const bunBin = Bun.which("bun") ?? process.execPath;
@@ -2027,13 +2146,16 @@ export async function daemonInstall(serveUrl: string): Promise<void> {
     await runPm(mgr, ["save"]); // persist process list for `pm2 resurrect` on reboot
   } else {
     const envArgs = Object.entries(daemonEnv).flatMap(([k, v]) => ["--env", `${k}=${v}`]);
+    // oxmgr shell-splits the command string (backslashes are escapes, so `C:\Users\…` became
+    // `C:Users…`); pass quoted forward-slash paths — Windows accepts `/`, quotes keep spaces.
+    const q = (path: string) => `"${path.replaceAll("\\", "/")}"`;
     startCode = await runPm(mgr, [
       "start",
       "--name", PM_PROCESS_NAME,
       "--restart", "always",
       "--cwd", home,
       ...envArgs,
-      `${bunBin} ${rechScript} serve`,
+      `${q(bunBin)} ${q(rechScript)} serve`,
     ]);
     // Boot/login persistence: on Windows the winfix oxmgr wires Task Scheduler,
     // on POSIX a systemd --user unit / launchd agent — the equivalent of the pm2

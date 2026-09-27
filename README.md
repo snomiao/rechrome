@@ -108,7 +108,7 @@ rech open https://example.com
 `.rechrome/.env.local`. Remote listeners allow navigation, tabs, snapshots, screenshots and basic
 interactions, but not `eval`/`run-code` or filesystem commands (see [Remote access](#remote-access)).
 
-**Share several profiles in one link.** `rech share work@example.com taku2 symval-dev` puts
+**Share several profiles in one link.** `rech share work@example.com personal team-dev` puts
 exactly those profiles on one listener (its own key; running it again reuses it). Add
 `--listener <name>` to use a listener that already has a proxy route. Its links then reach
 exactly this list, and `rech listener rotate-key <name>` issues a fresh key if old links shouldn't.
@@ -264,7 +264,7 @@ the last working configuration. Each listener has its own bearer key. Use `rech 
 to see configured exposure, and `rech listener ls` to list bindings without credentials.
 
 ```bash
-rech listener add qa --listen tailscale --profile qamac-remote --port 13776
+rech listener add qa --listen tailscale --profile qa-remote --port 13776
 rech listener remove qa
 ```
 

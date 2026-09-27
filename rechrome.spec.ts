@@ -305,31 +305,31 @@ describe("isIsoSession", () => {
 
 describe("resolveGlobalProfile", () => {
   const registry = {
-    "taku@example.com": { extensionId: "abc123", token: "tok001", profileDir: "Profile 1" },
+    "you@example.com": { extensionId: "abc123", token: "tok001", profileDir: "Profile 1" },
     "other@example.com": { extensionId: "def456", token: "tok002", profileDir: "Default", userDataDir: "/tmp/ud" },
   };
   const cache = {
     "Default": { user_name: "other@example.com", name: "Work" },
-    "Profile 1": { user_name: "taku@example.com", name: "Personal" },
+    "Profile 1": { user_name: "you@example.com", name: "Personal" },
     "Profile 2": { name: "Guest" },
   };
 
   test("resolves by exact registry email key (case-insensitive)", async () => {
-    const result = await resolveGlobalProfile(registry, null, "Taku@Example.com");
-    expect(result.email).toBe("taku@example.com");
+    const result = await resolveGlobalProfile(registry, null, "You@Example.com");
+    expect(result.email).toBe("you@example.com");
     expect(result.entry.profileDir).toBe("Profile 1");
     expect(result.entry.token).toBe("tok001");
   });
 
   test("resolves by Chrome profile name via cache → email → registry", async () => {
     const result = await resolveGlobalProfile(registry, cache, "Personal");
-    expect(result.email).toBe("taku@example.com");
+    expect(result.email).toBe("you@example.com");
     expect(result.entry.profileDir).toBe("Profile 1");
   });
 
   test("resolves by Chrome profile folder name via cache → email → registry", async () => {
     const result = await resolveGlobalProfile(registry, cache, "Profile 1");
-    expect(result.email).toBe("taku@example.com");
+    expect(result.email).toBe("you@example.com");
     expect(result.entry.extensionId).toBe("abc123");
   });
 
@@ -356,7 +356,7 @@ describe("resolveGlobalProfile", () => {
   });
 
   test("throws when email from cache is not in registry", async () => {
-    const noReg = { "taku@example.com": { extensionId: "a", token: "t", profileDir: "Default" } };
+    const noReg = { "you@example.com": { extensionId: "a", token: "t", profileDir: "Default" } };
     await expect(resolveGlobalProfile(noReg, cache, "other@example.com"))
       .rejects.toThrow("is not registered");
   });
@@ -384,17 +384,17 @@ describe("resolveGlobalProfile", () => {
 describe("extractGlobalProfileArg", () => {
   test("extracts --profile <val> from the leading flags", () => {
     const { args, selector } = extractGlobalProfileArg(
-      ["--profile", "taku@example.com", "open", "https://example.com"],
+      ["--profile", "you@example.com", "open", "https://example.com"],
     );
-    expect(selector).toBe("taku@example.com");
+    expect(selector).toBe("you@example.com");
     expect(args).toEqual(["open", "https://example.com"]);
   });
 
   test("extracts --profile=<val> from the leading flags", () => {
     const { args, selector } = extractGlobalProfileArg(
-      ["--profile=taku@example.com", "eval", "() => document.title"],
+      ["--profile=you@example.com", "eval", "() => document.title"],
     );
-    expect(selector).toBe("taku@example.com");
+    expect(selector).toBe("you@example.com");
     expect(args).toEqual(["eval", "() => document.title"]);
   });
 
@@ -431,5 +431,19 @@ describe("extractGlobalProfileArg", () => {
     const { args, selector } = extractGlobalProfileArg(["open", "https://example.com"]);
     expect(selector).toBeUndefined();
     expect(args).toEqual(["open", "https://example.com"]);
+  });
+});
+
+describe("keepProfileParam", () => {
+  test("rewriting RECHROME_URL for a new key keeps the saved ?profile=", async () => {
+    const { keepProfileParam } = await import("./rechrome.ts");
+    expect(keepProfileParam("http://newkey@127.0.0.1:13775/", "http://old@127.0.0.1:13775/?profile=you%40example.com"))
+      .toBe("http://newkey@127.0.0.1:13775/?profile=you%40example.com");
+    expect(keepProfileParam("http://newkey@127.0.0.1:13775/?profile=b", "http://old@127.0.0.1:13775/?profile=a"))
+      .toBe("http://newkey@127.0.0.1:13775/?profile=b");
+    expect(keepProfileParam("http://newkey@127.0.0.1:13775/", undefined)).toBe("http://newkey@127.0.0.1:13775/");
+    expect(keepProfileParam("http://newkey@127.0.0.1:13775/", `"http://old@127.0.0.1:13775/?profile=work"`))
+      .toBe("http://newkey@127.0.0.1:13775/?profile=work");
+    expect(keepProfileParam("http://newkey@127.0.0.1:13775/", "not a url")).toBe("http://newkey@127.0.0.1:13775/");
   });
 });

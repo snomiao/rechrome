@@ -254,20 +254,20 @@ test("share picks the scoped listener that allows the profile, never the managem
   expect(chooseShareListener("a@x", [local, L("lan", ["a@x"]), L("proxy", ["a@x"], "https://h/")])).toBe("proxy");
   expect(() => chooseShareListener("a@x", [local, L("one", ["a@x"]), L("two", ["a@x"])])).toThrow(/several listeners \(one, two\)/);
   expect(() => chooseShareListener("a@x", [local, L("share", ["b@x"])])).toThrow(/rech listener allow share "a@x"/);
-  expect(() => chooseShareListener("a@x", [local])).toThrow(/rech listener add share/);
+  expect(() => chooseShareListener("a@x", [local])).toThrow(/Give it its own link:  rech share "a@x"/);
 });
 
 test("a loose profile match (email name, or 3+ char prefix) is accepted only when unique", () => {
   const c = (label: string, fields: string[], localPart?: string) => ({ id: label, label, fields, localPart });
-  const all = [c("taku@corp.jp", ["taku@corp.jp", "corp.jp", "Profile 2"], "taku"), c("taku2", ["taku2", "Profile 5"]), c("taku3", ["taku3", "Profile 7"]), c("symval-dev", ["symval-dev", "SymVal Dev"])];
-  expect(matchProfileLoosely("taku", all)?.label).toBe("taku@corp.jp");      // exact email name beats prefixes
-  expect(matchProfileLoosely("symval", all)?.label).toBe("symval-dev");      // unique prefix
-  expect(matchProfileLoosely("SymVal D", all)?.label).toBe("symval-dev");    // case-insensitive
-  expect(matchProfileLoosely("orp.jp", all)).toBeNull();                      // no substring matching
-  expect(matchProfileLoosely("corp", all)?.label).toBe("taku@corp.jp");      // a name prefix is fine
+  const all = [c("work@example.com", ["work@example.com", "example.com", "Profile 2"], "work"), c("work2", ["work2", "Profile 5"]), c("work3", ["work3", "Profile 7"]), c("team-dev", ["team-dev", "Team Dev"])];
+  expect(matchProfileLoosely("work", all)?.label).toBe("work@example.com");      // exact email name beats prefixes
+  expect(matchProfileLoosely("team", all)?.label).toBe("team-dev");      // unique prefix
+  expect(matchProfileLoosely("Team D", all)?.label).toBe("team-dev");    // case-insensitive
+  expect(matchProfileLoosely("xample.com", all)).toBeNull();                      // no substring matching
+  expect(matchProfileLoosely("exam", all)?.label).toBe("work@example.com");      // a name prefix is fine
   expect(matchProfileLoosely("h", all)).toBeNull();
-  expect(matchProfileLoosely("sy", all)).toBeNull();                          // prefixes need 3+ characters
-  expect(() => matchProfileLoosely("tak", all)).toThrow(/several profiles: taku@corp.jp, taku2, taku3/);
+  expect(matchProfileLoosely("te", all)).toBeNull();                          // prefixes need 3+ characters
+  expect(() => matchProfileLoosely("wor", all)).toThrow(/several profiles: work@example.com, work2, work3/);
   expect(matchProfileLoosely("nobody", all)).toBeNull();
 });
 
@@ -304,4 +304,32 @@ test("profile rm <name> removes a profile; flags pass through", async () => {
   expect(await run(["profile", "remove", "qa", "--yes", "--close"])).toEqual([["removeProfile", "qa", { yes: true, close: true }]]);
   await expect(run(["profile", "rm"])).rejects.toThrow(/rech profile rm <name>/);
   await expect(run(["profile", "qa", "extra"])).rejects.toThrow(/rech profile rm/);
+});
+
+test("a new share link is named after its profile, not a hash", async () => {
+  const { profileSlug, uniqueShareName } = await import("./rechrome.ts");
+  expect(profileSlug("personal@example.com")).toBe("personal");
+  expect(profileSlug("Jane.Doe@example.com")).toBe("jane-doe");
+  expect(profileSlug("Profile 25")).toBe("profile-25");
+  expect(profileSlug("@@@")).toBe("profile");
+  const taken = [L("personal", ["a@x"]), { ...L("other", ["b@x"]), prefix: "/rechrome/personal-2/" }];
+  expect(uniqueShareName("personal", taken)).toBe("personal-3");
+  expect(uniqueShareName("work", taken)).toBe("work");
+});
+
+test("a new link never takes a reserved name or a mount a proxy already serves", async () => {
+  const { uniqueShareName, serveMountsAndFunnel } = await import("./rechrome.ts");
+  // share --all / share a b rewrite their listeners' allowlists; a one-profile link must not sit there.
+  expect(uniqueShareName("share-all", [])).toBe("share-all-2");
+  expect(uniqueShareName("local", [])).toBe("local-2");
+  expect(uniqueShareName("share-abc123", [])).toBe("share-abc123-2");
+  expect(uniqueShareName("personal", [], ["/rechrome/personal", "/webcode"])).toBe("personal-2");
+  const status = {
+    Web: { "node.ts.net:443": { Handlers: { "/webcode/": { Proxy: "http://127.0.0.1:4390/webcode/" }, "/rechrome/personal": { Proxy: "http://127.0.0.1:9/x" } } } },
+    AllowFunnel: { "node.ts.net:443": true },
+  };
+  expect(serveMountsAndFunnel(status, "node.ts.net")).toEqual({ mounts: ["/webcode", "/rechrome/personal"], funnel: true });
+  expect(serveMountsAndFunnel(status, "other.ts.net").funnel).toBe(false);
+  expect(serveMountsAndFunnel({ ...status, AllowFunnel: { "node.ts.net:443": false } }, "node.ts.net").funnel).toBe(false);
+  expect(serveMountsAndFunnel(null, "node.ts.net")).toEqual({ mounts: [], funnel: false });
 });
