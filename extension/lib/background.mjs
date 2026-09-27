@@ -1,6 +1,9 @@
 var __defProp = Object.defineProperty;
 var __defNormalProp = (obj, key, value) => key in obj ? __defProp(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
 var __publicField = (obj, key, value) => __defNormalProp(obj, typeof key !== "symbol" ? key + "" : key, value);
+/*! Rechrome fork: modified by rechrome contributors (2026).
+ * Playwright: Copyright (c) Microsoft Corporation; Apache-2.0.
+ * See LICENSE, NOTICE, MODIFICATIONS.md and THIRD_PARTY_NOTICES.txt. */
 class ProtocolV1Handler {
   constructor(context) {
     __publicField(this, "_context");

@@ -1,3 +1,6 @@
+/*! Rechrome fork: modified by rechrome contributors (2026).
+ * Playwright: Copyright (c) Microsoft Corporation; Apache-2.0.
+ * See LICENSE, NOTICE, MODIFICATIONS.md and THIRD_PARTY_NOTICES.txt. */
 import { c as clientExports, j as jsxRuntimeExports, r as reactExports, B as Button, T as TabItem, A as AuthTokenSection } from "./authToken.js";
 const StatusApp = () => {
   const [connectedTabs, setConnectedTabs] = reactExports.useState([]);
