@@ -433,3 +433,15 @@ describe("extractGlobalProfileArg", () => {
     expect(args).toEqual(["open", "https://example.com"]);
   });
 });
+
+describe("keepProfileParam", () => {
+  test("rewriting RECHROME_URL for a new key keeps the saved ?profile=", async () => {
+    const { keepProfileParam } = await import("./rechrome.ts");
+    expect(keepProfileParam("http://newkey@127.0.0.1:13775/", "http://old@127.0.0.1:13775/?profile=you%40example.com"))
+      .toBe("http://newkey@127.0.0.1:13775/?profile=you%40example.com");
+    expect(keepProfileParam("http://newkey@127.0.0.1:13775/?profile=b", "http://old@127.0.0.1:13775/?profile=a"))
+      .toBe("http://newkey@127.0.0.1:13775/?profile=b");
+    expect(keepProfileParam("http://newkey@127.0.0.1:13775/", undefined)).toBe("http://newkey@127.0.0.1:13775/");
+    expect(keepProfileParam("http://newkey@127.0.0.1:13775/", "not a url")).toBe("http://newkey@127.0.0.1:13775/");
+  });
+});

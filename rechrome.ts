@@ -1922,14 +1922,29 @@ async function ensureDaemonManager(ask: (q: string, def?: string) => Promise<str
   daemonManager();
 }
 
+/**
+ * Rewriting RECHROME_URL for a new daemon key must not drop the saved `?profile=`: without it
+ * every client loses its Chrome profile (and a setup aborted before its final save step used
+ * to leave it that way).
+ */
+export function keepProfileParam(next: string, previous?: string): string {
+  try {
+    const url = new URL(next);
+    const profile = previous ? new URL(previous).searchParams.get("profile") : null;
+    if (profile && !url.searchParams.has("profile")) url.searchParams.set("profile", profile);
+    return url.toString();
+  } catch { return next; }
+}
+
 export async function daemonInstall(serveUrl: string): Promise<void> {
   // Resolve the manager first so a missing dependency fails before config is mutated.
   const mgr = daemonManager();
   // Persist the URL for future clients without an explicit environment override.
   // The daemon's explicit environment takes precedence over this saved default.
   const envRaw = await file(globalEnvFile).text().catch(() => "");
-  const filtered = envRaw.trimEnd().split("\n").filter(l => !l.startsWith(`${ENV_KEY}=`));
-  await Bun.write(globalEnvFile, [...filtered, `${ENV_KEY}=${serveUrl}`, ""].join("\n"));
+  const lines = envRaw.trimEnd().split("\n");
+  const filtered = lines.filter(l => !l.startsWith(`${ENV_KEY}=`));
+  await Bun.write(globalEnvFile, [...filtered, `${ENV_KEY}=${keepProfileParam(serveUrl, lines.find(l => l.startsWith(`${ENV_KEY}=`))?.slice(ENV_KEY.length + 1))}`, ""].join("\n"));
 
   const home = HOME;
   const bunBin = Bun.which("bun") ?? process.execPath;
