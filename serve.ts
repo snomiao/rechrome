@@ -328,10 +328,12 @@ export async function serve() {
       const scoped = listener.profiles !== "*";
       const reqUrl = new URL(req.url);
       const prefix = normalizePrefix(listener.prefix);
+      // Accept the path with or without the prefix, so a proxy works whether it keeps the
+      // mount path (target .../rechrome) or strips it (bare port). The key, not the prefix,
+      // guards every route.
       if (prefix !== "/") {
         if (reqUrl.pathname === prefix.slice(0, -1)) reqUrl.pathname = "/";
         else if (reqUrl.pathname.startsWith(prefix)) reqUrl.pathname = "/" + reqUrl.pathname.slice(prefix.length);
-        else return new Response("Not found", { status: 404 });
       }
 
       // Serve files from output dir
