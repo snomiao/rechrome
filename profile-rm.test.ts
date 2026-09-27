@@ -31,6 +31,8 @@ test("profile rm: plan first, consent for a running window, then unregister ever
   };
   // A stand-in for the managed profile's browser: a process whose command line names the folder.
   const browser = Bun.spawn([process.execPath, "-e", "setTimeout(() => {}, 60000)", `--user-data-dir=${dataDir}`], { stdout: "ignore", stderr: "ignore" });
+  // A browser on a sibling folder whose name only starts with the same path must never be closed.
+  const sibling = Bun.spawn([process.execPath, "-e", "setTimeout(() => {}, 60000)", `--user-data-dir=${dataDir} backup`], { stdout: "ignore", stderr: "ignore" });
   try {
     const noConsent = await rech("profile", "rm", "qa");
     expect(noConsent.code).toBe(1);
@@ -48,6 +50,7 @@ test("profile rm: plan first, consent for a running window, then unregister ever
     const removed = await rech("profile", "rm", "qa", "--yes", "--close");
     expect(removed.code).toBe(0);
     expect(await browser.exited).not.toBe(0);                                                 // closed by SIGTERM
+    expect(sibling.exitCode).toBeNull();                                                       // "qa backup" untouched
     const listeners = JSON.parse(await readFile(listenersPath, "utf8")).listeners;
     expect(listeners.map((l: any) => l.name)).toEqual(["local", "team"]);
     expect(listeners.find((l: any) => l.name === "team").profiles).toEqual(["me@x.com"]);
@@ -65,6 +68,24 @@ test("profile rm: plan first, consent for a running window, then unregister ever
     expect(real.out).toContain("its Chrome data is left alone");
   } finally {
     browser.kill();
+    sibling.kill();
     await rm(home, { recursive: true, force: true });
   }
 }, 60_000);
+
+test("--user-data-dir is parsed whole: a sibling folder never matches", async () => {
+  const { userDataDirOf, sameDataDir } = await import("./rechrome.ts");
+  const qa = String.raw`C:\Users\A\.rechrome\profiles\qa`;
+  const backup = String.raw`C:\Users\A\.rechrome\profiles\qa backup`;
+  expect(userDataDirOf(`chrome.exe --user-data-dir="${backup}" --no-first-run`, true)).toBe(backup);
+  expect(userDataDirOf(`bun.exe -e x "--user-data-dir=${backup}"`, true)).toBe(backup);
+  expect(userDataDirOf(`chrome.exe --user-data-dir=${qa} --flag`, true)).toBe(qa);
+  expect(userDataDirOf("chrome.exe --no-first-run", true)).toBeNull();
+  expect(sameDataDir(backup, qa, true)).toBe(false);
+  expect(sameDataDir(qa.toLowerCase() + "\\", qa, true)).toBe(true);           // case and a trailing separator don't matter
+  expect(sameDataDir(`${qa}2`, qa, true)).toBe(false);
+  // POSIX ps output has no quotes: the value runs to the next -flag, so "qa backup" is not "qa".
+  expect(userDataDirOf("/opt/chrome --user-data-dir=/h/.rechrome/profiles/qa backup --no-first-run", false)).toBe("/h/.rechrome/profiles/qa backup");
+  expect(userDataDirOf("/opt/chrome --user-data-dir=/h/.rechrome/profiles/qa --no-first-run", false)).toBe("/h/.rechrome/profiles/qa");
+  expect(sameDataDir("/h/.rechrome/profiles/qa backup", "/h/.rechrome/profiles/qa", false)).toBe(false);
+});

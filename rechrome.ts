@@ -905,24 +905,38 @@ export function buildProfileRows(cache: Record<string, ChromeProfileInfo> | null
   return rows;
 }
 
-/** PIDs of browser processes (not helpers) running on a Chrome user-data dir. */
+/**
+ * The `--user-data-dir` a process command line names, or null. Windows command lines keep
+ * quotes: `--user-data-dir="C:\a b"`, `"--user-data-dir=C:\a b"`, or unquoted up to a space.
+ * POSIX `ps` output has no quotes, so there the value runs to the next ` -flag` or the end;
+ * an ambiguous value then fails the exact comparison (a miss, never the wrong browser).
+ */
+export function userDataDirOf(commandLine: string, windows = process.platform === "win32"): string | null {
+  const m = windows
+    ? /(?:^|\s)"--user-data-dir=([^"]*)"|(?:^|\s)--user-data-dir="([^"]*)"|(?:^|\s)--user-data-dir=([^\s"]+)/.exec(commandLine)
+    : /(?:^|\s)--user-data-dir=(.+?)(?=\s+-|\s*$)/.exec(commandLine);
+  return m ? (m[1] ?? m[2] ?? m[3] ?? null) : null;
+}
+
+/** Same folder: exact path, ignoring trailing separators (and case on Windows). */
+export function sameDataDir(a: string, b: string, windows = process.platform === "win32"): boolean {
+  const norm = (p: string) => { const t = p.replace(/[\\/]+$/, ""); return windows ? t.replaceAll("/", "\\").toLowerCase() : t; };
+  return norm(a) === norm(b);
+}
+
+/** PIDs of browser processes (not helpers) running on exactly this Chrome user-data dir. */
 function browsersUsing(userDataDir: string): number[] {
-  if (process.platform === "win32") {
-    // Chrome quotes a path with spaces (--user-data-dir="C:\…"), and Windows paths are
-    // case-insensitive: compare without quotes, lowercased, and require the path to end there
-    // (so …\qa never matches …\qa2).
-    const out = Bun.spawnSync(["powershell", "-NoProfile", "-NonInteractive", "-Command",
-      "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId)`t$($_.CommandLine)\" }"], { windowsHide: true }).stdout.toString();
-    const want = `--user-data-dir=${userDataDir}`.toLowerCase();
-    return out.split(/\r?\n/).map(line => {
-      const tab = line.indexOf("\t");
-      return { pid: Number(line.slice(0, tab)), command: ` ${line.slice(tab + 1).replaceAll('"', "").toLowerCase()} ` };
-    }).filter(p => p.pid && p.pid !== process.pid && p.command.includes(` ${want} `) && !p.command.includes("--type="))
-      .map(p => p.pid);
-  }
-  const ps = Bun.spawnSync(["ps", "ax", "-o", "pid=,command="]).stdout.toString();
-  return ps.split("\n").filter(line => line.includes(`--user-data-dir=${userDataDir}`) && !line.includes("--type="))
-    .map(line => Number(line.trim().split(/\s+/)[0])).filter(Boolean);
+  const rows = process.platform === "win32"
+    ? Bun.spawnSync(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+        "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId)`t$($_.CommandLine)\" }"], { windowsHide: true })
+        .stdout.toString().split(/\r?\n/).map(line => { const tab = line.indexOf("\t"); return { pid: Number(line.slice(0, tab)), command: line.slice(tab + 1) }; })
+    : Bun.spawnSync(["ps", "ax", "-o", "pid=,command="]).stdout.toString().split("\n")
+        .map(line => { const m = /^\s*(\d+)\s+(.*)$/.exec(line); return { pid: m ? Number(m[1]) : 0, command: m?.[2] ?? "" }; });
+  return rows.filter(p => {
+    if (!p.pid || p.pid === process.pid || /(?:^|\s)"?--type=/.test(p.command)) return false;
+    const dir = userDataDirOf(p.command);
+    return !!dir && sameDataDir(dir, userDataDir);
+  }).map(p => p.pid);
 }
 
 /** Move a folder to the user's Trash (recoverable). Returns where it went, or null if unsupported here. */
