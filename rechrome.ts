@@ -1009,7 +1009,10 @@ export function normalizeCommandArgs(args: string[]): string[] {
 export function withDefaultScheme(target: string): string {
   if (/^[./\\~]/.test(target) || /^[a-z]:[\\/]/i.test(target)) return target; // a file path, not a host
   if (/^[a-z][a-z0-9+.-]*:/i.test(target) && !/^[^/:]+:\d+(\/|$|[?#])/.test(target)) return target;
-  return /^(localhost|127\.|\[::1\])/i.test(target) ? `http://${target}` : `https://${target}`;
+  // Loopback by exact hostname: `localhost.example.com` / `127.example.com` are public hosts.
+  const host = (target.match(/^(\[[^\]]*\]|[^/:?#]*)/)?.[1] ?? "").toLowerCase();
+  const loopback = host === "localhost" || host === "[::1]" || /^127(\.\d{1,3}){3}$/.test(host);
+  return loopback ? `http://${target}` : `https://${target}`;
 }
 
 // Pull a global `--profile <val>` / `--profile=<val>` out of the leading flags of an argv.

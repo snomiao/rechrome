@@ -137,6 +137,11 @@ describe("withDefaultScheme", () => {
     expect(withDefaultScheme("example.com:8443/a")).toBe("https://example.com:8443/a");
     expect(withDefaultScheme("127.0.0.1:8080/x")).toBe("http://127.0.0.1:8080/x");
     expect(withDefaultScheme("[::1]:8080")).toBe("http://[::1]:8080");
+    // Loopback is matched by exact hostname, not prefix (Codex review of #22).
+    expect(withDefaultScheme("localhost.example.com")).toBe("https://localhost.example.com");
+    expect(withDefaultScheme("127.example.com/x")).toBe("https://127.example.com/x");
+    expect(withDefaultScheme("localhost")).toBe("http://localhost");
+    expect(withDefaultScheme("127.0.0.1")).toBe("http://127.0.0.1");
   });
 
   test("leaves URLs with a scheme and file paths alone", () => {
