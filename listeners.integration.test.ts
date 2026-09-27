@@ -111,7 +111,7 @@ test("multiple sockets enforce profile/file policies and reload without browser 
       expect(await Bun.file(saved).exists()).toBe(false);
       const ok = await connect(shared);
       expect(ok.code).toBe(0);
-      expect(await Bun.file(saved).text()).toBe(`RECHROME_URL=${shared}\n`);
+      expect(await Bun.file(saved).text()).toBe(`RECHROME_URL="${shared}"\n`);   // quoted: Bun would cut an unquoted value at #
       // POSIX permission bits are not reported on Windows (always 0o666).
       if (process.platform !== "win32") expect((await stat(saved)).mode & 0o777).toBe(0o600);
       expect(await Bun.file(join(project, ".rechrome", ".gitignore")).text()).toBe("*\n");
