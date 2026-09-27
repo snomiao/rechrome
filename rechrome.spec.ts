@@ -122,6 +122,9 @@ describe("normalizeCommandArgs", () => {
   test("gives a bare navigation target a scheme (open/goto/tab-new only)", () => {
     expect(normalizeCommandArgs(["open", "hello.com"])).toEqual(["open", "https://hello.com"]);
     expect(normalizeCommandArgs(["goto", "--headed", "a.io/x?y=1"])).toEqual(["goto", "--headed", "https://a.io/x?y=1"]);
+    // A value-taking flag's value is not the target (Codex review of #22).
+    expect(normalizeCommandArgs(["open", "--profile", "my-profile", "hello.com"])).toEqual(["open", "--profile", "my-profile", "https://hello.com"]);
+    expect(normalizeCommandArgs(["open", "--browser=chrome", "hello.com"])).toEqual(["open", "--browser=chrome", "https://hello.com"]);
     expect(normalizeCommandArgs(["tab-new", "localhost:3000"])).toEqual(["tab-new", "http://localhost:3000"]);
     expect(normalizeCommandArgs(["open"])).toEqual(["open"]);
     expect(normalizeCommandArgs(["eval", "hello.com"])).toEqual(["eval", "hello.com"]);

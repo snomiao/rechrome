@@ -988,14 +988,19 @@ async function callServe(
   }
 }
 
+const BOOLEAN_OPEN_FLAGS = new Set(["--headed", "--persistent", "--in-memory", "--extension"]);
+
 export function normalizeCommandArgs(args: string[]): string[] {
   const normalized = [...args];
   if (normalized[0] === "tabs" || normalized[0] === "list") normalized[0] = "tab-list";
   // `rech open hello.com`: profile-scoped listeners accept only HTTP(S)/about:blank targets, so
   // give a bare host an https:// scheme the way a browser address bar would.
   if (["open", "goto", "tab-new"].includes(normalized[0])) {
-    const i = normalized.findIndex((a, idx) => idx > 0 && !a.startsWith("-"));
-    if (i > 0) normalized[i] = withDefaultScheme(normalized[i]);
+    // The target is the first positional. A token after a `--flag` without `=` is that flag's
+    // value (`open --profile my-profile url`), unless the flag is a known boolean.
+    const takesValue = (flag: string) => flag.startsWith("-") && !flag.includes("=") && !BOOLEAN_OPEN_FLAGS.has(flag);
+    const i = normalized.findIndex((a, idx) => idx > 0 && !a.startsWith("-") && !takesValue(normalized[idx - 1]!));
+    if (i > 0) normalized[i] = withDefaultScheme(normalized[i]!);
   }
   return normalized;
 }
@@ -1576,7 +1581,10 @@ export async function daemonInstall(serveUrl: string): Promise<void> {
     if (stale.length) {
       console.log(`      Migrating from pm2: removing ${stale.join(", ")}`);
       for (const name of stale) await runPm(pm2, ["delete", name]);
-      await runPm(pm2, ["save"]);
+      // --force: pm2 won't save an empty list otherwise, keeping the old dump that `pm2 resurrect`
+      // would bring back at login to fight the oxmgr-managed serve over the port.
+      if (await runPm(pm2, ["save", "--force"]) !== 0)
+        console.warn("      pm2 save failed; run `pm2 save --force` so pm2 doesn't resurrect the old serve at login.");
     }
   }
 
@@ -1617,7 +1625,7 @@ export async function daemonInstall(serveUrl: string): Promise<void> {
 async function daemonUninstall(): Promise<void> {
   const mgr = daemonManager();
   for (const name of [PM_PROCESS_NAME, ...LEGACY_PROCESS_NAMES]) await runPm(mgr, ["delete", name]);
-  if (mgr.id === "pm2") await runPm(mgr, ["save"]);
+  if (mgr.id === "pm2") await runPm(mgr, ["save", "--force"]); // an emptied list must still overwrite the dump
   else await runPm(mgr, ["service", "uninstall"]);
   console.log(`Removed ${mgr.id} process: ${PM_PROCESS_NAME}`);
 }
