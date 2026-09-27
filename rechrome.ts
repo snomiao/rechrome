@@ -362,7 +362,18 @@ export async function detectListenChoices(): Promise<ListenChoice[]> {
   return buildListenChoices(networkInterfaces(), ips);
 }
 
-export type TailscaleServe = { dnsName: string | null; routeUrl: string | null };
+/**
+ * `funnel`: Funnel (public internet) is on for the host that serves — or would serve — this
+ * node's routes, so a route there is not tailnet-only. `mounts`: every Serve path in use.
+ */
+export type TailscaleServe = { dnsName: string | null; routeUrl: string | null; funnel: boolean; mounts: string[] };
+
+export function serveMountsAndFunnel(serveStatus: unknown, host: string | null): { mounts: string[]; funnel: boolean } {
+  const status = serveStatus as { Web?: Record<string, { Handlers?: Record<string, unknown> }>; AllowFunnel?: Record<string, boolean> } | null;
+  const mounts = Object.values(status?.Web ?? {}).flatMap(config => Object.keys(config.Handlers ?? {}).map(path => path.replace(/\/+$/, "") || "/"));
+  const funnel = Object.entries(status?.AllowFunnel ?? {}).some(([hostPort, on]) => on && (!host || hostPort.split(/:(?=\d+$)/)[0] === host));
+  return { mounts: [...new Set(mounts)], funnel };
+}
 
 /**
  * Find the HTTPS Serve route that forwards `prefix` to a loopback listener on `port`,
@@ -393,7 +404,8 @@ export async function detectTailscaleServe(port: number, prefix: string): Promis
   let serveStatus: unknown = null;
   try { dnsName = (JSON.parse(status ?? "null")?.Self?.DNSName as string | undefined)?.replace(/\.$/, "") || null; } catch { /* not connected */ }
   try { serveStatus = JSON.parse(serve ?? "null"); } catch { /* no Serve config */ }
-  return { dnsName, routeUrl: findTailscaleServeRoute(dnsName, serveStatus, port, prefix) };
+  const routeUrl = findTailscaleServeRoute(dnsName, serveStatus, port, prefix);
+  return { dnsName, routeUrl, ...serveMountsAndFunnel(serveStatus, routeUrl ? new URL(routeUrl).hostname : dnsName) };
 }
 
 /** The same connection (key and profile) at another base URL, e.g. where a proxy exposes the listener. */
@@ -1195,9 +1207,16 @@ export function profileSlug(profile: string): string {
   return slug || "profile";
 }
 
-/** `base`, or `base-2`, `base-3`… — the first listener name and path not already in use. */
-export function uniqueShareName(base: string, listeners: Listener[]): string {
-  const taken = (name: string) => listeners.some(l => l.name === name || normalizePrefix(l.prefix) === `/rechrome/${name}/`);
+/**
+ * `base`, or `base-2`, `base-3`… — the first name whose listener and path are free. Never a
+ * reserved name (`share --all` and `share a b` reuse theirs and rewrite their allowlists, so a
+ * one-profile link under such a name would later grant its key more profiles), and never a
+ * mount a proxy already serves (Tailscale Serve would replace that route).
+ */
+export function uniqueShareName(base: string, listeners: Listener[], servedMounts: string[] = []): string {
+  const reserved = (name: string) => name === "local" || name === "share-all" || /^share-[0-9a-f]{6}$/.test(name);
+  const taken = (name: string) => reserved(name) || servedMounts.includes(`/rechrome/${name}`)
+    || listeners.some(l => l.name === name || normalizePrefix(l.prefix) === `/rechrome/${name}/`);
   for (let i = 1; ; i++) { const name = i === 1 ? base : `${base}-${i}`; if (!taken(name)) return name; }
 }
 
@@ -1205,6 +1224,10 @@ export function uniqueShareName(base: string, listeners: Listener[]): string {
 async function exposeWithTailscaleServe(listener: Listener): Promise<string | null> {
   const prefix = normalizePrefix(listener.prefix);
   const existing = await detectTailscaleServe(listener.port, prefix);
+  if (existing.funnel) {
+    console.error("Tailscale Funnel is on for this machine, so a Serve route here would be public, not tailnet-only. Not exposing it.\n  Turn Funnel off (tailscale funnel reset), then rech share again.");
+    return null;
+  }
   if (existing.routeUrl) return existing.routeUrl;
   const binary = tailscaleBinary();
   if (!binary) return null;
@@ -1225,7 +1248,8 @@ async function exposeWithTailscaleServe(listener: Listener): Promise<string | nu
  * loopback link, like `rech share a b`.
  */
 async function shareNewLink(profile: string, opts: { local?: boolean; save?: boolean }): Promise<void> {
-  const name = uniqueShareName(profileSlug(profile), (await requireListeners()).listeners);
+  const served = tailscaleBinary() ? (await detectTailscaleServe(0, "/")).mounts : [];
+  const name = uniqueShareName(profileSlug(profile), (await requireListeners()).listeners, served);
   let host = "127.0.0.1", tailscaleServe = false;
   if (isInteractive()) {
     const serve = !!tailscaleBinary();
@@ -1321,7 +1345,14 @@ async function printProfileUri(selector?: string, listener?: string, opts: { loc
     console.error(`[rech] note: this link's key works for every profile on listener "${chosen.name}" (${chosen.profiles.join(", ")}); ?profile= only picks the default. For a one-profile link, give that profile its own listener.`);
   let uri = profileConnectionUri(profile, url, listeners, listener);
   // Prefer where a proxy exposes the listener, when it has been recorded.
-  const publicUrl = listeners.find(l => l.key === parseUrl(uri).key)?.publicUrl;
+  // A link whose proxy was set up by hand since (e.g. after `tailscale serve` failed here):
+  // record the tailnet-only route so this and later shares print it.
+  const pending = listeners.find(l => l.key === parseUrl(uri).key);
+  if (config && pending && pending.profiles !== "*" && !pending.publicUrl && isLoopback(pending.host) && tailscaleBinary()) {
+    const serve = await detectTailscaleServe(pending.port, normalizePrefix(pending.prefix));
+    if (serve.routeUrl && !serve.funnel) { pending.publicUrl = serve.routeUrl; await writeListeners(config); }
+  }
+  const publicUrl = pending?.publicUrl;
   if (publicUrl && !opts.local) uri = rebaseConnectionUrl(publicUrl, uri);
   console.log(uri);
   if (opts.save) console.error(`Saved RECHROME_URL to ${await saveProjectUrl(uri)}`);
