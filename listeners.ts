@@ -187,3 +187,27 @@ export function resolveAllowedProfile(
   }
   throw new Error(`"${selector}" is not shared by this link. It shares: ${list}.`);
 }
+
+export type ProfileRemovalPlan = {
+  keys: string[];                                              // every registry alias of the profile
+  listeners: { name: string; remove: string[]; drop: boolean }[];  // allowlist edits; drop = no profiles left
+  dataDir?: string;                                            // a managed profile's own folder (never real Chrome data)
+};
+
+/**
+ * What `rech profile rm` would change for one registry key: all aliases of that Chrome profile,
+ * their listener entries (dropping a listener left empty), and, for a managed test profile
+ * whose data lives under `managedRoot`, its folder. Real Chrome profiles only get unregistered.
+ */
+export function planProfileRemoval(
+  key: string, registry: Record<string, RegisteredProfile & { loadExtension?: string }>, listeners: Listener[], managedRoot: string,
+): ProfileRemovalPlan {
+  const entry = registry[key];
+  if (!entry) throw new Error(`"${key}" is not a registered profile.`);
+  const keys = Object.keys(registry).filter(k => profileIdentity(registry[k]) === profileIdentity(entry));
+  const edits = listeners.filter(l => l.profiles !== "*" && l.profiles.some(p => keys.includes(p)))
+    .map(l => ({ name: l.name, remove: (l.profiles as string[]).filter(p => keys.includes(p)), drop: (l.profiles as string[]).every(p => keys.includes(p)) }));
+  const root = managedRoot.replace(/[\\/]+$/, "");
+  const managed = !!entry.loadExtension && !!entry.userDataDir && (entry.userDataDir.startsWith(root + "/") || entry.userDataDir.startsWith(root + "\\"));
+  return { keys, listeners: edits, ...(managed ? { dataDir: entry.userDataDir } : {}) };
+}
