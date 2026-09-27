@@ -6,7 +6,7 @@ import { mkdirSync, appendFileSync, existsSync, realpathSync, accessSync, cpSync
 import { hostname, homedir } from "os";
 import { join, basename, dirname } from "path";
 import { spawn as cpSpawn } from "child_process";
-import { oxmgrInstallCommand, pickDaemonManager, type DaemonManager } from "./daemon-manager.ts";
+import { listsProcess, oxmgrInstallCommand, pickDaemonManager, PM2_DEPRECATION, type DaemonManager } from "./daemon-manager.ts";
 
 export const ENV_KEY = "RECHROME_URL";
 export const DEFAULT_PORT = 13775;
@@ -870,6 +870,10 @@ function daemonManager(): DaemonManager {
     isWindows: IS_WINDOWS,
     override: process.env.RECH_DAEMON_MANAGER,
   });
+  if (_daemonMgr.id === "pm2") {
+    const why = oxmgrBin ? "stock oxmgr on Windows lacks the winfix build" : "oxmgr is not on PATH";
+    console.error(`[rech] warning: using pm2 (${why}). ${PM2_DEPRECATION}`);
+  }
   return _daemonMgr;
 }
 
@@ -906,7 +910,7 @@ async function oxmgrEnsureAutostart(mgr: DaemonManager): Promise<void> {
 }
 
 // Capture the process-manager's process list as text (oxmgr `list` / pm2 `jlist`).
-// Both render the process name verbatim, so callers can substring-match it.
+// Match a name in it with listsProcess, not a substring test.
 async function pmList(mgr: DaemonManager = daemonManager()): Promise<string> {
   const proc = Bun.spawn([mgr.bin, mgr.id === "pm2" ? "jlist" : "list"], { stdout: "pipe", stderr: "ignore", windowsHide: true });
   return await new Response(proc.stdout).text();
@@ -973,6 +977,19 @@ export async function daemonInstall(serveUrl: string): Promise<void> {
 
   // Drop any prior registration (current + legacy names) before re-adding.
   for (const name of [PM_PROCESS_NAME, ...LEGACY_PROCESS_NAMES]) await runPm(mgr, ["delete", name]);
+  // Migrating off the deprecated pm2: a serve still registered there would keep the port and be
+  // resurrected at login, fighting the oxmgr-managed one. Remove it from pm2 too.
+  const pm2Bin = mgr.id === "oxmgr" ? Bun.which("pm2") : null;
+  if (pm2Bin) {
+    const pm2: DaemonManager = { id: "pm2", bin: pm2Bin };
+    const listed = await pmList(pm2).catch(() => "");
+    const stale = [PM_PROCESS_NAME, ...LEGACY_PROCESS_NAMES].filter(n => listsProcess("pm2", listed, n));
+    if (stale.length) {
+      console.log(`      Migrating from pm2: removing ${stale.join(", ")}`);
+      for (const name of stale) await runPm(pm2, ["delete", name]);
+      await runPm(pm2, ["save"]);
+    }
+  }
 
   let startCode: number;
   if (mgr.id === "pm2") {
@@ -1442,30 +1459,37 @@ async function setup(opts: { profile?: string; token?: string; yes?: boolean } =
   const bindChanged = desiredBind !== currentBind;
   if (!daemonHealthy || bindChanged) {
     try {
-      try {
-        daemonManager();
-      } catch (error) {
-        // Respect an explicit pm2 choice; installing oxmgr would not satisfy it.
-        if (process.env.RECH_DAEMON_MANAGER?.toLowerCase() === "pm2") throw error;
+      let fallback: DaemonManager | undefined;
+      let missing: unknown;
+      try { fallback = daemonManager(); } catch (error) { missing = error; }
+      // Offer oxmgr when there is no manager at all, or only the deprecated pm2 because oxmgr is
+      // absent. An explicit RECH_DAEMON_MANAGER=pm2 is respected (installing oxmgr wouldn't satisfy it).
+      const explicitPm2 = process.env.RECH_DAEMON_MANAGER?.toLowerCase() === "pm2";
+      if (explicitPm2 && missing) throw missing;
+      if (!explicitPm2 && (missing || (fallback?.id === "pm2" && !Bun.which("oxmgr")))) {
         const command = oxmgrInstallCommand(process.env);
-        const answer = opts.yes ? "yes" : (await ask(`      oxmgr is missing. Install globally with \`${command.join(" ")}\`? [y/N]: `)).trim();
-        if (!/^(y|yes)$/i.test(answer)) {
+        const prompt = missing ? "oxmgr is missing" : "Only the deprecated pm2 is available";
+        const answer = opts.yes ? "yes" : (await ask(`      ${prompt}. Install oxmgr globally with \`${command.join(" ")}\`? [y/N]: `)).trim();
+        const declined = !/^(y|yes)$/i.test(answer);
+        if (declined && missing) {
           throw new Error(`Setup cancelled. To install oxmgr, run \`${command.join(" ")}\`, then rerun setup.`);
         }
-        console.log(`      Installing oxmgr: ${command.join(" ")}`);
-        const installer = Bun.which(command[0]) ?? (command[0] === "bun" ? process.execPath : null);
-        if (!installer) throw new Error(`${command[0]} is not on PATH. Install it or run \`${command.join(" ")}\` in your terminal, then rerun setup.`);
-        const proc = Bun.spawn([installer, ...command.slice(1)], {
-          stdin: "inherit", stdout: "inherit", stderr: "inherit", windowsHide: true,
-        });
-        const code = await proc.exited;
-        if (code !== 0) throw new Error(`\`${command.join(" ")}\` failed (exit code ${code}). Resolve the installation error, then rerun setup.`);
-        if (!Bun.which("oxmgr")) {
-          throw new Error("oxmgr was installed but is not on PATH. Add the package manager's global bin directory to PATH, then rerun setup.");
+        if (!declined) {
+          console.log(`      Installing oxmgr: ${command.join(" ")}`);
+          const installer = Bun.which(command[0]) ?? (command[0] === "bun" ? process.execPath : null);
+          if (!installer) throw new Error(`${command[0]} is not on PATH. Install it or run \`${command.join(" ")}\` in your terminal, then rerun setup.`);
+          const proc = Bun.spawn([installer, ...command.slice(1)], {
+            stdin: "inherit", stdout: "inherit", stderr: "inherit", windowsHide: true,
+          });
+          const code = await proc.exited;
+          if (code !== 0) throw new Error(`\`${command.join(" ")}\` failed (exit code ${code}). Resolve the installation error, then rerun setup.`);
+          if (!Bun.which("oxmgr")) {
+            throw new Error("oxmgr was installed but is not on PATH. Add the package manager's global bin directory to PATH, then rerun setup.");
+          }
+          _daemonMgr = undefined;
+          _oxmgrVersion = undefined;
+          daemonManager();
         }
-        _daemonMgr = undefined;
-        _oxmgrVersion = undefined;
-        daemonManager();
       }
     } catch (error) {
       console.error(error instanceof Error ? error.message : String(error));
@@ -1811,7 +1835,7 @@ async function status(): Promise<void> {
     // printing a stack trace instead of the restart hint.
     if (pingBody?.degraded)
       console.log(`relay:    ⚠ degraded (${pingBody.consecutiveTimeouts} consecutive command timeouts) — if it persists, the daemon self-restarts; force it now with \`${mgr?.id ?? "oxmgr"} restart ${PM_PROCESS_NAME}\``);
-    const daemonRegistered = mgr ? (await pmList(mgr)).includes(PM_PROCESS_NAME) : false;
+    const daemonRegistered = mgr ? listsProcess(mgr.id, await pmList(mgr), PM_PROCESS_NAME) : false;
     console.log(`daemon:   ${daemonRegistered ? `${mgr!.id} (${PM_PROCESS_NAME})` : mgr ? "not installed" : "not installed (no oxmgr or pm2 on PATH)"}`);
   }
   const registry = await readTokenRegistry();

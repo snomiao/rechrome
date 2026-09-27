@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { compareVersion, oxmgrHasWinfix, oxmgrInstallCommand, pickDaemonManager } from "./daemon-manager.ts";
+import { compareVersion, listsProcess, oxmgrHasWinfix, oxmgrInstallCommand, pickDaemonManager } from "./daemon-manager.ts";
 
 describe("oxmgrHasWinfix", () => {
   test("accepts the winfix build tag", () => {
@@ -55,7 +55,7 @@ describe("pickDaemonManager", () => {
   for (const isWindows of [false, true]) {
     test(`missing managers give installation instructions (Windows: ${isWindows})`, () => {
       expect(() => pickDaemonManager({ oxmgrBin: null, pm2Bin: null, oxmgrVersion: null, isWindows }))
-        .toThrow("bun add -g pm2");
+        .toThrow("bun i -g oxmgr");
     });
   }
   test("an unavailable explicit manager does not silently fall back", () => {
@@ -85,5 +85,20 @@ describe("oxmgrInstallCommand", () => {
   test("uses bun for bunx or direct invocation", () => {
     expect(oxmgrInstallCommand({ npm_config_user_agent: "bun/1.4.2", npm_execpath: "/bin/npm" })).toEqual(["bun", "i", "-g", "oxmgr"]);
     expect(oxmgrInstallCommand({})).toEqual(["bun", "i", "-g", "oxmgr"]);
+  });
+});
+
+describe("listsProcess", () => {
+  const jlist = JSON.stringify([
+    { name: "rech-local-shim", pm2_env: { pm_cwd: "/home/u/ws/rechrome/tree/main", args: ["rechrome"] } },
+  ]);
+  test("pm2: matches the process name exactly, not paths/args mentioning it", () => {
+    expect(listsProcess("pm2", jlist, "rechrome")).toBe(false);
+    expect(listsProcess("pm2", JSON.stringify([...JSON.parse(jlist), { name: "rechrome" }]), "rechrome")).toBe(true);
+    expect(listsProcess("pm2", "not json", "rechrome")).toBe(false);
+  });
+  test("oxmgr: matches a table cell exactly", () => {
+    expect(listsProcess("oxmgr", "│ 0 │ rechrome │ running │", "rechrome")).toBe(true);
+    expect(listsProcess("oxmgr", "│ 0 │ rechrome-old │ /x/rechrome/rech.ts │", "rechrome")).toBe(false);
   });
 });

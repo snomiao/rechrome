@@ -166,8 +166,41 @@ mod imp {
         }
     }
 
+    /// The manager that owns the daemon, mirroring `rech`'s choice: RECH_DAEMON_MANAGER if set,
+    /// else oxmgr — unless only the deprecated pm2 has `rechrome` registered (e.g. stock oxmgr on
+    /// Windows, where rech falls back to pm2).
     fn pm_bin() -> &'static str {
-        if cfg!(target_os = "windows") {
+        match std::env::var("RECH_DAEMON_MANAGER")
+            .map(|v| v.to_lowercase())
+            .as_deref()
+        {
+            Ok("pm2") => return "pm2",
+            Ok("oxmgr") => return "oxmgr",
+            _ => {}
+        }
+        // npm-installed managers are `.cmd` shims on Windows, which only cmd.exe resolves.
+        let registered = |pm: &str, list: &str| {
+            let mut cmd = if cfg!(target_os = "windows") {
+                let mut c = Command::new("cmd");
+                c.args(["/C", pm]);
+                c
+            } else {
+                Command::new(pm)
+            };
+            cmd.arg(list)
+                .output()
+                // Exact name match (pm2 `"name":"rechrome"`, an oxmgr table cell): other
+                // processes' paths often contain "rechrome" too.
+                .map(|o| {
+                    let out = String::from_utf8_lossy(&o.stdout);
+                    out.contains("\"name\":\"rechrome\"")
+                        || out
+                            .split(|c: char| c.is_whitespace() || "│|┃".contains(c))
+                            .any(|t| t == "rechrome")
+                })
+                .unwrap_or(false)
+        };
+        if !registered("oxmgr", "list") && registered("pm2", "jlist") {
             "pm2"
         } else {
             "oxmgr"

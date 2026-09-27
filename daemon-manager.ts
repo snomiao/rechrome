@@ -1,6 +1,9 @@
 // Process-manager selection policy for the `rech serve` daemon.
 //
-// oxmgr is the cross-platform default. On Windows, stock oxmgr 0.4.0 wedges after
+// oxmgr is the cross-platform default. pm2 is DEPRECATED: it is only picked when
+// oxmgr is unavailable (or unsafe, see below) or explicitly requested, and callers
+// warn with PM2_DEPRECATION when it is. New installs should use oxmgr.
+// On Windows, stock oxmgr 0.4.0 wedges after
 // a daemon crash: it leaves the daemon's control socket bound to a dead PID, so
 // every subsequent oxmgr command fails with "daemon did not become ready in
 // time". The snomiao/OxMgr fork fixes it and stamps the build `0.4.0+winfix`.
@@ -13,6 +16,9 @@
 // rech.ts and feeds its results into pickDaemonManager.
 
 export type DaemonManager = { id: "oxmgr" | "pm2"; bin: string };
+
+export const PM2_DEPRECATION =
+  "pm2 is deprecated as the rech daemon manager; install oxmgr (`bun i -g oxmgr`) and rerun `rech setup` to migrate.";
 
 // Base version that first shipped the winfix build tag. A strictly newer base
 // version is assumed to carry the fix upstream even without the explicit
@@ -58,13 +64,13 @@ export function pickDaemonManager(opts: {
 }): DaemonManager {
   const override = opts.override?.toLowerCase();
   if (override === "oxmgr" && !opts.oxmgrBin) {
-    throw new Error("RECH_DAEMON_MANAGER=oxmgr, but oxmgr is not on PATH. Install oxmgr and add it to PATH, or install pm2 with `bun add -g pm2` and set RECH_DAEMON_MANAGER=pm2.");
+    throw new Error("RECH_DAEMON_MANAGER=oxmgr, but oxmgr is not on PATH. Install it with `bun i -g oxmgr` and ensure the global bin directory is on PATH.");
   }
   if (override === "pm2" && !opts.pm2Bin) {
-    throw new Error("RECH_DAEMON_MANAGER=pm2, but pm2 is not on PATH. Install it with `bun add -g pm2` and ensure the global bin directory is on PATH.");
+    throw new Error("RECH_DAEMON_MANAGER=pm2, but pm2 is not on PATH. pm2 is deprecated — unset RECH_DAEMON_MANAGER to use oxmgr (`bun i -g oxmgr`).");
   }
   if (!opts.oxmgrBin && !opts.pm2Bin) {
-    throw new Error("No daemon process manager found on PATH (oxmgr or pm2). Install pm2 with `bun add -g pm2`, ensure the global bin directory is on PATH, then rerun `bunx rechrome setup`.");
+    throw new Error("No daemon process manager found on PATH. Install oxmgr with `bun i -g oxmgr`, ensure the global bin directory is on PATH, then rerun `bunx rechrome setup`.");
   }
   const oxmgr: DaemonManager = { id: "oxmgr", bin: opts.oxmgrBin ?? "oxmgr" };
   const pm2: DaemonManager = { id: "pm2", bin: opts.pm2Bin ?? "pm2" };
@@ -96,4 +102,18 @@ export function oxmgrInstallCommand(env: { npm_config_user_agent?: string; npm_e
   const execPath = env.npm_execpath?.replace(/\\/g, "/") ?? "";
   if (/(^|\/)(npm|npx)(-cli\.js|\.cmd|\.exe)?$/i.test(execPath)) return ["npm", "i", "-g", "oxmgr"];
   return ["bun", "i", "-g", "oxmgr"];
+}
+
+// Whether a manager's process list (pm2 `jlist` JSON / oxmgr `list` table) registers exactly
+// `name`. A plain substring test false-positives on other processes whose paths or args
+// mention it (e.g. a pm2 app running from a `.../rechrome/...` checkout).
+export function listsProcess(id: DaemonManager["id"], output: string, name: string): boolean {
+  if (id === "pm2") {
+    try {
+      return (JSON.parse(output) as Array<{ name?: string }>).some(p => p?.name === name);
+    } catch {
+      return false;
+    }
+  }
+  return output.split(/[\s│|┃]+/).includes(name);
 }

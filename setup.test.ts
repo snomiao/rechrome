@@ -107,3 +107,29 @@ for (const exposesBinary of [false, true]) {
     }
   });
 }
+
+test("pm2-only: setup offers oxmgr, and declining continues with the deprecated pm2", async () => {
+  const taskHome = mkdtempSync(join(tmpdir(), "rechrome-pm2-test-"));
+  const marker = join(taskHome, "pm2-called");
+  writeFileSync(join(taskHome, "pm2"), `#!${process.execPath}\nawait Bun.write(${JSON.stringify(marker)}, "called");\nprocess.exit(23);\n`, { mode: 0o755 });
+  try {
+    const proc = Bun.spawn([process.execPath, join(import.meta.dir, "rech.ts"), "setup", "--profile", "Default"], {
+      cwd: taskHome,
+      env: {
+        HOME: taskHome, USERPROFILE: taskHome, PATH: taskHome,
+        npm_config_user_agent: "bun/1.0.0",
+        RECHROME_URL: "http://test@127.0.0.1:1", RECH_HOST: "0.0.0.0",
+      },
+      stdin: new Blob(["n\n"]), stdout: "pipe", stderr: "pipe",
+    });
+    const [code, stdout, stderr] = await Promise.all([proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+    expect(stdout).toContain("Only the deprecated pm2 is available. Install oxmgr globally with `bun i -g oxmgr`? [y/N]:");
+    expect(stderr).toContain("pm2 is deprecated");
+    expect(stderr).not.toContain("Setup cancelled");
+    // The stub pm2 fails deliberately; reaching it proves setup carried on with pm2.
+    expect(existsSync(marker)).toBe(true);
+    expect(code).toBe(1);
+  } finally {
+    rmSync(taskHome, { recursive: true, force: true });
+  }
+});
