@@ -2,7 +2,7 @@ import { test, expect } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
-import { migrateLegacyDataDir, RECH_DIR, LOG_DIR } from "./rechrome.ts";
+import { migrateLegacyDataDir, projectDataDir, RECH_DIR, LOG_DIR } from "./rechrome.ts";
 
 function sandbox() {
   const root = mkdtempSync(join(tmpdir(), "rechrome-data-dir-"));
@@ -52,4 +52,11 @@ test("is a no-op without a legacy dir, and when both paths are the same dir", ()
     expect(migrateLegacyDataDir(target, target)).toEqual([]);
     expect(readFileSync(join(target, "logs", "a.log"), "utf8")).toBe("keep\n");
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("a project's rechrome folder follows the session root: worktree, or cwd in cwd mode / outside git", () => {
+  expect(projectDataDir({ mode: "worktree", cwd: "/repo/sub", root: "/repo" })).toBe(join("/repo", ".rechrome"));
+  expect(projectDataDir({ mode: "branch", cwd: "/repo/sub", root: "/repo" })).toBe(join("/repo", ".rechrome"));
+  expect(projectDataDir({ mode: "cwd", cwd: "/repo/sub", root: "/repo" })).toBe(join("/repo/sub", ".rechrome"));
+  expect(projectDataDir({ mode: "worktree", cwd: "/tmp/scratch", root: null })).toBe(join("/tmp/scratch", ".rechrome"));
 });

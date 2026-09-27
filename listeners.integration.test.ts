@@ -75,7 +75,9 @@ test("multiple sockets enforce profile/file policies and reload without browser 
         stdin: "ignore", stdout: "pipe", stderr: "pipe",
       });
       expect(await client.exited).toBe(0);
-      expect(await Bun.file(join(root, ".playwright-cli-multi-tab", "probe.png")).text()).toBe("fixture");
+      // Not a git repo, so the project folder is cwd: <root>/.rechrome/output, git-ignored as a whole.
+      expect(await Bun.file(join(root, ".rechrome", "output", "probe.png")).text()).toBe("fixture");
+      expect(await Bun.file(join(root, ".rechrome", ".gitignore")).text()).toBe("*\n");
     } finally { proxy.stop(true); }
     await writeFile(join(root, ".rechrome", "output", "secret.png"), "private");
     const link = profileOutputPrefix("qa") + "link.png";
