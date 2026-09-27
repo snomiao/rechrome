@@ -9,6 +9,8 @@ import {
   getOrCreateUrl,
   authCheck,
   RECH_DIR,
+  LEGACY_RECH_DIR,
+  migrateLegacyDataDir,
   HOME,
   PASSTHROUGH_ENV_KEYS,
   resolvePlaywrightCli,
@@ -263,11 +265,14 @@ export function shouldExitOrphanedServe(opts: {
 }
 
 export async function serve() {
+  // The daemon owns logs/ and output/, so it migrates them before writing anything.
+  const migrated = migrateLegacyDataDir();
   const url = await getOrCreateUrl();
   const { key, port } = parseUrl(url);
 
   const workDir = join(RECH_DIR, "output");
   mkdirSync(workDir, { recursive: true });
+  if (migrated.length) log(`Moved ${migrated.length} legacy entries from ${LEGACY_RECH_DIR} to ${RECH_DIR}`);
 
   // Foreground/orphan self-exit: a serve whose parent has been re-parented to init
   // (ppid 1) is a leaked foreground serve. Poll for that, track the last real /run,
@@ -656,7 +661,7 @@ export async function serve() {
           outputFiles.push(f);
         } else {
           const basename = f.split("/").pop()!;
-          for (const subdir of [".playwright-cli", ".rech-multi-tab"]) {
+          for (const subdir of [".playwright-cli", ".playwright-cli-multi-tab"]) {
             // Forward-slash for the wire: join() would use "\" on the Windows daemon, which
             // a POSIX client can't treat as a separator (it builds a literal-backslash path).
             const subpath = `${subdir}/${basename}`;

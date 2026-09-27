@@ -5,7 +5,7 @@ import { file } from "bun";
 import yargs from "yargs";
 import { readExtensionTokenFromProfile } from "./extension-token.ts";
 import { randomBytes } from "crypto";
-import { mkdirSync, appendFileSync, existsSync, realpathSync, accessSync, cpSync, unlinkSync, readFileSync, readdirSync, constants as fsConstants } from "fs";
+import { mkdirSync, appendFileSync, existsSync, realpathSync, accessSync, cpSync, unlinkSync, readFileSync, readdirSync, renameSync, rmdirSync, constants as fsConstants } from "fs";
 import { hostname, homedir, networkInterfaces } from "os";
 import { isIPv4 } from "net";
 import { join, basename, dirname } from "path";
@@ -16,14 +16,16 @@ import { oxmgrInstallCommand, pickDaemonManager, type DaemonManager } from "./da
 
 export const ENV_KEY = "RECHROME_URL";
 export const DEFAULT_PORT = 13775;
-export const RECH_DIR = join(import.meta.dir, ".rech");
-export const LOG_DIR = join(RECH_DIR, "logs");
-
 // Home dir: HOME on POSIX, USERPROFILE on Windows (handled by os.homedir()).
 export const HOME = homedir();
 
-const RECH_HOME_DIR = join(HOME, ".rechrome");
-const TOKENS_FILE = join(RECH_HOME_DIR, "profiles.yaml");
+// All rechrome state (registry, listeners, extension, logs, daemon output) lives in
+// ~/.rechrome, never next to the code: a bunx/npx install dir is a disposable cache.
+export const RECH_DIR = join(HOME, ".rechrome");
+export const LOG_DIR = join(RECH_DIR, "logs");
+// Before the rename, logs and daemon output lived in <install dir>/.rech.
+export const LEGACY_RECH_DIR = join(import.meta.dir, ".rech");
+const TOKENS_FILE = join(RECH_DIR, "profiles.yaml");
 
 type TokenEntry = { extensionId: string; token: string; profileDir: string; userDataDir?: string; loadExtension?: string };
 
@@ -38,7 +40,7 @@ function validateTokenRegistry(value: unknown): Record<string, TokenEntry> {
   return value as Record<string, TokenEntry>;
 }
 
-export async function writeTokenRegistry(registry: Record<string, TokenEntry>, directory = RECH_HOME_DIR): Promise<void> {
+export async function writeTokenRegistry(registry: Record<string, TokenEntry>, directory = RECH_DIR): Promise<void> {
   validateTokenRegistry(registry);
   await mkdir(directory, { recursive: true });
   const path = join(directory, "profiles.yaml");
@@ -51,7 +53,7 @@ export async function writeTokenRegistry(registry: Record<string, TokenEntry>, d
   }
 }
 
-export async function readTokenRegistry(directory = RECH_HOME_DIR): Promise<Record<string, TokenEntry>> {
+export async function readTokenRegistry(directory = RECH_DIR): Promise<Record<string, TokenEntry>> {
   const path = join(directory, "profiles.yaml");
   let raw: string;
   try { raw = await readFile(path, "utf8"); }
@@ -74,7 +76,7 @@ export async function readTokenRegistry(directory = RECH_HOME_DIR): Promise<Reco
 }
 
 async function saveTokenEntry(profileEmail: string, entry: TokenEntry): Promise<void> {
-  mkdirSync(RECH_HOME_DIR, { recursive: true });
+  mkdirSync(RECH_DIR, { recursive: true });
   const registry = await readTokenRegistry();
   registry[profileEmail] = entry;
   await writeTokenRegistry(registry);
@@ -239,6 +241,31 @@ export function log(msg: string) {
   console.error(line.trimEnd());
   const logFile = join(LOG_DIR, `${ts.slice(0, 10)}.log`);
   appendFileSync(logFile, line);
+}
+
+/**
+ * Move logs and daemon output from the legacy <install dir>/.rech into RECH_DIR, entry by
+ * entry. An entry already present in RECH_DIR is kept and the legacy copy left in place,
+ * so nothing is overwritten. Best effort: a cross-device rename just leaves the old copy.
+ */
+export function migrateLegacyDataDir(legacy = LEGACY_RECH_DIR, target = RECH_DIR): string[] {
+  const moved: string[] = [];
+  if (!existsSync(legacy)) return moved;
+  mkdirSync(target, { recursive: true });
+  if (realpathSync(legacy) === realpathSync(target)) return moved;
+  for (const sub of ["logs", "output"]) {
+    const from = join(legacy, sub);
+    if (!existsSync(from)) continue;
+    mkdirSync(join(target, sub), { recursive: true });
+    for (const entry of readdirSync(from)) {
+      const to = join(target, sub, entry);
+      if (existsSync(to)) continue;
+      try { renameSync(join(from, entry), to); moved.push(`${sub}/${entry}`); } catch { /* keep the legacy copy */ }
+    }
+  }
+  // Remove only directories left empty (the unused tls/ included); rmdir refuses non-empty ones.
+  for (const dir of ["logs", "output", "tls", ""]) { try { rmdirSync(join(legacy, dir)); } catch { /* not empty */ } }
+  return moved;
 }
 
 export function parseUrl(raw: string) {
@@ -1467,7 +1494,7 @@ async function daemonUninstall(): Promise<void> {
 // locate the binary and launch it detached (singleton via a pidfile).
 // `rech tray hide` / the menu "Hide" item both kill the process;
 // `rech tray show` starts a fresh one.
-const TRAY_PID_FILE = join(RECH_HOME_DIR, "tray.pid");
+const TRAY_PID_FILE = join(RECH_DIR, "tray.pid");
 
 // A desktop GUI must be present. Linux needs an X11/Wayland display; a headless
 // box (SSH, CI, container) has neither, so the tray is skipped. macOS/Windows
@@ -1729,7 +1756,7 @@ async function provisionProfile(name: string, opts: { headed?: boolean } = {}): 
     process.exit(1);
   }
   const dist = await ensureExtensionDistInstalled();
-  const userDataDir = join(RECH_HOME_DIR, "profiles", name);
+  const userDataDir = join(RECH_DIR, "profiles", name);
   const token = randomBytes(32).toString("base64url");
 
   console.log(`\n[1/3] Provisioning managed profile "${name}"`);

@@ -77,9 +77,9 @@ test("multiple sockets enforce profile/file policies and reload without browser 
       expect(await client.exited).toBe(0);
       expect(await Bun.file(join(root, ".playwright-cli-multi-tab", "probe.png")).text()).toBe("fixture");
     } finally { proxy.stop(true); }
-    await writeFile(join(root, ".rech", "output", "secret.png"), "private");
+    await writeFile(join(root, ".rechrome", "output", "secret.png"), "private");
     const link = profileOutputPrefix("qa") + "link.png";
-    await symlink(join(root, ".rech", "output", "secret.png"), join(root, ".rech", "output", link));
+    await symlink(join(root, ".rechrome", "output", "secret.png"), join(root, ".rechrome", "output", link));
     expect((await get(qa, `/files/${link}`)).status).toBe(403);
     const rotated = { ...qa, key: "c".repeat(24), profiles: ["personal"] };
     await save([rotated, personal]);
