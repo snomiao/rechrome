@@ -48,9 +48,9 @@ test("share --all: one snapshot link, profiles picked on the host, never the man
     // (loopback, own key) instead of stopping with instructions.
     const own = await rech(["share", "personal"], hostEnv);
     expect(own.code).toBe(0);
-    expect(own.stdout.trim()).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/rechrome-[0-9a-f]{6}\/\?profile=personal#key=[\w-]{20,}$/);
+    expect(own.stdout.trim()).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/rechrome\/personal\/\?profile=personal#key=[\w-]{20,}$/);
     let ownConfig = JSON.parse(await readFile(listenersPath, "utf8"));
-    const ownListener = ownConfig.listeners.find((l: any) => l.name.startsWith("share-") && l.profiles.length === 1 && l.profiles[0] === "personal");
+    const ownListener = ownConfig.listeners.find((l: any) => l.name === "personal");
     expect(ownListener.host).toBe("127.0.0.1");
     expect(ownListener.key).not.toBe(one.key);
     expect((await rech(["share", "personal"], hostEnv)).stdout.trim()).toBe(own.stdout.trim());   // now shared: same link
