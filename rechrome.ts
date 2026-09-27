@@ -10,6 +10,7 @@ import { hostname, homedir, networkInterfaces } from "os";
 import { isIPv4 } from "net";
 import { join, basename, dirname } from "path";
 import { pathToFileURL } from "url";
+import { createRequire } from "node:module";
 import { spawn as cpSpawn } from "child_process";
 import { readFile, writeFile, rename, chmod, mkdir } from "node:fs/promises";
 import { oxmgrInstallCommand, pickDaemonManager, type DaemonManager } from "./daemon-manager.ts";
@@ -1446,23 +1447,41 @@ async function pmList(mgr: DaemonManager = daemonManager()): Promise<string> {
   return await new Response(proc.stdout).text();
 }
 
+// A candidate playwright-cli entry is usable only if the playwright-core it requires actually
+// resolves FROM that entry — the wrapper does `require('playwright-core/lib/tools/cli-client/program')`,
+// a deep subpath reachable only through the fork's patched `exports` map. existsSync on the .js is
+// not the same check: an uninitialised/half-built lib/playwright-cli submodule leaves the wrapper on
+// disk with no resolvable core, and the failure surfaces later as MODULE_NOT_FOUND inside the daemon.
+export function playwrightCliIsUsable(jsEntry: string): boolean {
+  try {
+    createRequire(jsEntry).resolve("playwright-core/lib/tools/cli-client/program");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // Resolve which playwright-cli the daemon runs to drive Chrome. Priority:
 //   1. PLAYWRIGHT_CLI env override — explicit, already a full command string.
 //   2. Vendored fork in a git checkout (lib/playwright-cli/playwright-cli.js) — the patched
 //      multi-tab CLI + patched playwright-core (PLAYWRIGHT_MCP_PROFILE_DIRECTORY etc.).
 //   3. The fork bundled into the npm tarball (vendor/playwright-cli/playwright-cli.js, produced by
-//      scripts/vendor-cli.sh at prepublish). This is the batteries-included default for
-//      `bun i -g rechrome`: self-contained, no @playwright/cli dep, no browser-binary download.
+//      scripts/vendor-cli.sh at prepublish, and by `prepare` on `bun install` in a checkout). This
+//      is the batteries-included default for `bun i -g rechrome`: self-contained, no
+//      @playwright/cli dep, no browser-binary download.
 //   4. Bare `playwright-cli-multi-tab` on PATH — legacy fallback for a pre-existing global link.
+// Candidates 2–3 must also pass playwrightCliIsUsable(), so a present-but-broken one falls through.
+// lib/ stays ahead of vendor/ on purpose: a dev who built the fork wants their patched core, not
+// the (possibly older) vendor-src snapshot that `prepare` unpacks into vendor/.
 // A resolved .js entry is run through `node` on Windows (which can't exec a .js by shebang) and
 // bare on POSIX (its `#!/usr/bin/env node` shebang runs it under node, which the relay handshake
 // needs — see daemonInstall). serve splits the result on spaces into argv.
-export function resolvePlaywrightCli(): string {
+export function resolvePlaywrightCli(root: string = import.meta.dir): string {
   if (process.env.PLAYWRIGHT_CLI) return process.env.PLAYWRIGHT_CLI;
   const jsEntry = [
-    join(import.meta.dir, "lib/playwright-cli/playwright-cli.js"),
-    join(import.meta.dir, "vendor/playwright-cli/playwright-cli.js"),
-  ].find(existsSync);
+    join(root, "lib/playwright-cli/playwright-cli.js"),
+    join(root, "vendor/playwright-cli/playwright-cli.js"),
+  ].filter(existsSync).find(playwrightCliIsUsable);
   if (jsEntry) return IS_WINDOWS ? `node ${jsEntry}` : jsEntry;
   return "playwright-cli-multi-tab";
 }
