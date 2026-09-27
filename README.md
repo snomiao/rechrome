@@ -39,7 +39,7 @@ Pick the profile up front with `rech setup --profile you@example.com`.
 Check it:
 
 ```bash
-rech status            # daemon, the URL in use, registered profiles
+rech status            # is it working: the URL in use, the daemon, the current profile
 rech profile           # every Chrome profile and whether it is connected
 ```
 

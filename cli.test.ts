@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { rechCli, listenerNextSteps, type RechHandlers } from "./rechrome.ts";
+import { rechCli, listenerNextSteps, unknownCommandHint, notConnectedMessage, type RechHandlers } from "./rechrome.ts";
 
 async function run(argv: string[]) {
   const calls: [string, ...unknown[]][] = [];
@@ -32,7 +32,7 @@ test("profile lists by default and prints a URI with an optional listener", asyn
   expect(await run(["profiles", "ls"])).toEqual([["listProfiles"]]);
   expect(await run(["profile", "qa", "--print-uri", "--listener", "local"])).toEqual([["printProfileUri", "qa", "local"]]); // alias of url
   expect(await run(["profile", "--print-uri"])).toEqual([["printProfileUri", undefined, undefined]]);
-  await expect(run(["profile", "qa"])).rejects.toThrow(/not implemented/);
+  await expect(run(["profile", "qa"])).rejects.toThrow(/rech url "qa"/);
 });
 
 test("listener subcommands, with repeatable --profile", async () => {
@@ -119,5 +119,74 @@ test("rech pw --version reaches playwright-cli, not rech", async () => {
     const [code, stdout] = await Promise.all([proc.exited, new Response(proc.stdout).text()]);
     expect(code).toBe(0);
     expect(JSON.parse(stdout.trim())).toEqual(["--version"]);
+  } finally { server.stop(true); }
+});
+
+// playwright-cli's reply to an unknown command: the error on stderr, its usage listing on stdout.
+const playwrightUsage = `Unknown command: listner
+
+Usage: playwright-cli <command> [args] [options]
+
+Core:
+  open [url]                  open the browser
+  click <target> [button]     perform click on a web page
+  screenshot [target]         screenshot of the current page or element
+  tab-list                    list all tabs
+`;
+
+test("a typo'd command gets a rech hint with the nearest rech or browser command", () => {
+  expect(unknownCommandHint(playwrightUsage)).toContain(`unknown command "listner". Did you mean "listener"?`);
+  expect(unknownCommandHint(playwrightUsage.replace("listner", "screnshot"))).toContain(`Did you mean "screenshot"?`);
+  expect(unknownCommandHint(playwrightUsage.replace("listner", "tab-lst"))).toContain(`Did you mean "tab-list"?`);
+  const noGuess = unknownCommandHint(playwrightUsage.replace("listner", "frobnicate"))!;
+  expect(noGuess).not.toContain("Did you mean");
+  expect(noGuess).toContain("rech pw --help");
+  expect(noGuess).not.toContain("Usage: playwright-cli");
+  expect(unknownCommandHint("Error: page closed")).toBeNull();
+});
+
+test("an unconfigured client is told both ways to connect, without a help dump", () => {
+  const message = notConnectedMessage();
+  expect(message).toContain("rech setup");
+  expect(message).toContain("rech connect");
+  expect(message.split("\n")).toHaveLength(3);
+});
+
+async function runRech(args: string[], env: Record<string, string | undefined>) {
+  const proc = Bun.spawn([process.execPath, `${import.meta.dir}/rechrome.ts`, ...args], {
+    cwd: "/", env: { ...process.env, ...env }, stdout: "pipe", stderr: "pipe",
+  });
+  const [code, stdout, stderr] = await Promise.all([proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+  return { code, stdout, stderr };
+}
+
+test("rech --help is generated from the command tree and needs no daemon", async () => {
+  const { code, stdout, stderr } = await runRech(["--help"], { RECHROME_URL: "http://unused-key-0123456789@127.0.0.1:1" });
+  expect(code).toBe(0);
+  for (const text of ["rech setup", "rech status", "rech url [profile]", "rech connect <url>", "rech listener", "Browser commands", "rech pw <args>", "RECHROME_URL"])
+    expect(stdout).toContain(text);
+  expect(stderr).not.toContain("connecting to");
+});
+
+test("a browser command with no RECHROME_URL prints the short connect hint and exits 1", async () => {
+  const { code, stdout, stderr } = await runRech(["open", "https://example.com"], { RECHROME_URL: "", HOME: "/nonexistent-home" });
+  expect(code).toBe(1);
+  expect(stderr).toContain("rech connect");
+  expect(stdout + stderr).not.toContain("Commands:");
+});
+
+test("a typo'd command through a daemon shows the rech hint, not playwright's usage", async () => {
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(req) {
+    if (new URL(req.url).pathname === "/run") {
+      const [stderr, stdout] = playwrightUsage.split("\n\n", 2);
+      return Response.json({ status: 1, stdout: playwrightUsage.slice(stderr.length + 2), stderr: stderr + "\n" });
+    }
+    return new Response("rech server\n");
+  } });
+  try {
+    const { code, stdout, stderr } = await runRech(["listner", "ls"], { RECHROME_URL: `http://127.0.0.1:${server.port}/#key=stub-key-0123456789` });
+    expect(code).toBe(1);
+    expect(stderr).toContain(`Did you mean "listener"?`);
+    expect(stdout + stderr).not.toContain("Usage: playwright-cli");
   } finally { server.stop(true); }
 });
