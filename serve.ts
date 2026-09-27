@@ -691,6 +691,39 @@ export async function serve() {
       const isOpenNoUrl = isOpenCmd && filteredArgs.length === 1;
       if (isOpenNoUrl) filteredArgs.push("about:blank");
 
+      // Merge passthrough env: server .env.local defaults, then client overrides
+      const passthroughEnv: Record<string, string | undefined> = {};
+      for (const key of PASSTHROUGH_ENV_KEYS) {
+        if (process.env[key]) passthroughEnv[key] = process.env[key];
+      }
+      Object.assign(passthroughEnv, clientEnv, profileEnv);
+
+      // Resolve profile name/email → directory name
+      if (!scoped && passthroughEnv.PLAYWRIGHT_MCP_PROFILE_DIRECTORY) {
+        const resolved = await resolveProfileDirectory(passthroughEnv.PLAYWRIGHT_MCP_PROFILE_DIRECTORY);
+        if (resolved !== passthroughEnv.PLAYWRIGHT_MCP_PROFILE_DIRECTORY)
+          log(`profile resolved: "${passthroughEnv.PLAYWRIGHT_MCP_PROFILE_DIRECTORY}" → "${resolved}"`);
+        passthroughEnv.PLAYWRIGHT_MCP_PROFILE_DIRECTORY = resolved;
+      }
+
+      // Never fall back silently: without extension credentials (a registered profile) or a managed
+      // user-data dir, `open` would launch a separate headless browser with a throwaway profile —
+      // the command "succeeds" and nothing shows up in the user's Chrome.
+      const extensionMode = !!(passthroughEnv.PLAYWRIGHT_MCP_EXTENSION_ID && passthroughEnv.PLAYWRIGHT_MCP_EXTENSION_TOKEN);
+      // Checked before the existing-session shortcuts below: reusing a leftover headless session
+      // (bare `open` answered with its tab list, or `open <url>` rewritten to goto) is the same
+      // silent fallback.
+      if (isOpenCmd && !extensionMode && !passthroughEnv.PLAYWRIGHT_MCP_USER_DATA_DIR) {
+        const requested = passthroughEnv.PLAYWRIGHT_MCP_PROFILE_DIRECTORY;
+        const registered = Object.keys(await readTokenRegistry().catch(() => ({})));
+        const known = registered.length ? `Registered here: ${registered.join(", ")}` : "No profiles are registered here yet: rech setup";
+        const stderr = requested
+          ? `[rech] profile "${requested}" has no extension token on this machine, so rech would open a separate headless browser instead of your Chrome. Refusing.\n  Register it: rech setup --profile ${JSON.stringify(requested)}\n  ${known}\n`
+          : `[rech] no Chrome profile selected, so rech would open a separate headless browser instead of your Chrome. Refusing.\n  Pick one: rech --profile <email> open <url>, or add ?profile=<email> to RECHROME_URL\n  ${known}\n`;
+        log(`refused open without a profile (session=${namespacedSession}, requested=${requested ?? "-"})`);
+        return Response.json({ status: 1, stdout: "", stderr, files: [] });
+      }
+
       // open against an existing session: bare `open` returns a tab-list hint; `open <url>`
       // converts to `goto` to reuse the live browser. (Guarding on filteredArgs.length===1
       // was dead — about:blank/<url> is already appended above, so length is always >=2.)
@@ -728,38 +761,6 @@ export async function serve() {
         } catch (e) {
           log(`tab-list check failed: ${e}`);
         }
-      }
-
-      // Merge passthrough env: server .env.local defaults, then client overrides
-      const passthroughEnv: Record<string, string | undefined> = {};
-      for (const key of PASSTHROUGH_ENV_KEYS) {
-        if (process.env[key]) passthroughEnv[key] = process.env[key];
-      }
-      Object.assign(passthroughEnv, clientEnv, profileEnv);
-
-      // Resolve profile name/email → directory name
-      if (!scoped && passthroughEnv.PLAYWRIGHT_MCP_PROFILE_DIRECTORY) {
-        const resolved = await resolveProfileDirectory(passthroughEnv.PLAYWRIGHT_MCP_PROFILE_DIRECTORY);
-        if (resolved !== passthroughEnv.PLAYWRIGHT_MCP_PROFILE_DIRECTORY)
-          log(`profile resolved: "${passthroughEnv.PLAYWRIGHT_MCP_PROFILE_DIRECTORY}" → "${resolved}"`);
-        passthroughEnv.PLAYWRIGHT_MCP_PROFILE_DIRECTORY = resolved;
-      }
-
-      // Never fall back silently: without extension credentials (a registered profile) or a managed
-      // user-data dir, `open` would launch a separate headless browser with a throwaway profile —
-      // the command "succeeds" and nothing shows up in the user's Chrome.
-      const extensionMode = !!(passthroughEnv.PLAYWRIGHT_MCP_EXTENSION_ID && passthroughEnv.PLAYWRIGHT_MCP_EXTENSION_TOKEN);
-      // Keyed on the original command: an open that found an existing session was rewritten to goto,
-      // and reusing a leftover headless session is the same silent fallback.
-      if (isOpenCmd && !extensionMode && !passthroughEnv.PLAYWRIGHT_MCP_USER_DATA_DIR) {
-        const requested = passthroughEnv.PLAYWRIGHT_MCP_PROFILE_DIRECTORY;
-        const registered = Object.keys(await readTokenRegistry().catch(() => ({})));
-        const known = registered.length ? `Registered here: ${registered.join(", ")}` : "No profiles are registered here yet: rech setup";
-        const stderr = requested
-          ? `[rech] profile "${requested}" has no extension token on this machine, so rech would open a separate headless browser instead of your Chrome. Refusing.\n  Register it: rech setup --profile ${JSON.stringify(requested)}\n  ${known}\n`
-          : `[rech] no Chrome profile selected, so rech would open a separate headless browser instead of your Chrome. Refusing.\n  Pick one: rech --profile <email> open <url>, or add ?profile=<email> to RECHROME_URL\n  ${known}\n`;
-        log(`refused open without a profile (session=${namespacedSession}, requested=${requested ?? "-"})`);
-        return Response.json({ status: 1, stdout: "", stderr, files: [] });
       }
 
       const childEnv: Record<string, string | undefined> = {

@@ -1930,7 +1930,9 @@ async function ensureDaemonManager(ask: (q: string, def?: string) => Promise<str
 export function keepProfileParam(next: string, previous?: string): string {
   try {
     const url = new URL(next);
-    const profile = previous ? new URL(previous).searchParams.get("profile") : null;
+    // A .env.local value may be quoted: RECHROME_URL="http://…/?profile=work".
+    const raw = previous?.trim().replace(/^(['"])(.*)\1$/, "$2");
+    const profile = raw ? new URL(raw).searchParams.get("profile") : null;
     if (profile && !url.searchParams.has("profile")) url.searchParams.set("profile", profile);
     return url.toString();
   } catch { return next; }

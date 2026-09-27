@@ -442,6 +442,8 @@ describe("keepProfileParam", () => {
     expect(keepProfileParam("http://newkey@127.0.0.1:13775/?profile=b", "http://old@127.0.0.1:13775/?profile=a"))
       .toBe("http://newkey@127.0.0.1:13775/?profile=b");
     expect(keepProfileParam("http://newkey@127.0.0.1:13775/", undefined)).toBe("http://newkey@127.0.0.1:13775/");
+    expect(keepProfileParam("http://newkey@127.0.0.1:13775/", `"http://old@127.0.0.1:13775/?profile=work"`))
+      .toBe("http://newkey@127.0.0.1:13775/?profile=work");
     expect(keepProfileParam("http://newkey@127.0.0.1:13775/", "not a url")).toBe("http://newkey@127.0.0.1:13775/");
   });
 });

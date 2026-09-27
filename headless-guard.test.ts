@@ -44,6 +44,10 @@ test("open without a profile is refused instead of silently launching a headless
     expect(refused.status).toBe(1);
     expect(refused.stderr).toContain("no Chrome profile selected");
     expect(refused.stderr).toContain("Registered here: qa");
+    // The fake CLI reports an existing session: a bare open would be answered with its tab list.
+    const bare = await run(["open"]);
+    expect(bare.status).toBe(1);
+    expect(bare.stderr).toContain("no Chrome profile selected");
     const unregistered = await run(["open", "https://example.com"], { PLAYWRIGHT_MCP_PROFILE_DIRECTORY: "Nope" });
     expect(unregistered.status).toBe(1);
     expect(unregistered.stderr).toContain(`profile "Nope" has no extension token`);
