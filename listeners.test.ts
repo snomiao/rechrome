@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { validateListeners, authorizeProfileRequest, canReadProfileFile, profileOutputPrefix, normalizePrefix, serviceUrl, allowProfiles, denyProfiles, rotateListenerKey, setPublicUrl, normalizePublicUrl, type Listener, type ListenerConfig } from "./listeners.ts";
+import { validateListeners, authorizeProfileRequest, canReadProfileFile, profileOutputPrefix, normalizePrefix, serviceUrl, allowProfiles, denyProfiles, rotateListenerKey, setPublicUrl, normalizePublicUrl, canonicalProfileKeys, resolveAllowedProfile, type Listener, type ListenerConfig } from "./listeners.ts";
 
 test("normalizes prefixes and preserves them in credential-free API URLs", () => {
   for (const value of ["rechrome", "/rechrome", "/rechrome/"]) expect(normalizePrefix(value)).toBe("/rechrome/");
@@ -79,4 +79,41 @@ test("public URLs are plain http(s) bases, normalized with a trailing slash, and
   expect(validateListeners(JSON.parse(JSON.stringify(config))).listeners[1].publicUrl).toBe("https://h.ts.net/rechrome/");
   expect(setPublicUrl(config, "share", null).publicUrl).toBeUndefined();
   expect(() => validateListeners({ ...config, listeners: [{ ...config.listeners[1], publicUrl: "https://KEY@h/" }] })).toThrow();
+});
+
+const registry = {
+  "taku@corp.jp": { profileDir: "Profile 2" },
+  "Profile 5": { profileDir: "Profile 5" },
+  "taku2": { profileDir: "Profile 5" },                                    // alias of Profile 5
+  "symval-dev": { profileDir: "symval-dev" },
+  "qa-box": { profileDir: "Default", userDataDir: "/managed/qa" },          // same folder name, other data dir
+  "Default": { profileDir: "Default" },
+};
+
+test("canonical keys: one per Chrome profile, aliases collapse (email preferred), data dirs kept apart", () => {
+  expect(canonicalProfileKeys(registry).sort()).toEqual(["Default", "Profile 5", "qa-box", "symval-dev", "taku@corp.jp"]);
+  expect(canonicalProfileKeys({ "Profile 2": { profileDir: "Profile 2" }, "me@x.com": { profileDir: "Profile 2" } })).toEqual(["me@x.com"]);
+  expect(canonicalProfileKeys({})).toEqual([]);
+});
+
+test("the host resolves what a client typed among the link's profiles only", () => {
+  const allowed = ["taku@corp.jp", "Profile 5", "symval-dev"];
+  const names = { "Profile 2": "Work", "Profile 5": "Personal" };
+  const resolve = (s?: string) => resolveAllowedProfile(s, allowed, registry, names);
+  expect(resolve("TAKU@corp.jp")).toBe("taku@corp.jp");        // exact, case-insensitive
+  expect(resolve("taku2")).toBe("Profile 5");                   // alias → canonical key (one session)
+  expect(resolve("profile 5")).toBe("Profile 5");               // folder
+  expect(resolve("work")).toBe("taku@corp.jp");                 // Chrome display name
+  expect(resolve("taku")).toBe("taku@corp.jp");                 // email part before @
+  expect(resolve("symv")).toBe("symval-dev");                   // unique 3+ char prefix
+  expect(() => resolve("sy")).toThrow(/not shared/);            // prefixes need 3+ characters
+  expect(() => resolve("Default")).toThrow(/not shared by this link\. It shares: taku@corp.jp, Profile 5, symval-dev/);
+  expect(() => resolve(undefined)).toThrow(/Pick a profile: this link shares/);
+  expect(() => resolve(" ")).toThrow(/Pick a profile/);
+  expect(() => resolveAllowedProfile("pro", ["Profile 5", "taku@corp.jp"], registry, { "Profile 2": "Profile Work" })).toThrow(/several shared profiles/);
+});
+
+test("a managed profile's folder name doesn't borrow a real Chrome profile's display name", () => {
+  expect(() => resolveAllowedProfile("Person 1", ["qa-box"], registry, { Default: "Person 1" })).toThrow(/not shared/);
+  expect(resolveAllowedProfile("Person 1", ["Default"], registry, { Default: "Person 1" })).toBe("Default");
 });

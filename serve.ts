@@ -1,4 +1,4 @@
-import { readListeners, listenerAddress, authorizeProfileRequest, canReadProfileFile, profileOutputPrefix, normalizePrefix, type Listener } from "./listeners.ts";
+import { readListeners, listenerAddress, authorizeProfileRequest, canReadProfileFile, profileOutputPrefix, normalizePrefix, resolveAllowedProfile, type Listener } from "./listeners.ts";
 import { file } from "bun";
 import { createHash, X509Certificate } from "crypto";
 import { mkdirSync, unlinkSync, accessSync, readdirSync, realpathSync, constants as fsConstants } from "fs";
@@ -15,6 +15,7 @@ import {
   PASSTHROUGH_ENV_KEYS,
   resolvePlaywrightCli,
   readTokenRegistry,
+  readChromeProfileCache,
 } from "./rechrome.ts";
 
 const TAILSCALE_BIN = process.env.TAILSCALE_BIN || "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
@@ -477,8 +478,19 @@ export async function serve() {
       let profileEnv: Record<string, string> = {};
       if (scoped) {
         try {
-          scopedProfile = authorizeProfileRequest(listener, body);
           const registry = await readTokenRegistry();
+          // The client sends whatever the user typed (`rech --profile work`); resolve it here,
+          // among this listener's profiles only, to one canonical key BEFORE authorization and
+          // session hashing, so aliases of one profile share a session and a remote client needs
+          // no registry of its own.
+          if (body && !Array.isArray(body) && typeof body.identity === "object" && body.identity) {
+            const chromeNames = Object.fromEntries(Object.entries(await readChromeProfileCache().catch(() => null) ?? {}).map(([dir, info]) => [dir, info.name ?? ""]).filter(([, name]) => name));
+            const allowed = listener.profiles as string[];
+            body.identity.profile = resolveAllowedProfile(body.identity.profile ?? body.env?.PLAYWRIGHT_MCP_PROFILE_DIRECTORY, allowed, registry, chromeNames);
+            if (typeof body.env?.PLAYWRIGHT_MCP_PROFILE_DIRECTORY === "string")
+              body.env.PLAYWRIGHT_MCP_PROFILE_DIRECTORY = resolveAllowedProfile(body.env.PLAYWRIGHT_MCP_PROFILE_DIRECTORY, allowed, registry, chromeNames);
+          }
+          scopedProfile = authorizeProfileRequest(listener, body);
           const entry = registry[scopedProfile];
           if (!entry?.token || !entry?.extensionId || !entry?.profileDir) throw new Error("Profile is not registered on this server");
           profileEnv = {
@@ -490,7 +502,7 @@ export async function serve() {
           };
           body.identity.key = `scoped:${body.identity.key}`;
           body.env = {}; // Server-owned profile configuration wins over every client override.
-        } catch (error) { return Response.json({ status: 1, stdout: "", stderr: String(error) }, { status: 403 }); }
+        } catch (error) { return Response.json({ status: 1, stdout: "", stderr: `${error instanceof Error ? error.message : String(error)}\n` }, { status: 403 }); }
       }
       const outputPrefix = scopedProfile ? profileOutputPrefix(scopedProfile) : "";
       const runWorkDir = scopedProfile ? join(workDir, outputPrefix) : workDir;

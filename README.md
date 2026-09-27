@@ -106,6 +106,18 @@ rech open https://example.com
 `.rechrome/.env.local`. Remote listeners allow navigation, tabs, snapshots, screenshots and basic
 interactions, but not `eval`/`run-code` or filesystem commands (see [Remote access](#remote-access)).
 
+**Share every profile at once.** `rech share --all` gives one link for all Chrome profiles
+registered on the host. It uses its own listener (`share-all`) and key, so one-profile links you
+already handed out never gain access to the others. It is a snapshot: after registering another
+profile, run `rech share --all` again. On the other machine, pick a profile per command, and the
+host resolves the name (exact, the part of an email before `@`, or a unique 3+ letter prefix):
+
+```bash
+rech connect '<url from rech share --all>'
+rech profile                                   # the profiles that link shares
+rech --profile work@example.com open https://example.com
+```
+
 On a trusted LAN without a proxy, `rech setup --listen lan --profile you@example.com` binds the
 profile to your LAN address directly (plain HTTP); share the result of `rech share`.
 
@@ -121,6 +133,9 @@ rech listener remove share
 ```
 
 Changes apply immediately; the daemon reloads its listeners without restarting Chrome.
+A link's key opens **every** profile its listener allows (`?profile=` only picks the default),
+so give a profile its own listener when a link should reach only that one. `rech share ls`
+points out keys that cover several profiles. The local management listener is never shared.
 
 ## Setup reference
 

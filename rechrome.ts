@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { readListeners, writeListeners, listenerAddress, isLoopback, normalizePrefix, serviceUrl, allowProfiles, denyProfiles, rotateListenerKey, setPublicUrl, type Listener } from "./listeners.ts";
+import { readListeners, writeListeners, listenerAddress, isLoopback, normalizePrefix, serviceUrl, allowProfiles, denyProfiles, rotateListenerKey, setPublicUrl, canonicalProfileKeys, type Listener } from "./listeners.ts";
 
 import { file } from "bun";
 import yargs from "yargs";
@@ -624,7 +624,7 @@ const CHROME_LOCAL_STATE_PATHS = () => {
 
 type ChromeProfileInfo = { user_name?: string; name?: string };
 
-async function readChromeProfileCache(): Promise<Record<string, ChromeProfileInfo> | null> {
+export async function readChromeProfileCache(): Promise<Record<string, ChromeProfileInfo> | null> {
   for (const statePath of CHROME_LOCAL_STATE_PATHS()) {
     const f = file(statePath);
     if (!(await f.exists())) continue;
@@ -893,6 +893,19 @@ export function buildProfileRows(cache: Record<string, ChromeProfileInfo> | null
   return rows;
 }
 
+/** On a client of a remote host, `rech profile` lists what that host's link shares. */
+async function listRemoteProfiles(url: string): Promise<void> {
+  const response = await fetch(serviceUrl(url, "ping"), { headers: { Authorization: `Bearer ${parseUrl(url).key}` }, signal: AbortSignal.timeout(5000) })
+    .catch(error => { throw new Error(`Could not reach ${serviceUrl(url)}: ${error instanceof Error ? error.message : error}`); });
+  if (response.status === 401) throw new Error("The host rejected this link's key; ask for a fresh one (rech share on the host), then rech connect '<url>'.");
+  const body = await response.json().catch(() => ({})) as { listener?: string; profiles?: string[] | "*" };
+  const current = resolveEffectiveProfile(parseUrl(url).profileDirectory);
+  console.log(`Profiles shared by ${serviceUrl(url)}${body.listener ? ` (listener ${body.listener})` : ""}:`);
+  if (body.profiles === "*") console.log("  every profile registered on that host");
+  else for (const p of body.profiles ?? []) console.log(`  ${p}${p === current ? "   ← current" : ""}`);
+  console.log(`\nUse one: rech --profile <name> open https://example.com`);
+}
+
 async function listProfiles(): Promise<void> {
   const [cache, registry, root] = await Promise.all([readChromeProfileCache(), readTokenRegistry(), findChromeUserDataDir()]);
   const profiles = buildProfileRows(cache, registry, root);
@@ -983,15 +996,12 @@ export async function promptChoice<T>(
   } finally { rl.close(); }
 }
 
-/** Registered profiles as choices, one per Chrome profile folder (the registry may alias one folder twice). */
+/** Registered profiles as choices, one per Chrome profile (data dir + folder; aliases collapse). */
 function registeredProfileChoices(registry: Record<string, TokenEntry>): { label: string; value: string }[] {
-  const byDir = new Map<string, string>();
-  for (const key of Object.keys(registry)) {
+  return canonicalProfileKeys(registry).map(key => {
     const dir = registry[key].profileDir;
-    const kept = byDir.get(dir);
-    if (!kept || (!kept.includes("@") && key.includes("@"))) byDir.set(dir, key);
-  }
-  return [...byDir.entries()].map(([dir, key]) => ({ label: key === dir ? key : `${key}  [${dir}]`, value: key }));
+    return { label: key === dir ? key : `${key}  [${dir}]`, value: key };
+  });
 }
 
 /**
@@ -1013,7 +1023,64 @@ export function chooseShareListener(profile: string, listeners: Listener[]): str
   ].filter(Boolean).join("\n"), "none", scoped);
 }
 
-async function printProfileUri(selector?: string, listener?: string, opts: { local?: boolean; save?: boolean } = {}): Promise<void> {
+/** A loopback port no listener uses and nothing else is bound to, from the management port + 2. */
+function freeListenerPort(listeners: Listener[]): number {
+  const used = new Set(listeners.map(l => l.port));
+  for (let port = DEFAULT_PORT + 2; port < 65536; port++) {
+    if (used.has(port)) continue;
+    try { Bun.serve({ hostname: "127.0.0.1", port, fetch: () => new Response() }).stop(true); return port; } catch { /* taken */ }
+  }
+  throw new Error("No free port for the share-all listener; pass one with rech listener add");
+}
+
+/**
+ * `rech share --all`: one link for every Chrome profile registered now (a snapshot; run it
+ * again after registering more). It uses its own listener and key, so single-profile links
+ * already handed out never gain access to the other profiles.
+ */
+async function shareAll(opts: { listener?: string; local?: boolean; save?: boolean }): Promise<void> {
+  const config = await requireListeners();
+  const snapshot = canonicalProfileKeys(await readTokenRegistry());
+  if (!snapshot.length) throw new Error("No registered profiles to share. Set one up first: rech setup");
+  const name = opts.listener ?? "share-all";
+  let listener = config.listeners.find(l => l.name === name);
+  if (listener?.profiles === "*")
+    throw new Error(`"${name}" is the local management listener; it is never shared. Omit --listener to use "share-all".`);
+  let changes = "";
+  if (!listener) {
+    if (opts.listener) throw new Error(`Unknown listener "${name}". See rech listener ls.`);
+    listener = { name, host: "127.0.0.1", port: freeListenerPort(config.listeners), prefix: "/rechrome-all/", key: randomBytes(24).toString("base64url"), profiles: snapshot };
+    config.listeners.push(listener);
+    changes = `created listener "${name}" on ${listenerAddress(listener)}${listener.prefix}`;
+  } else {
+    const before = listener.profiles as string[];
+    const added = snapshot.filter(p => !before.includes(p)), removed = before.filter(p => !snapshot.includes(p));
+    listener.profiles = snapshot;
+    changes = added.length || removed.length ? [added.length && `added ${added.join(", ")}`, removed.length && `removed ${removed.join(", ")}`].filter(Boolean).join("; ") : "no changes";
+  }
+  await writeListeners(config);
+  console.error(`[rech] sharing ${snapshot.length} profiles through "${name}" (${changes}): ${snapshot.join(", ")}`);
+  console.error(`[rech] this is a snapshot: after registering another profile, run rech share --all again.`);
+  // The daemon reloads listeners.json about every second: confirm this listener answers before handing out its URL.
+  const local = `http://${listener.key}@${listenerAddress(listener)}${normalizePrefix(listener.prefix)}`;
+  let ready = false;
+  for (let i = 0; i < 20 && !ready; i++) {
+    ready = await fetch(serviceUrl(local, "ping"), { headers: { Authorization: `Bearer ${listener.key}` }, signal: AbortSignal.timeout(1000) }).then(r => r.ok).catch(() => false);
+    if (!ready) await Bun.sleep(250);
+  }
+  if (!ready) console.error(`[rech] warning: listener "${name}" is not answering yet; check the daemon with rech status.`);
+  const uri = listener.publicUrl && !opts.local ? rebaseConnectionUrl(listener.publicUrl, local) : registeredProfileUrl(local);
+  if (!listener.publicUrl) for (const line of listenerNextSteps(listener, undefined, "rech share --all")) console.error(line);
+  console.log(uri);
+  console.error(`[rech] on the other machine: rech connect '<url>', then rech --profile <name> open https://example.com`);
+  if (opts.save) console.error(`Saved RECHROME_URL to ${await saveProjectUrl(uri)}`);
+}
+
+async function printProfileUri(selector?: string, listener?: string, opts: { local?: boolean; save?: boolean; all?: boolean } = {}): Promise<void> {
+  if (opts.all) {
+    if (selector) throw new Error("Pass a profile or --all, not both.");
+    return shareAll({ listener, local: opts.local, save: opts.save });
+  }
   const url = process.env[ENV_KEY];
   const interactive = isInteractive();
   const registry = await readTokenRegistry();
@@ -1073,8 +1140,11 @@ async function printProfileUri(selector?: string, listener?: string, opts: { loc
       }
     }
   }
-  if (listeners.find(l => l.name === listener)?.profiles === "*")
-    console.error(`[rech] "${listener}" is the local management listener: its key controls every profile. Don't share this URL.`);
+  const chosen = listeners.find(l => l.name === listener);
+  if (chosen?.profiles === "*")
+    throw new Error(`"${listener}" is the local management listener: its key controls every profile and allows eval and file access, so it is never shared. Share through a scoped listener: rech share <profile>, or rech share --all.`);
+  if (chosen && chosen.profiles.length > 1)
+    console.error(`[rech] note: this link's key works for every profile on listener "${chosen.name}" (${chosen.profiles.join(", ")}); ?profile= only picks the default. For a one-profile link, give that profile its own listener.`);
   let uri = profileConnectionUri(profile, url, listeners, listener);
   // Prefer where a proxy exposes the listener, when it has been recorded.
   const publicUrl = listeners.find(l => l.key === parseUrl(uri).key)?.publicUrl;
@@ -1088,6 +1158,29 @@ export function sandboxConnectionWarning(env: Record<string, string | undefined>
   return "[rech] warning: running inside a sandbox; network restrictions may block access to the rechrome daemon, even on localhost. " +
     "Retry this command outside the sandbox (with approval in your coding agent). " +
     "If it still fails, check that the daemon is running and the host/port are correct.";
+}
+
+/**
+ * Is RECHROME_URL this machine's own daemon? True when its key is one of our listeners (or,
+ * before listeners.json existed, when it points at loopback and profiles are registered here). A remote daemon resolves
+ * profiles itself, and must never receive this machine's own extension tokens.
+ */
+export async function isLocalDaemon(url: string): Promise<boolean> {
+  const { key, host } = parseUrl(url);
+  const config = await readListeners().catch(() => null);
+  // Before listeners.json existed, a local install pointed at loopback and had its own registry;
+  // a fresh client (no registry) talking to a tunnelled loopback port is still remote.
+  if (!config) return ["127.0.0.1", "localhost", "::1", "[::1]"].includes(host) && Object.keys(await readTokenRegistry().catch(() => ({}))).length > 0;
+  return !!key && config.listeners.some(l => l.key === key);
+}
+
+/** For a remote daemon: only what the URL itself carries, plus the profile selector (not secret). */
+export function remoteClientEnv(url: string, profile?: string): Record<string, string> {
+  const { extensionId, extensionToken, userDataDir, loadExtension } = parseUrl(url);
+  return Object.fromEntries(Object.entries({
+    PLAYWRIGHT_MCP_EXTENSION_ID: extensionId, PLAYWRIGHT_MCP_EXTENSION_TOKEN: extensionToken,
+    PLAYWRIGHT_MCP_PROFILE_DIRECTORY: profile, PLAYWRIGHT_MCP_USER_DATA_DIR: userDataDir, PLAYWRIGHT_MCP_LOAD_EXTENSION: loadExtension,
+  }).filter(([, v]) => typeof v === "string" && v)) as Record<string, string>;
 }
 
 async function callServe(
@@ -1107,7 +1200,9 @@ async function callServe(
   // reuse the default profile's session (and its browser) instead of opening its own.
   const effectiveProfile = overrideEnv?.["PLAYWRIGHT_MCP_PROFILE_DIRECTORY"] || resolveEffectiveProfile(profileDirectory);
   if (effectiveProfile) identity.profile = effectiveProfile;
-  const env = { ...(await getClientEnv({ extensionId, extensionToken, profileDirectory: effectiveProfile, userDataDir, loadExtension })), ...overrideEnv };
+  const env = await isLocalDaemon(url)
+    ? { ...(await getClientEnv({ extensionId, extensionToken, profileDirectory: effectiveProfile, userDataDir, loadExtension })), ...overrideEnv }
+    : { ...remoteClientEnv(url, effectiveProfile), ...overrideEnv };
   const res = await fetch(serviceUrl(url, "run"), {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
@@ -2185,7 +2280,7 @@ async function resolveProfileKeys(selectors: string[]): Promise<string[]> {
 }
 
 /** Next steps after exposing a listener: proxy it, record where, share. Plain text, so any shell works. */
-export function listenerNextSteps(listener: Listener, profile?: string): string[] {
+export function listenerNextSteps(listener: Listener, profile?: string, shareCommand?: string): string[] {
   const prefix = normalizePrefix(listener.prefix);
   const mount = prefix === "/" ? "" : prefix.slice(0, -1);
   return [
@@ -2193,7 +2288,7 @@ export function listenerNextSteps(listener: Listener, profile?: string): string[
     `  tailscale serve --bg${mount ? ` --set-path=${mount}` : ""} ${listener.port}`,
     `Then record where it is reachable and print the URL to share:`,
     `  rech listener set ${listener.name} --public-url https://<your-host>${prefix}`,
-    `  rech share ${profile ? JSON.stringify(profile) : "<profile>"}`,
+    `  ${shareCommand ?? `rech share ${profile ? JSON.stringify(profile) : "<profile>"}`}`,
   ];
 }
 
@@ -2265,7 +2360,9 @@ async function urlList(): Promise<void> {
     for (const profile of l.profiles === "*" ? ["(all profiles)"] : l.profiles) rows.push([l.name, profile, local, l.publicUrl ?? "-"]);
   }
   printTable(rows);
-  console.log(`\nPrint a full URL (contains the secret key): rech share <profile>`);
+  const wide = config.listeners.filter(l => l.profiles !== "*" && l.profiles.length > 1);
+  if (wide.length) console.log(`\nOne key covers several profiles on: ${wide.map(l => `${l.name} (${(l.profiles as string[]).length})`).join(", ")}. Anyone with such a link can use each of them.`);
+  console.log(`\nPrint a full URL (contains the secret key): rech share <profile>, or rech share --all`);
 }
 
 /** Write RECHROME_URL to this project's .rechrome/.env.local (the folder git-ignores itself). */
@@ -2293,6 +2390,8 @@ async function connect(url: string): Promise<void> {
     throw new Error(`Connected, but listener "${body.listener}" does not allow profile "${parsed.profileDirectory}".`);
   const saved = await saveProjectUrl(url);
   console.log(`Connected to ${serviceUrl(url)}${body.listener ? ` (listener ${body.listener})` : ""}. Saved RECHROME_URL to ${saved}`);
+  if (Array.isArray(body.profiles) && body.profiles.length > 1 && !parsed.profileDirectory)
+    console.log(`This link shares ${body.profiles.length} profiles: ${body.profiles.join(", ")}.\nPick one per command: rech --profile <name> open https://example.com   (see them again with rech profile)`);
 }
 
 export function detectSetupAgent(env: Record<string, string | undefined> = process.env): "Codex" | "Claude Code" | null {
@@ -2746,7 +2845,7 @@ export type RechHandlers = {
   addListener(name: string, opts: { listen: string; profile: string[]; port?: number; prefix?: string }): Promise<void>;
   removeListener(name: string): Promise<void>;
   listProfiles(): Promise<void>;
-  printProfileUri(selector?: string, listener?: string, opts?: { local?: boolean; save?: boolean }): Promise<void>;
+  printProfileUri(selector?: string, listener?: string, opts?: { local?: boolean; save?: boolean; all?: boolean }): Promise<void>;
   urlList(): Promise<void>;
   connect(url: string): Promise<void>;
   listenerPort(name?: string): Promise<void>;
@@ -2824,10 +2923,11 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
       .positional("profile", { type: "string", describe: "Profile: email, name, folder, or a unique part of one; ls/list lists everything shared" })
       .option("listener", { type: "string", requiresArg: true, describe: "Listener to share through (default: the one that allows the profile)" })
       .option("local", { type: "boolean", describe: "Print the direct listener address even when a public URL is set" })
-      .option("save", { type: "boolean", describe: "Also save it as RECHROME_URL in this project's .rechrome/.env.local" }),
-      a => ["ls", "list"].includes(a.profile ?? "") && !a.listener && !a.save
+      .option("save", { type: "boolean", describe: "Also save it as RECHROME_URL in this project's .rechrome/.env.local" })
+      .option("all", { type: "boolean", describe: "One link for every registered profile (a snapshot, on its own listener); the other machine picks with --profile" }),
+      a => ["ls", "list"].includes(a.profile ?? "") && !a.listener && !a.save && !a.all
         ? handlers.urlList()
-        : handlers.printProfileUri(a.profile, a.listener, { local: a.local, save: a.save }))
+        : handlers.printProfileUri(a.profile, a.listener, a.all ? { local: a.local, save: a.save, all: true } : { local: a.local, save: a.save }))
     .command("connect <url>", "Use a URL from another machine in this project (checks it first)", y => y
       .positional("url", { type: "string", demandOption: true, describe: "The URL printed by `rech share <profile>` on the machine with Chrome. Quote it: it contains #" })
       .example("rech connect 'https://host.example.ts.net/rechrome/?profile=you%40example.com#key=…'", ""),
@@ -2893,7 +2993,11 @@ if (import.meta.main) {
   const handlers: RechHandlers = {
     serve: async () => { const { serve } = await import("./serve.ts"); serve(); }, // long-lived; watcher intentionally kept alive
     status,
-    listListeners, addListener, removeListener, listProfiles, printProfileUri,
+    listListeners, addListener, removeListener, printProfileUri,
+    listProfiles: async () => {
+      const url = process.env[ENV_KEY];
+      return url && !(await isLocalDaemon(url)) ? listRemoteProfiles(url) : listProfiles();
+    },
     urlList, connect, listenerPort, allowListener, denyListener, rotateKey, setListener,
     setup: async (opts) => {
       await setup(opts); // setup closes envWatcher itself before printing Done
@@ -2954,7 +3058,11 @@ if (import.meta.main) {
       envWatcher?.close();
       process.exit(1);
     }
-    if (profileSelector !== undefined) {
+    if (profileSelector !== undefined && !(await isLocalDaemon(url))) {
+      // A remote host resolves the name among the profiles its link shares; this machine's
+      // registry is irrelevant (and usually empty on a client).
+      overrideEnv = { PLAYWRIGHT_MCP_PROFILE_DIRECTORY: profileSelector.trim() };
+    } else if (profileSelector !== undefined) {
       try {
         const registry = await readTokenRegistry();
         const cache = await readChromeProfileCache();
