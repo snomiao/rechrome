@@ -11,12 +11,12 @@ Use this workflow when the user requests rechrome setup for an existing Chrome p
 
 - Preserve the user's browser choice. Installed Google Chrome profiles belong to the user; do not rename, create, delete, or replace them as part of setup.
 - If the user wants an isolated Playwright browser, do not send them through real-Chrome extension installation. Playwright can control its own browser directly. Check the current CLI help for available managed-browser support: the legacy `provision-profile --experimental` flow still uses a bridge and may require the vendored relay patch described in the repo's `AGENTS.md`. Do not present a proposed direct-browser mode as implemented.
-- Run `rech profile ls` and resolve the exact email, display name, or folder. For no-email profiles, use the folder (for example `Profile 7`) to avoid ambiguity. A requested display name such as `taku3` is also accepted with `--profile`.
+- Run `rech profile ls` and resolve the exact email, display name, or folder. For no-email profiles, use the folder (for example `Profile 7`) to avoid ambiguity. A requested display name such as `Work 2` is also accepted with `--profile`.
 - Use `rech` or `rechrome` if installed; from a checkout use `bun rechrome.ts`. The package is `rechrome`, not `rech`: use `bunx rechrome`, never `bunx rech`.
 
 ## Start and retain the setup process
 
-Run `rech setup --profile "<selector>"` in a retained terminal session, preferably with a TTY. A bare positional selector such as `rech setup taku3` is not supported by the current CLI.
+Run `rech setup --profile "<selector>"` in a retained terminal session, preferably with a TTY. A bare positional selector such as `rech setup work-2` is not supported by the current CLI.
 
 - The listen choice applies to the selected profile. Local is the default and removes that profile from remote allowlists; choose LAN or Tailscale when requested. Other profiles keep their exposure. The menu shows Tailscale only when detected. Use `rech listener ls` and `rech profile ls` to review configured bindings. Listener changes reload in one daemon without restarting Chrome; first migration may restart only the daemon.
 - Keep the terminal session handle and poll it while working in Chrome. Non-TTY mode also works, but input is read until EOF before setup starts: provide all prompt answers and close stdin. EOF does not stop the guide server.

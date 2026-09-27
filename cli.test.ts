@@ -259,15 +259,15 @@ test("share picks the scoped listener that allows the profile, never the managem
 
 test("a loose profile match (email name, or 3+ char prefix) is accepted only when unique", () => {
   const c = (label: string, fields: string[], localPart?: string) => ({ id: label, label, fields, localPart });
-  const all = [c("taku@corp.jp", ["taku@corp.jp", "corp.jp", "Profile 2"], "taku"), c("taku2", ["taku2", "Profile 5"]), c("taku3", ["taku3", "Profile 7"]), c("symval-dev", ["symval-dev", "SymVal Dev"])];
-  expect(matchProfileLoosely("taku", all)?.label).toBe("taku@corp.jp");      // exact email name beats prefixes
-  expect(matchProfileLoosely("symval", all)?.label).toBe("symval-dev");      // unique prefix
-  expect(matchProfileLoosely("SymVal D", all)?.label).toBe("symval-dev");    // case-insensitive
-  expect(matchProfileLoosely("orp.jp", all)).toBeNull();                      // no substring matching
-  expect(matchProfileLoosely("corp", all)?.label).toBe("taku@corp.jp");      // a name prefix is fine
+  const all = [c("work@example.com", ["work@example.com", "example.com", "Profile 2"], "work"), c("work2", ["work2", "Profile 5"]), c("work3", ["work3", "Profile 7"]), c("team-dev", ["team-dev", "Team Dev"])];
+  expect(matchProfileLoosely("work", all)?.label).toBe("work@example.com");      // exact email name beats prefixes
+  expect(matchProfileLoosely("team", all)?.label).toBe("team-dev");      // unique prefix
+  expect(matchProfileLoosely("Team D", all)?.label).toBe("team-dev");    // case-insensitive
+  expect(matchProfileLoosely("xample.com", all)).toBeNull();                      // no substring matching
+  expect(matchProfileLoosely("exam", all)?.label).toBe("work@example.com");      // a name prefix is fine
   expect(matchProfileLoosely("h", all)).toBeNull();
-  expect(matchProfileLoosely("sy", all)).toBeNull();                          // prefixes need 3+ characters
-  expect(() => matchProfileLoosely("tak", all)).toThrow(/several profiles: taku@corp.jp, taku2, taku3/);
+  expect(matchProfileLoosely("te", all)).toBeNull();                          // prefixes need 3+ characters
+  expect(() => matchProfileLoosely("wor", all)).toThrow(/several profiles: work@example.com, work2, work3/);
   expect(matchProfileLoosely("nobody", all)).toBeNull();
 });
 

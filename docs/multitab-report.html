@@ -58,10 +58,10 @@
   <p>identity × profile × tabs. Two identities targeting the <b>same</b> Chrome profile were run, each opening 2 tabs:</p>
   <table>
     <tr><th>identity (cwd)</th><th>profile</th><th>session</th><th>result</th></tr>
-    <tr><td>id1-sno</td><td>snomiao@gmail.com</td><td><code>7df4b464</code></td><td class="bad">EVICTED — only 1 tab, then "not open"</td></tr>
-    <tr><td>id2-sno</td><td>snomiao@gmail.com</td><td><code>3ad9fea2</code></td><td class="ok">alive, 2 tabs</td></tr>
-    <tr><td>id1-taku</td><td>taku@symphoneed.co.jp</td><td><code>bb1e7262</code></td><td class="bad">EVICTED</td></tr>
-    <tr><td>id2-taku</td><td>taku@symphoneed.co.jp</td><td><code>87cfa765</code></td><td class="ok">alive, 2 tabs</td></tr>
+    <tr><td>id1-personal</td><td>personal@example.com</td><td><code>7df4b464</code></td><td class="bad">EVICTED — only 1 tab, then "not open"</td></tr>
+    <tr><td>id2-personal</td><td>personal@example.com</td><td><code>3ad9fea2</code></td><td class="ok">alive, 2 tabs</td></tr>
+    <tr><td>id1-work</td><td>work@example.com</td><td><code>bb1e7262</code></td><td class="bad">EVICTED</td></tr>
+    <tr><td>id2-work</td><td>work@example.com</td><td><code>87cfa765</code></td><td class="ok">alive, 2 tabs</td></tr>
   </table>
   <p class="mut">Only the <b>last</b> session per profile survived → 4 of 8 pages reachable. The first identity on each profile was killed the moment the second connected.</p>
 

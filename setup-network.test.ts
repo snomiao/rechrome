@@ -10,17 +10,17 @@ const ip = (address: string, internal = false): NetworkInterfaceInfo => ({
 test("network menu orders local, LAN, confirmed Tailscale, then detected tunnels", () => {
   const choices = buildListenChoices({
     lo0: [ip("127.0.0.1", true)], en0: [ip("192.168.1.10")],
-    utun3: [ip("100.80.43.42")], wg0: [ip("10.9.0.2")],
-  }, ["100.80.43.42"]);
+    utun3: [ip("100.64.0.10")], wg0: [ip("10.9.0.2")],
+  }, ["100.64.0.10"]);
   expect(choices.map(c => c.kind)).toEqual(["local", "lan", "tailscale", "other"]);
   expect(chooseListenAddress(choices, "lan")).toBe("192.168.1.10");
-  expect(chooseListenAddress(choices, "tailscale")).toBe("100.80.43.42");
+  expect(chooseListenAddress(choices, "tailscale")).toBe("100.64.0.10");
   expect(chooseListenAddress(choices, "10.9.0.2")).toBe("10.9.0.2");
   expect(choices.some(c => c.address === "0.0.0.0")).toBe(false);
 });
 
 test("offline Tailscale and unconfirmed CGNAT are not advertised as Tailscale", () => {
-  const choices = buildListenChoices({ en0: [ip("100.90.0.1")] }, ["100.80.43.42"]);
+  const choices = buildListenChoices({ en0: [ip("100.90.0.1")] }, ["100.64.0.10"]);
   expect(choices.some(c => c.kind === "tailscale")).toBe(false);
   expect(() => chooseListenAddress(choices, "tailscale")).toThrow("not detected");
 });
@@ -42,8 +42,8 @@ test("multiple LANs require an explicit address in non-interactive setup", () =>
 });
 
 test("rebind updates connection host while preserving authentication and profile", () => {
-  const url = new URL(listenUrl("http://example-key@127.0.0.1:13775/?profile=Profile+4&token=example", "100.80.43.42"));
-  expect(url.hostname).toBe("100.80.43.42");
+  const url = new URL(listenUrl("http://example-key@127.0.0.1:13775/?profile=Profile+4&token=example", "100.64.0.10"));
+  expect(url.hostname).toBe("100.64.0.10");
   expect(url.username).toBe("example-key");
   expect(url.searchParams.get("profile")).toBe("Profile 4");
   expect(new URL(listenUrl(url.toString(), "192.168.1.10")).hostname).toBe("192.168.1.10");
