@@ -1,5 +1,8 @@
 import { test, expect } from "bun:test";
-import { rechCli, listenerNextSteps, unknownCommandHint, notConnectedMessage, type RechHandlers } from "./rechrome.ts";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
+import { rechCli, listenerNextSteps, unknownCommandHint, notConnectedMessage, chooseShareListener, matchProfileLoosely, promptChoice, type RechHandlers } from "./rechrome.ts";
 
 async function run(argv: string[]) {
   const calls: [string, ...unknown[]][] = [];
@@ -32,7 +35,7 @@ test("profile lists by default and prints a URI with an optional listener", asyn
   expect(await run(["profiles", "ls"])).toEqual([["listProfiles"]]);
   expect(await run(["profile", "qa", "--print-uri", "--listener", "local"])).toEqual([["printProfileUri", "qa", "local"]]); // alias of url
   expect(await run(["profile", "--print-uri"])).toEqual([["printProfileUri", undefined, undefined]]);
-  await expect(run(["profile", "qa"])).rejects.toThrow(/rech url "qa"/);
+  await expect(run(["profile", "qa"])).rejects.toThrow(/rech share "qa"/);
 });
 
 test("listener subcommands, with repeatable --profile", async () => {
@@ -52,12 +55,13 @@ test("tray and provision-profile", async () => {
   await expect(run(["provision-profile"])).rejects.toThrow();
 });
 
-test("url prints, saves, or lists connection URLs; connect takes a shared URL", async () => {
-  expect(await run(["url", "qa"])).toEqual([["printProfileUri", "qa", undefined, { local: undefined, save: undefined }]]);
-  expect(await run(["url", "qa", "--listener", "share", "--local", "--save"])).toEqual([["printProfileUri", "qa", "share", { local: true, save: true }]]);
-  expect(await run(["url"])).toEqual([["printProfileUri", undefined, undefined, { local: undefined, save: undefined }]]);
-  expect(await run(["url", "ls"])).toEqual([["urlList"]]);
-  expect(await run(["urls", "list"])).toEqual([["urlList"]]);
+test("share prints, saves, or lists connection URLs; connect takes a shared URL", async () => {
+  expect(await run(["share", "qa"])).toEqual([["printProfileUri", "qa", undefined, { local: undefined, save: undefined }]]);
+  expect(await run(["share", "ls"])).toEqual([["urlList"]]);
+  expect(await run(["share", "qa", "--listener", "share", "--local", "--save"])).toEqual([["printProfileUri", "qa", "share", { local: true, save: true }]]);
+  expect(await run(["share"])).toEqual([["printProfileUri", undefined, undefined, { local: undefined, save: undefined }]]);
+  expect(await run(["share", "list"])).toEqual([["urlList"]]);
+  await expect(run(["url", "qa"])).rejects.toThrow(/Unknown argument|url/);
   expect(await run(["connect", "https://h.ts.net/rechrome/?profile=qa#key=k"])).toEqual([["connect", "https://h.ts.net/rechrome/?profile=qa#key=k"]]);
   await expect(run(["connect"])).rejects.toThrow();
 });
@@ -78,6 +82,7 @@ test("next steps are plain text with the port filled in, so any shell (cmd too) 
   const steps = listenerNextSteps({ name: "share", host: "127.0.0.1", port: 13776, key: "k".repeat(24), profiles: ["qa"], prefix: "/rechrome/" }, "qa");
   expect(steps).toContain("  tailscale serve --bg --set-path=/rechrome 13776");
   expect(steps).toContain("  rech listener set share --public-url https://<your-host>/rechrome/");
+  expect(steps).toContain('  rech share "qa"');
   expect(steps.join("\n")).not.toContain("$(");
   expect(listenerNextSteps({ name: "root", host: "127.0.0.1", port: 13777, key: "k".repeat(24), profiles: ["qa"], prefix: "/" })).toContain("  tailscale serve --bg 13777");
 });
@@ -163,7 +168,7 @@ async function runRech(args: string[], env: Record<string, string | undefined>) 
 test("rech --help is generated from the command tree and needs no daemon", async () => {
   const { code, stdout, stderr } = await runRech(["--help"], { RECHROME_URL: "http://unused-key-0123456789@127.0.0.1:1" });
   expect(code).toBe(0);
-  for (const text of ["rech setup", "rech status", "rech url [profile]", "rech connect <url>", "rech listener", "Browser commands", "rech pw <args>", "RECHROME_URL"])
+  for (const text of ["rech setup", "rech status", "rech share [profile]", "rech connect <url>", "rech listener", "Browser commands", "rech pw <args>", "RECHROME_URL"])
     expect(stdout).toContain(text);
   expect(stderr).not.toContain("connecting to");
 });
@@ -191,12 +196,46 @@ test("a typo'd command through a daemon shows the rech hint, not playwright's us
   } finally { server.stop(true); }
 });
 
+test("a non-daemon reply (e.g. a proxy 404 under the URL's path prefix) is reported, not JSON-parsed", async () => {
+  const seen: string[] = [];
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch(req) {
+    seen.push(new URL(req.url).pathname);
+    return new Response("404 page not found\n", { status: 404 });
+  } });
+  try {
+    const { code, stderr } = await runRech(["pw", "--version"], { RECHROME_URL: `http://127.0.0.1:${server.port}/rechrome/?profile=p#key=stub-key-0123456789` });
+    expect(code).toBe(1);
+    expect(seen).toContain("/rechrome/run");
+    expect(stderr).toContain("HTTP 404");
+    expect(stderr).toContain("404 page not found");
+    expect(stderr).not.toContain("JSON Parse error");
+  } finally { server.stop(true); }
+});
+
+test("status on a daemon host without oxmgr or pm2 reports it instead of throwing", async () => {
+  const home = mkdtempSync(join(tmpdir(), "rech-status-"));
+  const emptyPath = join(home, "bin");
+  mkdirSync(join(home, ".rechrome"), { recursive: true });
+  mkdirSync(emptyPath);
+  writeFileSync(join(home, ".rechrome", "listeners.json"), JSON.stringify({ version: 1, listeners: [{ name: "local", host: "127.0.0.1", port: 1, key: "k".repeat(20), profiles: "*" }] }));
+  try {
+    const proc = Bun.spawn([process.execPath, `${import.meta.dir}/rechrome.ts`, "status"], {
+      cwd: home, stdout: "pipe", stderr: "pipe",
+      env: { HOME: home, USERPROFILE: home, PATH: emptyPath, SYSTEMROOT: process.env.SYSTEMROOT ?? "", RECHROME_URL: "http://k@127.0.0.1:1/" },
+    });
+    const [code, stdout, stderr] = await Promise.all([proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+    expect(stderr).not.toContain("No daemon process manager found");
+    expect(code).toBe(0);
+    expect(stdout).toContain("daemon:   not installed (no oxmgr or pm2 on PATH)");
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
 test("-h shows a command's help, and a parse error shows it too, above the error", async () => {
   const env = { RECHROME_URL: "http://unused-key-0123456789@127.0.0.1:1" };
   const help = await runRech(["connect", "-h"], env);
   expect(help.code).toBe(0);
   expect(help.stdout).toContain("rech connect <url>");
-  expect(help.stdout).toContain("rech url <profile>");
+  expect(help.stdout).toContain("rech share <profile>");
   const missing = await runRech(["connect"], env);
   expect(missing.code).toBe(1);
   expect(missing.stderr).toContain("rech connect <url>");
@@ -204,4 +243,52 @@ test("-h shows a command's help, and a parse error shows it too, above the error
   const nested = await runRech(["listener", "allow", "share"], env);
   expect(nested.code).toBe(1);
   expect(nested.stderr).toContain("rech listener allow <name> <profiles..>");
+});
+
+const L = (name: string, profiles: string[] | "*", publicUrl?: string) =>
+  ({ name, host: "127.0.0.1", port: 1, key: name.padEnd(16, "k"), profiles, prefix: "/", publicUrl });
+
+test("share picks the scoped listener that allows the profile, never the management one", () => {
+  const local = L("local", "*");
+  expect(chooseShareListener("a@x", [local, L("share", ["a@x"])])).toBe("share");
+  expect(chooseShareListener("a@x", [local, L("lan", ["a@x"]), L("proxy", ["a@x"], "https://h/")])).toBe("proxy");
+  expect(() => chooseShareListener("a@x", [local, L("one", ["a@x"]), L("two", ["a@x"])])).toThrow(/several listeners \(one, two\)/);
+  expect(() => chooseShareListener("a@x", [local, L("share", ["b@x"])])).toThrow(/rech listener allow share "a@x"/);
+  expect(() => chooseShareListener("a@x", [local])).toThrow(/rech listener add share/);
+});
+
+test("a loose profile match (email name, or 3+ char prefix) is accepted only when unique", () => {
+  const c = (label: string, fields: string[], localPart?: string) => ({ id: label, label, fields, localPart });
+  const all = [c("taku@corp.jp", ["taku@corp.jp", "corp.jp", "Profile 2"], "taku"), c("taku2", ["taku2", "Profile 5"]), c("taku3", ["taku3", "Profile 7"]), c("symval-dev", ["symval-dev", "SymVal Dev"])];
+  expect(matchProfileLoosely("taku", all)?.label).toBe("taku@corp.jp");      // exact email name beats prefixes
+  expect(matchProfileLoosely("symval", all)?.label).toBe("symval-dev");      // unique prefix
+  expect(matchProfileLoosely("SymVal D", all)?.label).toBe("symval-dev");    // case-insensitive
+  expect(matchProfileLoosely("orp.jp", all)).toBeNull();                      // no substring matching
+  expect(matchProfileLoosely("corp", all)?.label).toBe("taku@corp.jp");      // a name prefix is fine
+  expect(matchProfileLoosely("h", all)).toBeNull();
+  expect(matchProfileLoosely("sy", all)).toBeNull();                          // prefixes need 3+ characters
+  expect(() => matchProfileLoosely("tak", all)).toThrow(/several profiles: taku@corp.jp, taku2, taku3/);
+  expect(matchProfileLoosely("nobody", all)).toBeNull();
+});
+
+async function answer(input: string, defaultIndex = 0) {
+  const { PassThrough } = await import("node:stream");
+  const io = { input: new PassThrough(), output: new PassThrough() };
+  let shown = "";
+  io.output.on("data", chunk => { shown += chunk; });
+  io.input.end(input);
+  const value = await promptChoice("Share which profile?", [{ label: "a@x", value: "a" }, { label: "b@x", value: "b" }], defaultIndex, io);
+  return { value, shown };
+}
+
+test("promptChoice: number, Enter for the default, re-ask on nonsense, q or EOF cancels", async () => {
+  expect((await answer("2\n")).value).toBe("b");
+  const byDefault = await answer("\n", 1);
+  expect(byDefault.value).toBe("b");
+  expect(byDefault.shown).toContain("2. b@x  (default)");
+  const retried = await answer("9\nx\n1\n");
+  expect(retried.value).toBe("a");
+  expect(retried.shown).toContain("Enter a number from 1 to 2.");
+  expect((await answer("q\n")).value).toBeNull();
+  expect((await answer("")).value).toBeNull();
 });

@@ -88,13 +88,14 @@ On the host (the machine with Chrome):
 rech listener add share --listen local --prefix=rechrome --port 13776 --profile you@example.com
 tailscale serve --bg --set-path=/rechrome 13776
 rech listener set share --public-url https://host.example.ts.net/rechrome/
-rech url you@example.com --listener share        # prints the URL to share — it contains a secret key
+rech share you@example.com                       # prints the URL to share — it contains a secret key
 ```
 
 `rech listener add` prints these follow-up lines with your port filled in. For scripts,
 `rech listener port share` prints the port (`$(rech listener port share)` in bash or PowerShell).
 
-On the other machine, inside the project that should use it:
+On the other machine, inside the project that should use it (or just open the link in a
+browser: it shows these commands, per shell, with a Copy button):
 
 ```bash
 rech connect 'https://host.example.ts.net/rechrome/?profile=you%40example.com#key=…'
@@ -106,13 +107,13 @@ rech open https://example.com
 interactions, but not `eval`/`run-code` or filesystem commands (see [Remote access](#remote-access)).
 
 On a trusted LAN without a proxy, `rech setup --listen lan --profile you@example.com` binds the
-profile to your LAN address directly (plain HTTP); share the result of `rech url`.
+profile to your LAN address directly (plain HTTP); share the result of `rech share`.
 
 ### 5. Manage access
 
 ```bash
-rech url ls                                   # every listener × profile, local and public URLs (keys hidden)
-rech url you@example.com --listener share     # print one URL again (add --save to use it in this project)
+rech share ls                                 # everything shared: listener × profile, local and public URLs (keys hidden)
+rech share you@example.com                    # print one URL again (add --save to use it in this project)
 rech listener allow share teammate@example.com
 rech listener deny share teammate@example.com
 rech listener rotate-key share                # revoke: every URL for this listener stops working
@@ -193,7 +194,7 @@ Connection parameters also accept URL fragments:
 RECHROME_URL='https://your-host.ts.net/rechrome/?profile=qa#key=DAEMON_KEY' rech status
 ```
 
-`rech setup` prints and saves this URI format. Retrieve it later with `rech url qa` (alias: `rech profile qa --print-uri`), or omit `qa` to use the configured profile. `profiles` remains an alias. The command prints only the URI to stdout, using the configured `RECHROME_URL` endpoint; `--listener local` selects a local listener instead. For example: `rech profile qa --print-uri --listener local`. The output contains a secret daemon key.
+`rech setup` prints and saves this URI format. Retrieve it later with `rech share qa` (alias: `rech profile qa --print-uri`), or omit `qa` to use the configured profile. `profiles` remains an alias. The command prints only the URI to stdout, using the configured `RECHROME_URL` endpoint; `--listener local` selects a local listener instead. For example: `rech profile qa --print-uri --listener local`. The output contains a secret daemon key.
 
 Direct connections use the root path, such as `http://127.0.0.1:13775/?profile=qa#key=DAEMON_KEY`. A prefix is optional and only added when explicitly configured with `--prefix`, for example for a proxy mounted at `/rechrome/`. Tailscale can also serve at the root without a prefix.
 
@@ -207,7 +208,7 @@ cp .env.example .env.local
 
 | Variable                            | Description                                                                                                                         | Default          |
 | ----------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- | ---------------- |
-| `RECHROME_URL`                      | Connection URL, saved by `rech setup` / `rech connect` / `rech url --save`. Also accepts `?extension_id=`, `?token=`, `?profile=` query params | —                |
+| `RECHROME_URL`                      | Connection URL, saved by `rech setup` / `rech connect` / `rech share --save`. Also accepts `?extension_id=`, `?token=`, `?profile=` query params | —                |
 | `PLAYWRIGHT_CLI`                    | Override the playwright-cli command/path (defaults to the bundled `@playwright/cli`; set this only for a custom or forked CLI)       | bundled `@playwright/cli` |
 | `RECH_HOST`                         | Legacy bind address, used only before listeners.json is configured                                                                  | `127.0.0.1`      |
 | `PLAYWRIGHT_MCP_EXTENSION_ID`       | Chrome extension ID (client overrides server)                                                                                       | —                |

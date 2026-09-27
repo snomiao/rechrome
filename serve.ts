@@ -374,6 +374,88 @@ export function shouldExitOrphanedServe(opts: {
   return opts.idleTimeoutMs > 0 && opts.orphaned && opts.idleMs >= opts.idleTimeoutMs;
 }
 
+export const LANDING_HEADERS = {
+  "Content-Type": "text/html; charset=utf-8",
+  "Cache-Control": "no-store",
+  "Referrer-Policy": "no-referrer",
+  "X-Content-Type-Options": "nosniff",
+  "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+};
+
+/**
+ * The page a shared connection URL shows in a browser: install-and-connect commands to copy,
+ * one per shell. It is static; the script reads the full URL (with its #key) from the address
+ * bar, shows it with the key masked, and copies it whole.
+ */
+export function landingPage(): string {
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Connect to a shared Chrome · rechrome</title>
+<style>
+:root { --bg:#fff; --fg:#1d1d1f; --muted:#6e6e73; --card:#f5f5f7; --line:#d2d2d7; --accent:#0a66c2; --warn:#b25000; }
+@media (prefers-color-scheme: dark) { :root { --bg:#161617; --fg:#f5f5f7; --muted:#a1a1a6; --card:#232325; --line:#3a3a3c; --accent:#4c9bff; --warn:#ffb86b; } }
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 760px; margin: 0 auto; padding: 40px 16px 56px; }
+h1 { font-size: 1.6rem; margin: 0 0 8px; }
+p { margin: 0 0 16px; color: var(--muted); }
+.row { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; margin: 0 0 12px; }
+.label { font-size: .8rem; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin-bottom: 6px; }
+.cmd { display: flex; gap: 10px; align-items: flex-start; }
+code { flex: 1; font: 13px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace; word-break: break-all; white-space: pre-wrap; }
+button { flex: none; font: inherit; font-size: .9rem; padding: 4px 12px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); cursor: pointer; }
+button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.warn { color: var(--warn); font-weight: 600; }
+.small { font-size: .85rem; }
+a { color: var(--accent); }
+</style></head>
+<body><main>
+<h1>Connect to a shared Chrome</h1>
+<p>Someone shared a Chrome profile with you through <a href="https://github.com/snomiao/rechrome">rechrome</a>.
+On your computer, inside the project folder that should use it, run:</p>
+<p id="nokey" class="warn" hidden>This link is missing its key (the part after #key=). Ask for the full link from <code>rech share</code>.</p>
+<div id="cmds"></div>
+<p class="small">Needs <a href="https://bun.sh">Bun</a>. Then try <code>rechrome open https://example.com</code>.
+This link contains a secret key: anyone with it can use this browser profile, so share it privately.</p>
+</main>
+<script>
+(() => {
+  const url = location.href;
+  if (!/[#&?]key=/.test(location.hash)) document.getElementById("nokey").hidden = false;
+  const posix = s => "'" + s.replace(/'/g, "'\\\\''") + "'";
+  const pwsh = s => '"' + s.replace(/[\`"$]/g, c => "\`" + c) + '"';
+  const cmd = s => '"' + s.replace(/"/g, "%22") + '"';
+  const shells = [
+    ["macOS / Linux", "bun i -g rechrome && rechrome connect " + posix(url)],
+    ["Windows PowerShell", "bun i -g rechrome; rechrome connect " + pwsh(url)],
+    ["Windows cmd", "bun i -g rechrome && rechrome connect " + cmd(url)],
+  ];
+  const mask = s => s.replace(/(key=)[^&"'\`]+/, "$1…");
+  const root = document.getElementById("cmds");
+  for (const [label, text] of shells) {
+    const row = document.createElement("div"); row.className = "row";
+    const name = document.createElement("div"); name.className = "label"; name.textContent = label;
+    const line = document.createElement("div"); line.className = "cmd";
+    const code = document.createElement("code"); code.textContent = mask(text);
+    const button = document.createElement("button"); button.type = "button"; button.textContent = "Copy";
+    button.setAttribute("aria-label", "Copy the " + label + " command");
+    button.addEventListener("click", async () => {
+      try { await navigator.clipboard.writeText(text); }
+      catch {
+        // Plain-HTTP pages (e.g. a LAN address) have no clipboard API: copy via a hidden textarea.
+        const area = document.createElement("textarea"); area.value = text; document.body.append(area);
+        area.select(); document.execCommand("copy"); area.remove();
+      }
+      button.textContent = "Copied"; setTimeout(() => { button.textContent = "Copy"; }, 1500);
+    });
+    line.append(code, button); row.append(name, line); root.append(row);
+  }
+})();
+</script>
+</body></html>
+`;
+}
+
 export async function serve() {
   // The daemon owns logs/ and output/, so it migrates them before writing anything.
   const migrated = migrateLegacyDataDir();
@@ -495,6 +577,10 @@ export async function serve() {
           consecutiveTimeouts, degraded: degraded || !healthy,
         });
       }
+      // A browser opening a shared URL gets copyable connect instructions. The key stays in the
+      // #fragment, which browsers never send, so the page is static and the key never reaches here.
+      if (reqUrl.pathname === "/" && req.method === "GET" && (req.headers.get("accept") ?? "").includes("text/html"))
+        return new Response(landingPage(), { headers: LANDING_HEADERS });
       if (reqUrl.pathname !== "/run") return new Response("rech server\n");
       const denied = authCheck(req, key);
       if (denied) return denied;
