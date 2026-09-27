@@ -1990,13 +1990,16 @@ export async function daemonInstall(serveUrl: string): Promise<void> {
     await runPm(mgr, ["save"]); // persist process list for `pm2 resurrect` on reboot
   } else {
     const envArgs = Object.entries(daemonEnv).flatMap(([k, v]) => ["--env", `${k}=${v}`]);
+    // oxmgr shell-splits the command string (backslashes are escapes, so `C:\Users\…` became
+    // `C:Users…`); pass quoted forward-slash paths — Windows accepts `/`, quotes keep spaces.
+    const q = (path: string) => `"${path.replaceAll("\\", "/")}"`;
     startCode = await runPm(mgr, [
       "start",
       "--name", PM_PROCESS_NAME,
       "--restart", "always",
       "--cwd", home,
       ...envArgs,
-      `${bunBin} ${rechScript} serve`,
+      `${q(bunBin)} ${q(rechScript)} serve`,
     ]);
     // Boot/login persistence: on Windows the winfix oxmgr wires Task Scheduler,
     // on POSIX a systemd --user unit / launchd agent — the equivalent of the pm2
