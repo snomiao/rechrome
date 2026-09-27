@@ -2,7 +2,7 @@ import { test, expect } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { rechCli, listenerNextSteps, unknownCommandHint, notConnectedMessage, type RechHandlers } from "./rechrome.ts";
+import { rechCli, listenerNextSteps, unknownCommandHint, notConnectedMessage, chooseShareListener, matchProfileLoosely, type RechHandlers } from "./rechrome.ts";
 
 async function run(argv: string[]) {
   const calls: [string, ...unknown[]][] = [];
@@ -35,7 +35,7 @@ test("profile lists by default and prints a URI with an optional listener", asyn
   expect(await run(["profiles", "ls"])).toEqual([["listProfiles"]]);
   expect(await run(["profile", "qa", "--print-uri", "--listener", "local"])).toEqual([["printProfileUri", "qa", "local"]]); // alias of url
   expect(await run(["profile", "--print-uri"])).toEqual([["printProfileUri", undefined, undefined]]);
-  await expect(run(["profile", "qa"])).rejects.toThrow(/rech url "qa"/);
+  await expect(run(["profile", "qa"])).rejects.toThrow(/rech share "qa"/);
 });
 
 test("listener subcommands, with repeatable --profile", async () => {
@@ -55,12 +55,13 @@ test("tray and provision-profile", async () => {
   await expect(run(["provision-profile"])).rejects.toThrow();
 });
 
-test("url prints, saves, or lists connection URLs; connect takes a shared URL", async () => {
-  expect(await run(["url", "qa"])).toEqual([["printProfileUri", "qa", undefined, { local: undefined, save: undefined }]]);
-  expect(await run(["url", "qa", "--listener", "share", "--local", "--save"])).toEqual([["printProfileUri", "qa", "share", { local: true, save: true }]]);
-  expect(await run(["url"])).toEqual([["printProfileUri", undefined, undefined, { local: undefined, save: undefined }]]);
-  expect(await run(["url", "ls"])).toEqual([["urlList"]]);
-  expect(await run(["urls", "list"])).toEqual([["urlList"]]);
+test("share prints, saves, or lists connection URLs; connect takes a shared URL", async () => {
+  expect(await run(["share", "qa"])).toEqual([["printProfileUri", "qa", undefined, { local: undefined, save: undefined }]]);
+  expect(await run(["share", "ls"])).toEqual([["urlList"]]);
+  expect(await run(["share", "qa", "--listener", "share", "--local", "--save"])).toEqual([["printProfileUri", "qa", "share", { local: true, save: true }]]);
+  expect(await run(["share"])).toEqual([["printProfileUri", undefined, undefined, { local: undefined, save: undefined }]]);
+  expect(await run(["share", "list"])).toEqual([["urlList"]]);
+  await expect(run(["url", "qa"])).rejects.toThrow(/Unknown argument|url/);
   expect(await run(["connect", "https://h.ts.net/rechrome/?profile=qa#key=k"])).toEqual([["connect", "https://h.ts.net/rechrome/?profile=qa#key=k"]]);
   await expect(run(["connect"])).rejects.toThrow();
 });
@@ -81,6 +82,7 @@ test("next steps are plain text with the port filled in, so any shell (cmd too) 
   const steps = listenerNextSteps({ name: "share", host: "127.0.0.1", port: 13776, key: "k".repeat(24), profiles: ["qa"], prefix: "/rechrome/" }, "qa");
   expect(steps).toContain("  tailscale serve --bg --set-path=/rechrome 13776");
   expect(steps).toContain("  rech listener set share --public-url https://<your-host>/rechrome/");
+  expect(steps).toContain('  rech share "qa"');
   expect(steps.join("\n")).not.toContain("$(");
   expect(listenerNextSteps({ name: "root", host: "127.0.0.1", port: 13777, key: "k".repeat(24), profiles: ["qa"], prefix: "/" })).toContain("  tailscale serve --bg 13777");
 });
@@ -166,7 +168,7 @@ async function runRech(args: string[], env: Record<string, string | undefined>) 
 test("rech --help is generated from the command tree and needs no daemon", async () => {
   const { code, stdout, stderr } = await runRech(["--help"], { RECHROME_URL: "http://unused-key-0123456789@127.0.0.1:1" });
   expect(code).toBe(0);
-  for (const text of ["rech setup", "rech status", "rech url [profile]", "rech connect <url>", "rech listener", "Browser commands", "rech pw <args>", "RECHROME_URL"])
+  for (const text of ["rech setup", "rech status", "rech share [profile]", "rech connect <url>", "rech listener", "Browser commands", "rech pw <args>", "RECHROME_URL"])
     expect(stdout).toContain(text);
   expect(stderr).not.toContain("connecting to");
 });
@@ -233,7 +235,7 @@ test("-h shows a command's help, and a parse error shows it too, above the error
   const help = await runRech(["connect", "-h"], env);
   expect(help.code).toBe(0);
   expect(help.stdout).toContain("rech connect <url>");
-  expect(help.stdout).toContain("rech url <profile>");
+  expect(help.stdout).toContain("rech share <profile>");
   const missing = await runRech(["connect"], env);
   expect(missing.code).toBe(1);
   expect(missing.stderr).toContain("rech connect <url>");
@@ -241,4 +243,27 @@ test("-h shows a command's help, and a parse error shows it too, above the error
   const nested = await runRech(["listener", "allow", "share"], env);
   expect(nested.code).toBe(1);
   expect(nested.stderr).toContain("rech listener allow <name> <profiles..>");
+});
+
+const L = (name: string, profiles: string[] | "*", publicUrl?: string) =>
+  ({ name, host: "127.0.0.1", port: 1, key: name.padEnd(16, "k"), profiles, prefix: "/", publicUrl });
+
+test("share picks the scoped listener that allows the profile, never the management one", () => {
+  const local = L("local", "*");
+  expect(chooseShareListener("a@x", [local, L("share", ["a@x"])])).toBe("share");
+  expect(chooseShareListener("a@x", [local, L("lan", ["a@x"]), L("proxy", ["a@x"], "https://h/")])).toBe("proxy");
+  expect(() => chooseShareListener("a@x", [local, L("one", ["a@x"]), L("two", ["a@x"])])).toThrow(/several listeners \(one, two\)/);
+  expect(() => chooseShareListener("a@x", [local, L("share", ["b@x"])])).toThrow(/rech listener allow share "a@x"/);
+  expect(() => chooseShareListener("a@x", [local])).toThrow(/rech listener add share/);
+});
+
+test("a loose profile match is accepted only when unique, strongest match first", () => {
+  const c = (label: string, fields: string[], localPart?: string) => ({ id: label, label, fields, localPart });
+  const all = [c("taku@corp.jp", ["taku@corp.jp", "corp.jp", "Profile 2"], "taku"), c("taku2", ["taku2", "Profile 5"]), c("taku3", ["taku3", "Profile 7"]), c("symval-dev", ["symval-dev", "SymVal Dev"])];
+  expect(matchProfileLoosely("taku", all)?.label).toBe("taku@corp.jp");      // exact email name beats prefixes
+  expect(matchProfileLoosely("symval", all)?.label).toBe("symval-dev");      // unique prefix
+  expect(matchProfileLoosely("SymVal D", all)?.label).toBe("symval-dev");    // case-insensitive
+  expect(matchProfileLoosely("corp", all)?.label).toBe("taku@corp.jp");      // unique substring
+  expect(() => matchProfileLoosely("tak", all)).toThrow(/several profiles: taku@corp.jp, taku2, taku3/);
+  expect(matchProfileLoosely("nobody", all)).toBeNull();
 });

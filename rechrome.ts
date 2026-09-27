@@ -671,6 +671,30 @@ export function validateChromeProfileSelector(selector: string): void {
   );
 }
 
+export type ProfileCandidate = { id: string; label: string; fields: string[]; localPart?: string };
+
+/**
+ * Looser profile matching, tried after the exact rules: the email's part before "@", then the
+ * start of an email/name/folder, then anywhere in one. Each stage counts only when it picks out
+ * exactly one profile; if a stage matches several, stop and name them rather than guess.
+ */
+export function matchProfileLoosely(value: string, candidates: ProfileCandidate[]): ProfileCandidate | null {
+  const needle = value.trim().toLowerCase();
+  if (!needle) return null;
+  const stages: Array<[string, (c: ProfileCandidate) => boolean]> = [
+    ["email name", c => c.localPart?.toLowerCase() === needle],
+    ["prefix", c => c.fields.some(f => f.toLowerCase().startsWith(needle))],
+    ["substring", c => c.fields.some(f => f.toLowerCase().includes(needle))],
+  ];
+  for (const [, test] of stages) {
+    const hits = candidates.filter(test);
+    if (hits.length === 1) return hits[0];
+    if (hits.length > 1)
+      throw new Error(`Profile "${value}" matches several profiles: ${hits.map(c => c.label).join(", ")}. Use one of those, or see \`rech profile\`.`);
+  }
+  return null;
+}
+
 export async function resolveGlobalProfile(
   registry: Record<string, TokenEntry>,
   chromeProfiles: Record<string, ChromeProfileInfo> | null,
@@ -690,18 +714,32 @@ export async function resolveGlobalProfile(
   }
 
   const profiles = Object.entries(chromeProfiles);
-  let match: [string, ChromeProfileInfo] | null;
-  try {
-    match = resolveChromeProfileSelector(profiles, value);
-  } catch (err) {
-    throw err;
-  }
+  let match = resolveChromeProfileSelector(profiles, value);
 
   if (!match) {
-    throw new Error(
-      `--profile "${value}" does not match any Chrome profile. ` +
-      `See available profiles with \`rech profile\`.`,
-    );
+    // No exact match: accept a looser one only when it is unique, and say which profile it chose.
+    const chromeIds = new Set(profiles.flatMap(([dir, info]) => [dir, info.user_name ?? ""]));
+    for (const [key, entry] of Object.entries(registry)) if (profiles.some(([dir]) => dir === entry.profileDir)) chromeIds.add(key);
+    const candidates: ProfileCandidate[] = [
+      ...profiles.map(([dir, info]) => ({
+        id: `chrome:${dir}`,
+        label: info.user_name ? `${info.user_name} (${info.name ?? dir})` : `${info.name ?? dir} [${dir}]`,
+        fields: [info.user_name ?? "", info.name ?? "", dir].filter(Boolean),
+        localPart: info.user_name?.split("@")[0],
+      })),
+      // Registered profiles Chrome doesn't list (managed test profiles).
+      ...Object.keys(registry).filter(k => !chromeIds.has(k)).map(k => ({ id: `registry:${k}`, label: k, fields: [k], localPart: k.includes("@") ? k.split("@")[0] : undefined })),
+    ];
+    const loose = matchProfileLoosely(value, candidates);
+    if (!loose) {
+      throw new Error(`Profile "${value}" does not match any Chrome profile. See available profiles with \`rech profile\`.`);
+    }
+    console.error(`[rech] profile "${value}" → ${loose.label}`);
+    if (loose.id.startsWith("registry:")) {
+      const key = loose.id.slice("registry:".length);
+      return { email: key, entry: registry[key] };
+    }
+    match = profiles.find(([dir]) => `chrome:${dir}` === loose.id)!;
   }
 
   const [dir, info] = match;
@@ -883,6 +921,12 @@ async function listProfiles(): Promise<void> {
 export function profileConnectionUri(profile: string, configuredUrl: string | undefined, listeners: Listener[], listenerName?: string): string {
   let url = configuredUrl;
   if (listenerName || !url) {
+    if (listenerName) {
+      const named = listeners.find(l => l.name === listenerName);
+      if (!named) throw new Error(`Unknown listener "${listenerName}". See rech listener ls.`);
+      if (named.profiles !== "*" && !named.profiles.includes(profile))
+        throw new Error(`Listener "${listenerName}" does not allow "${profile}". Allow it with: rech listener allow ${listenerName} ${JSON.stringify(profile)}`);
+    }
     const candidates = listeners.filter(l => (l.profiles === "*" || l.profiles.includes(profile)) && (!listenerName || l.name === listenerName));
     if (candidates.length !== 1) throw new Error("Choose a listener with --listener <name>, or set RECHROME_URL to the desired endpoint.");
     const listener = candidates[0];
@@ -898,16 +942,39 @@ export function profileConnectionUri(profile: string, configuredUrl: string | un
   return result.toString();
 }
 
+/**
+ * Which listener `rech share <profile>` uses when none is named: a scoped one that allows the
+ * profile, preferring one with a public URL. Never the management listener, whose key gives
+ * full access to every profile.
+ */
+export function chooseShareListener(profile: string, listeners: Listener[]): string {
+  const scoped = listeners.filter(l => l.profiles !== "*");
+  const allowing = scoped.filter(l => (l.profiles as string[]).includes(profile));
+  const pick = allowing.length === 1 ? allowing : allowing.filter(l => l.publicUrl);
+  if (pick.length === 1) return pick[0].name;
+  if (allowing.length > 1)
+    throw new Error(`"${profile}" is shared on several listeners (${allowing.map(l => l.name).join(", ")}). Pick one with --listener <name>.`);
+  throw new Error([
+    `"${profile}" isn't shared on any listener yet.`,
+    scoped.length ? `  Allow it on one:  rech listener allow ${scoped[0].name} ${JSON.stringify(profile)}   (listeners: ${scoped.map(l => l.name).join(", ")})` : "",
+    `  Or create one:    rech listener add share --listen local --prefix=rechrome --port 13776 --profile ${JSON.stringify(profile)}`,
+  ].filter(Boolean).join("\n"));
+}
+
 async function printProfileUri(selector?: string, listener?: string, opts: { local?: boolean; save?: boolean } = {}): Promise<void> {
   const url = process.env[ENV_KEY];
   selector ??= url ? parseUrl(url).profileDirectory : undefined;
-  if (!selector) throw new Error("Specify a profile: rech url <profile>");
+  if (!selector) throw new Error("Specify a profile: rech share <profile>");
   const registry = await readTokenRegistry();
   const cache = await readChromeProfileCache();
   // A configured remote profile may not exist in this machine's local registry.
   const profile = url && parseUrl(url).profileDirectory === selector && !listener
     ? selector : (await resolveGlobalProfile(registry, cache, selector)).email;
   const listeners = (await readListeners())?.listeners ?? [];
+  // On a host, share through a scoped listener by default, never the management key.
+  if (!listener && listeners.length) listener = chooseShareListener(profile, listeners);
+  if (listeners.find(l => l.name === listener)?.profiles === "*")
+    console.error(`[rech] "${listener}" is the local management listener: its key controls every profile. Don't share this URL.`);
   let uri = profileConnectionUri(profile, url, listeners, listener);
   // Prefer where a proxy exposes the listener, when it has been recorded.
   const publicUrl = listeners.find(l => l.key === parseUrl(uri).key)?.publicUrl;
@@ -1091,7 +1158,7 @@ export function notConnectedMessage(): string {
   return [
     `rech: not connected to a rechrome daemon (${ENV_KEY} is not set).`,
     `  On the machine with Chrome:   rech setup`,
-    `  On another machine:           rech connect '<URL printed by \`rech url\` on that machine>'`,
+    `  On another machine:           rech connect '<URL printed by \`rech share\` on that machine>'`,
   ].join("\n");
 }
 
@@ -1109,7 +1176,7 @@ export function unknownCommandHint(output: string, rechCommands: Iterable<string
   const best = scored[0] && scored[0].d <= Math.max(1, Math.floor(unknown.length / 3)) ? scored[0].c : null;
   return [
     `rech: unknown command "${unknown}".${best ? ` Did you mean "${best}"?` : ""}`,
-    `  rech --help       rechrome commands (setup, status, profile, url, connect, listener…)`,
+    `  rech --help       rechrome commands (setup, status, profile, share, connect, listener…)`,
     `  rech pw --help    browser commands (open, click, screenshot…)`,
   ].join("\n");
 }
@@ -2026,7 +2093,7 @@ export function listenerNextSteps(listener: Listener, profile?: string): string[
     `  tailscale serve --bg${mount ? ` --set-path=${mount}` : ""} ${listener.port}`,
     `Then record where it is reachable and print the URL to share:`,
     `  rech listener set ${listener.name} --public-url https://<your-host>${prefix}`,
-    `  rech url ${profile ? JSON.stringify(profile) : "<profile>"} --listener ${listener.name}`,
+    `  rech share ${profile ? JSON.stringify(profile) : "<profile>"}`,
   ];
 }
 
@@ -2078,7 +2145,7 @@ async function rotateKey(name: string): Promise<void> {
   const config = await requireListeners();
   rotateListenerKey(config, name);
   await writeListeners(config);
-  console.log(`New key for ${name}; URLs carrying the old key stop working now. Print new ones with: rech url <profile> --listener ${name}`);
+  console.log(`New key for ${name}; URLs carrying the old key stop working now. Print new ones with: rech share <profile> --listener ${name}`);
 }
 
 async function setListener(name: string, opts: { publicUrl?: string; clearPublicUrl?: boolean }): Promise<void> {
@@ -2098,7 +2165,7 @@ async function urlList(): Promise<void> {
     for (const profile of l.profiles === "*" ? ["(all profiles)"] : l.profiles) rows.push([l.name, profile, local, l.publicUrl ?? "-"]);
   }
   printTable(rows);
-  console.log(`\nPrint a full URL (contains the secret key): rech url <profile> --listener <name>`);
+  console.log(`\nPrint a full URL (contains the secret key): rech share <profile>`);
 }
 
 /** Write RECHROME_URL to this project's .rechrome/.env.local (the folder git-ignores itself). */
@@ -2116,7 +2183,7 @@ async function saveProjectUrl(url: string): Promise<string> {
 
 async function connect(url: string): Promise<void> {
   const parsed = parseUrl(url);
-  if (!parsed.key) throw new Error("That URL has no key (#key=…). Ask the host for the full URL from: rech url <profile>");
+  if (!parsed.key) throw new Error("That URL has no key (#key=…). Ask the host for the full URL from: rech share <profile>");
   const response = await fetch(serviceUrl(url, "ping"), { headers: { Authorization: `Bearer ${parsed.key}` }, signal: AbortSignal.timeout(5000) })
     .catch(error => { throw new Error(`Could not reach ${serviceUrl(url)}: ${error instanceof Error ? error.message : error}`); });
   if (response.status === 401) throw new Error("The daemon rejected this key; ask the host for a fresh URL (keys change on rech listener rotate-key).");
@@ -2546,7 +2613,7 @@ async function status(): Promise<void> {
   const details = [pingBody?.listener && `listener ${pingBody.listener}`, pingBody?.bind && `bind ${pingBody.bind}`].filter(Boolean).join(", ");
   console.log(`serve:    ${ping ? `running  ${serviceUrl(url)}${details ? `  (${details})` : ""}` : `not reachable at ${serviceUrl(url)}`}`);
   if (pingResponse?.status === 401)
-    console.log(`auth:     ✗ key rejected — ask the host for a fresh URL (\`rech url <profile>\`), then \`rech connect '<url>'\``);
+    console.log(`auth:     ✗ key rejected — ask the host for a fresh URL (\`rech share <profile>\`), then \`rech connect '<url>'\``);
   // daemonManager().id — there is no PM_BIN constant. Referencing one threw a
   // ReferenceError that took down the whole of `rech status`, so the one command
   // that reports "the relay is wedged" died exactly when the relay was wedged,
@@ -2567,7 +2634,7 @@ async function status(): Promise<void> {
   const current = effective ? await resolveProfileEmail(effective).catch(() => effective) : undefined;
   const allowed = pingBody?.profiles === "*" ? "all registered profiles" : pingBody?.profiles?.join(", ");
   console.log(`profile:  ${current ?? "(none selected; add ?profile= to the URL or pass --profile)"}${allowed ? `  — this listener serves: ${allowed}` : ""}`);
-  if (isHost) console.log(`\nMore: rech profile (profiles) · rech url ls (who can connect, and where)`);
+  if (isHost) console.log(`\nMore: rech profile (profiles) · rech share ls (who can connect, and where)`);
 }
 
 
@@ -2594,7 +2661,7 @@ export type RechHandlers = {
 };
 
 /** Commands rech handles itself; anything else is forwarded verbatim to playwright-cli. */
-export const RECH_COMMANDS = new Set(["serve", "status", "listener", "listeners", "profile", "profiles", "url", "urls", "connect", "setup", "tray", "provision-profile", "uninstall"]);
+export const RECH_COMMANDS = new Set(["serve", "status", "listener", "listeners", "profile", "profiles", "share", "connect", "setup", "tray", "provision-profile", "uninstall"]);
 
 const portOption = { type: "number", requiresArg: true, describe: "Listener port (1-65535)" } as const;
 
@@ -2621,7 +2688,7 @@ Examples:
   rech setup --profile you@example.com         set up Chrome on this machine
   rech open https://example.com                open a page in this project's session
   rech screenshot                              saved to <project>/.rechrome/output/
-  rech url you@example.com --listener share    URL to give another machine (secret)
+  rech share you@example.com                   URL to give another machine (secret)
   rech connect '<url>'                         use that URL in this project
 
 Run \`rech <command> --help\` for a command's options. Tutorial: https://github.com/snomiao/rechrome#tutorial`;
@@ -2645,24 +2712,24 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
     .command("status", "Is it working? The URL in use, the daemon, and the current profile", {}, () => handlers.status())
     .command(["profile [name]", "profiles [name]"], "List Chrome profiles and whether each is connected", y => y
       .positional("name", { type: "string", describe: "ls/list lists all (the default)" })
-      .option("print-uri", { type: "boolean", describe: "Same as `rech url <name>`" })
+      .option("print-uri", { type: "boolean", describe: "Same as `rech share <name>`" })
       .option("listener", { type: "string", requiresArg: true, implies: "print-uri", describe: "Listener to build the URL for" }),
       a => {
-        if (a.printUri) return handlers.printProfileUri(a.name, a.listener); // alias of `rech url`
+        if (a.printUri) return handlers.printProfileUri(a.name, a.listener); // alias of `rech share`
         if (a.name === undefined || ["ls", "list"].includes(a.name)) return handlers.listProfiles();
-        throw new Error(`To print "${a.name}"'s connection URL: rech url ${JSON.stringify(a.name)}. To list profiles: rech profile`);
+        throw new Error(`To share "${a.name}" with another machine: rech share ${JSON.stringify(a.name)}. To list profiles: rech profile`);
       })
     // Share with and connect from other machines
-    .command(["url [profile]", "urls [profile]"], "Print a connection URL to share (contains a secret key); `url ls` lists all", y => y
-      .positional("profile", { type: "string", describe: "Profile (email, name or folder); ls/list lists every listener's URLs" })
-      .option("listener", { type: "string", requiresArg: true, describe: "Listener to build the URL for" })
+    .command("share [profile]", "Print a URL another machine can connect with (secret); `share ls` lists all", y => y
+      .positional("profile", { type: "string", describe: "Profile: email, name, folder, or a unique part of one; ls/list lists everything shared" })
+      .option("listener", { type: "string", requiresArg: true, describe: "Listener to share through (default: the one that allows the profile)" })
       .option("local", { type: "boolean", describe: "Print the direct listener address even when a public URL is set" })
       .option("save", { type: "boolean", describe: "Also save it as RECHROME_URL in this project's .rechrome/.env.local" }),
       a => ["ls", "list"].includes(a.profile ?? "") && !a.listener && !a.save
         ? handlers.urlList()
         : handlers.printProfileUri(a.profile, a.listener, { local: a.local, save: a.save }))
     .command("connect <url>", "Use a URL from another machine in this project (checks it first)", y => y
-      .positional("url", { type: "string", demandOption: true, describe: "The URL printed by `rech url <profile>` on the machine with Chrome. Quote it: it contains #" })
+      .positional("url", { type: "string", demandOption: true, describe: "The URL printed by `rech share <profile>` on the machine with Chrome. Quote it: it contains #" })
       .example("rech connect 'https://host.example.ts.net/rechrome/?profile=you%40example.com#key=…'", ""),
       a => handlers.connect(a.url))
     .command(["listener", "listeners"], "Control who can connect: listeners, allowed profiles, keys, public URLs", y => y
