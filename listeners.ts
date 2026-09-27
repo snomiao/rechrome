@@ -135,3 +135,55 @@ export function setPublicUrl(config: ListenerConfig, name: string, publicUrl: st
   else listener.publicUrl = normalizePublicUrl(publicUrl);
   return listener;
 }
+
+/** What the resolver needs from a registry entry: which Chrome profile it points at. */
+export type RegisteredProfile = { profileDir: string; userDataDir?: string };
+const profileIdentity = (e: RegisteredProfile) => `${e.userDataDir ?? ""}\0${e.profileDir}`;
+
+/**
+ * One registry key per Chrome profile (a profile can be registered under several aliases,
+ * e.g. "Profile 5" and "taku2"): prefer an email, else the alphabetically first key.
+ */
+export function canonicalProfileKeys(registry: Record<string, RegisteredProfile>): string[] {
+  const byProfile = new Map<string, string>();
+  for (const key of Object.keys(registry).sort()) {
+    const id = profileIdentity(registry[key]);
+    const kept = byProfile.get(id);
+    if (!kept || (!kept.includes("@") && key.includes("@"))) byProfile.set(id, key);
+  }
+  return [...byProfile.values()];
+}
+
+/**
+ * Resolve what a remote client typed (`rech --profile work`) to one allowed registry key, on
+ * the host, so the client needs no registry of its own. Aliases of an allowed profile map to
+ * it, so they share one session. Matching: exact key, alias, folder or Chrome name
+ * (case-insensitive), then the email part before "@", then a unique 3+ character prefix.
+ * Ambiguity and misses list the allowed profiles; nothing outside the allowlist can match.
+ */
+export function resolveAllowedProfile(
+  selector: string | undefined, allowed: string[], registry: Record<string, RegisteredProfile>,
+  chromeNames: Record<string, string> = {},
+): string {
+  const list = allowed.join(", ");
+  if (!selector?.trim()) throw new Error(`Pick a profile: this link shares ${list}. For example: rech --profile ${JSON.stringify(allowed[0] ?? "<name>")} open https://example.com`);
+  const needle = selector.trim().toLowerCase();
+  const candidates = allowed.filter(k => registry[k]).map(key => {
+    const entry = registry[key];
+    const aliases = Object.keys(registry).filter(k => profileIdentity(registry[k]) === profileIdentity(entry));
+    const name = entry.userDataDir ? undefined : chromeNames[entry.profileDir];
+    const fields = [...new Set([...aliases, entry.profileDir, ...(name ? [name] : [])])].map(f => f.toLowerCase());
+    return { key, fields, localParts: fields.filter(f => f.includes("@")).map(f => f.split("@")[0]) };
+  });
+  const stages: Array<(c: typeof candidates[number]) => boolean> = [
+    c => c.fields.includes(needle),
+    c => c.localParts.includes(needle),
+    c => needle.length >= 3 && c.fields.some(f => f.startsWith(needle)),
+  ];
+  for (const test of stages) {
+    const hits = candidates.filter(test);
+    if (hits.length === 1) return hits[0].key;
+    if (hits.length > 1) throw new Error(`"${selector}" matches several shared profiles (${hits.map(h => h.key).join(", ")}); be more specific.`);
+  }
+  throw new Error(`"${selector}" is not shared by this link. It shares: ${list}.`);
+}
