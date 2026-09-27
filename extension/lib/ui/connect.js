@@ -1,3 +1,6 @@
+/*! Rechrome fork: modified by rechrome contributors (2026).
+ * Playwright: Copyright (c) Microsoft Corporation; Apache-2.0.
+ * See LICENSE, NOTICE, MODIFICATIONS.md and THIRD_PARTY_NOTICES.txt. */
 import { c as clientExports, j as jsxRuntimeExports, r as reactExports, A as AuthTokenSection, T as TabItem, B as Button, g as getOrCreateAuthToken } from "./authToken.js";
 const SUPPORTED_PROTOCOL_VERSION = 2;
 const BACKGROUND_RESPONSE_TIMEOUT_MS = 1e4;

@@ -1,6 +1,7 @@
+import { readListeners, listenerAddress, authorizeProfileRequest, canReadProfileFile, profileOutputPrefix, normalizePrefix, type Listener } from "./listeners.ts";
 import { file } from "bun";
 import { createHash, X509Certificate } from "crypto";
-import { mkdirSync, unlinkSync, accessSync, readdirSync, constants as fsConstants } from "fs";
+import { mkdirSync, unlinkSync, accessSync, readdirSync, realpathSync, constants as fsConstants } from "fs";
 import { join, resolve, relative, isAbsolute } from "path";
 import {
   log,
@@ -11,7 +12,8 @@ import {
   HOME,
   PASSTHROUGH_ENV_KEYS,
   resolvePlaywrightCli,
-} from "./rech.ts";
+  readTokenRegistry,
+} from "./rechrome.ts";
 
 const TAILSCALE_BIN = process.env.TAILSCALE_BIN || "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
 const CERT_RENEW_THRESHOLD_DAYS = 7;
@@ -239,45 +241,6 @@ async function resolveProfileDirectory(nameOrEmail: string): Promise<string> {
   return nameOrEmail;
 }
 
-// Free the listening port from stale daemon holders before retrying a failed bind.
-// On Windows the listening socket (created inheritable by Bun.serve) is swept into the
-// detached cliDaemon grandchild via bInheritHandles, so an orphaned cliDaemon from a
-// previous `serve` keeps the port in LISTEN after the old serve dies — the fresh serve
-// then crash-loops on EADDRINUSE. A clean restart releases the port, so a failed bind
-// only happens when such a stale holder exists; killing orphaned daemon holders here is
-// safe because a freshly-starting serve owns no live sessions of its own yet (the user's
-// Chrome tabs persist regardless — the cliDaemon only drives them).
-async function freeStalePort(port: number): Promise<void> {
-  try {
-    if (process.platform === "win32") {
-      // Two-phase, narrow-first: (1) kill the port's actual listed owner if it's a live
-      // process; (2) only if the port is STILL held — the inherited-handle case, where the
-      // socket lives in a child while netstat attributes it to a now-dead owner — fall back
-      // to killing orphaned cliDaemon holders. The fallback is the only recovery for that
-      // case (the live holder can't be mapped from the port), but it runs only when the
-      // precise kill failed, so the broad sweep is a logged last resort, not the default.
-      const ps = [
-        "$ErrorActionPreference='SilentlyContinue';",
-        `$o=(Get-NetTCPConnection -LocalPort ${port} -State Listen).OwningProcess;`,
-        "if($o -and (Get-Process -Id $o)){ Stop-Process -Id $o -Force; Start-Sleep -Milliseconds 400 };",
-        `if(Get-NetTCPConnection -LocalPort ${port} -State Listen){`,
-        "  $h=Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*cliDaemon.js*' };",
-        "  Write-Output (\"freeStalePort: port still held; killing cliDaemon holders: \" + ($h.ProcessId -join ','));",
-        "  $h | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }",
-        "}",
-      ].join(" ");
-      const r = Bun.spawnSync(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], { windowsHide: true });
-      const out = r.stdout?.toString().trim();
-      if (out) log(out);
-    } else {
-      Bun.spawnSync(["sh", "-c", `fuser -k ${port}/tcp 2>/dev/null || (lsof -ti tcp:${port} | xargs -r kill -9) 2>/dev/null || true`]);
-    }
-  } catch {
-    // best effort — the retry will surface a clear error if the port is still held
-  }
-  await new Promise(r => setTimeout(r, 800)); // let the OS release the socket before retry
-}
-
 // --- Foreground/orphan self-exit ---------------------------------------------------
 // A foreground `rech serve` (run directly by an agent, NOT under oxmgr/pm2) has no
 // process-manager safety net: when the agent that spawned it exits, the OS re-parents
@@ -341,20 +304,30 @@ export async function serve() {
     }, 86_400_000);
   }
   const tls = certPath && keyPath ? { cert: Bun.file(certPath), key: Bun.file(keyPath) } : undefined;
-  const startServer = (reusePort = false) => Bun.serve({
-    hostname: listenHost,
-    port,
-    // reusePort is used only as a last-resort fallback (see the bind loop below): if an orphaned
-    // holder can't be killed, binding with SO_REUSEADDR keeps serve up (degraded, port-shared)
-    // instead of crash-looping on EADDRINUSE. The normal path binds a clean, exclusive socket.
-    reusePort,
+  const legacy: Listener = { name: "legacy", host: listenHost, port, key, profiles: "*" };
+  const policies = new Map<string, Listener>();
+  const servers = new Map<string, ReturnType<typeof Bun.serve>>();
+  const startServer = (initial: Listener) => Bun.serve({
+    hostname: initial.host,
+    port: initial.port,
     tls,
     error(err) {
       log(`unhandled error: ${err.message}`);
       return Response.json({ status: 1, stdout: "", stderr: err.message }, { status: 500 });
     },
-    async fetch(req) {
+    async fetch(req, server) {
+      const listener = policies.get(listenerAddress(initial));
+      if (!listener) return new Response("Listener removed", { status: 403 });
+      const key = listener.key;
+      const listenHost = listener.host;
+      const scoped = listener.profiles !== "*";
       const reqUrl = new URL(req.url);
+      const prefix = normalizePrefix(listener.prefix);
+      if (prefix !== "/") {
+        if (reqUrl.pathname === prefix.slice(0, -1)) reqUrl.pathname = "/";
+        else if (reqUrl.pathname.startsWith(prefix)) reqUrl.pathname = "/" + reqUrl.pathname.slice(prefix.length);
+        else return new Response("Not found", { status: 404 });
+      }
 
       // Serve files from output dir
       if (reqUrl.pathname.startsWith("/files/")) {
@@ -362,9 +335,12 @@ export async function serve() {
         if (denied) return denied;
         const name = decodeURIComponent(reqUrl.pathname.slice(7));
         if (!isUnderDir(workDir, name)) return new Response("Forbidden", { status: 403 });
+        if (!canReadProfileFile(listener, name)) return new Response("Forbidden", { status: 403 });
         const resolved = resolve(workDir, name);
         const f = file(resolved);
         if (!(await f.exists())) return new Response("Not found", { status: 404 });
+        const real = realpathSync(resolved);
+        if (!isUnderDir(realpathSync(workDir), real) || !canReadProfileFile(listener, relative(realpathSync(workDir), real).replaceAll("\\", "/"))) return new Response("Forbidden", { status: 403 });
         return new Response(f);
       }
 
@@ -375,8 +351,8 @@ export async function serve() {
         // relay wedges). `degraded` surfaces the passive timeout streak from real traffic so
         // clients / `rech status` can see trouble without an active probe.
         const degraded = consecutiveTimeouts > 0;
-        if (!reqUrl.searchParams.get("deep"))
-          return Response.json({ ok: true, bind: listenHost, consecutiveTimeouts, degraded });
+        if (scoped || !reqUrl.searchParams.get("deep"))
+          return Response.json({ ok: true, bind: listenHost, listener: listener.name, profiles: listener.profiles, multiListener: true, consecutiveTimeouts, degraded });
         // Deep probe: exercise the relay read-only via `tab-list` (opens nothing) against the
         // most-recently-used session — never a fresh one, which could spawn a browser window.
         const target = [...recentSessions.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
@@ -404,6 +380,28 @@ export async function serve() {
       markActivity(); // a real command: this serve is not idle
 
       const body = await req.json();
+      let scopedProfile: string | undefined;
+      let profileEnv: Record<string, string> = {};
+      if (scoped) {
+        try {
+          scopedProfile = authorizeProfileRequest(listener, body);
+          const registry = await readTokenRegistry();
+          const entry = registry[scopedProfile];
+          if (!entry?.token || !entry?.extensionId || !entry?.profileDir) throw new Error("Profile is not registered on this server");
+          profileEnv = {
+            PLAYWRIGHT_MCP_PROFILE_DIRECTORY: entry.profileDir,
+            PLAYWRIGHT_MCP_EXTENSION_ID: entry.extensionId,
+            PLAYWRIGHT_MCP_EXTENSION_TOKEN: entry.token,
+            PLAYWRIGHT_MCP_USER_DATA_DIR: entry.userDataDir || "",
+            PLAYWRIGHT_MCP_LOAD_EXTENSION: entry.loadExtension || "",
+          };
+          body.identity.key = `scoped:${body.identity.key}`;
+          body.env = {}; // Server-owned profile configuration wins over every client override.
+        } catch (error) { return Response.json({ status: 1, stdout: "", stderr: String(error) }, { status: 403 }); }
+      }
+      const outputPrefix = scopedProfile ? profileOutputPrefix(scopedProfile) : "";
+      const runWorkDir = scopedProfile ? join(workDir, outputPrefix) : workDir;
+      mkdirSync(runWorkDir, { recursive: true });
       let args: string[];
       let sessionId: string;
       let clientName = "";
@@ -480,7 +478,7 @@ export async function serve() {
       if (isOpenCmd) {
         try {
           const listProc = Bun.spawn([bin, ...binArgs, "tab-list", `-s=${namespacedSession}`], {
-            cwd: workDir,
+            cwd: runWorkDir,
             stdin: "ignore",
             stdout: "pipe",
             stderr: "pipe",
@@ -518,10 +516,10 @@ export async function serve() {
       for (const key of PASSTHROUGH_ENV_KEYS) {
         if (process.env[key]) passthroughEnv[key] = process.env[key];
       }
-      Object.assign(passthroughEnv, clientEnv);
+      Object.assign(passthroughEnv, clientEnv, profileEnv);
 
       // Resolve profile name/email → directory name
-      if (passthroughEnv.PLAYWRIGHT_MCP_PROFILE_DIRECTORY) {
+      if (!scoped && passthroughEnv.PLAYWRIGHT_MCP_PROFILE_DIRECTORY) {
         const resolved = await resolveProfileDirectory(passthroughEnv.PLAYWRIGHT_MCP_PROFILE_DIRECTORY);
         if (resolved !== passthroughEnv.PLAYWRIGHT_MCP_PROFILE_DIRECTORY)
           log(`profile resolved: "${passthroughEnv.PLAYWRIGHT_MCP_PROFILE_DIRECTORY}" → "${resolved}"`);
@@ -564,7 +562,7 @@ export async function serve() {
 
       const commandStartedAt = Date.now();
       const proc = Bun.spawn([bin, ...binArgs, ...filteredArgs, `-s=${namespacedSession}`], {
-        cwd: workDir,
+        cwd: runWorkDir,
         stdin: "ignore",
         stdout: "pipe",
         stderr: "pipe",
@@ -623,7 +621,7 @@ export async function serve() {
           log(`session ${namespacedSession} wedged (${streak} consecutive timeouts) — closing so the next command respawns a clean cliDaemon`);
           try {
             Bun.spawn([bin, ...binArgs, "close", `-s=${namespacedSession}`], {
-              cwd: workDir, stdin: "ignore", stdout: "ignore", stderr: "ignore",
+              cwd: runWorkDir, stdin: "ignore", stdout: "ignore", stderr: "ignore",
               windowsHide: true,
               env: { PATH: process.env.PATH, HOME: HOME, USERPROFILE: process.env.USERPROFILE },
             });
@@ -653,8 +651,8 @@ export async function serve() {
       ];
       const outputFiles: string[] = [];
       for (const f of mentionedFiles) {
-        if (!isUnderDir(workDir, f)) continue;
-        if (await file(join(workDir, f)).exists()) {
+        if (!isUnderDir(runWorkDir, f)) continue;
+        if (await file(join(runWorkDir, f)).exists()) {
           outputFiles.push(f);
         } else {
           const basename = f.split("/").pop()!;
@@ -662,7 +660,7 @@ export async function serve() {
             // Forward-slash for the wire: join() would use "\" on the Windows daemon, which
             // a POSIX client can't treat as a separator (it builds a literal-backslash path).
             const subpath = `${subdir}/${basename}`;
-            if (await file(join(workDir, subpath)).exists()) {
+            if (await file(join(runWorkDir, subpath)).exists()) {
               outputFiles.push(subpath);
               break;
             }
@@ -677,40 +675,55 @@ export async function serve() {
         stderr: rebrand(stderr),
         // Normalize any platform separators to "/" so relative paths are portable across
         // a cross-OS daemon↔client (e.g. Windows daemon serving a Linux container client).
-        files: outputFiles.map((p) => p.replaceAll("\\", "/")),
+        files: outputFiles.map((p) => (outputPrefix + p).replaceAll("\\", "/")),
       });
     },
   });
 
-  // A leaked listening-socket handle in an orphaned cliDaemon can keep the port in LISTEN after a
-  // prior serve exits: Bun.serve creates the socket inheritable and Bun.spawn sweeps it into the
-  // detached daemon grandchild via bInheritHandles, so the socket outlives its creating serve.
-  // netstat then attributes the port to the now-dead *creator*, not the live holder, so we can't
-  // map port -> killable PID — freeStalePort kills the orphan by its cliDaemon signature instead.
-  // Retry a bounded number of times: the old single retry crash-looped whenever the OS hadn't yet
-  // released the socket after the kill (pm2 then restarts serve into the same race). As an absolute
-  // last resort, bind with reusePort so a holder we genuinely can't kill degrades to "up but sharing
-  // the port" rather than a permanent EADDRINUSE crash-loop.
-  const isEaddrInUse = (e: any) => String(e?.code ?? e?.message ?? "").includes("EADDRINUSE");
-  const MAX_BIND_ATTEMPTS = 4;
-  let server: ReturnType<typeof startServer> | undefined;
-  for (let attempt = 1; attempt <= MAX_BIND_ATTEMPTS; attempt++) {
+  // Stage all new sockets before changing policy. Bind failure leaves existing
+  // listeners and browser sessions intact; never kill a process holding another port.
+  const reconcile = async (listeners: Listener[]) => {
+    const staged = new Map<string, ReturnType<typeof Bun.serve>>();
     try {
-      server = startServer();
-      break;
-    } catch (e: any) {
-      if (!isEaddrInUse(e)) throw e;
-      if (attempt === MAX_BIND_ATTEMPTS) {
-        log(`port ${port} still held after ${attempt - 1} cleanup attempts — binding with reusePort (last resort)`);
-        server = startServer(true);
-        break;
+      for (const listener of listeners) {
+        const address = listenerAddress(listener);
+        if (!servers.has(address)) staged.set(address, startServer(listener));
       }
-      log(`port ${port} in use — clearing stale daemon holders and retrying (attempt ${attempt}/${MAX_BIND_ATTEMPTS - 1})`);
-      await freeStalePort(port);
+    } catch (error) {
+      for (const server of staged.values()) server.stop(true);
+      throw error;
     }
-  }
-  if (!server) throw new Error(`failed to bind port ${port}`);
-
-  log(`serving on ${tls ? "https" : "http"}://${server.hostname}:${server.port}`);
-  log(`Connection URL set (use .env.local to view)`);
+    policies.clear();
+    for (const listener of listeners) policies.set(listenerAddress(listener), listener);
+    for (const [address, server] of staged) { servers.set(address, server); log(`listening on ${address}`); }
+    for (const [address, server] of servers) {
+      if (!policies.has(address)) { server.stop(false); servers.delete(address); log(`listener removed: ${address}`); }
+    }
+  };
+  let applied = "";
+  let configured = false;
+  const reload = async () => {
+    const config = await readListeners();
+    if (!config && configured) throw new Error("listeners.json disappeared; refusing to restore unrestricted legacy access");
+    const listeners = config?.listeners ?? [legacy];
+    const fingerprint = JSON.stringify(listeners);
+    if (applied === fingerprint) return;
+    await reconcile(listeners);
+    configured ||= !!config;
+    applied = fingerprint;
+  };
+  await reload();
+  let reloading = false;
+  let lastError = "";
+  setInterval(async () => {
+    if (reloading) return;
+    reloading = true;
+    try { await reload(); lastError = ""; }
+    catch (error) {
+      const message = String(error);
+      if (message !== lastError) log(`listener reload rejected; previous configuration retained: ${message}`);
+      lastError = message;
+    } finally { reloading = false; }
+  }, 1000);
+  log("Connection credentials remain in local configuration; listener changes reload automatically");
 }

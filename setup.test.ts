@@ -10,7 +10,7 @@ for (const existingConfig of [false, true]) {
     const original = "UNRELATED_SETTING=keep\n";
     if (existingConfig) writeFileSync(config, original);
     try {
-      const proc = Bun.spawn([process.execPath, join(import.meta.dir, "rech.ts"), "setup", "--profile", "Default"], {
+      const proc = Bun.spawn([process.execPath, join(import.meta.dir, "rechrome.ts"), "setup", "--profile", "Default"], {
         cwd: taskHome,
         env: {
           HOME: taskHome,
@@ -47,12 +47,12 @@ for (const launcher of ["bun", "npm"] as const) {
       const installer = join(taskHome, launcher);
       writeFileSync(installer, `#!${process.execPath}\nawait Bun.write(${JSON.stringify(marker)}, JSON.stringify(process.argv.slice(2)));\nprocess.exit(23);\n`, { mode: 0o755 });
       try {
-        const proc = Bun.spawn([process.execPath, join(import.meta.dir, "rech.ts"), "setup", "--profile", "Default", ...(consent === "--yes" ? [consent] : [])], {
+        const proc = Bun.spawn([process.execPath, join(import.meta.dir, "rechrome.ts"), "setup", "--profile", "Default", ...(consent === "--yes" ? [consent] : [])], {
           cwd: taskHome,
           env: {
             HOME: taskHome, USERPROFILE: taskHome, PATH: taskHome,
             npm_config_user_agent: `${launcher}/1.0.0`,
-            RECHROME_URL: "http://test@127.0.0.1:1", RECH_HOST: "0.0.0.0",
+            RECHROME_URL: "http://test-key-0123456789@127.0.0.1:1", RECH_HOST: "0.0.0.0",
           },
           stdin: new Blob([consent === "--yes" ? "" : `${consent}\n`]),
           stdout: "pipe", stderr: "pipe",
@@ -83,12 +83,12 @@ for (const exposesBinary of [false, true]) {
     const managerScript = `#!${process.execPath}\nawait Bun.write(${JSON.stringify(marker)}, "called");\nprocess.exit(23);\n`;
     writeFileSync(join(taskHome, "npm"), `#!${process.execPath}\nimport { writeFileSync } from "node:fs";\n${exposesBinary ? `writeFileSync(${JSON.stringify(oxmgr)}, ${JSON.stringify(managerScript)}, { mode: 0o755 });` : ""}\n`, { mode: 0o755 });
     try {
-      const proc = Bun.spawn([process.execPath, join(import.meta.dir, "rech.ts"), "setup", "--profile", "Default", "--yes"], {
+      const proc = Bun.spawn([process.execPath, join(import.meta.dir, "rechrome.ts"), "setup", "--profile", "Default", "--yes"], {
         cwd: taskHome,
         env: {
           HOME: taskHome, USERPROFILE: taskHome, PATH: taskHome,
           npm_config_user_agent: "npm/11.0.0",
-          RECHROME_URL: "http://test@127.0.0.1:1", RECH_HOST: "0.0.0.0",
+          RECHROME_URL: "http://test-key-0123456789@127.0.0.1:1", RECH_HOST: "0.0.0.0",
         },
         stdin: "ignore", stdout: "pipe", stderr: "pipe",
       });

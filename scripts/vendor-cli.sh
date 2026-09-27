@@ -3,7 +3,7 @@
 # Runs at prepublish — needs NO submodules and NO playwright build, so the release CI just works.
 # Regenerate the inputs with scripts/refresh-vendor-src.sh when the fork changes.
 #
-# Layout produced (resolved by resolvePlaywrightCli() in rech.ts, priority 3):
+# Layout produced (resolved by resolvePlaywrightCli() in rechrome.ts, priority 3):
 #   vendor/playwright-cli/playwright-cli.js                  <- thin wrapper
 #   vendor/playwright-cli/node_modules/playwright-core/...   <- patched core (unpacked tarball)
 # The wrapper's `require('playwright-core/lib/tools/cli-client/program')` resolves to the nested

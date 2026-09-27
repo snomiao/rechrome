@@ -10,7 +10,7 @@
 //
 // This module is deliberately pure (no Bun/process/fs) so the selection policy is
 // unit-testable; the impure probing (Bun.which, `oxmgr --version`) lives in
-// rech.ts and feeds its results into pickDaemonManager.
+// rechrome.ts and feeds its results into pickDaemonManager.
 
 export type DaemonManager = { id: "oxmgr" | "pm2"; bin: string };
 
@@ -89,7 +89,7 @@ export function pickDaemonManager(opts: {
 
 // npm/npx sets npm_config_user_agent even when the CLI's shebang runs Bun.
 // Prefer launcher metadata over the runtime, which is Bun for both launchers.
-export function oxmgrInstallCommand(env: { npm_config_user_agent?: string; npm_execpath?: string }): ["bun" | "npm", "i", "-g", "oxmgr"] {
+export function oxmgrInstallCommand(env: { npm_config_user_agent?: string; npm_execpath?: string; [name: string]: string | undefined }):["bun" | "npm", "i", "-g", "oxmgr"] {
   const agent = env.npm_config_user_agent?.toLowerCase() ?? "";
   if (agent.startsWith("npm/")) return ["npm", "i", "-g", "oxmgr"];
   if (agent.startsWith("bun/")) return ["bun", "i", "-g", "oxmgr"];

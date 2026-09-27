@@ -40,16 +40,18 @@ mod imp {
         host: String,
         port: u16,
         https: bool,
+        prefix: String,
         raw: String,
     }
 
     impl Parsed {
         fn origin(&self) -> String {
             format!(
-                "{}://{}:{}/",
+                "{}://{}:{}{}",
                 if self.https { "https" } else { "http" },
                 self.host,
-                self.port
+                self.port,
+                self.prefix
             )
         }
     }
@@ -102,6 +104,9 @@ mod imp {
         let (scheme, rest) = raw.split_once("://")?;
         let https = scheme.eq_ignore_ascii_case("https");
         let authority = rest.split(['/', '?']).next().unwrap_or(rest);
+        let path = rest[authority.len()..].split(['?', '#']).next().unwrap_or("").trim_matches('/');
+        if path.chars().any(|c| c.is_control() || c == ' ') { return None; }
+        let prefix = if path.is_empty() { "/".to_string() } else { format!("/{path}/") };
         let (key, hostport) = match authority.split_once('@') {
             Some((u, h)) => (u.to_string(), h),
             None => (String::new(), authority),
@@ -119,8 +124,39 @@ mod imp {
             host,
             port,
             https,
+            prefix,
             raw: raw.to_string(),
         })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn prefixed_urls_keep_path_without_credentials_or_query() {
+            let p = parse_url("http://secret@localhost:13776/rechrome?profile=qa").unwrap();
+            assert_eq!(p.prefix, "/rechrome/");
+            assert_eq!(p.origin(), "http://localhost:13776/rechrome/");
+            assert_eq!(parse_url("http://localhost:13775?profile=qa").unwrap().prefix, "/");
+        }
+
+        #[test]
+        fn health_probe_uses_prefix() {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(PROBE_TIMEOUT)).unwrap();
+                let mut buffer = [0; 1024];
+                let count = socket.read(&mut buffer).unwrap();
+                assert!(String::from_utf8_lossy(&buffer[..count]).starts_with("GET /rechrome/ping HTTP/1.0"));
+                socket.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n").unwrap();
+            });
+            let p = parse_url(&format!("http://secret@127.0.0.1:{port}/rechrome/")).unwrap();
+            assert!(probe(&p) == Health::Healthy);
+            server.join().unwrap();
+        }
     }
 
     fn probe(p: &Parsed) -> Health {
@@ -144,8 +180,8 @@ mod imp {
         let _ = stream.set_read_timeout(Some(PROBE_TIMEOUT));
         let _ = stream.set_write_timeout(Some(PROBE_TIMEOUT));
         let req = format!(
-            "GET /ping HTTP/1.0\r\nHost: {}:{}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
-            p.host, p.port, p.key
+            "GET {}ping HTTP/1.0\r\nHost: {}:{}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+            p.prefix, p.host, p.port, p.key
         );
         if stream.write_all(req.as_bytes()).is_err() {
             return Health::Reachable;

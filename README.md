@@ -40,7 +40,17 @@ bun link
 
 Now `rechrome` (or `rech`) is available globally.
 
+`rech profile` and `rech profiles` are aliases that list installed Chrome profiles and registered managed test profiles together.
+Both also accept `ls` or `list`, for example `rechrome profiles ls`.
+The connection column checks each profile's default session for the current worktree without
+opening a browser: **Connected**, **Registered / idle**, **Registered / unknown** (the check
+could not complete), or **Not set up**. Sessions opened with a custom `-s` or from another
+worktree are outside this check. Managed test profiles are labeled separately from real Chrome.
+
 ## Quick start
+
+Agents setting up Chrome on macOS can use the [rechrome setup skill](skills/rechrome-setup/SKILL.md), which covers native extension installation with Computer Use and CLI connection verification.
+`rech setup` detects Codex and Claude Code environment hints and prints agent-specific guidance before the setup prompts. Set `RECH_SETUP_AGENT=codex`, `claude`, or `none` to override detection. Detection changes guidance only; desktop automation still follows the available tools and approval rules.
 
 ### 0. One-command setup (recommended)
 
@@ -52,26 +62,47 @@ when launched with npx. Pass `--yes` to approve this installation without prompt
 for example `bunx rechrome setup --profile Default --yes`.
 
 ```bash
-rech setup                          # interactive: pick a profile, follow the prompts
+rech setup                          # choose a network, then a Chrome profile
 rech setup --profile you@email.com  # non-interactive profile selection
+rech setup --listen tailscale --profile you@email.com
 ```
 
 What it does per Chrome profile:
 
-1. **Daemon** — installs/starts the `serve` daemon (skipped if already healthy).
-2. **Extension** — if the multi-tab extension isn't installed in the chosen profile, it opens an
+1. **Network** — choose where this profile should be accessible: Local (default),
+   LAN, Tailscale (only when detected), or another detected interface. One daemon
+   serves multiple addresses; changing this profile's exposure preserves other
+   profiles. Listener changes reload without restarting the daemon or Chrome.
+2. **Profile** — choose a Chrome profile; automatically select it when only one exists.
+3. **Extension** — if the multi-tab extension isn't installed in the chosen profile, it opens an
    install guide **in that exact profile**; load it once via `chrome://extensions → Load unpacked`
    (a one-time manual click — Chrome only allows unpacked extensions through the GUI).
-3. **Token** — once the extension is present, the auth token is **read automatically** from the
+4. **Token and connection** — once the extension is present, the auth token is **read automatically** from the
    profile's `localStorage` (no copy-paste). For headless/agent runs you can also pass it
    explicitly:
 
    ```bash
-   rech setup --profile 18 --token <PLAYWRIGHT_MCP_EXTENSION_TOKEN>   # or RECH_TOKEN=… rech setup …
+   rech setup --profile "Profile 18" --token <PLAYWRIGHT_MCP_EXTENSION_TOKEN>   # or RECH_TOKEN=… rech setup …
    ```
 
-`setup` is agent-friendly: it never blocks on a TTY, opens the guide in the right profile, and
-auto-reads the token, so a non-interactive run completes end-to-end once the extension is loaded.
+For unattended runs, `--listen local`, `--listen lan`, `--listen tailscale`, or
+`--listen <detected-IP>` chooses the network. Multiple LAN addresses require an
+explicit IP. Without `--listen`, setup selects local-only access for this profile.
+Choosing Local removes this profile from remote listener allowlists. LAN binds to the selected address,
+not `0.0.0.0`. Discovery lists IPv4 interfaces; it does not configure port forwarding
+or publish through external tunnel providers.
+
+`setup` opens a live guide in the selected profile. On macOS, the Extensions tab
+is immediately before the guide: copy the path, switch to the previous tab, choose
+Load unpacked, paste the path, and return. Setup monitors installation and reads
+the token automatically, then verifies the browser connection. The page updates
+without a refresh and offers Retry connection if the handshake fails.
+
+Manual token paste remains available in the guide and interactive terminal;
+`--token` / `RECH_TOKEN` also work. Keep the setup process running while using the
+guide. Installation/token detection and connection retries each time out after
+15 minutes. Non-interactive setup waits for browser installation rather than
+prompting for stdin, then uses the default configuration save location.
 
 > **Managed QA profiles (experimental):** `rech provision-profile <name> --experimental` spins up a
 > fully isolated profile on **Chrome for Testing** (run `npx playwright install chromium` first) with
@@ -110,9 +141,23 @@ rech tab-list
 rech --help
 ```
 
-rechrome walks up from the current working directory to find `.env.local`, so each project can have its own connection URL, Chrome profile, and extension token.
+rechrome walks up from the current working directory to find `.env.local`, so each project can have its own connection URL, Chrome profile, and extension token. Explicit environment variables take priority: `RECHROME_URL='http://KEY@host:13775' rech status` overrides the saved URL for that command.
 
 ## Configuration
+
+Profiles are stored in `~/.rechrome/profiles.yaml`. Existing `profiles.json` registries are also supported and automatically migrated on first read; the original JSON is retained as a private backup. YAML takes precedence when both exist. Registry writes are atomic and use owner-only permissions because entries contain Playwright bridge tokens. Invalid YAML fails explicitly instead of falling back to potentially stale JSON credentials.
+
+Connection parameters also accept URL fragments:
+
+```sh
+RECHROME_URL='https://your-host.ts.net/rechrome/?profile=qa#key=DAEMON_KEY' rech status
+```
+
+`rech setup` prints and saves this URI format. Retrieve it later with `rech profile qa --print-uri`, or omit `qa` to use the configured profile. `profiles` remains an alias. The command prints only the URI to stdout, using the configured `RECHROME_URL` endpoint; `--listener local` selects a local listener instead. For example: `rech profile qa --print-uri --listener local`. The output contains a secret daemon key.
+
+Direct connections use the root path, such as `http://127.0.0.1:13775/?profile=qa#key=DAEMON_KEY`. A prefix is optional and only added when explicitly configured with `--prefix`, for example for a proxy mounted at `/rechrome/`. Tailscale can also serve at the root without a prefix.
+
+Setup generates this format: the profile is in the query and the daemon listener's bearer `key` is in the fragment. The daemon looks up the registered profile's separate Playwright bridge token and browser paths locally. Advanced clients can still supply the bridge credential as `token` (for example `#key=DAEMON_KEY&token=BRIDGE_TOKEN`). Fragment parameters override matching query parameters; fragment `key` overrides legacy `KEY@host`. Both `#?key=…` and `#key=…` work. The CLI reads these locally and sends the daemon key as an Authorization header; fragments are omitted from HTTP request URLs. Opening the URL in a browser does not configure a client or display a dashboard. Fragments can still be stored in browser history and copied links, so treat the complete connection URL as a secret.
 
 Copy `.env.example` to `.env.local` and edit:
 
@@ -124,7 +169,7 @@ cp .env.example .env.local
 | ----------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- | ---------------- |
 | `RECHROME_URL`                      | Connection URL (auto-generated by `rech serve`). Also accepts `?extension_id=`, `?token=`, `?profile=` query params                 | —                |
 | `PLAYWRIGHT_CLI`                    | Override the playwright-cli command/path (defaults to the bundled `@playwright/cli`; set this only for a custom or forked CLI)       | bundled `@playwright/cli` |
-| `RECH_HOST`                         | Server bind address                                                                                                                 | `127.0.0.1`      |
+| `RECH_HOST`                         | Legacy bind address, used only before listeners.json is configured                                                                  | `127.0.0.1`      |
 | `PLAYWRIGHT_MCP_EXTENSION_ID`       | Chrome extension ID (client overrides server)                                                                                       | —                |
 | `PLAYWRIGHT_MCP_EXTENSION_TOKEN`    | Chrome extension token — profile-specific, get it from the extension's status page (client overrides server)                        | —                |
 | `PLAYWRIGHT_MCP_USER_DATA_DIR`      | Chrome user data directory — use to pin connections to a specific Chrome install (client overrides server)                          | —                |
@@ -141,10 +186,59 @@ cp .env.example .env.local
 
 ### Remote access
 
-By default the server binds to `127.0.0.1` (localhost only). For remote access, either:
+`rech setup --profile <profile> --listen tailscale` exposes that profile through a
+dedicated authenticated listener while retaining local management. The daemon
+stores listener addresses, keys, and profile allowlists in `~/.rechrome/listeners.json`
+(mode 0600), reloads changes automatically, and rejects invalid changes while keeping
+the last working configuration. Each listener has its own bearer key. Use `rech profile ls`
+to see configured exposure, and `rech listener ls` to list bindings without credentials.
 
-- Use an SSH tunnel: `ssh -L 13775:localhost:13775 server-host`
-- Or set `RECH_HOST=0.0.0.0` (⚠️ ensure network is trusted — traffic is plain HTTP)
+```bash
+rech listener add qa --listen tailscale --profile qamac-remote --port 13776
+rech listener remove qa
+```
+
+Repeat `--profile` to allow several registered profiles. A profile may appear on
+multiple listeners; `setup --listen` selects its exposure afresh. Edit the protected
+JSON file to update an existing listener's allowlist or key. Changes do not terminate
+browser sessions; removed listeners reject further requests. An occupied or unavailable
+address causes reload to retain the old configuration, so verify reachability after editing.
+
+Remote listeners permit navigation, tabs, snapshots, screenshots, and basic page interactions.
+They reject arbitrary `run-code`/`eval`, filesystem commands, global session commands, and
+browser/config overrides. Those commands remain available on the unrestricted **loopback
+management listener**. Scoped sessions and output directories are separate from management
+sessions; a listener cannot download another profile's output. This is an application access
+policy, not an OS sandbox for the browser. Never publish the management listener through a
+proxy or tunnel to clients that should have restricted access.
+
+LAN traffic is plain HTTP unless TLS is configured. Tailscale provides its private transport;
+binding an address does not configure Tailscale ACLs, port forwarding, or public tunnels.
+
+To mount rechrome under a Tailscale Serve path, use a separate scoped loopback listener:
+
+```bash
+rech setup --profile taku3 --listen local --prefix=rechrome --port=13776
+tailscale serve --bg --https=443 --set-path=/rechrome http://127.0.0.1:13776/rechrome
+```
+
+`--prefix=rechrome` and `--prefix=/rechrome/` both normalize to `/rechrome/`.
+Without `--port`, prefixed setup reuses a matching scoped listener or defaults to
+the management port plus one. Existing profiles can also use
+`rech listener add qa-proxy --listen local --profile <profile> --port 13776 --prefix=rechrome`.
+Setup prints the matching Serve command but does not run it or change existing Serve routes.
+Include the path in the proxy target: Serve strips the mount path and the target restores it.
+
+For remote clients, change the saved connection URL's origin to
+`https://<machine>.<tailnet>.ts.net`, retaining `/rechrome/`, the listener's bearer
+userinfo, and the profile query. Health checks, commands, and file downloads honor
+that base path. The setup guide remains a temporary local page owned by the setup
+process; it is not published through Serve. Never proxy the unrestricted management listener.
+
+Existing installations retain the legacy listener until `rech setup` initializes the new
+configuration. The first migration restarts only the daemon to load the new source. Existing
+remote access is retained for currently registered profiles with a **new scoped key**; remote
+clients need the new listener credentials. Browser processes are left running.
 
 ## Session namespacing
 

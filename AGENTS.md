@@ -1,4 +1,4 @@
-# rechrome — repo-scoped Claude rules
+# rechrome — repo-scoped Codex rules
 
 ## NEVER restart / quit the user's Chrome without explicit approval
 
@@ -61,11 +61,13 @@ How a profile gets its auth token and extension, and the platform constraints be
   first load of `status.html`/`connect.html`; random 32-byte base64url). The daemon's token-bypass
   connect compares `?token=` against this value (`extension/src/ui/connect.tsx`).
 - **`rech setup` auto-reads the token** straight from the profile's `Local Storage/leveldb`
-  (`readExtensionTokenFromProfile` in `rechrome.ts`) — read-only, never takes LevelDB's lock, safe while
-  the user's Chrome runs. It anchors on the `auth-token` marker + `\x01`+43-char base64url value
-  shape (LevelDB prefix-compression can split the origin string, so don't match the full origin).
-  Verified to extract the exact registry token for every installed profile. So setup needs **no
-  manual paste**; `--token`/`RECH_TOKEN` still override for headless edge cases.
+  (`readExtensionTokenFromProfile` in `extension-token.ts`) — read-only, never takes LevelDB's lock,
+  safe while the user's Chrome runs. Decode SST prefix-compressed keys, Snappy blocks, and WAL write
+  batches; match the exact extension origin and select the greatest internal sequence number,
+  including deletions. Never restore the old raw `auth-token` byte scan: it picked an obsolete token
+  from `000005.ldb` while missing the current compressed value, causing repeated Invalid token /
+  connection timeouts. Both default and explicit `--profile` clients refresh the registry before
+  connecting. Setup needs **no manual paste**; `--token`/`RECH_TOKEN` still override for headless cases.
 - **Extension install still needs a one-time GUI "Load unpacked"** in the target profile. There is no
   non-GUI install path for the user's real Chrome: Secure Preferences is HMAC-signed (can't forge an
   install entry), and **branded Google Chrome 149+ rejects `--load-extension`** outright (stderr:
@@ -126,8 +128,8 @@ For an agent that just wants to *use* rech to open/verify a URL in the user's Ch
   from this repo (or `bunx rechrome <cmd>`).
 - **Env:** `PLAYWRIGHT_CLI="bunx playwright-cli" PLAYWRIGHT_BROWSERS_PATH="$HOME/.cache/ms-playwright"`
   (npm `playwright-cli` works when the vendored fork isn't checked out). It auto-loads `RECHROME_URL`
-  from the nearest `.env.local` (walks cwd→root and **overwrites** `process.env`, so a URL passed on the
-  CLI is ignored — edit the file).
+  from the nearest `.env.local` (walks cwd→root). Explicit environment variables win over files,
+  so `RECHROME_URL='http://KEY@host:13775' bun rechrome.ts status` overrides the saved URL.
 - **`bun rechrome.ts status` first.** "bearer key rejected" = the `<KEY>@host` userinfo rotated (it does so
   every Mac serve restart) → ask the user for a fresh `RECHROME_URL`; can't SSH into the Mac.
 - **Commands:** `open <url>` · `screenshot [--full-page] [--filename x.png]` · `resize <w> <h>` ·
