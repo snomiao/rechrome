@@ -56,6 +56,11 @@ Agents setting up Chrome on macOS can use the [rechrome setup skill](skills/rech
 
 `rech setup` configures the daemon, Chrome extension, and connection URL in one pass:
 
+If no supported daemon manager is available, setup asks before installing `oxmgr` globally
+(default: No). It uses `bun i -g oxmgr` when launched with bunx and `npm i -g oxmgr`
+when launched with npx. Pass `--yes` to approve this installation without prompting,
+for example `bunx rechrome setup --profile Default --yes`.
+
 ```bash
 rech setup                          # choose a network, then a Chrome profile
 rech setup --profile you@email.com  # non-interactive profile selection

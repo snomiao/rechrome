@@ -12,7 +12,9 @@ async function run(argv: string[]) {
 
 test("setup parses options in both --opt value and --opt=value forms, keeping numeric profiles as strings", async () => {
   expect(await run(["setup", "--profile", "18", "--listen=tailscale", "--prefix", "rechrome", "--port=13776", "--token", "t"]))
-    .toEqual([["setup", { profile: "18", token: "t", listen: "tailscale", prefix: "rechrome", port: 13776 }]]);
+    .toEqual([["setup", { profile: "18", token: "t", listen: "tailscale", prefix: "rechrome", port: 13776, yes: false }]]);
+  expect((await run(["setup", "--yes"]))[0][1]).toMatchObject({ yes: true });
+  expect((await run(["setup", "-y"]))[0][1]).toMatchObject({ yes: true });
 });
 
 test("setup falls back to RECH_TOKEN and rejects a flag without a value or an unknown flag", async () => {

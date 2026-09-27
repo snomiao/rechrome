@@ -12,7 +12,7 @@ import { join, basename, dirname } from "path";
 import { pathToFileURL } from "url";
 import { spawn as cpSpawn } from "child_process";
 import { readFile, writeFile, rename, chmod, mkdir } from "node:fs/promises";
-import { pickDaemonManager, type DaemonManager } from "./daemon-manager.ts";
+import { oxmgrInstallCommand, pickDaemonManager, type DaemonManager } from "./daemon-manager.ts";
 
 export const ENV_KEY = "RECHROME_URL";
 export const DEFAULT_PORT = 13775;
@@ -391,17 +391,19 @@ export function listenUrl(rawUrl: string, address: string): string {
   return url.toString();
 }
 
-export async function getOrCreateUrl(): Promise<string> {
+export async function getOrCreateUrl(persist = true): Promise<string> {
   // Treat a URL without a bearer key as missing — it cannot authenticate
   try { if (process.env[ENV_KEY] && parseUrl(process.env[ENV_KEY]!).key) return process.env[ENV_KEY]!; } catch {}
   const key = randomBytes(12).toString("base64url"); // 16 chars
   const url = `http://${key}@127.0.0.1:${DEFAULT_PORT}`;
-  const newLine = `${ENV_KEY}=${url}`;
-  // Write to ~/.env.local so it's not shadowed by project .env.local
-  const envRaw = await file(globalEnvFile).text().catch(() => "");
-  const lines = envRaw.trimEnd().split("\n").filter(l => !l.startsWith(`${ENV_KEY}=`));
-  const content = [...lines, newLine, ""].join("\n");
-  Bun.write(globalEnvFile, content);
+  if (persist) {
+    const newLine = `${ENV_KEY}=${url}`;
+    // Write to ~/.env.local so it's not shadowed by project .env.local
+    const envRaw = await file(globalEnvFile).text().catch(() => "");
+    const lines = envRaw.trimEnd().split("\n").filter(l => !l.startsWith(`${ENV_KEY}=`));
+    const content = [...lines, newLine, ""].join("\n");
+    await Bun.write(globalEnvFile, content);
+  }
   process.env[ENV_KEY] = url;
   return url;
 }
@@ -1348,7 +1350,42 @@ export function resolvePlaywrightCli(): string {
   return "playwright-cli-multi-tab";
 }
 
+/**
+ * Make sure a daemon process manager is available, offering to install oxmgr
+ * (default No; --yes approves). An explicit RECH_DAEMON_MANAGER=pm2 is respected,
+ * since installing oxmgr would not satisfy it.
+ */
+async function ensureDaemonManager(ask: (q: string, def?: string) => Promise<string>, yes = false): Promise<void> {
+  try {
+    daemonManager();
+    return;
+  } catch (error) {
+    if (process.env.RECH_DAEMON_MANAGER?.toLowerCase() === "pm2") throw error;
+  }
+  const command = oxmgrInstallCommand(process.env);
+  const answer = yes ? "yes" : (await ask(`      oxmgr is missing. Install globally with \`${command.join(" ")}\`? [y/N]: `)).trim();
+  if (!/^(y|yes)$/i.test(answer)) {
+    throw new Error(`Setup cancelled. To install oxmgr, run \`${command.join(" ")}\`, then rerun setup.`);
+  }
+  console.log(`      Installing oxmgr: ${command.join(" ")}`);
+  const installer = Bun.which(command[0]) ?? (command[0] === "bun" ? process.execPath : null);
+  if (!installer) throw new Error(`${command[0]} is not on PATH. Install it or run \`${command.join(" ")}\` in your terminal, then rerun setup.`);
+  const proc = Bun.spawn([installer, ...command.slice(1)], {
+    stdin: "inherit", stdout: "inherit", stderr: "inherit", windowsHide: true,
+  });
+  const code = await proc.exited;
+  if (code !== 0) throw new Error(`\`${command.join(" ")}\` failed (exit code ${code}). Resolve the installation error, then rerun setup.`);
+  if (!Bun.which("oxmgr")) {
+    throw new Error("oxmgr was installed but is not on PATH. Add the package manager's global bin directory to PATH, then rerun setup.");
+  }
+  _daemonMgr = undefined;
+  _oxmgrVersion = undefined;
+  daemonManager();
+}
+
 export async function daemonInstall(serveUrl: string): Promise<void> {
+  // Resolve the manager first so a missing dependency fails before config is mutated.
+  const mgr = daemonManager();
   // Persist the URL for future clients without an explicit environment override.
   // The daemon's explicit environment takes precedence over this saved default.
   const envRaw = await file(globalEnvFile).text().catch(() => "");
@@ -1379,8 +1416,6 @@ export async function daemonInstall(serveUrl: string): Promise<void> {
   if (process.env.RECH_HOST) daemonEnv.RECH_HOST = process.env.RECH_HOST;
   if (isReadable(process.env.RECH_TLS_CERT)) daemonEnv.RECH_TLS_CERT = process.env.RECH_TLS_CERT!;
   if (isReadable(process.env.RECH_TLS_KEY)) daemonEnv.RECH_TLS_KEY = process.env.RECH_TLS_KEY!;
-
-  const mgr = daemonManager();
 
   // Drop any prior registration (current + legacy names) before re-adding.
   for (const name of [PM_PROCESS_NAME, ...LEGACY_PROCESS_NAMES]) await runPm(mgr, ["delete", name]);
@@ -1816,7 +1851,7 @@ export function setupAgentGuidance(agent: "Codex" | "Claude Code", platform = pr
   ].join("\n");
 }
 
-async function setup(opts: { profile?: string; token?: string; listen?: string; prefix?: string; port?: number } = {}): Promise<void> {
+async function setup(opts: SetupOptions = {}): Promise<void> {
   const prefix = normalizePrefix(opts.prefix);
   if (opts.port !== undefined && (!Number.isInteger(opts.port) || opts.port < 1 || opts.port > 65535)) throw new Error("--port must be between 1 and 65535");
   const agent = detectSetupAgent();
@@ -1856,7 +1891,8 @@ async function setup(opts: { profile?: string; token?: string; listen?: string; 
   console.log("\n○ [1/5] Detecting networks and configuring the daemon...");
   const listenChoices = await detectListenChoices();
 
-  const currentUrl = await getOrCreateUrl();
+  // Defer persistence until daemon prerequisites have passed; daemonInstall saves the URL.
+  const currentUrl = await getOrCreateUrl(false);
   const previous = parseUrl(currentUrl);
   let config = await readListeners();
   if (!config) {
@@ -1893,6 +1929,14 @@ async function setup(opts: { profile?: string; token?: string; listen?: string; 
   if (!await pingManagement()) {
     // A one-time source upgrade restarts only the daemon, never Chrome. Subsequent
     // listener changes are reloaded in place by the running daemon.
+    try {
+      await ensureDaemonManager(ask, opts.yes);
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      rl?.close();
+      envWatcher?.close();
+      process.exit(1);
+    }
     process.env.RECH_HOST = management.host;
     await daemonInstall(url);
     let ready = false;
@@ -2236,10 +2280,12 @@ Usage:
                                must already be registered (see \`rech setup\`). Place
                                --profile before the playwright subcommand. Requires
                                ${ENV_KEY}.
-  rech setup [--listen <local|lan|tailscale|IP>] [--profile <email|name|folder>] [--token <tok>] [--prefix <path>] [--port <port>]
+  rech setup [--listen <local|lan|tailscale|IP>] [--profile <email|name|folder>] [--token <tok>] [--prefix <path>] [--port <port>] [--yes]
                                First-time setup: daemon + Chrome extension + config
                                --prefix=rechrome mounts at /rechrome/ on a scoped listener.
                                Prefixed setup defaults to the management port + 1; override with --port.
+                               Offers to install missing oxmgr globally (y/N).
+                               --yes approves installation without prompting.
                                --profile selects the Chrome profile non-interactively.
                                Menu numbers are not accepted. Resolution order is exact
                                email (e.g. you@gmail.com), exact Chrome profile name,
@@ -2286,7 +2332,7 @@ Examples:
   rech screenshot`);
 }
 
-export type SetupOptions = { profile?: string; token?: string; listen?: string; prefix?: string; port?: number };
+export type SetupOptions = { profile?: string; token?: string; listen?: string; prefix?: string; port?: number; yes?: boolean };
 export type RechHandlers = {
   serve(): Promise<void> | void;
   status(): Promise<void>;
@@ -2338,8 +2384,9 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
       .option("token", { type: "string", requiresArg: true, describe: "Extension token (default: read from the profile, or RECH_TOKEN)" })
       .option("listen", { type: "string", requiresArg: true, describe: "local | lan | tailscale | <detected IP>" })
       .option("prefix", { type: "string", requiresArg: true, describe: "URL path prefix for a scoped listener, e.g. rechrome" })
-      .option("port", portOption),
-      a => handlers.setup({ profile: a.profile, token: a.token ?? process.env.RECH_TOKEN, listen: a.listen, prefix: a.prefix, port: a.port }))
+      .option("port", portOption)
+      .option("yes", { alias: "y", type: "boolean", default: false, describe: "Approve installing a missing oxmgr without prompting" }),
+      a => handlers.setup({ profile: a.profile, token: a.token ?? process.env.RECH_TOKEN, listen: a.listen, prefix: a.prefix, port: a.port, yes: a.yes }))
     .command("tray [action]", "Show or hide the tray icon", y => y
       .positional("action", { type: "string", choices: ["show", "start", "hide", "stop", "quit"] }),
       a => handlers.tray(a.action))
