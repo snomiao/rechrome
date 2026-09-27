@@ -1007,7 +1007,8 @@ function moveToTrash(dir: string): string | null {
   const override = process.env.RECH_TRASH_DIR;
   if (override) {
     mkdirSync(override, { recursive: true });
-    const dest = join(override, basename(dir));
+    let dest = join(override, basename(dir));
+    if (existsSync(dest)) dest = `${dest} ${new Date().toISOString().replace(/[:.]/g, "-")}`;
     renameSync(dir, dest);
     return dest;
   }
@@ -1030,7 +1031,7 @@ function moveToTrash(dir: string): string | null {
     ].join("\n");
     const r = Bun.spawnSync(["powershell", "-NoProfile", "-NonInteractive", "-Command",
       "Add-Type -TypeDefinition $env:RECH_RECYCLE_SOURCE; exit [RechRecycle]::Recycle($env:RECH_RECYCLE_PATH)"],
-      { env: { ...process.env, RECH_RECYCLE_SOURCE: source, RECH_RECYCLE_PATH: dir }, windowsHide: true });
+      { env: { ...process.env, RECH_RECYCLE_SOURCE: source, RECH_RECYCLE_PATH: dir.replaceAll("/", "\\").replace(/\\+$/, "") }, windowsHide: true }); // SHFileOperation rejects `/` and a trailing `\`
     return r.exitCode === 0 && !existsSync(dir) ? "the Recycle Bin" : null;
   }
   const trash = process.platform === "darwin" ? join(HOME, ".Trash") : process.platform === "linux" ? join(HOME, ".local", "share", "Trash", "files") : null;
@@ -1096,7 +1097,7 @@ async function removeProfile(selector: string, opts: { yes?: boolean; close?: bo
   }
   let moved: string | null = null;
   if (plan.dataDir && existsSync(plan.dataDir)) moved = moveToTrash(plan.dataDir);
-  console.log(`Removed "${key}".${moved ? ` Its data folder was moved to ${moved}.` :plan.dataDir ? ` Its data folder was left at ${plan.dataDir}; delete it yourself if you like.` : ""}`);
+  console.log(`Removed "${key}".${moved ? ` Its data folder was moved to ${moved}.` : plan.dataDir ? ` Its data folder was left at ${plan.dataDir}; delete it yourself if you like.` : ""}`);
 }
 
 /** On a client of a remote host, `rech profile` lists what that host's link shares. */
