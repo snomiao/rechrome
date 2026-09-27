@@ -34,7 +34,7 @@ predictability contract: a human can tell which browser they're driving from whe
 
 The `rech serve` daemon is **local** — sessions never cross machines, so a machine-independent/branch key
 buys nothing functional; the path key is strictly better. A `serve` change needs `oxmgr restart
-rechrome-serve` to take effect (see the build/verify section below).
+rechrome` to take effect (see the build/verify section below).
 
 ## Never modify node_modules
 
@@ -116,7 +116,7 @@ Hard-won notes — a source edit not taking effect at runtime is almost always o
 - **The connect flow has two paths: token-bypass and Allow-click.** The daemon uses **token-bypass**
   (auto-connect, no UI click). A test that only drives the Allow-click path (`clickAllowAndSelect`)
   misses bypass-only bugs — cover token-bypass explicitly.
-- **A daemon (`serve`) change needs the daemon restarted** (`oxmgr restart rechrome-serve`) to take
+- **A daemon (`serve`) change needs the daemon restarted** (`oxmgr restart rechrome`) to take
   effect; the daemon runs the `serve` source directly (no build step). Restarting it does not touch
   Chrome or live browser sessions.
 
