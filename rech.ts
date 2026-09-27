@@ -156,6 +156,10 @@ export function log(msg: string) {
   appendFileSync(logFile, line);
 }
 
+export function isLoopbackHost(host: string): boolean {
+  return /^(localhost|127\.\d+\.\d+\.\d+|\[?::1\]?)$/i.test(host);
+}
+
 export function parseUrl(raw: string) {
   const u = new URL(raw);
   const scheme = u.protocol.replace(":", "");
@@ -1788,18 +1792,28 @@ async function status(): Promise<void> {
         signal: AbortSignal.timeout(2000),
       }).then(r => (r.ok ? r.json() : null)).catch(() => null) as { bind?: string; degraded?: boolean; consecutiveTimeouts?: number } | null
     : null;
-  const bind = pingBody?.bind;
-  const listenAddr = bind ? `${bind}:${port}` : `${host}:${port}`;
-  console.log(`serve:    ${ping ? `running  ${protocol}://${listenAddr}` : "not running"}`);
-  // daemonManager().id — there is no PM_BIN constant. Referencing one threw a
-  // ReferenceError that took down the whole of `rech status`, so the one command
-  // that reports "the relay is wedged" died exactly when the relay was wedged,
-  // printing a stack trace instead of the restart hint.
-  if (pingBody?.degraded)
-    console.log(`relay:    ⚠ degraded (${pingBody.consecutiveTimeouts} consecutive command timeouts) — if it persists, the daemon self-restarts; force it now with \`${daemonManager().id} restart ${PM_PROCESS_NAME}\``);
-  const pmOut = await pmList();
-  const daemonRegistered = pmOut.includes(PM_PROCESS_NAME);
-  console.log(`daemon:   ${daemonRegistered ? `${daemonManager().id} (${PM_PROCESS_NAME})` : "not installed"}`);
+  // A remote URL (e.g. a tailscale serve proxy to another machine) is managed over there: the
+  // daemon's reported bind is on *that* host, and this machine may have no process manager at all.
+  if (!isLoopbackHost(host)) {
+    console.log(`serve:    ${ping?.ok ? "running" : "not reachable"}  ${base} (remote)`);
+    if (pingBody?.degraded)
+      console.log(`relay:    ⚠ degraded (${pingBody.consecutiveTimeouts} consecutive command timeouts) — the remote daemon self-restarts if it persists`);
+  } else {
+    const bind = pingBody?.bind;
+    const listenAddr = bind ? `${bind}:${port}` : `${host}:${port}`;
+    console.log(`serve:    ${ping ? `running  ${protocol}://${listenAddr}` : "not running"}`);
+    // No oxmgr/pm2 on PATH must not take down `rech status` — report it instead.
+    let mgr: DaemonManager | undefined;
+    try { mgr = daemonManager(); } catch {}
+    // daemonManager().id — there is no PM_BIN constant. Referencing one threw a
+    // ReferenceError that took down the whole of `rech status`, so the one command
+    // that reports "the relay is wedged" died exactly when the relay was wedged,
+    // printing a stack trace instead of the restart hint.
+    if (pingBody?.degraded)
+      console.log(`relay:    ⚠ degraded (${pingBody.consecutiveTimeouts} consecutive command timeouts) — if it persists, the daemon self-restarts; force it now with \`${mgr?.id ?? "oxmgr"} restart ${PM_PROCESS_NAME}\``);
+    const daemonRegistered = mgr ? (await pmList(mgr)).includes(PM_PROCESS_NAME) : false;
+    console.log(`daemon:   ${daemonRegistered ? `${mgr!.id} (${PM_PROCESS_NAME})` : mgr ? "not installed" : "not installed (no oxmgr or pm2 on PATH)"}`);
+  }
   const registry = await readTokenRegistry();
   const entries = Object.entries(registry);
   if (entries.length) {

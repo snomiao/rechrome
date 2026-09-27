@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { parseUrl, authCheck, DEFAULT_PORT, ENV_KEY, deriveIdentity, normalizeRemote, normalizeCommandArgs, withDefaultScheme, resolveChromeProfileSelector, resolveGlobalProfile, extractGlobalProfileArg } from "./rech.ts";
+import { parseUrl, authCheck, DEFAULT_PORT, ENV_KEY, deriveIdentity, normalizeRemote, normalizeCommandArgs, withDefaultScheme, isLoopbackHost, resolveChromeProfileSelector, resolveGlobalProfile, extractGlobalProfileArg } from "./rech.ts";
 import { isUnderDir, splitCommand, shortClientLabel, isIsoSession } from "./serve.ts";
 
 describe("parseUrl", () => {
@@ -52,6 +52,13 @@ describe("parseUrl", () => {
 
   test("userinfo key wins over #key=", () => {
     expect(parseUrl("https://USER@host/#key=HASH").key).toBe("USER");
+  });
+});
+
+describe("isLoopbackHost", () => {
+  test("recognizes loopback hosts only", () => {
+    for (const h of ["localhost", "127.0.0.1", "127.1.2.3", "[::1]"]) expect(isLoopbackHost(h)).toBe(true);
+    for (const h of ["sym003.goby-symmetric.ts.net", "0.0.0.0", "192.168.1.2", "localhost.example.com"]) expect(isLoopbackHost(h)).toBe(false);
   });
 });
 
