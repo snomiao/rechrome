@@ -106,6 +106,11 @@ rech open https://example.com
 `.rechrome/.env.local`. Remote listeners allow navigation, tabs, snapshots, screenshots and basic
 interactions, but not `eval`/`run-code` or filesystem commands (see [Remote access](#remote-access)).
 
+**Share several profiles in one link.** `rech share work@example.com taku2 symval-dev` puts
+exactly those profiles on one listener (its own key; running it again reuses it). Add
+`--listener <name>` to use a listener that already has a proxy route. Its links then reach
+exactly this list, and `rech listener rotate-key <name>` issues a fresh key if old links shouldn't.
+
 **Share every profile at once.** `rech share --all` gives one link for all Chrome profiles
 registered on the host. It uses its own listener (`share-all`) and key, so one-profile links you
 already handed out never gain access to the others. It is a snapshot: after registering another
@@ -130,7 +135,14 @@ rech listener allow share teammate@example.com
 rech listener deny share teammate@example.com
 rech listener rotate-key share                # revoke: every URL for this listener stops working
 rech listener remove share
+rech profile rm old-test-profile              # unregister a profile everywhere (asks first)
 ```
+
+`rech profile rm <name>` shows its plan and asks before changing anything (`--yes` skips the
+question). It removes every alias of the profile from rech's registry and from every listener,
+dropping a listener left with no profiles. A managed test profile's own folder goes to the Trash,
+and its running window is closed only with your consent (`--close` when not in a terminal). A real
+Chrome profile's data is never touched: it is only unregistered from rech.
 
 Changes apply immediately; the daemon reloads its listeners without restarting Chrome.
 A link's key opens **every** profile its listener allows (`?profile=` only picks the default),

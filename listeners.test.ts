@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { validateListeners, authorizeProfileRequest, canReadProfileFile, profileOutputPrefix, normalizePrefix, serviceUrl, allowProfiles, denyProfiles, rotateListenerKey, setPublicUrl, normalizePublicUrl, canonicalProfileKeys, resolveAllowedProfile, type Listener, type ListenerConfig } from "./listeners.ts";
+import { validateListeners, authorizeProfileRequest, canReadProfileFile, profileOutputPrefix, normalizePrefix, serviceUrl, allowProfiles, denyProfiles, rotateListenerKey, setPublicUrl, normalizePublicUrl, canonicalProfileKeys, resolveAllowedProfile, planProfileRemoval, type Listener, type ListenerConfig } from "./listeners.ts";
 
 test("normalizes prefixes and preserves them in credential-free API URLs", () => {
   for (const value of ["rechrome", "/rechrome", "/rechrome/"]) expect(normalizePrefix(value)).toBe("/rechrome/");
@@ -116,4 +116,26 @@ test("the host resolves what a client typed among the link's profiles only", () 
 test("a managed profile's folder name doesn't borrow a real Chrome profile's display name", () => {
   expect(() => resolveAllowedProfile("Person 1", ["qa-box"], registry, { Default: "Person 1" })).toThrow(/not shared/);
   expect(resolveAllowedProfile("Person 1", ["Default"], registry, { Default: "Person 1" })).toBe("Default");
+});
+
+test("profile rm plans every alias, listener edits (dropping emptied ones), and only a managed data folder", () => {
+  const reg = {
+    "Profile 5": { profileDir: "Profile 5" }, taku2: { profileDir: "Profile 5" },
+    "me@x.com": { profileDir: "Profile 2" },
+    qa: { profileDir: "qa", userDataDir: "/home/u/.rechrome/profiles/qa", loadExtension: "/ext" },
+    odd: { profileDir: "odd", userDataDir: "/elsewhere/odd", loadExtension: "/ext" },
+  };
+  const ls = [
+    { name: "local", host: "127.0.0.1", port: 1, key: "k".repeat(16), profiles: "*" as const },
+    { name: "team", host: "127.0.0.1", port: 2, key: "t".repeat(16), profiles: ["me@x.com", "Profile 5"] },
+    { name: "solo", host: "127.0.0.1", port: 3, key: "s".repeat(16), profiles: ["taku2"] },
+  ];
+  expect(planProfileRemoval("taku2", reg, ls, "/home/u/.rechrome/profiles")).toEqual({
+    keys: ["Profile 5", "taku2"],
+    listeners: [{ name: "team", remove: ["Profile 5"], drop: false }, { name: "solo", remove: ["taku2"], drop: true }],
+  });
+  expect(planProfileRemoval("qa", reg, ls, "/home/u/.rechrome/profiles/").dataDir).toBe("/home/u/.rechrome/profiles/qa");
+  expect(planProfileRemoval("odd", reg, ls, "/home/u/.rechrome/profiles").dataDir).toBeUndefined();   // outside rech's folder: never deleted
+  expect(planProfileRemoval("me@x.com", reg, ls, "/home/u/.rechrome/profiles").dataDir).toBeUndefined(); // real Chrome profile
+  expect(() => planProfileRemoval("nope", reg, ls, "/x")).toThrow(/not a registered profile/);
 });

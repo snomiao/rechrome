@@ -9,7 +9,7 @@ async function run(argv: string[]) {
   const record = (name: string) => async (...args: unknown[]) => { calls.push([name, ...args]); };
   const handlers = Object.fromEntries(["serve", "status", "listListeners", "addListener", "removeListener", "listProfiles",
     "printProfileUri", "setup", "tray", "provisionProfile", "uninstall",
-    "urlList", "connect", "listenerPort", "allowListener", "denyListener", "rotateKey", "setListener"].map(n => [n, record(n)])) as unknown as RechHandlers;
+    "urlList", "shareProfiles", "removeProfile", "connect", "listenerPort", "allowListener", "denyListener", "rotateKey", "setListener"].map(n => [n, record(n)])) as unknown as RechHandlers;
   await rechCli(argv, handlers).exitProcess(false).parseAsync();
   return calls;
 }
@@ -168,7 +168,7 @@ async function runRech(args: string[], env: Record<string, string | undefined>) 
 test("rech --help is generated from the command tree and needs no daemon", async () => {
   const { code, stdout, stderr } = await runRech(["--help"], { RECHROME_URL: "http://unused-key-0123456789@127.0.0.1:1" });
   expect(code).toBe(0);
-  for (const text of ["rech setup", "rech status", "rech share [profile]", "rech connect <url>", "rech listener", "Browser commands", "rech pw <args>", "RECHROME_URL"])
+  for (const text of ["rech setup", "rech status", "rech share [profiles..]", "rech connect <url>", "rech listener", "Browser commands", "rech pw <args>", "RECHROME_URL"])
     expect(stdout).toContain(text);
   expect(stderr).not.toContain("connecting to");
 });
@@ -291,4 +291,17 @@ test("promptChoice: number, Enter for the default, re-ask on nonsense, q or EOF 
   expect(retried.shown).toContain("Enter a number from 1 to 2.");
   expect((await answer("q\n")).value).toBeNull();
   expect((await answer("")).value).toBeNull();
+});
+
+test("share with several profiles makes one link for exactly those", async () => {
+  expect(await run(["share", "a@x", "b@x", "--listener", "team"])).toEqual([["shareProfiles", ["a@x", "b@x"], { listener: "team", local: undefined, save: undefined }]]);
+  expect(await run(["share", "a@x"])).toEqual([["printProfileUri", "a@x", undefined, { local: undefined, save: undefined }]]);
+  await expect(run(["share", "a@x", "b@x", "--all"])).rejects.toThrow(/not both/);
+});
+
+test("profile rm <name> removes a profile; flags pass through", async () => {
+  expect(await run(["profile", "rm", "qa"])).toEqual([["removeProfile", "qa", { yes: undefined, close: undefined }]]);
+  expect(await run(["profile", "remove", "qa", "--yes", "--close"])).toEqual([["removeProfile", "qa", { yes: true, close: true }]]);
+  await expect(run(["profile", "rm"])).rejects.toThrow(/rech profile rm <name>/);
+  await expect(run(["profile", "qa", "extra"])).rejects.toThrow(/rech profile rm/);
 });

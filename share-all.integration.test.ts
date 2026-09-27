@@ -101,6 +101,20 @@ test("share --all: one snapshot link, profiles picked on the host, never the man
     const again = await rech(["share", "--all"], hostEnv);
     expect(again.stderr).toContain("added newbie");
     expect(again.stdout.trim()).toBe(link);                             // same listener, same key
+
+    // A profile list: one link for exactly those, on its own listener; the same list reuses it.
+    const pair = await rech(["share", "qa-alias", "personal"], hostEnv);
+    expect(pair.code).toBe(0);
+    config = JSON.parse(await readFile(listenersPath, "utf8"));
+    const group = config.listeners.find((l: any) => l.name.startsWith("share-") && l.name !== "share-all");
+    expect([...group.profiles].sort()).toEqual(["personal", "qa"]);   // the alias became the canonical key
+    expect((await rech(["share", "personal", "qa"], hostEnv)).stdout.trim()).toBe(pair.stdout.trim());
+    // --listener sets an existing listener to exactly the list, and says old links now reach them.
+    const onto = await rech(["share", "qa", "personal", "--listener", "one"], hostEnv);
+    expect(onto.stderr).toContain("added personal");
+    expect(onto.stderr).toContain("now reach exactly these profiles");
+    config = JSON.parse(await readFile(listenersPath, "utf8"));
+    expect([...config.listeners.find((l: any) => l.name === "one").profiles].sort()).toEqual(["personal", "qa"]);
   } finally {
     daemon.kill();
     await daemon.exited;

@@ -1,10 +1,10 @@
 #!/usr/bin/env bun
-import { readListeners, writeListeners, listenerAddress, isLoopback, normalizePrefix, serviceUrl, allowProfiles, denyProfiles, rotateListenerKey, setPublicUrl, canonicalProfileKeys, type Listener } from "./listeners.ts";
+import { readListeners, writeListeners, listenerAddress, isLoopback, normalizePrefix, serviceUrl, allowProfiles, denyProfiles, rotateListenerKey, setPublicUrl, canonicalProfileKeys, planProfileRemoval, type Listener } from "./listeners.ts";
 
 import { file } from "bun";
 import yargs from "yargs";
 import { readExtensionTokenFromProfile } from "./extension-token.ts";
-import { randomBytes } from "crypto";
+import { createHash, randomBytes } from "crypto";
 import { mkdirSync, appendFileSync, existsSync, realpathSync, accessSync, cpSync, unlinkSync, readFileSync, readdirSync, renameSync, rmdirSync, constants as fsConstants } from "fs";
 import { hostname, homedir, networkInterfaces } from "os";
 import { isIPv4 } from "net";
@@ -893,6 +893,78 @@ export function buildProfileRows(cache: Record<string, ChromeProfileInfo> | null
   return rows;
 }
 
+/** PIDs of browser processes (not helpers) running on a Chrome user-data dir. POSIX only. */
+function browsersUsing(userDataDir: string): number[] {
+  if (process.platform === "win32") return [];
+  const ps = Bun.spawnSync(["ps", "ax", "-o", "pid=,command="]).stdout.toString();
+  return ps.split("\n").filter(line => line.includes(`--user-data-dir=${userDataDir}`) && !line.includes("--type="))
+    .map(line => Number(line.trim().split(/\s+/)[0])).filter(Boolean);
+}
+
+/** Move a folder to the user's Trash (recoverable). Returns where it went, or null if unsupported here. */
+function moveToTrash(dir: string): string | null {
+  const trash = process.platform === "darwin" ? join(HOME, ".Trash") : process.platform === "linux" ? join(HOME, ".local", "share", "Trash", "files") : null;
+  if (!trash) return null;
+  mkdirSync(trash, { recursive: true });
+  let dest = join(trash, basename(dir));
+  if (existsSync(dest)) dest = `${dest} ${new Date().toISOString().replace(/[:.]/g, "-")}`;
+  renameSync(dir, dest);
+  return dest;
+}
+
+/**
+ * `rech profile rm <name>`: unregister a profile everywhere (all its aliases, every listener
+ * allowlist, dropping listeners left empty) and move a managed test profile's own folder to the
+ * Trash. Real Chrome profile data is never touched. Shows the plan and asks first (--yes skips);
+ * a browser still running on a managed folder is closed only with consent (--close).
+ */
+async function removeProfile(selector: string, opts: { yes?: boolean; close?: boolean } = {}): Promise<void> {
+  const registry = await readTokenRegistry(), cache = await readChromeProfileCache();
+  const key = (await resolveGlobalProfile(registry, cache, selector)).email;
+  const config = await readListeners();
+  const plan = planProfileRemoval(key, registry, config?.listeners ?? [], join(RECH_DIR, "profiles"));
+  const running = plan.dataDir ? browsersUsing(plan.dataDir) : [];
+  console.log(`Remove profile "${key}"${plan.keys.length > 1 ? ` (registered as ${plan.keys.join(", ")})` : ""}:`);
+  for (const edit of plan.listeners) console.log(edit.drop ? `  - remove listener "${edit.name}" (it serves only this profile)` : `  - stop sharing it on listener "${edit.name}"`);
+  console.log(`  - unregister it from rech (~/.rechrome/profiles.yaml)`);
+  if (plan.dataDir) console.log(`  - move its data folder to the Trash: ${plan.dataDir}`);
+  else console.log(`  - its Chrome data is left alone (this only unregisters it from rech)`);
+  if (running.length) console.log(`  - close its browser window, which is running now (pid ${running.join(", ")})`);
+  const interactive = isInteractive();
+  if (!opts.yes) {
+    if (!interactive) throw new Error("Not removed. Re-run with --yes to confirm" + (running.length ? " and --close to close its running window." : "."));
+    const ok = await promptChoice("Go ahead?", [{ label: "No, keep it", value: false }, { label: "Yes, remove it", value: true }], 0);
+    if (!ok) throw new Error("Cancelled; nothing changed.");
+  }
+  if (running.length) {
+    // In a terminal, confirming the plan above (which lists closing it) is the consent; otherwise --close.
+    if (!interactive && !opts.close) throw new Error("Its window is running; re-run with --close to close it, or close it yourself first.");
+    for (const pid of running) process.kill(pid, "SIGTERM");
+    for (let i = 0; i < 40 && browsersUsing(plan.dataDir!).length; i++) await Bun.sleep(250);
+    if (browsersUsing(plan.dataDir!).length) throw new Error("Its window did not close; close it and run this again. Nothing else changed.");
+  }
+  if (config && plan.listeners.length) {
+    for (const edit of plan.listeners) {
+      if (edit.drop) config.listeners = config.listeners.filter(l => l.name !== edit.name);
+      else { const l = config.listeners.find(x => x.name === edit.name)!; l.profiles = (l.profiles as string[]).filter(p => !plan.keys.includes(p)); }
+    }
+    await writeListeners(config);
+  }
+  for (const k of plan.keys) delete registry[k];
+  await writeTokenRegistry(registry);
+  // The migrated profiles.json backup still holds tokens: drop the same keys there.
+  const legacy = join(RECH_DIR, "profiles.json");
+  if (existsSync(legacy)) {
+    try {
+      const old = JSON.parse(readFileSync(legacy, "utf8"));
+      if (plan.keys.some(k => k in old)) { for (const k of plan.keys) delete old[k]; await writeFile(legacy, JSON.stringify(old, null, 2) + "\n", { mode: 0o600 }); await chmod(legacy, 0o600); }
+    } catch { /* unreadable backup: leave it */ }
+  }
+  let moved: string | null = null;
+  if (plan.dataDir && existsSync(plan.dataDir)) moved = moveToTrash(plan.dataDir);
+  console.log(`Removed "${key}".${moved ? ` Its data folder is in the Trash: ${moved}` : plan.dataDir ? ` Its data folder was left at ${plan.dataDir}; delete it yourself if you like.` : ""}`);
+}
+
 /** On a client of a remote host, `rech profile` lists what that host's link shares. */
 async function listRemoteProfiles(url: string): Promise<void> {
   const response = await fetch(serviceUrl(url, "ping"), { headers: { Authorization: `Bearer ${parseUrl(url).key}` }, signal: AbortSignal.timeout(5000) })
@@ -1039,17 +1111,47 @@ function freeListenerPort(listeners: Listener[]): number {
  * already handed out never gain access to the other profiles.
  */
 async function shareAll(opts: { listener?: string; local?: boolean; save?: boolean }): Promise<void> {
-  const config = await requireListeners();
   const snapshot = canonicalProfileKeys(await readTokenRegistry());
   if (!snapshot.length) throw new Error("No registered profiles to share. Set one up first: rech setup");
-  const name = opts.listener ?? "share-all";
+  return shareSet(snapshot, { ...opts, defaultName: "share-all", prefix: "/rechrome-all/", again: "rech share --all" });
+}
+
+/** The registry key rech uses for a profile: one per Chrome profile, whatever alias it was named by. */
+function canonicalKeyFor(registry: Record<string, TokenEntry>, key: string): string {
+  const entry = registry[key];
+  return canonicalProfileKeys(registry).find(k => registry[k].profileDir === entry?.profileDir && (registry[k].userDataDir ?? "") === (entry?.userDataDir ?? "")) ?? key;
+}
+
+/**
+ * `rech share a b c`: one link for exactly these profiles, on one listener. With --listener it
+ * sets that listener's profiles to the list (e.g. one that already has a proxy route); otherwise
+ * it reuses a listener with exactly this set, or creates one with its own key.
+ */
+async function shareProfiles(selectors: string[], opts: { listener?: string; local?: boolean; save?: boolean }): Promise<void> {
+  const registry = await readTokenRegistry(), cache = await readChromeProfileCache();
+  const keys: string[] = [];
+  for (const selector of selectors) {
+    const key = canonicalKeyFor(registry, (await resolveGlobalProfile(registry, cache, selector)).email);
+    if (!keys.includes(key)) keys.push(key);
+  }
+  if (keys.length === 1) return printProfileUri(keys[0], opts.listener, opts);
+  const config = await requireListeners();
+  const same = config.listeners.find(l => l.profiles !== "*" && l.profiles.length === keys.length && keys.every(k => (l.profiles as string[]).includes(k)));
+  const id = createHash("sha256").update([...keys].sort().join("\0")).digest("hex").slice(0, 6);
+  return shareSet(keys, { ...opts, listener: opts.listener ?? same?.name, defaultName: `share-${id}`, prefix: `/rechrome-${id}/`, again: `rech share ${selectors.map(s => JSON.stringify(s)).join(" ")}` });
+}
+
+/** Put exactly `snapshot` on one scoped listener (created if missing) and print its link. */
+async function shareSet(snapshot: string[], opts: { listener?: string; local?: boolean; save?: boolean; defaultName: string; prefix: string; again: string }): Promise<void> {
+  const config = await requireListeners();
+  const name = opts.listener ?? opts.defaultName;
   let listener = config.listeners.find(l => l.name === name);
   if (listener?.profiles === "*")
-    throw new Error(`"${name}" is the local management listener; it is never shared. Omit --listener to use "share-all".`);
+    throw new Error(`"${name}" is the local management listener; it is never shared. Omit --listener, or name a scoped one.`);
   let changes = "";
   if (!listener) {
     if (opts.listener) throw new Error(`Unknown listener "${name}". See rech listener ls.`);
-    listener = { name, host: "127.0.0.1", port: freeListenerPort(config.listeners), prefix: "/rechrome-all/", key: randomBytes(24).toString("base64url"), profiles: snapshot };
+    listener = { name, host: "127.0.0.1", port: freeListenerPort(config.listeners), prefix: opts.prefix, key: randomBytes(24).toString("base64url"), profiles: snapshot };
     config.listeners.push(listener);
     changes = `created listener "${name}" on ${listenerAddress(listener)}${listener.prefix}`;
   } else {
@@ -1060,7 +1162,8 @@ async function shareAll(opts: { listener?: string; local?: boolean; save?: boole
   }
   await writeListeners(config);
   console.error(`[rech] sharing ${snapshot.length} profiles through "${name}" (${changes}): ${snapshot.join(", ")}`);
-  console.error(`[rech] this is a snapshot: after registering another profile, run rech share --all again.`);
+  if (opts.defaultName === "share-all") console.error(`[rech] this is a snapshot: after registering another profile, run ${opts.again} again.`);
+  else if (changes !== "no changes" && !changes.startsWith("created")) console.error(`[rech] links already given out for "${name}" now reach exactly these profiles too (same key). For a fresh key: rech listener rotate-key ${name}`);
   // The daemon reloads listeners.json about every second: confirm this listener answers before handing out its URL.
   const local = `http://${listener.key}@${listenerAddress(listener)}${normalizePrefix(listener.prefix)}`;
   let ready = false;
@@ -1070,7 +1173,7 @@ async function shareAll(opts: { listener?: string; local?: boolean; save?: boole
   }
   if (!ready) console.error(`[rech] warning: listener "${name}" is not answering yet; check the daemon with rech status.`);
   const uri = listener.publicUrl && !opts.local ? rebaseConnectionUrl(listener.publicUrl, local) : registeredProfileUrl(local);
-  if (!listener.publicUrl) for (const line of listenerNextSteps(listener, undefined, "rech share --all")) console.error(line);
+  if (!listener.publicUrl) for (const line of listenerNextSteps(listener, undefined, opts.again)) console.error(line);
   console.log(uri);
   console.error(`[rech] on the other machine: rech connect '<url>', then rech --profile <name> open https://example.com`);
   if (opts.save) console.error(`Saved RECHROME_URL to ${await saveProjectUrl(uri)}`);
@@ -2845,8 +2948,10 @@ export type RechHandlers = {
   addListener(name: string, opts: { listen: string; profile: string[]; port?: number; prefix?: string }): Promise<void>;
   removeListener(name: string): Promise<void>;
   listProfiles(): Promise<void>;
+  removeProfile(selector: string, opts: { yes?: boolean; close?: boolean }): Promise<void>;
   printProfileUri(selector?: string, listener?: string, opts?: { local?: boolean; save?: boolean; all?: boolean }): Promise<void>;
   urlList(): Promise<void>;
+  shareProfiles(selectors: string[], opts: { listener?: string; local?: boolean; save?: boolean }): Promise<void>;
   connect(url: string): Promise<void>;
   listenerPort(name?: string): Promise<void>;
   allowListener(name: string, profiles: string[]): Promise<void>;
@@ -2909,25 +3014,39 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
       .option("yes", { alias: "y", type: "boolean", default: false, describe: "Approve installing a missing oxmgr without prompting" }),
       a => handlers.setup({ profile: a.profile, token: a.token ?? process.env.RECH_TOKEN, listen: a.listen, prefix: a.prefix, port: a.port, yes: a.yes }))
     .command("status", "Is it working? The URL in use, the daemon, and the current profile", {}, () => handlers.status())
-    .command(["profile [name]", "profiles [name]"], "List Chrome profiles and whether each is connected", y => y
-      .positional("name", { type: "string", describe: "ls/list lists all (the default)" })
+    .command(["profile [name] [target]", "profiles [name] [target]"], "List Chrome profiles; `profile rm <name>` removes one from rech", y => y
+      .positional("name", { type: "string", describe: "ls/list lists all (the default); rm/remove <name> removes a profile" })
+      .positional("target", { type: "string", describe: "The profile to remove (with rm)" })
+      .option("yes", { alias: "y", type: "boolean", describe: "With rm: don't ask for confirmation" })
+      .option("close", { type: "boolean", describe: "With rm: close the profile's running window (managed profiles)" })
       .option("print-uri", { type: "boolean", describe: "Same as `rech share <name>`" })
       .option("listener", { type: "string", requiresArg: true, implies: "print-uri", describe: "Listener to build the URL for" }),
       a => {
+        if (a.name === "rm" || a.name === "remove") {
+          if (!a.target) throw new Error("Which profile? rech profile rm <name>   (see rech profile)");
+          return handlers.removeProfile(a.target, { yes: a.yes, close: a.close });
+        }
+        if (a.target) throw new Error(`Unexpected "${a.target}". To remove a profile: rech profile rm <name>`);
         if (a.printUri) return handlers.printProfileUri(a.name, a.listener); // alias of `rech share`
         if (a.name === undefined || ["ls", "list"].includes(a.name)) return handlers.listProfiles();
         throw new Error(`To share "${a.name}" with another machine: rech share ${JSON.stringify(a.name)}. To list profiles: rech profile`);
       })
     // Share with and connect from other machines
-    .command("share [profile]", "Print a URL another machine can connect with (secret); `share ls` lists all", y => y
-      .positional("profile", { type: "string", describe: "Profile: email, name, folder, or a unique part of one; ls/list lists everything shared" })
+    .command("share [profiles..]", "Print a URL another machine can connect with (secret); `share ls` lists all", y => y
+      .positional("profiles", { type: "string", array: true, describe: "Profile(s): email, name, folder, or a unique part of one. Several = one link for all of them. ls/list lists everything shared" })
       .option("listener", { type: "string", requiresArg: true, describe: "Listener to share through (default: the one that allows the profile)" })
       .option("local", { type: "boolean", describe: "Print the direct listener address even when a public URL is set" })
       .option("save", { type: "boolean", describe: "Also save it as RECHROME_URL in this project's .rechrome/.env.local" })
       .option("all", { type: "boolean", describe: "One link for every registered profile (a snapshot, on its own listener); the other machine picks with --profile" }),
-      a => ["ls", "list"].includes(a.profile ?? "") && !a.listener && !a.save && !a.all
-        ? handlers.urlList()
-        : handlers.printProfileUri(a.profile, a.listener, a.all ? { local: a.local, save: a.save, all: true } : { local: a.local, save: a.save }))
+      a => {
+        const profiles = (a.profiles ?? []) as string[];
+        if (profiles.length === 1 && ["ls", "list"].includes(profiles[0]) && !a.listener && !a.save && !a.all) return handlers.urlList();
+        if (profiles.length > 1) {
+          if (a.all) throw new Error("Pass profiles or --all, not both.");
+          return handlers.shareProfiles(profiles, { listener: a.listener, local: a.local, save: a.save });
+        }
+        return handlers.printProfileUri(profiles[0], a.listener, a.all ? { local: a.local, save: a.save, all: true } : { local: a.local, save: a.save });
+      })
     .command("connect <url>", "Use a URL from another machine in this project (checks it first)", y => y
       .positional("url", { type: "string", demandOption: true, describe: "The URL printed by `rech share <profile>` on the machine with Chrome. Quote it: it contains #" })
       .example("rech connect 'https://host.example.ts.net/rechrome/?profile=you%40example.com#key=…'", ""),
@@ -2998,7 +3117,7 @@ if (import.meta.main) {
       const url = process.env[ENV_KEY];
       return url && !(await isLocalDaemon(url)) ? listRemoteProfiles(url) : listProfiles();
     },
-    urlList, connect, listenerPort, allowListener, denyListener, rotateKey, setListener,
+    urlList, shareProfiles, removeProfile, connect, listenerPort, allowListener, denyListener, rotateKey, setListener,
     setup: async (opts) => {
       await setup(opts); // setup closes envWatcher itself before printing Done
       // Auto-start the tray (best-effort, silent on headless / missing binary).
