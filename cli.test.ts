@@ -254,7 +254,7 @@ test("share picks the scoped listener that allows the profile, never the managem
   expect(chooseShareListener("a@x", [local, L("lan", ["a@x"]), L("proxy", ["a@x"], "https://h/")])).toBe("proxy");
   expect(() => chooseShareListener("a@x", [local, L("one", ["a@x"]), L("two", ["a@x"])])).toThrow(/several listeners \(one, two\)/);
   expect(() => chooseShareListener("a@x", [local, L("share", ["b@x"])])).toThrow(/rech listener allow share "a@x"/);
-  expect(() => chooseShareListener("a@x", [local])).toThrow(/rech listener add share/);
+  expect(() => chooseShareListener("a@x", [local])).toThrow(/Give it its own link:  rech share "a@x"/);
 });
 
 test("a loose profile match (email name, or 3+ char prefix) is accepted only when unique", () => {
