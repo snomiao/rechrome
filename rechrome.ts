@@ -2586,7 +2586,8 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
         ? handlers.urlList()
         : handlers.printProfileUri(a.profile, a.listener, { local: a.local, save: a.save }))
     .command("connect <url>", "Use a URL from another machine in this project (checks it first)", y => y
-      .positional("url", { type: "string", demandOption: true }),
+      .positional("url", { type: "string", demandOption: true, describe: "The URL printed by `rech url <profile>` on the machine with Chrome. Quote it: it contains #" })
+      .example("rech connect 'https://host.example.ts.net/rechrome/?profile=you%40example.com#key=…'", ""),
       a => handlers.connect(a.url))
     .command(["listener", "listeners"], "Control who can connect: listeners, allowed profiles, keys, public URLs", y => y
       .command(["ls", "list", "$0"], "List listeners (keys hidden)", {}, () => handlers.listListeners())
@@ -2630,8 +2631,16 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
     .demandCommand(1)
     .strict()
     .help()
+    .alias("help", "h")
     .version(false)
-    .fail((message, error) => { throw error ?? new Error(message); });
+    // A parse error (missing argument, unknown option…) shows that command's help above the
+    // error, so the fix is visible. Errors thrown by a command's own handler pass through.
+    .fail((message, error, y) => {
+      if (error) throw error;
+      // Straight to stderr: Bun's console.error would paint the whole help red.
+      y.showHelp((help: string) => process.stderr.write(`${help}\n\n`));
+      throw new Error(`rech: ${/^Not enough non-option arguments/.test(message) ? "missing a required argument; see the usage line above" : message}`);
+    });
 }
 
 if (import.meta.main) {

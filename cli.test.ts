@@ -190,3 +190,18 @@ test("a typo'd command through a daemon shows the rech hint, not playwright's us
     expect(stdout + stderr).not.toContain("Usage: playwright-cli");
   } finally { server.stop(true); }
 });
+
+test("-h shows a command's help, and a parse error shows it too, above the error", async () => {
+  const env = { RECHROME_URL: "http://unused-key-0123456789@127.0.0.1:1" };
+  const help = await runRech(["connect", "-h"], env);
+  expect(help.code).toBe(0);
+  expect(help.stdout).toContain("rech connect <url>");
+  expect(help.stdout).toContain("rech url <profile>");
+  const missing = await runRech(["connect"], env);
+  expect(missing.code).toBe(1);
+  expect(missing.stderr).toContain("rech connect <url>");
+  expect(missing.stderr.indexOf("rech connect <url>")).toBeLessThan(missing.stderr.lastIndexOf("rech:"));
+  const nested = await runRech(["listener", "allow", "share"], env);
+  expect(nested.code).toBe(1);
+  expect(nested.stderr).toContain("rech listener allow <name> <profiles..>");
+});
