@@ -2,7 +2,7 @@ import { test, expect } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { rechCli, listenerNextSteps, unknownCommandHint, notConnectedMessage, chooseShareListener, matchProfileLoosely, type RechHandlers } from "./rechrome.ts";
+import { rechCli, listenerNextSteps, unknownCommandHint, notConnectedMessage, chooseShareListener, matchProfileLoosely, promptChoice, type RechHandlers } from "./rechrome.ts";
 
 async function run(argv: string[]) {
   const calls: [string, ...unknown[]][] = [];
@@ -257,13 +257,38 @@ test("share picks the scoped listener that allows the profile, never the managem
   expect(() => chooseShareListener("a@x", [local])).toThrow(/rech listener add share/);
 });
 
-test("a loose profile match is accepted only when unique, strongest match first", () => {
+test("a loose profile match (email name, or 3+ char prefix) is accepted only when unique", () => {
   const c = (label: string, fields: string[], localPart?: string) => ({ id: label, label, fields, localPart });
   const all = [c("taku@corp.jp", ["taku@corp.jp", "corp.jp", "Profile 2"], "taku"), c("taku2", ["taku2", "Profile 5"]), c("taku3", ["taku3", "Profile 7"]), c("symval-dev", ["symval-dev", "SymVal Dev"])];
   expect(matchProfileLoosely("taku", all)?.label).toBe("taku@corp.jp");      // exact email name beats prefixes
   expect(matchProfileLoosely("symval", all)?.label).toBe("symval-dev");      // unique prefix
   expect(matchProfileLoosely("SymVal D", all)?.label).toBe("symval-dev");    // case-insensitive
-  expect(matchProfileLoosely("corp", all)?.label).toBe("taku@corp.jp");      // unique substring
+  expect(matchProfileLoosely("orp.jp", all)).toBeNull();                      // no substring matching
+  expect(matchProfileLoosely("corp", all)?.label).toBe("taku@corp.jp");      // a name prefix is fine
+  expect(matchProfileLoosely("h", all)).toBeNull();
+  expect(matchProfileLoosely("sy", all)).toBeNull();                          // prefixes need 3+ characters
   expect(() => matchProfileLoosely("tak", all)).toThrow(/several profiles: taku@corp.jp, taku2, taku3/);
   expect(matchProfileLoosely("nobody", all)).toBeNull();
+});
+
+async function answer(input: string, defaultIndex = 0) {
+  const { PassThrough } = await import("node:stream");
+  const io = { input: new PassThrough(), output: new PassThrough() };
+  let shown = "";
+  io.output.on("data", chunk => { shown += chunk; });
+  io.input.end(input);
+  const value = await promptChoice("Share which profile?", [{ label: "a@x", value: "a" }, { label: "b@x", value: "b" }], defaultIndex, io);
+  return { value, shown };
+}
+
+test("promptChoice: number, Enter for the default, re-ask on nonsense, q or EOF cancels", async () => {
+  expect((await answer("2\n")).value).toBe("b");
+  const byDefault = await answer("\n", 1);
+  expect(byDefault.value).toBe("b");
+  expect(byDefault.shown).toContain("2. b@x  (default)");
+  const retried = await answer("9\nx\n1\n");
+  expect(retried.value).toBe("a");
+  expect(retried.shown).toContain("Enter a number from 1 to 2.");
+  expect((await answer("q\n")).value).toBeNull();
+  expect((await answer("")).value).toBeNull();
 });

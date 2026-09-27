@@ -673,9 +673,20 @@ export function validateChromeProfileSelector(selector: string): void {
 
 export type ProfileCandidate = { id: string; label: string; fields: string[]; localPart?: string };
 
+/** Several profiles match; an interactive caller can offer them as a choice. */
+export class AmbiguousProfileError extends Error {
+  constructor(message: string, readonly candidates: ProfileCandidate[]) { super(message); }
+}
+
+/** share can't pick a listener on its own; an interactive caller can ask. */
+export class ShareListenerError extends Error {
+  constructor(message: string, readonly kind: "several" | "none", readonly listeners: Listener[]) { super(message); }
+}
+
 /**
  * Looser profile matching, tried after the exact rules: the email's part before "@", then the
- * start of an email/name/folder, then anywhere in one. Each stage counts only when it picks out
+ * start (3+ characters) of an email/name/folder. No substring matching: "h" must not pick a
+ * profile because its email happens to contain an h. Each stage counts only when it picks out
  * exactly one profile; if a stage matches several, stop and name them rather than guess.
  */
 export function matchProfileLoosely(value: string, candidates: ProfileCandidate[]): ProfileCandidate | null {
@@ -683,14 +694,13 @@ export function matchProfileLoosely(value: string, candidates: ProfileCandidate[
   if (!needle) return null;
   const stages: Array<[string, (c: ProfileCandidate) => boolean]> = [
     ["email name", c => c.localPart?.toLowerCase() === needle],
-    ["prefix", c => c.fields.some(f => f.toLowerCase().startsWith(needle))],
-    ["substring", c => c.fields.some(f => f.toLowerCase().includes(needle))],
+    ["prefix", c => needle.length >= 3 && c.fields.some(f => f.toLowerCase().startsWith(needle))],
   ];
   for (const [, test] of stages) {
     const hits = candidates.filter(test);
     if (hits.length === 1) return hits[0];
     if (hits.length > 1)
-      throw new Error(`Profile "${value}" matches several profiles: ${hits.map(c => c.label).join(", ")}. Use one of those, or see \`rech profile\`.`);
+      throw new AmbiguousProfileError(`Profile "${value}" matches several profiles: ${hits.map(c => c.label).join(", ")}. Use one of those, or see \`rech profile\`.`, hits);
   }
   return null;
 }
@@ -942,6 +952,48 @@ export function profileConnectionUri(profile: string, configuredUrl: string | un
   return result.toString();
 }
 
+/** Prompts only when a person is at the terminal; scripts and agents get errors, never a hang. */
+export const isInteractive = () => !!process.stdin.isTTY && !!process.stderr.isTTY;
+
+/**
+ * Numbered choice on `output` (stderr, so stdout stays clean for piping). Enter takes the
+ * default; q or end of input cancels (null). Invalid answers ask again.
+ */
+export async function promptChoice<T>(
+  question: string, options: { label: string; value: T }[], defaultIndex = 0,
+  io: { input: NodeJS.ReadableStream; output: NodeJS.WritableStream } = { input: process.stdin, output: process.stderr },
+): Promise<T | null> {
+  const { createInterface } = await import("readline");
+  const rl = createInterface({ input: io.input, output: io.output, terminal: false });
+  const lines = rl[Symbol.asyncIterator]();
+  try {
+    io.output.write(`${question}\n`);
+    options.forEach((o, i) => io.output.write(`  ${String(i + 1).padStart(2)}. ${o.label}${i === defaultIndex ? "  (default)" : ""}\n`));
+    while (true) {
+      io.output.write(`Choice [${defaultIndex + 1}, q to cancel]: `);
+      const next = await lines.next();
+      if (next.done) return null;
+      const answer = String(next.value).trim().toLowerCase();
+      if (answer === "q") return null;
+      if (answer === "") return options[defaultIndex]?.value ?? null;
+      const index = Number(answer) - 1;
+      if (Number.isInteger(index) && options[index]) return options[index].value;
+      io.output.write(`Enter a number from 1 to ${options.length}.\n`);
+    }
+  } finally { rl.close(); }
+}
+
+/** Registered profiles as choices, one per Chrome profile folder (the registry may alias one folder twice). */
+function registeredProfileChoices(registry: Record<string, TokenEntry>): { label: string; value: string }[] {
+  const byDir = new Map<string, string>();
+  for (const key of Object.keys(registry)) {
+    const dir = registry[key].profileDir;
+    const kept = byDir.get(dir);
+    if (!kept || (!kept.includes("@") && key.includes("@"))) byDir.set(dir, key);
+  }
+  return [...byDir.entries()].map(([dir, key]) => ({ label: key === dir ? key : `${key}  [${dir}]`, value: key }));
+}
+
 /**
  * Which listener `rech share <profile>` uses when none is named: a scoped one that allows the
  * profile, preferring one with a public URL. Never the management listener, whose key gives
@@ -953,26 +1005,74 @@ export function chooseShareListener(profile: string, listeners: Listener[]): str
   const pick = allowing.length === 1 ? allowing : allowing.filter(l => l.publicUrl);
   if (pick.length === 1) return pick[0].name;
   if (allowing.length > 1)
-    throw new Error(`"${profile}" is shared on several listeners (${allowing.map(l => l.name).join(", ")}). Pick one with --listener <name>.`);
-  throw new Error([
+    throw new ShareListenerError(`"${profile}" is shared on several listeners (${allowing.map(l => l.name).join(", ")}). Pick one with --listener <name>.`, "several", allowing);
+  throw new ShareListenerError([
     `"${profile}" isn't shared on any listener yet.`,
     scoped.length ? `  Allow it on one:  rech listener allow ${scoped[0].name} ${JSON.stringify(profile)}   (listeners: ${scoped.map(l => l.name).join(", ")})` : "",
     `  Or create one:    rech listener add share --listen local --prefix=rechrome --port 13776 --profile ${JSON.stringify(profile)}`,
-  ].filter(Boolean).join("\n"));
+  ].filter(Boolean).join("\n"), "none", scoped);
 }
 
 async function printProfileUri(selector?: string, listener?: string, opts: { local?: boolean; save?: boolean } = {}): Promise<void> {
   const url = process.env[ENV_KEY];
-  selector ??= url ? parseUrl(url).profileDirectory : undefined;
-  if (!selector) throw new Error("Specify a profile: rech share <profile>");
+  const interactive = isInteractive();
   const registry = await readTokenRegistry();
   const cache = await readChromeProfileCache();
+  const cancelled = () => new Error("Cancelled; nothing shared.");
+  const current = resolveEffectiveProfile(url ? parseUrl(url).profileDirectory : undefined);
+  const pickProfile = async (question: string, choices = registeredProfileChoices(registry)) => {
+    const def = Math.max(0, choices.findIndex(c => c.value === current || registry[c.value]?.profileDir === current));
+    return (await promptChoice(question, choices, def)) ?? (() => { throw cancelled(); })();
+  };
+  if (!selector) {
+    // No profile given: ask, defaulting to the current one (?profile= in the URL, else PLAYWRIGHT_MCP_PROFILE_DIRECTORY).
+    if (interactive && Object.keys(registry).length) selector = await pickProfile("Share which profile?");
+    else {
+      selector = current;
+      if (!selector) throw new Error("No current profile to share. Name one: rech share <profile>   (see rech profile; rech share ls lists what is shared)");
+      console.error(`[rech] sharing the current profile: ${selector}`);
+    }
+  }
   // A configured remote profile may not exist in this machine's local registry.
-  const profile = url && parseUrl(url).profileDirectory === selector && !listener
-    ? selector : (await resolveGlobalProfile(registry, cache, selector)).email;
-  const listeners = (await readListeners())?.listeners ?? [];
+  let profile: string;
+  if (url && parseUrl(url).profileDirectory === selector && !listener) profile = selector;
+  else {
+    try { profile = (await resolveGlobalProfile(registry, cache, selector)).email; }
+    catch (error) {
+      if (!interactive || !(error instanceof Error)) throw error;
+      if (error instanceof AmbiguousProfileError) {
+        const choice = await pickProfile(`"${selector}" matches several profiles. Which one?`,
+          error.candidates.map(c => ({ label: c.label, value: c.id.replace(/^(chrome|registry):/, "") })));
+        profile = (await resolveGlobalProfile(registry, cache, choice)).email;
+      } else if (/does not match/.test(error.message)) {
+        profile = (await resolveGlobalProfile(registry, cache, await pickProfile(`No profile matches "${selector}". Share which one?`))).email;
+      } else throw error;
+    }
+  }
+  const config = await readListeners();
+  const listeners = config?.listeners ?? [];
   // On a host, share through a scoped listener by default, never the management key.
-  if (!listener && listeners.length) listener = chooseShareListener(profile, listeners);
+  if (!listener && config) {
+    try { listener = chooseShareListener(profile, listeners); }
+    catch (error) {
+      if (!interactive || !(error instanceof ShareListenerError)) throw error;
+      const describe = (l: Listener) => `${l.name}  ${l.publicUrl ?? `${listenerAddress(l)}${normalizePrefix(l.prefix)}`}`;
+      if (error.kind === "several") {
+        listener = (await promptChoice(`"${profile}" is on several listeners. Share through which?`, error.listeners.map(l => ({ label: describe(l), value: l.name })))) ?? undefined;
+        if (!listener) throw cancelled();
+      } else {
+        if (!error.listeners.length) throw error; // nothing to allow it on: the error names `rech listener add`
+        // Allowing is a config change, so the default is to cancel.
+        const target = await promptChoice(`"${profile}" isn't shared on any listener yet. Allow it on:`,
+          [...error.listeners.map(l => ({ label: describe(l), value: l.name as string | null })), { label: "Cancel (change nothing)", value: null }], error.listeners.length);
+        if (!target) throw cancelled();
+        allowProfiles(config, target, [profile]);
+        await writeListeners(config);
+        console.error(`[rech] allowed "${profile}" on ${target}`);
+        listener = target;
+      }
+    }
+  }
   if (listeners.find(l => l.name === listener)?.profiles === "*")
     console.error(`[rech] "${listener}" is the local management listener: its key controls every profile. Don't share this URL.`);
   let uri = profileConnectionUri(profile, url, listeners, listener);
