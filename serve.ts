@@ -258,36 +258,48 @@ const escapeRegex = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"
 const OWN_CLI_DAEMON = import.meta.dir.split(/[\\/]/).map(escapeRegex).join(String.raw`[\\/]`) + String.raw`[\\/].*cliDaemon\.js`;
 const RECH_SERVE = String.raw`rech(rome)?(\.ts)?"?\s+serve`;
 const STALE_HOLDER_PATTERN = `${OWN_CLI_DAEMON}|${RECH_SERVE}`;
-async function freeStalePort(port: number): Promise<void> {
+async function freeStalePort(port: number, host: string): Promise<void> {
+  const me = process.pid;
+  const wildcard = host === "0.0.0.0" || host === "::";
   try {
     if (process.platform === "win32") {
-      // Two-phase, narrow-first: (1) kill the port's actual listed owner if it's a live
-      // rech serve / cliDaemon process — never an unrelated app that happens to hold the
-      // port; (2) only if the port is STILL held — the inherited-handle case, where the
-      // socket lives in a child while netstat attributes it to a now-dead owner — fall back
-      // to killing orphaned cliDaemon holders. The fallback is the only recovery for that
-      // case (the live holder can't be mapped from the port), but it runs only when the
-      // precise kill failed, so the broad sweep is a logged last resort, not the default.
+      // Only listeners that conflict with THIS bind: the same address, or a wildcard of its
+      // family (a wildcard bind conflicts with every address). Never this serve's own sockets,
+      // which may already hold other addresses on the same port from this startup.
+      const q = (text: string) => text.replaceAll("'", "''");
+      const addressFilter = host === "0.0.0.0" ? "$_.LocalAddress -notmatch ':'"
+        : host === "::" ? "$true"
+        : `$_.LocalAddress -in @('${q(host)}','${host.includes(":") ? "::" : "0.0.0.0"}')`;
+      // Two-phase, narrow-first: (1) kill each conflicting owner that is a live rech serve /
+      // cliDaemon process — never an unrelated app that happens to hold the port; (2) only if
+      // the address is STILL held by owners that are all dead — the inherited-handle case, where
+      // the socket lives in a child while netstat attributes it to a now-dead owner — fall back
+      // to killing orphaned cliDaemon holders. The fallback is the only recovery for that case
+      // (the live holder can't be mapped from the port), so it is a logged last resort.
       const ps = [
         "$ErrorActionPreference='SilentlyContinue';",
-        `$o=(Get-NetTCPConnection -LocalPort ${port} -State Listen).OwningProcess;`,
-        "$c=(Get-CimInstance Win32_Process -Filter \"ProcessId=$o\").CommandLine;",
-        `if($o -and $c -match '${STALE_HOLDER_PATTERN.replaceAll("'", "''")}'){ Stop-Process -Id $o -Force; Start-Sleep -Milliseconds 400 }`,
-        `elseif($o){ Write-Output (\"freeStalePort: port ${port} is held by an unrelated process ($o); not killing it\") };`,
-        // Phase 2 only for the leaked-handle case: the listed owner is dead, not a live other app.
-        `$o=(Get-NetTCPConnection -LocalPort ${port} -State Listen).OwningProcess;`,
-        "if($o -and -not (Get-Process -Id $o)){",
+        `function Holders { @(Get-NetTCPConnection -LocalPort ${port} -State Listen | Where-Object { ${addressFilter} } | Select-Object -ExpandProperty OwningProcess -Unique | Where-Object { $_ -ne ${me} }) };`,
+        "foreach($o in (Holders)){",
+        "  if(Get-Process -Id $o){",
+        "    $c=(Get-CimInstance Win32_Process -Filter \"ProcessId=$o\").CommandLine;",
+        `    if($c -match '${q(STALE_HOLDER_PATTERN)}'){ Write-Output (\"freeStalePort: killing stale rech holder $o of port ${port}\"); Stop-Process -Id $o -Force }`,
+        `    else { Write-Output (\"freeStalePort: port ${port} is held by an unrelated process ($o); not killing it\") }`,
+        "  }",
+        "};",
+        "Start-Sleep -Milliseconds 400;",
+        "$h=Holders; $alive=@($h | Where-Object { Get-Process -Id $_ });",
+        "if($h.Count -and -not $alive.Count){",
         // A cliDaemon's parent (playwright-cli) exits right after spawning it, so a live one
         // can't be told from an orphan by ancestry. They are only provably orphaned when no
         // other rech serve is running: exclude this serve and its own wrappers (oxmgr, cmd).
-        `  $self=@(); $x=${process.pid}; while($x){ $self+=$x; $x=(Get-CimInstance Win32_Process -Filter \"ProcessId=$x\").ParentProcessId; if($self -contains $x){ break } };`,
-        `  $live=@(Get-CimInstance Win32_Process | Where-Object { $self -notcontains $_.ProcessId -and $_.ProcessId -ne $PID -and $_.CommandLine -match '${RECH_SERVE.replaceAll("'", "''")}' });`,
+        `  $self=@(); $x=${me}; while($x){ $self+=$x; $x=(Get-CimInstance Win32_Process -Filter \"ProcessId=$x\").ParentProcessId; if($self -contains $x){ break } };`,
+        `  $live=@(Get-CimInstance Win32_Process | Where-Object { $self -notcontains $_.ProcessId -and $_.ProcessId -ne $PID -and $_.CommandLine -match '${q(RECH_SERVE)}' });`,
         "  if($live.Count){ Write-Output (\"freeStalePort: port still held, but another rech serve is running (\" + ($live.ProcessId -join ',') + \"); not sweeping cliDaemons\") }",
         "  else {",
         // Exclude this PowerShell itself: its own command line contains the pattern.
-        `    $h=Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -match '${OWN_CLI_DAEMON.replaceAll("'", "''")}' };`,
-        "    Write-Output (\"freeStalePort: port still held; killing orphaned cliDaemon holders: \" + ($h.ProcessId -join ','));",
-        "    $h | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }",
+        `    $d=Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -match '${q(OWN_CLI_DAEMON)}' };`,
+        "    Write-Output (\"freeStalePort: port still held; killing orphaned cliDaemon holders: \" + ($d.ProcessId -join ','));",
+        "    $d | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }",
         "  }",
         "}",
       ].join(" ");
@@ -295,8 +307,18 @@ async function freeStalePort(port: number): Promise<void> {
       const out = r.stdout?.toString().trim();
       if (out) log(out);
     } else {
-      // Same rule off Windows: only kill holders whose command line is a rech serve / cliDaemon.
-      const r = Bun.spawnSync(["sh", "-c", `for p in $(lsof -ti tcp:${port} -sTCP:LISTEN 2>/dev/null); do if ps -o command= -p "$p" | grep -Eq '${STALE_HOLDER_PATTERN.replaceAll("'", "'\\''")}'; then kill -9 "$p"; else echo "freeStalePort: port ${port} is held by an unrelated process ($p); not killing it"; fi; done`]);
+      // Same rule off Windows: only conflicting listeners (same address or wildcard), never this
+      // serve itself, and only holders whose command line is a rech serve / cliDaemon.
+      const want = wildcard ? "*" : host.includes(":") ? `[${host}]` : host;
+      const sq = (text: string) => text.replaceAll("'", "'\\''");
+      const script = [
+        `for p in $(lsof -nP -iTCP:${port} -sTCP:LISTEN -Fpn 2>/dev/null | awk -v want='${sq(want)}' '/^p/{p=substr($0,2)} /^n/{a=substr($0,2); sub(/:[0-9]+$/,"",a); if (want=="*" || a=="*" || a==want) print p}' | sort -u); do`,
+        `  [ "$p" = "${me}" ] && continue;`,
+        `  if ps -o command= -p "$p" | grep -Eq '${sq(STALE_HOLDER_PATTERN)}'; then kill -9 "$p";`,
+        `  else echo "freeStalePort: port ${port} is held by an unrelated process ($p); not killing it"; fi;`,
+        "done",
+      ].join(" ");
+      const r = Bun.spawnSync(["sh", "-c", script]);
       const out = r.stdout?.toString().trim();
       if (out) log(out);
     }
@@ -792,7 +814,7 @@ export async function serve() {
           return startServer(listener, true);
         }
         log(`port ${listener.port} in use — clearing stale daemon holders and retrying (attempt ${attempt}/${MAX_BIND_ATTEMPTS - 1})`);
-        await freeStalePort(listener.port);
+        await freeStalePort(listener.port, listener.host);
       }
     }
   };
