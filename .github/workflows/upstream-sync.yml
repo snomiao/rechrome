@@ -1,0 +1,32 @@
+name: Review official Playwright updates
+
+on:
+  schedule:
+    - cron: '23 2 * * 1' # Monday 11:23 JST
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: official-playwright-updates
+  cancel-in-progress: false
+
+jobs:
+  upstream-pr:
+    if: github.repository == 'snomiao/rechrome'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [playwright, playwright-cli]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Open or refresh upstream merge PR
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+          COMPONENT: ${{ matrix.component }}
+        run: bash scripts/upstream-sync.sh "$COMPONENT"
