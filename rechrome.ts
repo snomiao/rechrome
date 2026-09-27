@@ -905,9 +905,21 @@ export function buildProfileRows(cache: Record<string, ChromeProfileInfo> | null
   return rows;
 }
 
-/** PIDs of browser processes (not helpers) running on a Chrome user-data dir. POSIX only. */
+/** PIDs of browser processes (not helpers) running on a Chrome user-data dir. */
 function browsersUsing(userDataDir: string): number[] {
-  if (process.platform === "win32") return [];
+  if (process.platform === "win32") {
+    // Chrome quotes a path with spaces (--user-data-dir="C:\…"), and Windows paths are
+    // case-insensitive: compare without quotes, lowercased, and require the path to end there
+    // (so …\qa never matches …\qa2).
+    const out = Bun.spawnSync(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+      "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId)`t$($_.CommandLine)\" }"], { windowsHide: true }).stdout.toString();
+    const want = `--user-data-dir=${userDataDir}`.toLowerCase();
+    return out.split(/\r?\n/).map(line => {
+      const tab = line.indexOf("\t");
+      return { pid: Number(line.slice(0, tab)), command: ` ${line.slice(tab + 1).replaceAll('"', "").toLowerCase()} ` };
+    }).filter(p => p.pid && p.pid !== process.pid && p.command.includes(` ${want} `) && !p.command.includes("--type="))
+      .map(p => p.pid);
+  }
   const ps = Bun.spawnSync(["ps", "ax", "-o", "pid=,command="]).stdout.toString();
   return ps.split("\n").filter(line => line.includes(`--user-data-dir=${userDataDir}`) && !line.includes("--type="))
     .map(line => Number(line.trim().split(/\s+/)[0])).filter(Boolean);
@@ -915,6 +927,36 @@ function browsersUsing(userDataDir: string): number[] {
 
 /** Move a folder to the user's Trash (recoverable). Returns where it went, or null if unsupported here. */
 function moveToTrash(dir: string): string | null {
+  // An explicit trash folder (tests use it to keep the real Trash / Recycle Bin clean).
+  const override = process.env.RECH_TRASH_DIR;
+  if (override) {
+    mkdirSync(override, { recursive: true });
+    const dest = join(override, basename(dir));
+    renameSync(dir, dest);
+    return dest;
+  }
+  if (process.platform === "win32") {
+    // SHFileOperation with ALLOWUNDO sends it to the Recycle Bin, with no prompts or progress UI.
+    // WANTNUKEWARNING makes Windows ask rather than silently delete for good when the item
+    // cannot be recycled. (.NET's FileSystem.DeleteDirectory(..., SendToRecycleBin) deleted
+    // permanently here.) The path goes through the environment so quoting can't break it.
+    const source = [
+      "using System; using System.Runtime.InteropServices;",
+      "public static class RechRecycle {",
+      "  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]",
+      "  struct Op { public IntPtr hwnd; public uint wFunc; public string pFrom; public string pTo; public ushort fFlags; public bool aborted; public IntPtr mappings; public string title; }",
+      "  [DllImport(\"shell32.dll\", CharSet = CharSet.Unicode)] static extern int SHFileOperation(ref Op op);",
+      "  public static int Recycle(string path) {",
+      "    var op = new Op { wFunc = 3, pFrom = path + \"\\0\\0\", fFlags = 0x0040 | 0x0010 | 0x0004 | 0x0400 | 0x4000 };",
+      "    int r = SHFileOperation(ref op); return op.aborted ? -1 : r;",
+      "  }",
+      "}",
+    ].join("\n");
+    const r = Bun.spawnSync(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+      "Add-Type -TypeDefinition $env:RECH_RECYCLE_SOURCE; exit [RechRecycle]::Recycle($env:RECH_RECYCLE_PATH)"],
+      { env: { ...process.env, RECH_RECYCLE_SOURCE: source, RECH_RECYCLE_PATH: dir }, windowsHide: true });
+    return r.exitCode === 0 && !existsSync(dir) ? "the Recycle Bin" : null;
+  }
   const trash = process.platform === "darwin" ? join(HOME, ".Trash") : process.platform === "linux" ? join(HOME, ".local", "share", "Trash", "files") : null;
   if (!trash) return null;
   mkdirSync(trash, { recursive: true });
@@ -974,7 +1016,7 @@ async function removeProfile(selector: string, opts: { yes?: boolean; close?: bo
   }
   let moved: string | null = null;
   if (plan.dataDir && existsSync(plan.dataDir)) moved = moveToTrash(plan.dataDir);
-  console.log(`Removed "${key}".${moved ? ` Its data folder is in the Trash: ${moved}` : plan.dataDir ? ` Its data folder was left at ${plan.dataDir}; delete it yourself if you like.` : ""}`);
+  console.log(`Removed "${key}".${moved ? ` Its data folder was moved to ${moved}.` :plan.dataDir ? ` Its data folder was left at ${plan.dataDir}; delete it yourself if you like.` : ""}`);
 }
 
 /** On a client of a remote host, `rech profile` lists what that host's link shares. */

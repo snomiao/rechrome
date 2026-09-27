@@ -21,7 +21,9 @@ test("profile rm: plan first, consent for a running window, then unregister ever
     { name: "solo", host: "127.0.0.1", port: 13790, key: "s".repeat(24), profiles: ["qa-alias"] },
     { name: "team", host: "127.0.0.1", port: 13791, key: "t".repeat(24), profiles: ["qa", "me@x.com"] },
   ] }));
-  const env = { ...Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith("PLAYWRIGHT_MCP_") && k !== "RECHROME_URL")), HOME: home, USERPROFILE: home };
+  const env = { ...Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith("PLAYWRIGHT_MCP_") && k !== "RECHROME_URL")), HOME: home, USERPROFILE: home,
+    // Windows has no per-HOME Trash: keep test runs out of the real Recycle Bin.
+    ...(process.platform === "win32" ? { RECH_TRASH_DIR: join(home, "Trash") } : {}) };
   const rech = async (...args: string[]) => {
     const proc = Bun.spawn([process.execPath, join(import.meta.dir, "rechrome.ts"), ...args], { cwd: home, env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
     const [code, stdout, stderr] = await Promise.all([proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
@@ -55,6 +57,7 @@ test("profile rm: plan first, consent for a running window, then unregister ever
     expect(JSON.parse(await readFile(join(home, ".rechrome", "profiles.json"), "utf8"))).not.toHaveProperty("qa-alias");
     expect(existsSync(dataDir)).toBe(false);
     if (process.platform === "darwin") expect(readdirSync(join(home, ".Trash"))).toContain("qa");
+    if (process.platform === "win32") expect(readdirSync(join(home, "Trash"))).toContain("qa");
 
     // A real Chrome profile is only unregistered; its data is not rech's to delete.
     const real = await rech("profile", "rm", "me@x.com", "--yes");
