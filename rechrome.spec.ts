@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { parseUrl, authCheck, DEFAULT_PORT, ENV_KEY, deriveIdentity, normalizeRemote, normalizeCommandArgs, resolveChromeProfileSelector, resolveGlobalProfile, extractGlobalProfileArg } from "./rech.ts";
+import { parseUrl, authCheck, DEFAULT_PORT, ENV_KEY, deriveIdentity, normalizeRemote, normalizeCommandArgs, resolveChromeProfileSelector, resolveGlobalProfile, extractGlobalProfileArg } from "./rechrome.ts";
 import { isUnderDir, splitCommand, shortClientLabel, isIsoSession } from "./serve.ts";
 
 describe("parseUrl", () => {

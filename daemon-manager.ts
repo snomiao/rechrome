@@ -10,7 +10,7 @@
 //
 // This module is deliberately pure (no Bun/process/fs) so the selection policy is
 // unit-testable; the impure probing (Bun.which, `oxmgr --version`) lives in
-// rech.ts and feeds its results into pickDaemonManager.
+// rechrome.ts and feeds its results into pickDaemonManager.
 
 export type DaemonManager = { id: "oxmgr" | "pm2"; bin: string };
 

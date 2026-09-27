@@ -107,7 +107,7 @@ ps eww -p "$(pgrep -f 'oxmgr.*daemon run')" \
 - Don't put machine-specific absolute paths in `.env.local` files that may be
   loaded by long-lived daemons. Use `${HOME}` expansion, or compute the path
   at runtime.
-- If `rech daemon-install` (`rech.ts:daemonInstall`) is the entrypoint, prefer
+- If `rech daemon-install` (`rechrome.ts:daemonInstall`) is the entrypoint, prefer
   invoking it from a clean shell (`env -i …`) so the daemon's persistent env
   matches what's declared in oxmgr's `state.json`.
 - Consider having `serve.ts` log every env var it actually reads on startup

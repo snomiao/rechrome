@@ -11,7 +11,7 @@ import {
   HOME,
   PASSTHROUGH_ENV_KEYS,
   resolvePlaywrightCli,
-} from "./rech.ts";
+} from "./rechrome.ts";
 
 const TAILSCALE_BIN = process.env.TAILSCALE_BIN || "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
 const CERT_RENEW_THRESHOLD_DAYS = 7;

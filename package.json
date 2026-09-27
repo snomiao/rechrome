@@ -6,26 +6,26 @@
     "url": "https://github.com/snomiao/rechrome.git"
   },
   "bin": {
-    "rech": "./rech.ts",
-    "rechrome": "./rech.ts"
+    "rech": "./rechrome.ts",
+    "rechrome": "./rechrome.ts"
   },
   "files": [
     ".env.example",
     "LICENSE",
     "README.md",
     "extension",
-    "rech.js",
-    "rech.ts",
+    "rechrome.js",
+    "rechrome.ts",
     "serve.js",
     "serve.ts",
     "vendor"
   ],
   "type": "module",
   "scripts": {
-    "serve": "bun run rech.ts serve",
+    "serve": "bun run rechrome.ts serve",
     "test": "bun test",
     "vendor-cli": "bash scripts/vendor-cli.sh",
-    "prepublishOnly": "bash scripts/vendor-cli.sh && sed 's/\\.ts/\\.js/g' rech.ts > rech.js && sed 's/\\.ts/\\.js/g' serve.ts > serve.js"
+    "prepublishOnly": "bash scripts/vendor-cli.sh && sed 's/\\.ts/\\.js/g' rechrome.ts > rechrome.js && sed 's/\\.ts/\\.js/g' serve.ts > serve.js"
   },
   "devDependencies": {
     "@types/bun": "latest"

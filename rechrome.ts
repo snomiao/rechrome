@@ -330,6 +330,22 @@ async function getClientEnv(urlExtras?: { extensionId?: string; extensionToken?:
       if (!env["PLAYWRIGHT_MCP_EXTENSION_ID"]) env["PLAYWRIGHT_MCP_EXTENSION_ID"] = entry.extensionId;
       if (!env["PLAYWRIGHT_MCP_USER_DATA_DIR"] && entry.userDataDir) env["PLAYWRIGHT_MCP_USER_DATA_DIR"] = entry.userDataDir;
       if (!env["PLAYWRIGHT_MCP_LOAD_EXTENSION"] && entry.loadExtension) env["PLAYWRIGHT_MCP_LOAD_EXTENSION"] = entry.loadExtension;
+      // The extension mints a fresh `auth-token` whenever its localStorage is cleared
+      // (reinstall, "Load unpacked" from a new path, site-data wipe). A registry token
+      // that predates that is silently rejected by connect.html ("Invalid token"), which
+      // surfaces only as an extension connection timeout. Re-read the live value from the
+      // profile and heal the registry instead of failing. Managed (provisioned) profiles are
+      // seeded over CDP, but their localStorage can be re-minted the same way, and they use the
+      // same <userDataDir>/<profileDir>/Local Storage layout — so they heal here too.
+      if (entry.userDataDir) {
+        const profileDir = entry.profileDir; // the folder name ("Profile 2"), not the email key
+        const live = profileDir ? readExtensionTokenFromProfile(entry.userDataDir, profileDir) : null;
+        if (live && live !== entry.token) {
+          console.error(`[rech] extension token for "${profileKey}" changed — refreshing registry`);
+          entry.token = live;
+          await saveTokenEntry(profileKey, entry);
+        }
+      }
       if (!env["PLAYWRIGHT_MCP_EXTENSION_TOKEN"]) {
         env["PLAYWRIGHT_MCP_EXTENSION_TOKEN"] = entry.token;
       } else if (env["PLAYWRIGHT_MCP_EXTENSION_TOKEN"] !== entry.token) {

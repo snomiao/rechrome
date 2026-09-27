@@ -11,7 +11,7 @@ restart Chrome when the user has explicitly approved it in the current request.
 ## Session identity — bucket by WORKTREE ROOT, decouple key from label
 
 Which browser session a client reuses is decided by a **session key**. The key is the realpath of the
-**git worktree root** (`getClientIdentity`/`deriveIdentity` in `rech.ts`), NOT the git branch. This is the
+**git worktree root** (`getClientIdentity`/`deriveIdentity` in `rechrome.ts`), NOT the git branch. This is the
 predictability contract: a human can tell which browser they're driving from where they `cd`'d.
 
 - **Why not branch** (the old `<remote>/tree/<branch>` key): (1) two worktrees on the same branch
@@ -61,7 +61,7 @@ How a profile gets its auth token and extension, and the platform constraints be
   first load of `status.html`/`connect.html`; random 32-byte base64url). The daemon's token-bypass
   connect compares `?token=` against this value (`extension/src/ui/connect.tsx`).
 - **`rech setup` auto-reads the token** straight from the profile's `Local Storage/leveldb`
-  (`readExtensionTokenFromProfile` in `rech.ts`) — read-only, never takes LevelDB's lock, safe while
+  (`readExtensionTokenFromProfile` in `rechrome.ts`) — read-only, never takes LevelDB's lock, safe while
   the user's Chrome runs. It anchors on the `auth-token` marker + `\x01`+43-char base64url value
   shape (LevelDB prefix-compression can split the origin string, so don't match the full origin).
   Verified to extract the exact registry token for every installed profile. So setup needs **no
@@ -122,13 +122,13 @@ Hard-won notes — a source edit not taking effect at runtime is almost always o
 
 For an agent that just wants to *use* rech to open/verify a URL in the user's Chrome:
 
-- **Package is `rechrome`, CLI alias `rech` — `bunx rech` 404s.** Not on PATH; run `bun rech.ts <cmd>`
+- **Package is `rechrome`, CLI alias `rech` — `bunx rech` 404s.** Not on PATH; run `bun rechrome.ts <cmd>`
   from this repo (or `bunx rechrome <cmd>`).
 - **Env:** `PLAYWRIGHT_CLI="bunx playwright-cli" PLAYWRIGHT_BROWSERS_PATH="$HOME/.cache/ms-playwright"`
   (npm `playwright-cli` works when the vendored fork isn't checked out). It auto-loads `RECHROME_URL`
   from the nearest `.env.local` (walks cwd→root and **overwrites** `process.env`, so a URL passed on the
   CLI is ignored — edit the file).
-- **`bun rech.ts status` first.** "bearer key rejected" = the `<KEY>@host` userinfo rotated (it does so
+- **`bun rechrome.ts status` first.** "bearer key rejected" = the `<KEY>@host` userinfo rotated (it does so
   every Mac serve restart) → ask the user for a fresh `RECHROME_URL`; can't SSH into the Mac.
 - **Commands:** `open <url>` · `screenshot [--full-page] [--filename x.png]` · `resize <w> <h>` ·
   `eval "() => …"`. Screenshots download to `./.playwright-cli-multi-tab/` (gitignored).
