@@ -13,6 +13,8 @@ test("multiple sockets enforce profile/file policies and reload without browser 
   await mkdir(join(root, ".rechrome"));
   for (const name of ["rechrome.ts", "serve.ts", "listeners.ts", "extension-token.ts", "daemon-manager.ts"])
     await copyFile(join(import.meta.dir, name), join(root, name));
+  // The copied sources import packages (e.g. yargs); resolve them from the repo's node_modules.
+  await symlink(join(import.meta.dir, "node_modules"), join(root, "node_modules"), "junction");
   await writeFile(join(root, "fake-cli.ts"), `
     import { mkdirSync, writeFileSync } from 'fs';
     if (process.argv.includes('screenshot')) {
@@ -31,7 +33,7 @@ test("multiple sockets enforce profile/file policies and reload without browser 
   const save = (listeners: any[]) => writeFile(configPath, JSON.stringify({ version: 1, listeners }));
   await save([qa, personal]);
   const child = Bun.spawn([process.execPath, join(root, "rechrome.ts"), "serve"], {
-    cwd: root, env: { ...process.env, HOME: root, RECHROME_URL: `http://${qa.key}@127.0.0.1:${portA}`, PLAYWRIGHT_CLI: `${process.execPath} ${join(root, "fake-cli.ts")}` },
+    cwd: root, env: { ...process.env, HOME: root, USERPROFILE: root, RECHROME_URL: `http://${qa.key}@127.0.0.1:${portA}`, PLAYWRIGHT_CLI: `${process.execPath} ${join(root, "fake-cli.ts")}` },
     stdin: "ignore", stdout: "ignore", stderr: "pipe",
   });
   const get = (l: typeof qa, path = "/ping") => fetch(serviceUrl(`http://127.0.0.1:${l.port}${l.prefix}`, path), { headers: { Authorization: `Bearer ${l.key}` } });
@@ -71,7 +73,7 @@ test("multiple sockets enforce profile/file policies and reload without browser 
       expect(await (await get(publicListener, `/files/${publicShot.files[0]}`)).text()).toBe("fixture");
       // Exercise the real client, including the download path, against the proxy.
       const client = Bun.spawn([process.execPath, join(root, "rechrome.ts"), "--profile", "qa", "screenshot"], {
-        cwd: root, env: { ...process.env, HOME: root, RECHROME_URL: `http://127.0.0.1:${proxy.port}/rechrome/#?key=${qa.key}&profile=qa` },
+        cwd: root, env: { ...process.env, HOME: root, USERPROFILE: root, RECHROME_URL: `http://127.0.0.1:${proxy.port}/rechrome/#?key=${qa.key}&profile=qa` },
         stdin: "ignore", stdout: "pipe", stderr: "pipe",
       });
       expect(await client.exited).toBe(0);
