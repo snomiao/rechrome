@@ -258,68 +258,92 @@ const escapeRegex = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"
 const OWN_CLI_DAEMON = import.meta.dir.split(/[\\/]/).map(escapeRegex).join(String.raw`[\\/]`) + String.raw`[\\/].*cliDaemon\.js`;
 const RECH_SERVE = String.raw`rech(rome)?(\.ts)?"?\s+serve`;
 const STALE_HOLDER_PATTERN = `${OWN_CLI_DAEMON}|${RECH_SERVE}`;
+// A leaked socket (or a wedged serve) accepts connections but never answers. Anything that
+// responds at an address is a live server there — possibly a healthy rech serve — so it is
+// never killed. Both schemes: the holder's TLS setting may differ from this serve's.
+async function answersAt(address: string, port: number): Promise<boolean> {
+  const host = address === "0.0.0.0" || address === "*" ? "127.0.0.1"
+    : address === "::" ? "[::1]"
+    : address.includes(":") ? `[${address}]` : address;
+  const probe = (scheme: string) => fetch(`${scheme}://${host}:${port}/`, {
+    signal: AbortSignal.timeout(1500), tls: { rejectUnauthorized: false },
+  } as RequestInit).then(() => true, () => false);
+  return (await Promise.all([probe("http"), probe("https")])).includes(true);
+}
+
+type PortHolder = { address: string; pid: number; alive: boolean; command: string };
+
+// Listeners on `port` that conflict with binding `host`: the same address, or a wildcard of
+// its family (a wildcard bind conflicts with every address of the family). Never this serve's
+// own sockets, which may already hold other addresses on the same port from this startup.
+function conflictingHolders(port: number, host: string): PortHolder[] {
+  let holders: PortHolder[] = [];
+  if (process.platform === "win32") {
+    const ps = [
+      "$ErrorActionPreference='SilentlyContinue';",
+      `$r=@(Get-NetTCPConnection -LocalPort ${port} -State Listen | ForEach-Object {`,
+      "  $p=Get-CimInstance Win32_Process -Filter \"ProcessId=$($_.OwningProcess)\";",
+      "  [pscustomobject]@{ address=[string]$_.LocalAddress; pid=[int]$_.OwningProcess; alive=[bool]$p; command=[string]$p.CommandLine } });",
+      "ConvertTo-Json -Compress -InputObject $r",
+    ].join(" ");
+    const out = Bun.spawnSync(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], { windowsHide: true }).stdout?.toString().trim();
+    try { holders = out ? [JSON.parse(out)].flat() : []; } catch { holders = []; }
+  } else {
+    const out = Bun.spawnSync(["sh", "-c", `lsof -nP -iTCP:${port} -sTCP:LISTEN -Fpn 2>/dev/null`]).stdout?.toString() ?? "";
+    let pid = 0;
+    for (const line of out.split("\n")) {
+      if (line.startsWith("p")) pid = Number(line.slice(1));
+      else if (line.startsWith("n") && pid) {
+        const address = line.slice(1).replace(/:\d+$/, "").replace(/^\[(.*)\]$/, "$1");
+        const command = Bun.spawnSync(["ps", "-o", "command=", "-p", String(pid)]).stdout?.toString().trim() ?? "";
+        holders.push({ address, pid, alive: true, command });
+      }
+    }
+  }
+  const v6 = (a: string) => a.includes(":");
+  const wildcard = (a: string) => a === "0.0.0.0" || a === "::" || a === "*";
+  return holders.filter(h => h.pid !== process.pid && (
+    wildcard(host) ? (h.address === "*" || host === "::" || !v6(h.address))
+      : h.address === host || h.address === "*" || (wildcard(h.address) && v6(h.address) === v6(host))));
+}
+
+// Free the conflicting address from stale rech holders before retrying a failed bind.
+// Narrow-first: (1) kill each conflicting owner that is a live rech serve / this install's
+// cliDaemon AND doesn't answer at its own address — never an unrelated app, never a healthy
+// server; (2) only if the address is STILL held by owners that are all dead — the
+// inherited-handle case, where the socket lives in a child while netstat attributes it to a
+// now-dead owner — sweep orphaned cliDaemons (Windows). That sweep is the only recovery for
+// the case (the live holder can't be mapped from the port), so it is a logged last resort.
 async function freeStalePort(port: number, host: string): Promise<void> {
-  const me = process.pid;
-  const wildcard = host === "0.0.0.0" || host === "::";
   try {
-    if (process.platform === "win32") {
-      // Only listeners that conflict with THIS bind: the same address, or a wildcard of its
-      // family (a wildcard bind conflicts with every address). Never this serve's own sockets,
-      // which may already hold other addresses on the same port from this startup.
+    const stale = new RegExp(STALE_HOLDER_PATTERN, process.platform === "win32" ? "i" : "");
+    for (const h of conflictingHolders(port, host)) {
+      if (!h.alive) continue;
+      if (!stale.test(h.command)) { log(`freeStalePort: port ${port} is held by an unrelated process (${h.pid}); not killing it`); continue; }
+      if (await answersAt(h.address, port)) { log(`freeStalePort: ${h.address}:${port} is served by a live process (${h.pid}); not killing it`); continue; }
+      log(`freeStalePort: killing stale rech holder ${h.pid} of ${h.address}:${port}`);
+      try { process.kill(h.pid, "SIGKILL"); } catch {}
+    }
+    await new Promise(r => setTimeout(r, 400));
+    const remaining = conflictingHolders(port, host);
+    if (process.platform === "win32" && remaining.length && remaining.every(h => !h.alive)) {
       const q = (text: string) => text.replaceAll("'", "''");
-      const addressFilter = host === "0.0.0.0" ? "$_.LocalAddress -notmatch ':'"
-        : host === "::" ? "$true"
-        : `$_.LocalAddress -in @('${q(host)}','${host.includes(":") ? "::" : "0.0.0.0"}')`;
-      // Two-phase, narrow-first: (1) kill each conflicting owner that is a live rech serve /
-      // cliDaemon process — never an unrelated app that happens to hold the port; (2) only if
-      // the address is STILL held by owners that are all dead — the inherited-handle case, where
-      // the socket lives in a child while netstat attributes it to a now-dead owner — fall back
-      // to killing orphaned cliDaemon holders. The fallback is the only recovery for that case
-      // (the live holder can't be mapped from the port), so it is a logged last resort.
       const ps = [
         "$ErrorActionPreference='SilentlyContinue';",
-        `function Holders { @(Get-NetTCPConnection -LocalPort ${port} -State Listen | Where-Object { ${addressFilter} } | Select-Object -ExpandProperty OwningProcess -Unique | Where-Object { $_ -ne ${me} }) };`,
-        "foreach($o in (Holders)){",
-        "  if(Get-Process -Id $o){",
-        "    $c=(Get-CimInstance Win32_Process -Filter \"ProcessId=$o\").CommandLine;",
-        `    if($c -match '${q(STALE_HOLDER_PATTERN)}'){ Write-Output (\"freeStalePort: killing stale rech holder $o of port ${port}\"); Stop-Process -Id $o -Force }`,
-        `    else { Write-Output (\"freeStalePort: port ${port} is held by an unrelated process ($o); not killing it\") }`,
-        "  }",
-        "};",
-        "Start-Sleep -Milliseconds 400;",
-        "$h=Holders; $alive=@($h | Where-Object { Get-Process -Id $_ });",
-        "if($h.Count -and -not $alive.Count){",
         // A cliDaemon's parent (playwright-cli) exits right after spawning it, so a live one
         // can't be told from an orphan by ancestry. They are only provably orphaned when no
         // other rech serve is running: exclude this serve and its own wrappers (oxmgr, cmd).
-        `  $self=@(); $x=${me}; while($x){ $self+=$x; $x=(Get-CimInstance Win32_Process -Filter \"ProcessId=$x\").ParentProcessId; if($self -contains $x){ break } };`,
-        `  $live=@(Get-CimInstance Win32_Process | Where-Object { $self -notcontains $_.ProcessId -and $_.ProcessId -ne $PID -and $_.CommandLine -match '${q(RECH_SERVE)}' });`,
-        "  if($live.Count){ Write-Output (\"freeStalePort: port still held, but another rech serve is running (\" + ($live.ProcessId -join ',') + \"); not sweeping cliDaemons\") }",
-        "  else {",
+        `$self=@(); $x=${process.pid}; while($x){ $self+=$x; $x=(Get-CimInstance Win32_Process -Filter \"ProcessId=$x\").ParentProcessId; if($self -contains $x){ break } };`,
+        `$live=@(Get-CimInstance Win32_Process | Where-Object { $self -notcontains $_.ProcessId -and $_.ProcessId -ne $PID -and $_.CommandLine -match '${q(RECH_SERVE)}' });`,
+        "if($live.Count){ Write-Output (\"freeStalePort: port still held, but another rech serve is running (\" + ($live.ProcessId -join ',') + \"); not sweeping cliDaemons\") }",
+        "else {",
         // Exclude this PowerShell itself: its own command line contains the pattern.
-        `    $d=Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -match '${q(OWN_CLI_DAEMON)}' };`,
-        "    Write-Output (\"freeStalePort: port still held; killing orphaned cliDaemon holders: \" + ($d.ProcessId -join ','));",
-        "    $d | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }",
-        "  }",
+        `  $d=Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -match '${q(OWN_CLI_DAEMON)}' };`,
+        "  Write-Output (\"freeStalePort: port still held; killing orphaned cliDaemon holders: \" + ($d.ProcessId -join ','));",
+        "  $d | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }",
         "}",
       ].join(" ");
-      const r = Bun.spawnSync(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], { windowsHide: true });
-      const out = r.stdout?.toString().trim();
-      if (out) log(out);
-    } else {
-      // Same rule off Windows: only conflicting listeners (same address or wildcard), never this
-      // serve itself, and only holders whose command line is a rech serve / cliDaemon.
-      const want = wildcard ? "*" : host.includes(":") ? `[${host}]` : host;
-      const sq = (text: string) => text.replaceAll("'", "'\\''");
-      const script = [
-        `for p in $(lsof -nP -iTCP:${port} -sTCP:LISTEN -Fpn 2>/dev/null | awk -v want='${sq(want)}' '/^p/{p=substr($0,2)} /^n/{a=substr($0,2); sub(/:[0-9]+$/,"",a); if (want=="*" || a=="*" || a==want) print p}' | sort -u); do`,
-        `  [ "$p" = "${me}" ] && continue;`,
-        `  if ps -o command= -p "$p" | grep -Eq '${sq(STALE_HOLDER_PATTERN)}'; then kill -9 "$p";`,
-        `  else echo "freeStalePort: port ${port} is held by an unrelated process ($p); not killing it"; fi;`,
-        "done",
-      ].join(" ");
-      const r = Bun.spawnSync(["sh", "-c", script]);
-      const out = r.stdout?.toString().trim();
+      const out = Bun.spawnSync(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], { windowsHide: true }).stdout?.toString().trim();
       if (out) log(out);
     }
   } catch {
@@ -787,25 +811,14 @@ export async function serve() {
   // than a permanent EADDRINUSE crash-loop.
   const isEaddrInUse = (e: any) => String(e?.code ?? e?.message ?? "").includes("EADDRINUSE");
   const MAX_BIND_ATTEMPTS = 4;
-  // A leaked socket (or a wedged serve) accepts connections but never answers. Anything that
-  // responds is a live server — possibly a healthy rech serve — so it is never killed, and the
-  // port is not shared with it via reusePort either.
-  const answersHttp = async (listener: Listener) => {
-    const host = ["0.0.0.0", "::"].includes(listener.host) ? "127.0.0.1" : listener.host.includes(":") ? `[${listener.host}]` : listener.host;
-    // Try both schemes: the holder's TLS setting may differ from this serve's.
-    const probe = (scheme: string) => fetch(`${scheme}://${host}:${listener.port}/`, {
-      signal: AbortSignal.timeout(1500), tls: { rejectUnauthorized: false },
-    } as RequestInit).then(() => true, () => false);
-    const answers = await Promise.all([probe("http"), probe("https")]);
-    return answers.includes(true);
-  };
   const bindAtStartup = async (listener: Listener) => {
     for (let attempt = 1; ; attempt++) {
       try {
         return startServer(listener);
       } catch (e: any) {
         if (!isEaddrInUse(e)) throw e;
-        if (await answersHttp(listener)) {
+        // Something answers at this exact address: a live server (never killed, never port-shared).
+        if (await answersAt(listener.host, listener.port)) {
           log(`port ${listener.port} is held by a live server that answers requests — not touching it`);
           throw e;
         }
