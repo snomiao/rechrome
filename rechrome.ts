@@ -1,29 +1,32 @@
 #!/usr/bin/env bun
-import { readListeners, writeListeners, listenerAddress, isLoopback, normalizePrefix, serviceUrl, type Listener } from "./listeners.ts";
+import { readListeners, writeListeners, listenerAddress, isLoopback, normalizePrefix, serviceUrl, allowProfiles, denyProfiles, rotateListenerKey, setPublicUrl, type Listener } from "./listeners.ts";
 
 import { file } from "bun";
 import yargs from "yargs";
 import { readExtensionTokenFromProfile } from "./extension-token.ts";
 import { randomBytes } from "crypto";
-import { mkdirSync, appendFileSync, existsSync, realpathSync, accessSync, cpSync, unlinkSync, readFileSync, readdirSync, constants as fsConstants } from "fs";
+import { mkdirSync, appendFileSync, existsSync, realpathSync, accessSync, cpSync, unlinkSync, readFileSync, readdirSync, renameSync, rmdirSync, constants as fsConstants } from "fs";
 import { hostname, homedir, networkInterfaces } from "os";
 import { isIPv4 } from "net";
 import { join, basename, dirname } from "path";
 import { pathToFileURL } from "url";
+import { createRequire } from "node:module";
 import { spawn as cpSpawn } from "child_process";
 import { readFile, writeFile, rename, chmod, mkdir } from "node:fs/promises";
 import { oxmgrInstallCommand, pickDaemonManager, type DaemonManager } from "./daemon-manager.ts";
 
 export const ENV_KEY = "RECHROME_URL";
 export const DEFAULT_PORT = 13775;
-export const RECH_DIR = join(import.meta.dir, ".rech");
-export const LOG_DIR = join(RECH_DIR, "logs");
-
 // Home dir: HOME on POSIX, USERPROFILE on Windows (handled by os.homedir()).
 export const HOME = homedir();
 
-const RECH_HOME_DIR = join(HOME, ".rechrome");
-const TOKENS_FILE = join(RECH_HOME_DIR, "profiles.yaml");
+// All rechrome state (registry, listeners, extension, logs, daemon output) lives in
+// ~/.rechrome, never next to the code: a bunx/npx install dir is a disposable cache.
+export const RECH_DIR = join(HOME, ".rechrome");
+export const LOG_DIR = join(RECH_DIR, "logs");
+// Before the rename, logs and daemon output lived in <install dir>/.rech.
+export const LEGACY_RECH_DIR = join(import.meta.dir, ".rech");
+const TOKENS_FILE = join(RECH_DIR, "profiles.yaml");
 
 type TokenEntry = { extensionId: string; token: string; profileDir: string; userDataDir?: string; loadExtension?: string };
 
@@ -38,7 +41,7 @@ function validateTokenRegistry(value: unknown): Record<string, TokenEntry> {
   return value as Record<string, TokenEntry>;
 }
 
-export async function writeTokenRegistry(registry: Record<string, TokenEntry>, directory = RECH_HOME_DIR): Promise<void> {
+export async function writeTokenRegistry(registry: Record<string, TokenEntry>, directory = RECH_DIR): Promise<void> {
   validateTokenRegistry(registry);
   await mkdir(directory, { recursive: true });
   const path = join(directory, "profiles.yaml");
@@ -51,7 +54,7 @@ export async function writeTokenRegistry(registry: Record<string, TokenEntry>, d
   }
 }
 
-export async function readTokenRegistry(directory = RECH_HOME_DIR): Promise<Record<string, TokenEntry>> {
+export async function readTokenRegistry(directory = RECH_DIR): Promise<Record<string, TokenEntry>> {
   const path = join(directory, "profiles.yaml");
   let raw: string;
   try { raw = await readFile(path, "utf8"); }
@@ -74,7 +77,7 @@ export async function readTokenRegistry(directory = RECH_HOME_DIR): Promise<Reco
 }
 
 async function saveTokenEntry(profileEmail: string, entry: TokenEntry): Promise<void> {
-  mkdirSync(RECH_HOME_DIR, { recursive: true });
+  mkdirSync(RECH_DIR, { recursive: true });
   const registry = await readTokenRegistry();
   registry[profileEmail] = entry;
   await writeTokenRegistry(registry);
@@ -241,6 +244,31 @@ export function log(msg: string) {
   appendFileSync(logFile, line);
 }
 
+/**
+ * Move logs and daemon output from the legacy <install dir>/.rech into RECH_DIR, entry by
+ * entry. An entry already present in RECH_DIR is kept and the legacy copy left in place,
+ * so nothing is overwritten. Best effort: a cross-device rename just leaves the old copy.
+ */
+export function migrateLegacyDataDir(legacy = LEGACY_RECH_DIR, target = RECH_DIR): string[] {
+  const moved: string[] = [];
+  if (!existsSync(legacy)) return moved;
+  mkdirSync(target, { recursive: true });
+  if (realpathSync(legacy) === realpathSync(target)) return moved;
+  for (const sub of ["logs", "output"]) {
+    const from = join(legacy, sub);
+    if (!existsSync(from)) continue;
+    mkdirSync(join(target, sub), { recursive: true });
+    for (const entry of readdirSync(from)) {
+      const to = join(target, sub, entry);
+      if (existsSync(to)) continue;
+      try { renameSync(join(from, entry), to); moved.push(`${sub}/${entry}`); } catch { /* keep the legacy copy */ }
+    }
+  }
+  // Remove only directories left empty (the unused tls/ included); rmdir refuses non-empty ones.
+  for (const dir of ["logs", "output", "tls", ""]) { try { rmdirSync(join(legacy, dir)); } catch { /* not empty */ } }
+  return moved;
+}
+
 export function parseUrl(raw: string) {
   const u = new URL(raw);
   const fragment = new URLSearchParams(u.hash.slice(1).replace(/^\?/, ""));
@@ -368,8 +396,8 @@ export async function detectTailscaleServe(port: number, prefix: string): Promis
   return { dnsName, routeUrl: findTailscaleServeRoute(dnsName, serveStatus, port, prefix) };
 }
 
-/** Remote connection URL for a Serve route, carrying the listener key and profile like the local one. */
-export function tailscaleConnectionUrl(routeUrl: string, localUrl: string): string {
+/** The same connection (key and profile) at another base URL, e.g. where a proxy exposes the listener. */
+export function rebaseConnectionUrl(routeUrl: string, localUrl: string): string {
   const local = new URL(localUrl);
   const remote = new URL(routeUrl);
   remote.username = parseUrl(localUrl).key;
@@ -482,7 +510,15 @@ export function deriveIdentity(opts: {
   return { key, label };
 }
 
-async function getClientIdentity(): Promise<{ key: string; label: string; profile?: string }> {
+/**
+ * A project's own rechrome folder: <root>/.rechrome, where root is the same one the session
+ * key uses (the worktree root, submodules rolled up), or cwd in `cwd` mode / outside git.
+ */
+export function projectDataDir(opts: { mode: string; cwd: string; root?: string | null }): string {
+  return join(opts.mode === "cwd" ? opts.cwd : opts.root || opts.cwd, ".rechrome");
+}
+
+async function getClientIdentity(): Promise<{ key: string; label: string; dataDir: string; profile?: string }> {
   const cwd = realpathSafe(process.cwd());
   const mode = (process.env.RECH_IDENTITY || "worktree").toLowerCase();
   let root: string | null = null;
@@ -508,7 +544,7 @@ async function getClientIdentity(): Promise<{ key: string; label: string; profil
     if (remoteUrl) remote = normalizeRemote(remoteUrl);
   }
 
-  return deriveIdentity({ mode, cwd, host: hostname(), root, remote, branch });
+  return { ...deriveIdentity({ mode, cwd, host: hostname(), root, remote, branch }), dataDir: projectDataDir({ mode, cwd, root }) };
 }
 
 // Profile precedence: an explicit `?profile=` in RECHROME_URL is authoritative; the
@@ -862,16 +898,22 @@ export function profileConnectionUri(profile: string, configuredUrl: string | un
   return result.toString();
 }
 
-async function printProfileUri(selector?: string, listener?: string): Promise<void> {
+async function printProfileUri(selector?: string, listener?: string, opts: { local?: boolean; save?: boolean } = {}): Promise<void> {
   const url = process.env[ENV_KEY];
   selector ??= url ? parseUrl(url).profileDirectory : undefined;
-  if (!selector) throw new Error("Specify a profile: rech profile <name> --print-uri");
+  if (!selector) throw new Error("Specify a profile: rech url <profile>");
   const registry = await readTokenRegistry();
   const cache = await readChromeProfileCache();
   // A configured remote profile may not exist in this machine's local registry.
   const profile = url && parseUrl(url).profileDirectory === selector && !listener
     ? selector : (await resolveGlobalProfile(registry, cache, selector)).email;
-  console.log(profileConnectionUri(profile, url, (await readListeners())?.listeners ?? [], listener));
+  const listeners = (await readListeners())?.listeners ?? [];
+  let uri = profileConnectionUri(profile, url, listeners, listener);
+  // Prefer where a proxy exposes the listener, when it has been recorded.
+  const publicUrl = listeners.find(l => l.key === parseUrl(uri).key)?.publicUrl;
+  if (publicUrl && !opts.local) uri = rebaseConnectionUrl(publicUrl, uri);
+  console.log(uri);
+  if (opts.save) console.error(`Saved RECHROME_URL to ${await saveProjectUrl(uri)}`);
 }
 
 export function sandboxConnectionWarning(env: Record<string, string | undefined> = process.env): string | null {
@@ -902,7 +944,8 @@ async function callServe(
   const res = await fetch(serviceUrl(url, "run"), {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
-    body: JSON.stringify({ args, identity, env }),
+    // dataDir is a client-local path; the daemon (possibly remote) only needs the session identity.
+    body: JSON.stringify({ args, identity: { key: identity.key, label: identity.label, profile: identity.profile }, env }),
     signal: AbortSignal.timeout(70_000),
   }).catch(async (e) => {
     if (throwOnFailure) throw new Error("Cannot reach the rechrome daemon. Check that it is running.");
@@ -948,6 +991,31 @@ export function normalizeCommandArgs(args: string[]): string[] {
 // --profile at/after the subcommand belongs to the forwarded CLI (e.g. playwright-cli's own
 // `open --profile <dir>`, a user-data-dir path) and must pass through untouched. Throws on a
 // missing value; accepts multiple occurrences (last one wins).
+/**
+ * `rech [--profile X] [--isolate] pw <args>` forwards <args> to playwright-cli verbatim, so
+ * `rech pw --version` or `rech pw status` reach playwright instead of rech. `--` works the
+ * same after a rech flag (`rech --profile X -- status`); a bare leading `--` cannot, because
+ * Bun consumes the `--` right after the script path. The separator counts only when
+ * everything before it is a rech global flag; otherwise it belongs to the playwright command
+ * (`rech open -- x`). Returns its index, or -1.
+ */
+export function rechSeparatorIndex(args: string[]): number {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--" || a === "pw" || a === "playwright") return i;
+    if (a === "--profile") { i++; continue; }
+    if (a.startsWith("--profile=") || a === "--isolate" || a === "--isolated") continue;
+    return -1;
+  }
+  return -1;
+}
+
+/** rechrome's own version, from the package.json shipped next to this file. */
+export function rechromeVersion(): string {
+  try { return JSON.parse(readFileSync(join(import.meta.dir, "package.json"), "utf8")).version ?? "unknown"; }
+  catch { return "unknown"; }
+}
+
 export function extractGlobalProfileArg(args: string[]): { args: string[]; selector?: string } {
   const rest = [...args];
   let selector: string | undefined;
@@ -974,7 +1042,49 @@ export function extractGlobalProfileArg(args: string[]): { args: string[]; selec
   return { args: rest, selector };
 }
 
-async function run(url: string, args: string[], overrideEnv?: Record<string, string>) {
+function editDistance(a: string, b: string): number {
+  const row = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    let diagonal = row[0];
+    row[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const above = row[j];
+      row[j] = Math.min(row[j] + 1, row[j - 1] + 1, diagonal + (a[i - 1] === b[j - 1] ? 0 : 1));
+      diagonal = above;
+    }
+  }
+  return row[b.length];
+}
+
+/** What to do when no RECHROME_URL is configured: set up here, or connect to another machine. */
+export function notConnectedMessage(): string {
+  return [
+    `rech: not connected to a rechrome daemon (${ENV_KEY} is not set).`,
+    `  On the machine with Chrome:   rech setup`,
+    `  On another machine:           rech connect '<URL printed by \`rech url\` on that machine>'`,
+  ].join("\n");
+}
+
+/**
+ * When playwright-cli rejects a command, replace its own usage dump with a rech-branded hint.
+ * Candidates are rech's commands plus the browser commands listed in that usage text, so the
+ * suggestion stays current without a hardcoded list. Returns null for any other output.
+ */
+export function unknownCommandHint(output: string, rechCommands: Iterable<string> = RECH_COMMANDS): string | null {
+  const unknown = output.match(/^Unknown command: (\S+)/m)?.[1];
+  if (!unknown) return null;
+  const browser = [...output.matchAll(/^ {2}([a-z][a-z0-9-]+) /gm)].map(m => m[1]);
+  const candidates = [...new Set([...rechCommands, ...browser])];
+  const scored = candidates.map(c => ({ c, d: editDistance(unknown.toLowerCase(), c) })).sort((x, y) => x.d - y.d);
+  const best = scored[0] && scored[0].d <= Math.max(1, Math.floor(unknown.length / 3)) ? scored[0].c : null;
+  return [
+    `rech: unknown command "${unknown}".${best ? ` Did you mean "${best}"?` : ""}`,
+    `  rech --help       rechrome commands (setup, status, profile, url, connect, listener…)`,
+    `  rech pw --help    browser commands (open, click, screenshot…)`,
+  ].join("\n");
+}
+
+async function run(url: string, args: string[], overrideEnv?: Record<string, string>, opts: { verbatim?: boolean } = {}) {
   // Match the underlying CLI's command names while accepting the short forms humans
   // naturally try. Keep this client-side so old and new serve daemons behave alike.
   args = normalizeCommandArgs(args);
@@ -993,11 +1103,17 @@ async function run(url: string, args: string[], overrideEnv?: Record<string, str
 
   const isOpenWithUrl = args[0] === "open" && args.length > 1;
   if (existingSession && isOpenWithUrl) {
-    return run(url, ["goto", ...args.slice(1)], overrideEnv);
+    return run(url, ["goto", ...args.slice(1)], overrideEnv, opts);
   }
 
   if (existingSession)
     console.error(`[rech] session already has open tabs — listing existing tabs instead of opening a new window`);
+  // A typo'd command: rech's hint instead of playwright-cli's full usage (kept for `rech pw`).
+  const hint = !opts.verbatim && status !== 0 ? unknownCommandHint(`${stderr ?? ""}\n${stdout ?? ""}`) : null;
+  if (hint) {
+    console.error(hint);
+    process.exit(status || 1);
+  }
   if (stderr) {
     if (stderr.includes('Extension connection timeout')) {
       const hasToken = !!effectiveEnv["PLAYWRIGHT_MCP_EXTENSION_TOKEN"];
@@ -1018,9 +1134,11 @@ async function run(url: string, args: string[], overrideEnv?: Record<string, str
   if (stdout) process.stdout.write(stdout);
 
   if (files?.length) {
-    const dlDir = join(process.cwd(), ".playwright-cli-multi-tab");
+    // Saved files belong to the project: <project>/.rechrome/output. The folder also holds
+    // .env.local (secrets), so it is git-ignored as a whole when first created.
+    const dlDir = join(identity.dataDir, "output");
     mkdirSync(dlDir, { recursive: true });
-    const gitignorePath = join(dlDir, ".gitignore");
+    const gitignorePath = join(identity.dataDir, ".gitignore");
     if (!existsSync(gitignorePath)) await Bun.write(gitignorePath, "*\n");
     for (const name of files) {
       const fileRes = await fetch(serviceUrl(url, `files/${name}`), {
@@ -1329,23 +1447,41 @@ async function pmList(mgr: DaemonManager = daemonManager()): Promise<string> {
   return await new Response(proc.stdout).text();
 }
 
+// A candidate playwright-cli entry is usable only if the playwright-core it requires actually
+// resolves FROM that entry — the wrapper does `require('playwright-core/lib/tools/cli-client/program')`,
+// a deep subpath reachable only through the fork's patched `exports` map. existsSync on the .js is
+// not the same check: an uninitialised/half-built lib/playwright-cli submodule leaves the wrapper on
+// disk with no resolvable core, and the failure surfaces later as MODULE_NOT_FOUND inside the daemon.
+export function playwrightCliIsUsable(jsEntry: string): boolean {
+  try {
+    createRequire(jsEntry).resolve("playwright-core/lib/tools/cli-client/program");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // Resolve which playwright-cli the daemon runs to drive Chrome. Priority:
 //   1. PLAYWRIGHT_CLI env override — explicit, already a full command string.
 //   2. Vendored fork in a git checkout (lib/playwright-cli/playwright-cli.js) — the patched
 //      multi-tab CLI + patched playwright-core (PLAYWRIGHT_MCP_PROFILE_DIRECTORY etc.).
 //   3. The fork bundled into the npm tarball (vendor/playwright-cli/playwright-cli.js, produced by
-//      scripts/vendor-cli.sh at prepublish). This is the batteries-included default for
-//      `bun i -g rechrome`: self-contained, no @playwright/cli dep, no browser-binary download.
+//      scripts/vendor-cli.sh at prepublish, and by `prepare` on `bun install` in a checkout). This
+//      is the batteries-included default for `bun i -g rechrome`: self-contained, no
+//      @playwright/cli dep, no browser-binary download.
 //   4. Bare `playwright-cli-multi-tab` on PATH — legacy fallback for a pre-existing global link.
+// Candidates 2–3 must also pass playwrightCliIsUsable(), so a present-but-broken one falls through.
+// lib/ stays ahead of vendor/ on purpose: a dev who built the fork wants their patched core, not
+// the (possibly older) vendor-src snapshot that `prepare` unpacks into vendor/.
 // A resolved .js entry is run through `node` on Windows (which can't exec a .js by shebang) and
 // bare on POSIX (its `#!/usr/bin/env node` shebang runs it under node, which the relay handshake
 // needs — see daemonInstall). serve splits the result on spaces into argv.
-export function resolvePlaywrightCli(): string {
+export function resolvePlaywrightCli(root: string = import.meta.dir): string {
   if (process.env.PLAYWRIGHT_CLI) return process.env.PLAYWRIGHT_CLI;
   const jsEntry = [
-    join(import.meta.dir, "lib/playwright-cli/playwright-cli.js"),
-    join(import.meta.dir, "vendor/playwright-cli/playwright-cli.js"),
-  ].find(existsSync);
+    join(root, "lib/playwright-cli/playwright-cli.js"),
+    join(root, "vendor/playwright-cli/playwright-cli.js"),
+  ].filter(existsSync).find(playwrightCliIsUsable);
   if (jsEntry) return IS_WINDOWS ? `node ${jsEntry}` : jsEntry;
   return "playwright-cli-multi-tab";
 }
@@ -1467,7 +1603,7 @@ async function daemonUninstall(): Promise<void> {
 // locate the binary and launch it detached (singleton via a pidfile).
 // `rech tray hide` / the menu "Hide" item both kill the process;
 // `rech tray show` starts a fresh one.
-const TRAY_PID_FILE = join(RECH_HOME_DIR, "tray.pid");
+const TRAY_PID_FILE = join(RECH_DIR, "tray.pid");
 
 // A desktop GUI must be present. Linux needs an X11/Wayland display; a headless
 // box (SSH, CI, container) has neither, so the tray is skipped. macOS/Windows
@@ -1729,7 +1865,7 @@ async function provisionProfile(name: string, opts: { headed?: boolean } = {}): 
     process.exit(1);
   }
   const dist = await ensureExtensionDistInstalled();
-  const userDataDir = join(RECH_HOME_DIR, "profiles", name);
+  const userDataDir = join(RECH_DIR, "profiles", name);
   const token = randomBytes(32).toString("base64url");
 
   console.log(`\n[1/3] Provisioning managed profile "${name}"`);
@@ -1797,8 +1933,17 @@ async function requireListeners() {
   return config;
 }
 
+/** Print rows as left-aligned columns; the first row is the header. */
+function printTable(rows: string[][]): void {
+  const widths = rows[0].map((_, i) => Math.max(...rows.map(r => (r[i] ?? "").length)));
+  for (const r of rows) console.log(r.map((c, i) => (c ?? "").padEnd(widths[i])).join("  ").trimEnd());
+}
+
 async function listListeners(): Promise<void> {
-  for (const l of (await requireListeners()).listeners) console.log(`${l.name}  ${listenerAddress(l)}${normalizePrefix(l.prefix)}  ${l.profiles === "*" ? "local management (all profiles)" : l.profiles.join(", ")}`);
+  const rows = [["NAME", "ADDRESS", "PROFILES", "PUBLIC URL"]];
+  for (const l of (await requireListeners()).listeners)
+    rows.push([l.name, `${listenerAddress(l)}${normalizePrefix(l.prefix)}`, l.profiles === "*" ? "(all — local management)" : l.profiles.join(", "), l.publicUrl ?? "-"]);
+  printTable(rows);
 }
 
 async function removeListener(name: string): Promise<void> {
@@ -1811,17 +1956,122 @@ async function removeListener(name: string): Promise<void> {
   console.log("Listener removed from configuration; daemon reloads automatically.");
 }
 
-async function addListener(name: string, opts: { listen: string; profile: string[]; port?: number; prefix?: string }): Promise<void> {
-  const config = await requireListeners();
+async function resolveProfileKeys(selectors: string[]): Promise<string[]> {
   const registry = await readTokenRegistry(), cache = await readChromeProfileCache();
   const profiles: string[] = [];
-  for (const selector of opts.profile) profiles.push((await resolveGlobalProfile(registry, cache, selector)).email);
+  for (const selector of selectors) profiles.push((await resolveGlobalProfile(registry, cache, selector)).email);
+  return [...new Set(profiles)];
+}
+
+/** Next steps after exposing a listener: proxy it, record where, share. Plain text, so any shell works. */
+export function listenerNextSteps(listener: Listener, profile?: string): string[] {
+  const prefix = normalizePrefix(listener.prefix);
+  const mount = prefix === "/" ? "" : prefix.slice(0, -1);
+  return [
+    `Expose it through any reverse proxy on port ${listener.port}${mount ? ` (mount ${mount}; stripping it is fine)` : ""}, e.g.:`,
+    `  tailscale serve --bg${mount ? ` --set-path=${mount}` : ""} ${listener.port}`,
+    `Then record where it is reachable and print the URL to share:`,
+    `  rech listener set ${listener.name} --public-url https://<your-host>${prefix}`,
+    `  rech url ${profile ? JSON.stringify(profile) : "<profile>"} --listener ${listener.name}`,
+  ];
+}
+
+async function addListener(name: string, opts: { listen: string; profile: string[]; port?: number; prefix?: string }): Promise<void> {
+  const config = await requireListeners();
+  const profiles = await resolveProfileKeys(opts.profile);
   const host = chooseListenAddress(await detectListenChoices(), opts.listen);
   const port = opts.port ?? DEFAULT_PORT;
-  if (config.listeners.some(l => l.name === name)) throw new Error("Listener name already exists; edit listeners.json to change its allowlist");
-  config.listeners.push({ name, host, port, prefix: normalizePrefix(opts.prefix), key: randomBytes(24).toString("base64url"), profiles: [...new Set(profiles)] });
+  if (config.listeners.some(l => l.name === name)) throw new Error(`Listener "${name}" already exists; change its profiles with rech listener allow|deny ${name} <profile>`);
+  const listener: Listener = { name, host, port, prefix: normalizePrefix(opts.prefix), key: randomBytes(24).toString("base64url"), profiles };
+  config.listeners.push(listener);
   await writeListeners(config);
   console.log(`Listener saved for ${host}:${port}; daemon reloads automatically. Credentials are in ~/.rechrome/listeners.json (keep private).`);
+  if (isLoopback(host)) for (const line of listenerNextSteps(listener, profiles[0])) console.log(line);
+}
+
+function findListener(config: { listeners: Listener[] }, name?: string): Listener {
+  if (name) {
+    const listener = config.listeners.find(l => l.name === name);
+    if (!listener) throw new Error(`Unknown listener "${name}". See rech listener ls.`);
+    return listener;
+  }
+  const scoped = config.listeners.filter(l => l.profiles !== "*");
+  if (scoped.length !== 1) throw new Error(`Name a listener: ${config.listeners.map(l => l.name).join(", ")}`);
+  return scoped[0];
+}
+
+async function listenerPort(name?: string): Promise<void> {
+  console.log(findListener(await requireListeners(), name).port);
+}
+
+async function allowListener(name: string, selectors: string[]): Promise<void> {
+  const config = await requireListeners();
+  const added = allowProfiles(config, name, await resolveProfileKeys(selectors));
+  await writeListeners(config);
+  console.log(added.length ? `Allowed on ${name}: ${added.join(", ")}` : `Already allowed on ${name}; nothing changed.`);
+}
+
+async function denyListener(name: string, selectors: string[]): Promise<void> {
+  const config = await requireListeners();
+  // Accept raw registry keys too, so a profile that no longer resolves can still be removed.
+  const keys = [...selectors, ...await resolveProfileKeys(selectors).catch(() => [] as string[])];
+  const removed = denyProfiles(config, name, keys);
+  await writeListeners(config);
+  console.log(removed.length ? `Removed from ${name}: ${removed.join(", ")}` : `Not on ${name}; nothing changed.`);
+}
+
+async function rotateKey(name: string): Promise<void> {
+  const config = await requireListeners();
+  rotateListenerKey(config, name);
+  await writeListeners(config);
+  console.log(`New key for ${name}; URLs carrying the old key stop working now. Print new ones with: rech url <profile> --listener ${name}`);
+}
+
+async function setListener(name: string, opts: { publicUrl?: string; clearPublicUrl?: boolean }): Promise<void> {
+  const config = await requireListeners();
+  const listener = setPublicUrl(config, name, opts.clearPublicUrl ? null : opts.publicUrl ?? null);
+  await writeListeners(config);
+  console.log(listener.publicUrl ? `${name} is reachable at ${listener.publicUrl}` : `${name}: public URL cleared`);
+}
+
+const hideKey = (url: string) => url.replace(/([#&?]key=)[^&]*/, "$1…");
+
+async function urlList(): Promise<void> {
+  const config = await requireListeners();
+  const rows = [["LISTENER", "PROFILE", "LOCAL", "PUBLIC"]];
+  for (const l of config.listeners) {
+    const local = `http://${listenerAddress(l)}${normalizePrefix(l.prefix)}`;
+    for (const profile of l.profiles === "*" ? ["(all profiles)"] : l.profiles) rows.push([l.name, profile, local, l.publicUrl ?? "-"]);
+  }
+  printTable(rows);
+  console.log(`\nPrint a full URL (contains the secret key): rech url <profile> --listener <name>`);
+}
+
+/** Write RECHROME_URL to this project's .rechrome/.env.local (the folder git-ignores itself). */
+async function saveProjectUrl(url: string): Promise<string> {
+  const { dataDir } = await getClientIdentity();
+  mkdirSync(dataDir, { recursive: true });
+  const gitignore = join(dataDir, ".gitignore");
+  if (!existsSync(gitignore)) await Bun.write(gitignore, "*\n");
+  const envPath = join(dataDir, ".env.local");
+  const lines = (await file(envPath).text().catch(() => "")).split("\n").filter(l => l.trim() && !l.startsWith(`${ENV_KEY}=`));
+  await writeFile(envPath, [...lines, `${ENV_KEY}=${url}`, ""].join("\n"), { mode: 0o600 });
+  await chmod(envPath, 0o600);
+  return envPath;
+}
+
+async function connect(url: string): Promise<void> {
+  const parsed = parseUrl(url);
+  if (!parsed.key) throw new Error("That URL has no key (#key=…). Ask the host for the full URL from: rech url <profile>");
+  const response = await fetch(serviceUrl(url, "ping"), { headers: { Authorization: `Bearer ${parsed.key}` }, signal: AbortSignal.timeout(5000) })
+    .catch(error => { throw new Error(`Could not reach ${serviceUrl(url)}: ${error instanceof Error ? error.message : error}`); });
+  if (response.status === 401) throw new Error("The daemon rejected this key; ask the host for a fresh URL (keys change on rech listener rotate-key).");
+  if (!response.ok) throw new Error(`${serviceUrl(url, "ping")} answered ${response.status}; is the proxy pointing at the listener?`);
+  const body = await response.json().catch(() => ({})) as { listener?: string; profiles?: string[] | "*" };
+  if (parsed.profileDirectory && Array.isArray(body.profiles) && !body.profiles.includes(parsed.profileDirectory))
+    throw new Error(`Connected, but listener "${body.listener}" does not allow profile "${parsed.profileDirectory}".`);
+  const saved = await saveProjectUrl(url);
+  console.log(`Connected to ${serviceUrl(url)}${body.listener ? ` (listener ${body.listener})` : ""}. Saved RECHROME_URL to ${saved}`);
 }
 
 export function detectSetupAgent(env: Record<string, string | undefined> = process.env): "Codex" | "Claude Code" | null {
@@ -2141,10 +2391,10 @@ async function setup(opts: SetupOptions = {}): Promise<void> {
     const serve = await detectTailscaleServe(exposure.port, prefix);
     if (serve.routeUrl) {
       console.log(`      Tailscale Serve route found: ${serve.routeUrl} → ${protocol}://${listenerAddress(exposure)}${prefix.slice(0, -1)}`);
-      console.log(`      Remote RECHROME_URL (secret; for other tailnet machines):\n        ${tailscaleConnectionUrl(serve.routeUrl, rechUrl.toString())}`);
+      console.log(`      Remote RECHROME_URL (secret; for other tailnet machines):\n        ${rebaseConnectionUrl(serve.routeUrl, rechUrl.toString())}`);
     } else {
       console.log(`      Tailscale Serve command (run separately): tailscale serve --bg --https=443 --set-path=${prefix.slice(0, -1)} ${protocol}://${listenerAddress(exposure)}${prefix.slice(0, -1)}`);
-      if (serve.dnsName) console.log(`      Then remote clients can use:\n        ${tailscaleConnectionUrl(`https://${serve.dnsName}${prefix}`, rechUrl.toString())}`);
+      if (serve.dnsName) console.log(`      Then remote clients can use:\n        ${rebaseConnectionUrl(`https://${serve.dnsName}${prefix}`, rechUrl.toString())}`);
       else console.log(`      For remote clients, use https://<your-machine-tailnet-name>${prefix} with this listener's bearer key and profile query.`);
     }
     console.log(`      The URL saved below is the local loopback one.`);
@@ -2225,112 +2475,44 @@ async function setup(opts: SetupOptions = {}): Promise<void> {
 async function status(): Promise<void> {
   const url = process.env[ENV_KEY];
   if (!url) {
-    console.log(`serve:    not configured (run \`rech setup\`)`);
+    console.log(`serve:    not configured`);
+    console.log(notConnectedMessage().split("\n").slice(1).join("\n"));
     return;
   }
-  const { host, port, protocol } = parseUrl(url);
   const parsed = parseUrl(url);
   const ping = await fetch(serviceUrl(url), { signal: AbortSignal.timeout(2000) }).catch(() => null);
-  // Resolve the daemon's actual bind from its authenticated /ping (cross-platform; lsof is
-  // POSIX-only and absent on Windows). bind is "0.0.0.0" (all interfaces) or the loopback IP.
-  const pingBody = ping
-    ? await fetch(serviceUrl(url, "ping"), {
-        headers: { Authorization: `Bearer ${parsed.key}` },
-        signal: AbortSignal.timeout(2000),
-      }).then(r => (r.ok ? r.json() : null)).catch(() => null) as { bind?: string; degraded?: boolean; consecutiveTimeouts?: number } | null
+  // The authenticated /ping reports which listener answered, its bind, and the profiles it allows.
+  const pingResponse = ping
+    ? await fetch(serviceUrl(url, "ping"), { headers: { Authorization: `Bearer ${parsed.key}` }, signal: AbortSignal.timeout(2000) }).catch(() => null)
     : null;
-  const bind = pingBody?.bind;
-  const listenAddr = bind ? `${bind}:${port}` : `${host}:${port}`;
-  console.log(`serve:    ${ping ? `running  ${protocol}://${listenAddr}` : "not running"}`);
+  const pingBody = pingResponse?.ok
+    ? await pingResponse.json().catch(() => null) as { bind?: string; listener?: string; profiles?: string[] | "*"; degraded?: boolean; consecutiveTimeouts?: number } | null
+    : null;
+  // Show the URL this client connects to; through a proxy, the daemon's bind is on another port.
+  const details = [pingBody?.listener && `listener ${pingBody.listener}`, pingBody?.bind && `bind ${pingBody.bind}`].filter(Boolean).join(", ");
+  console.log(`serve:    ${ping ? `running  ${serviceUrl(url)}${details ? `  (${details})` : ""}` : `not reachable at ${serviceUrl(url)}`}`);
+  if (pingResponse?.status === 401)
+    console.log(`auth:     ✗ key rejected — ask the host for a fresh URL (\`rech url <profile>\`), then \`rech connect '<url>'\``);
   // daemonManager().id — there is no PM_BIN constant. Referencing one threw a
   // ReferenceError that took down the whole of `rech status`, so the one command
   // that reports "the relay is wedged" died exactly when the relay was wedged,
   // printing a stack trace instead of the restart hint.
   if (pingBody?.degraded)
     console.log(`relay:    ⚠ degraded (${pingBody.consecutiveTimeouts} consecutive command timeouts) — if it persists, the daemon self-restarts; force it now with \`${daemonManager().id} restart ${PM_PROCESS_NAME}\``);
-  const pmOut = await pmList();
-  const daemonRegistered = pmOut.includes(PM_PROCESS_NAME);
-  console.log(`daemon:   ${daemonRegistered ? `${daemonManager().id} (${PM_PROCESS_NAME})` : "not installed"}`);
-  const registry = await readTokenRegistry();
-  const entries = Object.entries(registry);
-  if (entries.length) {
-    console.log(`\nprofiles:`);
-    const primaryProfile = parsed.profileDirectory;
-    for (const [email, entry] of entries) {
-      const isPrimary = email === primaryProfile || entry.profileDir === primaryProfile;
-      const marker = isPrimary ? " (primary)" : "";
-      console.log(`  ${email.padEnd(36)}  [${entry.profileDir}]  ext: ${entry.extensionId.slice(0, 8)}…  token: ${entry.token.slice(0, 8)}…${marker}`);
-    }
-  } else if (parsed.profileDirectory) {
-    // Legacy: no registry yet, show from RECHROME_URL
-    const email = await resolveProfileEmail(parsed.profileDirectory).catch(() => parsed.profileDirectory);
-    console.log(`\nprofiles:\n  ${email}  [${parsed.profileDirectory}]  (legacy — re-run \`rech setup\` to register)`);
+  // The daemon line is about this machine; a client of a remote host has no local daemon to report.
+  const isHost = !!(await readListeners().catch(() => null));
+  if (isHost) {
+    const daemonRegistered = (await pmList()).includes(PM_PROCESS_NAME);
+    console.log(`daemon:   ${daemonRegistered ? `${daemonManager().id} (${PM_PROCESS_NAME})` : "not installed"}`);
   }
+  // Same resolution as a command: ?profile= in the URL, else PLAYWRIGHT_MCP_PROFILE_DIRECTORY.
+  const effective = resolveEffectiveProfile(parsed.profileDirectory);
+  const current = effective ? await resolveProfileEmail(effective).catch(() => effective) : undefined;
+  const allowed = pingBody?.profiles === "*" ? "all registered profiles" : pingBody?.profiles?.join(", ");
+  console.log(`profile:  ${current ?? "(none selected; add ?profile= to the URL or pass --profile)"}${allowed ? `  — this listener serves: ${allowed}` : ""}`);
+  if (isHost) console.log(`\nMore: rech profile (profiles) · rech url ls (who can connect, and where)`);
 }
 
-function printHelp(): void {
-  console.log(`rechrome (rech) — drive Chrome via Playwright over HTTP
-
-Usage:
-  rech [--profile <email|name|folder>] <playwright-args...>
-                               Run Playwright CLI command with the given registered
-                               Chrome profile. --profile selects the profile by exact
-                               registered email (e.g. you@gmail.com), exact Chrome
-                               profile name, or exact profile folder name. The profile
-                               must already be registered (see \`rech setup\`). Place
-                               --profile before the playwright subcommand. Requires
-                               ${ENV_KEY}.
-  rech setup [--listen <local|lan|tailscale|IP>] [--profile <email|name|folder>] [--token <tok>] [--prefix <path>] [--port <port>] [--yes]
-                               First-time setup: daemon + Chrome extension + config
-                               --prefix=rechrome mounts at /rechrome/ on a scoped listener.
-                               Prefixed setup defaults to the management port + 1; override with --port.
-                               Offers to install missing oxmgr globally (y/N).
-                               --yes approves installation without prompting.
-                               --profile selects the Chrome profile non-interactively.
-                               Menu numbers are not accepted. Resolution order is exact
-                               email (e.g. you@gmail.com), exact Chrome profile name,
-                               then exact profile folder name (e.g. "Profile 1"). See
-                               available values with \`rech profile\`.
-                               --token (or RECH_TOKEN) supplies the auth token for
-                               non-TTY/agent runs, skipping the interactive paste
-  rech provision-profile <name> --experimental [--headed]
-                               (experimental) Auto-provision a managed QA profile on
-                               Chrome for Testing — branded Chrome 149+ rejects
-                               --load-extension, so this is a clean browser, not your
-                               real Chrome. For your real Chrome, use \`rech setup\`
-  rech status                  Show current configuration and serve health
-  rech tray [show|hide|stop]   Native menu-bar/tray icon for the serve daemon
-                               (show=start, hide/show toggle, stop=quit). Auto-
-                               starts after \`rech setup\`; skipped with no GUI
-  rech uninstall               Remove the serve daemon and clear config
-  rech serve                   Start the serve server manually (foreground)
-  rech listener [ls|add|remove]  Manage daemon listener addresses and allowed profiles
-  rech profile [ls|list]
-                               List Chrome + managed test profiles and connection status
-  rech profile [name] --print-uri [--listener <name>]
-                               Print a connection URI (includes the daemon key).
-                               Uses RECHROME_URL, or an explicitly selected local listener.
-  rech <playwright-args...>    Run Playwright CLI command (requires ${ENV_KEY})
-  rech --isolate <args...>     Run in a throwaway session (sugar for -s=<random>) so a
-                               fragile single-shot flow (OAuth/login) never shares tabs
-                               with the worktree's default session
-
-Environment:
-  ${ENV_KEY}   Server URL set by \`rech setup\`
-  RECH_TOKEN     Auth token for \`rech setup\` (same as --token)
-  RECH_IDENTITY  Session bucket mode: worktree (default) | branch | cwd. The session a
-                 client reuses is keyed on the worktree root path; \`branch\` restores the
-                 old <remote>/tree/<branch> keying, \`cwd\` keys on the exact directory
-  RECH_SETUP_AGENT  Setup hints: codex | claude | none (otherwise auto-detected)
-
-Examples:
-  rech setup
-  rech setup --profile you@gmail.com --token <PLAYWRIGHT_MCP_EXTENSION_TOKEN>
-  rech --profile you@gmail.com open https://example.com
-  rech eval "() => document.title"
-  rech open https://example.com
-  rech screenshot`);
-}
 
 export type SetupOptions = { profile?: string; token?: string; listen?: string; prefix?: string; port?: number; yes?: boolean };
 export type RechHandlers = {
@@ -2340,7 +2522,14 @@ export type RechHandlers = {
   addListener(name: string, opts: { listen: string; profile: string[]; port?: number; prefix?: string }): Promise<void>;
   removeListener(name: string): Promise<void>;
   listProfiles(): Promise<void>;
-  printProfileUri(selector?: string, listener?: string): Promise<void>;
+  printProfileUri(selector?: string, listener?: string, opts?: { local?: boolean; save?: boolean }): Promise<void>;
+  urlList(): Promise<void>;
+  connect(url: string): Promise<void>;
+  listenerPort(name?: string): Promise<void>;
+  allowListener(name: string, profiles: string[]): Promise<void>;
+  denyListener(name: string, profiles: string[]): Promise<void>;
+  rotateKey(name: string): Promise<void>;
+  setListener(name: string, opts: { publicUrl?: string; clearPublicUrl?: boolean }): Promise<void>;
   setup(opts: SetupOptions): Promise<void>;
   tray(action?: string): Promise<void>;
   provisionProfile(name: string, opts: { headed: boolean; experimental: boolean }): Promise<void>;
@@ -2348,90 +2537,162 @@ export type RechHandlers = {
 };
 
 /** Commands rech handles itself; anything else is forwarded verbatim to playwright-cli. */
-export const RECH_COMMANDS = new Set(["serve", "status", "listener", "listeners", "profile", "profiles", "setup", "tray", "provision-profile", "uninstall"]);
+export const RECH_COMMANDS = new Set(["serve", "status", "listener", "listeners", "profile", "profiles", "url", "urls", "connect", "setup", "tray", "provision-profile", "uninstall"]);
 
 const portOption = { type: "number", requiresArg: true, describe: "Listener port (1-65535)" } as const;
+
+// yargs trims indentation in .usage(), so the indented browser-command block lives in the epilogue.
+const HELP_USAGE = `rechrome (rech) — drive your real, logged-in Chrome from scripts, agents and other machines
+
+Usage: rech <command> [options]   ·   rech <browser-command> [args]`;
+
+const HELP_EPILOGUE = `Browser commands (sent to this project's Chrome session):
+  rech [--profile <p>] [--isolate] <browser-command> [args]
+      open, goto, click, fill, screenshot, eval, tab-list…  (\`rech pw --help\` lists all)
+      --profile <p>  as another registered profile (email, name or folder); put it first
+      --isolate      in a throwaway session, e.g. for a login flow
+  rech pw <args>     forward verbatim to playwright-cli, e.g. \`rech pw --version\`
+  rech --version     rechrome's version
+
+Environment:
+  ${ENV_KEY}      connection URL; read from the nearest .rechrome/.env.local or .env.local
+  RECH_IDENTITY     session key: worktree (default) | branch | cwd
+  RECH_TOKEN        extension token for \`rech setup\` (same as --token)
+  RECH_SETUP_AGENT  setup hints: codex | claude | none (auto-detected)
+
+Examples:
+  rech setup --profile you@example.com         set up Chrome on this machine
+  rech open https://example.com                open a page in this project's session
+  rech screenshot                              saved to <project>/.rechrome/output/
+  rech url you@example.com --listener share    URL to give another machine (secret)
+  rech connect '<url>'                         use that URL in this project
+
+Run \`rech <command> --help\` for a command's options. Tutorial: https://github.com/snomiao/rechrome#tutorial`;
 
 export function rechCli(argv: string[], handlers: RechHandlers) {
   return yargs(argv)
     .scriptName("rech")
+    .usage(HELP_USAGE)
+    .epilogue(HELP_EPILOGUE)
+    .wrap(Math.min(110, process.stdout.columns || 110))
     .parserConfiguration({ "parse-numbers": false, "parse-positional-numbers": false })
-    .command("serve", "Run the rechrome daemon in the foreground", {}, () => handlers.serve())
-    .command("status", "Show daemon, relay and profile connection status", {}, () => handlers.status())
-    .command(["listener", "listeners"], "Manage network listeners", y => y
-      .command(["ls", "list", "$0"], "List listeners (credentials hidden)", {}, () => handlers.listListeners())
-      .command("add <name>", "Expose registered profiles on a network", y => y
+    // Set up and inspect this machine
+    .command("setup", "Set up this machine: daemon, Chrome extension, connection", y => y
+      .option("profile", { type: "string", requiresArg: true, describe: "Chrome profile: exact email, Chrome profile name, or folder (e.g. \"Profile 1\"); not menu numbers" })
+      .option("token", { type: "string", requiresArg: true, describe: "Extension token, for headless runs (default: read from the profile, or RECH_TOKEN)" })
+      .option("listen", { type: "string", requiresArg: true, describe: "Who can reach this profile: local (default) | lan | tailscale | <detected IP>" })
+      .option("prefix", { type: "string", requiresArg: true, describe: "URL path for a proxied listener, e.g. rechrome (port defaults to the management port + 1)" })
+      .option("port", portOption)
+      .option("yes", { alias: "y", type: "boolean", default: false, describe: "Approve installing a missing oxmgr without prompting" }),
+      a => handlers.setup({ profile: a.profile, token: a.token ?? process.env.RECH_TOKEN, listen: a.listen, prefix: a.prefix, port: a.port, yes: a.yes }))
+    .command("status", "Is it working? The URL in use, the daemon, and the current profile", {}, () => handlers.status())
+    .command(["profile [name]", "profiles [name]"], "List Chrome profiles and whether each is connected", y => y
+      .positional("name", { type: "string", describe: "ls/list lists all (the default)" })
+      .option("print-uri", { type: "boolean", describe: "Same as `rech url <name>`" })
+      .option("listener", { type: "string", requiresArg: true, implies: "print-uri", describe: "Listener to build the URL for" }),
+      a => {
+        if (a.printUri) return handlers.printProfileUri(a.name, a.listener); // alias of `rech url`
+        if (a.name === undefined || ["ls", "list"].includes(a.name)) return handlers.listProfiles();
+        throw new Error(`To print "${a.name}"'s connection URL: rech url ${JSON.stringify(a.name)}. To list profiles: rech profile`);
+      })
+    // Share with and connect from other machines
+    .command(["url [profile]", "urls [profile]"], "Print a connection URL to share (contains a secret key); `url ls` lists all", y => y
+      .positional("profile", { type: "string", describe: "Profile (email, name or folder); ls/list lists every listener's URLs" })
+      .option("listener", { type: "string", requiresArg: true, describe: "Listener to build the URL for" })
+      .option("local", { type: "boolean", describe: "Print the direct listener address even when a public URL is set" })
+      .option("save", { type: "boolean", describe: "Also save it as RECHROME_URL in this project's .rechrome/.env.local" }),
+      a => ["ls", "list"].includes(a.profile ?? "") && !a.listener && !a.save
+        ? handlers.urlList()
+        : handlers.printProfileUri(a.profile, a.listener, { local: a.local, save: a.save }))
+    .command("connect <url>", "Use a URL from another machine in this project (checks it first)", y => y
+      .positional("url", { type: "string", demandOption: true, describe: "The URL printed by `rech url <profile>` on the machine with Chrome. Quote it: it contains #" })
+      .example("rech connect 'https://host.example.ts.net/rechrome/?profile=you%40example.com#key=…'", ""),
+      a => handlers.connect(a.url))
+    .command(["listener", "listeners"], "Control who can connect: listeners, allowed profiles, keys, public URLs", y => y
+      .command(["ls", "list", "$0"], "List listeners (keys hidden)", {}, () => handlers.listListeners())
+      .command("add <name>", "Expose registered profiles on an address (local for a proxy, lan, tailscale, IP)", y => y
         .positional("name", { type: "string", demandOption: true })
         .option("listen", { type: "string", requiresArg: true, demandOption: true, describe: "local | lan | tailscale | <detected IP>" })
         .option("profile", { type: "string", array: true, requiresArg: true, demandOption: true, describe: "Allowed profile; repeat for several" })
         .option("port", portOption)
         .option("prefix", { type: "string", requiresArg: true, describe: "URL path prefix, e.g. rechrome" }),
         a => handlers.addListener(a.name, { listen: a.listen, profile: a.profile, port: a.port, prefix: a.prefix }))
+      .command("allow <name> <profiles..>", "Allow more profiles on a listener", y => y
+        .positional("name", { type: "string", demandOption: true }).positional("profiles", { type: "string", array: true, demandOption: true }),
+        a => handlers.allowListener(a.name, a.profiles))
+      .command("deny <name> <profiles..>", "Remove profiles from a listener", y => y
+        .positional("name", { type: "string", demandOption: true }).positional("profiles", { type: "string", array: true, demandOption: true }),
+        a => handlers.denyListener(a.name, a.profiles))
+      .command("set <name>", "Record where a reverse proxy exposes a listener", y => y
+        .positional("name", { type: "string", demandOption: true })
+        .option("public-url", { type: "string", requiresArg: true, describe: "e.g. https://host.example.ts.net/rechrome/" })
+        .option("clear-public-url", { type: "boolean", conflicts: "public-url" })
+        .check(a => a.publicUrl !== undefined || a.clearPublicUrl ? true : "Pass --public-url <url> or --clear-public-url"),
+        a => handlers.setListener(a.name, { publicUrl: a.publicUrl, clearPublicUrl: a.clearPublicUrl }))
+      .command("port [name]", "Print a listener's port (for a proxy command)", y => y.positional("name", { type: "string" }),
+        a => handlers.listenerPort(a.name))
+      .command("rotate-key <name>", "Give a listener a new key (old URLs stop working)", y => y.positional("name", { type: "string", demandOption: true }),
+        a => handlers.rotateKey(a.name))
       .command("remove <name>", "Remove a listener", y => y.positional("name", { type: "string", demandOption: true }),
         a => handlers.removeListener(a.name))
       .demandCommand(1).strict())
-    .command(["profile [name]", "profiles [name]"], "List profiles, or print a profile's connection URI", y => y
-      .positional("name", { type: "string", describe: "Profile (email, name or folder); ls/list lists all" })
-      .option("print-uri", { type: "boolean", describe: "Print the profile's connection URI (contains a secret key)" })
-      .option("listener", { type: "string", requiresArg: true, implies: "print-uri", describe: "Listener to build the URI for" }),
-      a => {
-        if (a.printUri) return handlers.printProfileUri(a.name, a.listener);
-        if (a.name === undefined || ["ls", "list"].includes(a.name)) return handlers.listProfiles();
-        throw new Error("Usage: rech profile [ls|list] | rech profile [name] --print-uri. Create, rename, and delete are not implemented.");
-      })
-    .command("setup", "Install the daemon and connect a Chrome profile", y => y
-      .option("profile", { type: "string", requiresArg: true, describe: "Chrome profile: email, name or folder" })
-      .option("token", { type: "string", requiresArg: true, describe: "Extension token (default: read from the profile, or RECH_TOKEN)" })
-      .option("listen", { type: "string", requiresArg: true, describe: "local | lan | tailscale | <detected IP>" })
-      .option("prefix", { type: "string", requiresArg: true, describe: "URL path prefix for a scoped listener, e.g. rechrome" })
-      .option("port", portOption)
-      .option("yes", { alias: "y", type: "boolean", default: false, describe: "Approve installing a missing oxmgr without prompting" }),
-      a => handlers.setup({ profile: a.profile, token: a.token ?? process.env.RECH_TOKEN, listen: a.listen, prefix: a.prefix, port: a.port, yes: a.yes }))
-    .command("tray [action]", "Show or hide the tray icon", y => y
+    // Daemon and extras
+    .command("tray [action]", "Menu-bar icon for the daemon (starts after setup)", y => y
       .positional("action", { type: "string", choices: ["show", "start", "hide", "stop", "quit"] }),
       a => handlers.tray(a.action))
-    .command("provision-profile <name>", "Create a managed Chrome-for-Testing profile (experimental)", y => y
+    .command("provision-profile <name>", "(experimental) Clean Chrome-for-Testing profile, fully automated; not your real Chrome", y => y
       .positional("name", { type: "string", demandOption: true })
       .option("experimental", { type: "boolean", default: false })
       .option("headed", { type: "boolean", default: false }),
       a => handlers.provisionProfile(a.name, { headed: a.headed, experimental: a.experimental }))
-    .command("uninstall", "Stop and remove the rechrome daemon", {}, () => handlers.uninstall())
+    .command("uninstall", "Stop and remove the daemon", {}, () => handlers.uninstall())
+    .command("serve", "Run the daemon in the foreground (normally managed by oxmgr)", {}, () => handlers.serve())
     .demandCommand(1)
     .strict()
     .help()
+    .alias("help", "h")
     .version(false)
-    .fail((message, error) => { throw error ?? new Error(message); });
+    // A parse error (missing argument, unknown option…) shows that command's help above the
+    // error, so the fix is visible. Errors thrown by a command's own handler pass through.
+    .fail((message, error, y) => {
+      if (error) throw error;
+      // Straight to stderr: Bun's console.error would paint the whole help red.
+      y.showHelp((help: string) => process.stderr.write(`${help}\n\n`));
+      throw new Error(`rech: ${/^Not enough non-option arguments/.test(message) ? "missing a required argument; see the usage line above" : message}`);
+    });
 }
 
 if (import.meta.main) {
   let args = process.argv.slice(2);
   const cmd = args[0]?.toLowerCase();
 
+  const handlers: RechHandlers = {
+    serve: async () => { const { serve } = await import("./serve.ts"); serve(); }, // long-lived; watcher intentionally kept alive
+    status,
+    listListeners, addListener, removeListener, listProfiles, printProfileUri,
+    urlList, connect, listenerPort, allowListener, denyListener, rotateKey, setListener,
+    setup: async (opts) => {
+      await setup(opts); // setup closes envWatcher itself before printing Done
+      // Auto-start the tray (best-effort, silent on headless / missing binary).
+      await startTray({ quiet: true }).catch(() => {});
+    },
+    tray: trayCommand,
+    provisionProfile: async (name, { headed, experimental }) => {
+      // Experimental: a managed profile runs on Chrome for Testing, not the user's real Google Chrome
+      // (branded Chrome 149+ rejects --load-extension). It's a clean browser with no logins/cookies,
+      // so it's gated behind --experimental rather than offered as the default setup path.
+      if (!experimental) throw new Error([
+        `provision-profile is experimental and creates a Chrome-for-Testing profile (not your`,
+        `real Chrome): branded Google Chrome 149+ rejects --load-extension, so a managed profile`,
+        `can't reuse your logged-in Chrome. For your real Chrome use:  rech setup --profile <email|name|folder>`,
+        `To proceed anyway, re-run with --experimental.`,
+      ].join("\n"));
+      await provisionProfile(name, { headed });
+    },
+    uninstall: daemonUninstall,
+  };
+
   if (cmd && RECH_COMMANDS.has(cmd)) {
-    const handlers: RechHandlers = {
-      serve: async () => { const { serve } = await import("./serve.ts"); serve(); }, // long-lived; watcher intentionally kept alive
-      status,
-      listListeners, addListener, removeListener, listProfiles, printProfileUri,
-      setup: async (opts) => {
-        await setup(opts); // setup closes envWatcher itself before printing Done
-        // Auto-start the tray (best-effort, silent on headless / missing binary).
-        await startTray({ quiet: true }).catch(() => {});
-      },
-      tray: trayCommand,
-      provisionProfile: async (name, { headed, experimental }) => {
-        // Experimental: a managed profile runs on Chrome for Testing, not the user's real Google Chrome
-        // (branded Chrome 149+ rejects --load-extension). It's a clean browser with no logins/cookies,
-        // so it's gated behind --experimental rather than offered as the default setup path.
-        if (!experimental) throw new Error([
-          `provision-profile is experimental and creates a Chrome-for-Testing profile (not your`,
-          `real Chrome): branded Google Chrome 149+ rejects --load-extension, so a managed profile`,
-          `can't reuse your logged-in Chrome. For your real Chrome use:  rech setup --profile <email|name|folder>`,
-          `To proceed anyway, re-run with --experimental.`,
-        ].join("\n"));
-        await provisionProfile(name, { headed });
-      },
-      uninstall: daemonUninstall,
-    };
     try {
       await rechCli([cmd, ...args.slice(1)], handlers).parseAsync();
     } catch (error) {
@@ -2440,20 +2701,26 @@ if (import.meta.main) {
     } finally {
       if (cmd !== "serve") envWatcher?.close();
     }
-  } else if (cmd === "help" || cmd === "--help" || cmd === "-h" || args.length === 0) {
-    printHelp();
+  } else if (cmd === "--version") {
+    console.log(rechromeVersion()); // playwright-cli's own: rech pw --version
     envWatcher?.close();
+  } else if (cmd === "help" || cmd === "--help" || cmd === "-h" || args.length === 0) {
+    try { await rechCli(["--help"], handlers).parseAsync(); }
+    finally { envWatcher?.close(); }
   } else {
     const url = process.env[ENV_KEY];
     if (!url) {
-      console.error(`${ENV_KEY} is not set. Run \`rech setup\` to configure.\n`);
-      printHelp();
+      console.error(notConnectedMessage());
       process.exit(1);
     }
     // --profile: target a registered Chrome profile globally (see extractGlobalProfileArg for
     // the leading-flags-only rule that protects the forwarded CLI's own --profile).
     let profileSelector: string | undefined;
     let overrideEnv: Record<string, string> | undefined;
+    // Everything after rech's `pw` (or `--`) goes to playwright-cli untouched; only the flags before it are rech's.
+    const separator = rechSeparatorIndex(args);
+    const forwarded = separator === -1 ? [] : args.slice(separator + 1);
+    if (separator !== -1) args = args.slice(0, separator);
     try {
       const extracted = extractGlobalProfileArg(args);
       profileSelector = extracted.selector;
@@ -2493,7 +2760,8 @@ if (import.meta.main) {
       args.splice(isolateIdx, 1);
       args.push(`-s=iso-${randomBytes(8).toString("hex")}`);
     }
-    await run(url, args, overrideEnv);
+    args = [...forwarded, ...args];
+    await run(url, args, overrideEnv, { verbatim: separator !== -1 });
     envWatcher?.close();
   }
 }

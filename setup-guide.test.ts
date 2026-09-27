@@ -1,8 +1,9 @@
 import { test, expect } from "bun:test";
+import { join } from "path";
 import { buildSetupHtml, createSetupGuide } from "./rechrome.ts";
 
 test("guide remains reachable after non-TTY stdin closes", async () => {
-  const modulePath = new URL("./rechrome.ts", import.meta.url).pathname;
+  const modulePath = join(import.meta.dir, "rechrome.ts"); // URL.pathname is "/C:/…" on Windows
   const child = Bun.spawn([process.execPath, "--eval", `
     import { createSetupGuide } from ${JSON.stringify(modulePath)};
     await Bun.stdin.text();

@@ -34,7 +34,7 @@ predictability contract: a human can tell which browser they're driving from whe
 
 The `rech serve` daemon is **local** — sessions never cross machines, so a machine-independent/branch key
 buys nothing functional; the path key is strictly better. A `serve` change needs `oxmgr restart
-rechrome-serve` to take effect (see the build/verify section below).
+rechrome` to take effect (see the build/verify section below).
 
 ## Never modify node_modules
 
@@ -80,16 +80,14 @@ How a profile gets its auth token and extension, and the platform constraints be
   it as `PLAYWRIGHT_MCP_LOAD_EXTENSION`, and the patched `cdpRelay.ts` re-adds `--load-extension` and
   **forces the Chromium executable** on every launch (branded Chrome would ignore the flag). This is
   a clean browser (no logins) — gated behind `--experimental`, not the default.
-- **The relay-side `cdpRelay.ts` patch is NOT pinned on `main`.** It lives on the `lib/playwright`
-  submodule branch **`sno-dev`** (commit `9fd8e2dd5` re-adds `--load-extension` + forces Chromium for
-  `PLAYWRIGHT_MCP_LOAD_EXTENSION`); the pre-existing tip is preserved as tag `sno-dev-old-b6cc8dd`.
-  `main` keeps the submodule pinned at the upstream-fetchable commit so fresh clones / CI don't break
-  on an unpushed pin. So `rech setup` (the default real-Chrome flow) works from a clean checkout, but
-  **`--experimental` needs the relay patch applied first**: in `lib/playwright/`, `git checkout
-  sno-dev` then rebuild (`node utils/build/build.js`) so the patched `coreBundle.js` is what runs.
-  Without that, a managed profile is seeded fine but `rech open` launches without re-loading the
-  extension and the token-bypass connect fails. If the fork ever gets a pushed remote, pin `main` to
-  `sno-dev` and drop this caveat.
+- **The relay-side `cdpRelay.ts` patch is pinned on `main`.** The `lib/playwright` submodule tracks
+  the fork's `main` (`snomiao/playwright`), which carries it (commit `ace5051d1` re-adds
+  `--load-extension` + forces Chromium for `PLAYWRIGHT_MCP_LOAD_EXTENSION`). The old `sno-dev`
+  branch is superseded. **`--experimental` still needs a rebuild** in `lib/playwright/`
+  (`node utils/build/build.js`) so the patched `coreBundle.js` is what runs; without it, a managed
+  profile is seeded fine but `rech open` launches without re-loading the extension and the
+  token-bypass connect fails. Always push the fork before bumping the pin, so fresh clones / CI
+  can fetch it.
 
 ## Building & verifying the vendored playwright / extension
 
@@ -116,7 +114,7 @@ Hard-won notes — a source edit not taking effect at runtime is almost always o
 - **The connect flow has two paths: token-bypass and Allow-click.** The daemon uses **token-bypass**
   (auto-connect, no UI click). A test that only drives the Allow-click path (`clickAllowAndSelect`)
   misses bypass-only bugs — cover token-bypass explicitly.
-- **A daemon (`serve`) change needs the daemon restarted** (`oxmgr restart rechrome-serve`) to take
+- **A daemon (`serve`) change needs the daemon restarted** (`oxmgr restart rechrome`) to take
   effect; the daemon runs the `serve` source directly (no build step). Restarting it does not touch
   Chrome or live browser sessions.
 
@@ -133,7 +131,7 @@ For an agent that just wants to *use* rech to open/verify a URL in the user's Ch
 - **`bun rechrome.ts status` first.** "bearer key rejected" = the `<KEY>@host` userinfo rotated (it does so
   every Mac serve restart) → ask the user for a fresh `RECHROME_URL`; can't SSH into the Mac.
 - **Commands:** `open <url>` · `screenshot [--full-page] [--filename x.png]` · `resize <w> <h>` ·
-  `eval "() => …"`. Screenshots download to `./.playwright-cli-multi-tab/` (gitignored).
+  `eval "() => …"`. Screenshots download to `<project root>/.rechrome/output/` (the worktree root; the folder git-ignores itself).
 - **Each call is a SEPARATE session.** An `eval` that scrolls does NOT persist into the next
   `screenshot` (it re-opens at top) — but **`resize` DOES** persist (it's a window property). To shoot
   below the fold on a page that scrolls an inner container (where `--full-page` only captures the

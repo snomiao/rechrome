@@ -7,6 +7,7 @@ bun.lock
 rechrome.js
 daemon-manager.js
 extension-token.js
+listeners.js
 serve.js
 .playwright-cli/
 
