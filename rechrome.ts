@@ -311,20 +311,69 @@ export function buildListenChoices(interfaces: ReturnType<typeof networkInterfac
   return choices.sort((a, b) => rank[a.kind] - rank[b.kind]);
 }
 
-export async function detectListenChoices(): Promise<ListenChoice[]> {
-  const binary = Bun.which("tailscale") || (existsSync("/Applications/Tailscale.app/Contents/MacOS/Tailscale") ? "/Applications/Tailscale.app/Contents/MacOS/Tailscale" : null);
-  let ips: string[] = [];
-  if (binary) {
+const tailscaleBinary = () => Bun.which("tailscale") || (existsSync("/Applications/Tailscale.app/Contents/MacOS/Tailscale") ? "/Applications/Tailscale.app/Contents/MacOS/Tailscale" : null);
+
+/** Run the Tailscale CLI read-only; null when it is missing, disconnected, or slow. */
+async function runTailscale(args: string[]): Promise<string | null> {
+  const binary = tailscaleBinary();
+  if (!binary) return null;
+  try {
+    const proc = Bun.spawn([binary, ...args], { stdout: "pipe", stderr: "ignore" });
+    const timeout = setTimeout(() => proc.kill(), 2000);
     try {
-      const proc = Bun.spawn([binary, "ip", "-4"], { stdout: "pipe", stderr: "ignore" });
-      const timeout = setTimeout(() => proc.kill(), 2000);
-      try {
-        const output = await new Response(proc.stdout).text();
-        if (await proc.exited === 0) ips = output.trim().split(/\s+/).filter(isIPv4);
-      } finally { clearTimeout(timeout); }
-    } catch { /* No connected Tailscale CLI; still show detected interfaces. */ }
-  }
+      const output = await new Response(proc.stdout).text();
+      return await proc.exited === 0 ? output : null;
+    } finally { clearTimeout(timeout); }
+  } catch { return null; }
+}
+
+export async function detectListenChoices(): Promise<ListenChoice[]> {
+  const output = await runTailscale(["ip", "-4"]);
+  const ips = output ? output.trim().split(/\s+/).filter(isIPv4) : [];
   return buildListenChoices(networkInterfaces(), ips);
+}
+
+export type TailscaleServe = { dnsName: string | null; routeUrl: string | null };
+
+/**
+ * Find the HTTPS Serve route that forwards `prefix` to a loopback listener on `port`,
+ * keeping the prefix (a route that strips it would 404 on the prefixed listener).
+ * Prefers this node's own DNS name when several hostnames carry the same route.
+ */
+export function findTailscaleServeRoute(dnsName: string | null, serveStatus: unknown, port: number, prefix: string): string | null {
+  const web = (serveStatus as { Web?: Record<string, { Handlers?: Record<string, { Proxy?: string }> }> } | null)?.Web ?? {};
+  const mount = prefix.replace(/\/+$/, "");
+  const matches: string[] = [];
+  for (const [hostPort, config] of Object.entries(web)) {
+    for (const [path, handler] of Object.entries(config.Handlers ?? {})) {
+      if (path.replace(/\/+$/, "") !== mount || !handler.Proxy) continue;
+      let target: URL;
+      try { target = new URL(/^[a-z]+:\/\//i.test(handler.Proxy) ? handler.Proxy : `http://${handler.Proxy}`); } catch { continue; }
+      if (!["127.0.0.1", "localhost", "[::1]"].includes(target.hostname) || Number(target.port) !== port) continue;
+      if (target.pathname.replace(/\/+$/, "") !== mount) continue;
+      const [host, httpsPort] = hostPort.split(/:(?=\d+$)/);
+      matches.push(`https://${host}${httpsPort && httpsPort !== "443" ? `:${httpsPort}` : ""}${prefix}`);
+    }
+  }
+  return matches.find(url => dnsName && new URL(url).hostname === dnsName) ?? matches[0] ?? null;
+}
+
+export async function detectTailscaleServe(port: number, prefix: string): Promise<TailscaleServe> {
+  const [status, serve] = await Promise.all([runTailscale(["status", "--json"]), runTailscale(["serve", "status", "--json"])]);
+  let dnsName: string | null = null;
+  let serveStatus: unknown = null;
+  try { dnsName = (JSON.parse(status ?? "null")?.Self?.DNSName as string | undefined)?.replace(/\.$/, "") || null; } catch { /* not connected */ }
+  try { serveStatus = JSON.parse(serve ?? "null"); } catch { /* no Serve config */ }
+  return { dnsName, routeUrl: findTailscaleServeRoute(dnsName, serveStatus, port, prefix) };
+}
+
+/** Remote connection URL for a Serve route, carrying the listener key and profile like the local one. */
+export function tailscaleConnectionUrl(routeUrl: string, localUrl: string): string {
+  const local = new URL(localUrl);
+  const remote = new URL(routeUrl);
+  remote.username = parseUrl(localUrl).key;
+  remote.search = local.search;
+  return registeredProfileUrl(remote.toString());
 }
 
 export function chooseListenAddress(choices: ListenChoice[], selector: string): string {
@@ -2044,6 +2093,7 @@ async function setup(opts: { profile?: string; token?: string; listen?: string; 
   const existingPrefix = prefix !== "/" ? (await readListeners())?.listeners.find(l => l.host === desiredBind && l.profiles !== "*" && normalizePrefix(l.prefix) === prefix) : undefined;
   const exposurePort = opts.port ?? existingPrefix?.port ?? (prefix !== "/" ? port + 1 : port);
   const exposure = await exposeProfile(profileEmail, desiredBind, exposurePort, prefix);
+  const tailscaleChoice = listenChoices.find(c => c.kind === "tailscale")?.address;
   rechUrl.hostname = exposure.host;
   rechUrl.port = String(exposure.port);
   rechUrl.username = exposure.key;
@@ -2057,8 +2107,21 @@ async function setup(opts: { profile?: string; token?: string; listen?: string; 
   }
   if (!exposed) throw new Error("Profile registered, but its listener did not become reachable. Check for an occupied port or an unavailable interface.");
   if (prefix !== "/" && exposure.host === "127.0.0.1") {
-    console.log(`      Tailscale Serve command (run separately): tailscale serve --bg --https=443 --set-path=${prefix.slice(0, -1)} ${protocol}://${listenerAddress(exposure)}${prefix.slice(0, -1)}`);
-    console.log(`      For remote clients, use https://<your-machine-tailnet-name>${prefix} with this listener's bearer key and profile query.`);
+    // Detect only; never change the Serve config without the user running the command themselves.
+    const serve = await detectTailscaleServe(exposure.port, prefix);
+    if (serve.routeUrl) {
+      console.log(`      Tailscale Serve route found: ${serve.routeUrl} → ${protocol}://${listenerAddress(exposure)}${prefix.slice(0, -1)}`);
+      console.log(`      Remote RECHROME_URL (secret; for other tailnet machines):\n        ${tailscaleConnectionUrl(serve.routeUrl, rechUrl.toString())}`);
+    } else {
+      console.log(`      Tailscale Serve command (run separately): tailscale serve --bg --https=443 --set-path=${prefix.slice(0, -1)} ${protocol}://${listenerAddress(exposure)}${prefix.slice(0, -1)}`);
+      if (serve.dnsName) console.log(`      Then remote clients can use:\n        ${tailscaleConnectionUrl(`https://${serve.dnsName}${prefix}`, rechUrl.toString())}`);
+      else console.log(`      For remote clients, use https://<your-machine-tailnet-name>${prefix} with this listener's bearer key and profile query.`);
+    }
+    console.log(`      The URL saved below is the local loopback one.`);
+  } else if (tailscaleChoice && exposure.host === tailscaleChoice) {
+    console.log(`      This binds the raw Tailscale IP over plain HTTP. For an HTTPS tailnet URL instead, run:`);
+    console.log(`        rech setup --profile ${JSON.stringify(profileEmail)} --listen local --prefix=rechrome`);
+    console.log(`      then expose it with tailscale serve (setup prints the command and the remote URL).`);
   }
   const newLine = `RECHROME_URL=${registeredProfileUrl(rechUrl.toString())}`;
 
