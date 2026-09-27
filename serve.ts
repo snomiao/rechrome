@@ -661,7 +661,7 @@ export async function serve() {
           outputFiles.push(f);
         } else {
           const basename = f.split("/").pop()!;
-          for (const subdir of [".playwright-cli", ".rech-multi-tab"]) {
+          for (const subdir of [".playwright-cli", ".playwright-cli-multi-tab"]) {
             // Forward-slash for the wire: join() would use "\" on the Windows daemon, which
             // a POSIX client can't treat as a separator (it builds a literal-backslash path).
             const subpath = `${subdir}/${basename}`;
