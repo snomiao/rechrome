@@ -142,7 +142,7 @@ const profileIdentity = (e: RegisteredProfile) => `${e.userDataDir ?? ""}\0${e.p
 
 /**
  * One registry key per Chrome profile (a profile can be registered under several aliases,
- * e.g. "Profile 5" and "taku2"): prefer an email, else the alphabetically first key.
+ * e.g. "Profile 5" and "personal"): prefer an email, else the alphabetically first key.
  */
 export function canonicalProfileKeys(registry: Record<string, RegisteredProfile>): string[] {
   const byProfile = new Map<string, string>();

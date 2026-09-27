@@ -82,35 +82,35 @@ test("public URLs are plain http(s) bases, normalized with a trailing slash, and
 });
 
 const registry = {
-  "taku@corp.jp": { profileDir: "Profile 2" },
+  "work@example.com": { profileDir: "Profile 2" },
   "Profile 5": { profileDir: "Profile 5" },
-  "taku2": { profileDir: "Profile 5" },                                    // alias of Profile 5
-  "symval-dev": { profileDir: "symval-dev" },
+  "personal": { profileDir: "Profile 5" },                                    // alias of Profile 5
+  "team-dev": { profileDir: "team-dev" },
   "qa-box": { profileDir: "Default", userDataDir: "/managed/qa" },          // same folder name, other data dir
   "Default": { profileDir: "Default" },
 };
 
 test("canonical keys: one per Chrome profile, aliases collapse (email preferred), data dirs kept apart", () => {
-  expect(canonicalProfileKeys(registry).sort()).toEqual(["Default", "Profile 5", "qa-box", "symval-dev", "taku@corp.jp"]);
+  expect(canonicalProfileKeys(registry).sort()).toEqual(["Default", "Profile 5", "qa-box", "team-dev", "work@example.com"]);
   expect(canonicalProfileKeys({ "Profile 2": { profileDir: "Profile 2" }, "me@x.com": { profileDir: "Profile 2" } })).toEqual(["me@x.com"]);
   expect(canonicalProfileKeys({})).toEqual([]);
 });
 
 test("the host resolves what a client typed among the link's profiles only", () => {
-  const allowed = ["taku@corp.jp", "Profile 5", "symval-dev"];
-  const names = { "Profile 2": "Work", "Profile 5": "Personal" };
+  const allowed = ["work@example.com", "Profile 5", "team-dev"];
+  const names = { "Profile 2": "Office", "Profile 5": "Personal" };
   const resolve = (s?: string) => resolveAllowedProfile(s, allowed, registry, names);
-  expect(resolve("TAKU@corp.jp")).toBe("taku@corp.jp");        // exact, case-insensitive
-  expect(resolve("taku2")).toBe("Profile 5");                   // alias → canonical key (one session)
+  expect(resolve("WORK@Example.com")).toBe("work@example.com");        // exact, case-insensitive
+  expect(resolve("personal")).toBe("Profile 5");                   // alias → canonical key (one session)
   expect(resolve("profile 5")).toBe("Profile 5");               // folder
-  expect(resolve("work")).toBe("taku@corp.jp");                 // Chrome display name
-  expect(resolve("taku")).toBe("taku@corp.jp");                 // email part before @
-  expect(resolve("symv")).toBe("symval-dev");                   // unique 3+ char prefix
+  expect(resolve("office")).toBe("work@example.com");               // Chrome display name
+  expect(resolve("work")).toBe("work@example.com");                 // email part before @
+  expect(resolve("team")).toBe("team-dev");                   // unique 3+ char prefix
   expect(() => resolve("sy")).toThrow(/not shared/);            // prefixes need 3+ characters
-  expect(() => resolve("Default")).toThrow(/not shared by this link\. It shares: taku@corp.jp, Profile 5, symval-dev/);
+  expect(() => resolve("Default")).toThrow(/not shared by this link\. It shares: work@example.com, Profile 5, team-dev/);
   expect(() => resolve(undefined)).toThrow(/Pick a profile: this link shares/);
   expect(() => resolve(" ")).toThrow(/Pick a profile/);
-  expect(() => resolveAllowedProfile("pro", ["Profile 5", "taku@corp.jp"], registry, { "Profile 2": "Profile Work" })).toThrow(/several shared profiles/);
+  expect(() => resolveAllowedProfile("pro", ["Profile 5", "work@example.com"], registry, { "Profile 2": "Profile Work" })).toThrow(/several shared profiles/);
 });
 
 test("a managed profile's folder name doesn't borrow a real Chrome profile's display name", () => {
@@ -120,7 +120,7 @@ test("a managed profile's folder name doesn't borrow a real Chrome profile's dis
 
 test("profile rm plans every alias, listener edits (dropping emptied ones), and only a managed data folder", () => {
   const reg = {
-    "Profile 5": { profileDir: "Profile 5" }, taku2: { profileDir: "Profile 5" },
+    "Profile 5": { profileDir: "Profile 5" }, personal: { profileDir: "Profile 5" },
     "me@x.com": { profileDir: "Profile 2" },
     qa: { profileDir: "qa", userDataDir: "/home/u/.rechrome/profiles/qa", loadExtension: "/ext" },
     odd: { profileDir: "odd", userDataDir: "/elsewhere/odd", loadExtension: "/ext" },
@@ -128,11 +128,11 @@ test("profile rm plans every alias, listener edits (dropping emptied ones), and 
   const ls = [
     { name: "local", host: "127.0.0.1", port: 1, key: "k".repeat(16), profiles: "*" as const },
     { name: "team", host: "127.0.0.1", port: 2, key: "t".repeat(16), profiles: ["me@x.com", "Profile 5"] },
-    { name: "solo", host: "127.0.0.1", port: 3, key: "s".repeat(16), profiles: ["taku2"] },
+    { name: "solo", host: "127.0.0.1", port: 3, key: "s".repeat(16), profiles: ["personal"] },
   ];
-  expect(planProfileRemoval("taku2", reg, ls, "/home/u/.rechrome/profiles")).toEqual({
-    keys: ["Profile 5", "taku2"],
-    listeners: [{ name: "team", remove: ["Profile 5"], drop: false }, { name: "solo", remove: ["taku2"], drop: true }],
+  expect(planProfileRemoval("personal", reg, ls, "/home/u/.rechrome/profiles")).toEqual({
+    keys: ["Profile 5", "personal"],
+    listeners: [{ name: "team", remove: ["Profile 5"], drop: false }, { name: "solo", remove: ["personal"], drop: true }],
   });
   expect(planProfileRemoval("qa", reg, ls, "/home/u/.rechrome/profiles/").dataDir).toBe("/home/u/.rechrome/profiles/qa");
   expect(planProfileRemoval("odd", reg, ls, "/home/u/.rechrome/profiles").dataDir).toBeUndefined();   // outside rech's folder: never deleted

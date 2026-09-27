@@ -25,7 +25,7 @@ test("unconfigured Chrome profiles are distinct from registered ones", () => {
 });
 
 test("a renamed registered no-email profile resolves through its unchanged folder", async () => {
-  const registered = { ...entry, profileDir: "symval-dev", userDataDir: "/chrome" };
-  expect(await resolveGlobalProfile({ "symval-dev": registered }, { "symval-dev": { name: "SymVal Dev" } }, "SymVal Dev"))
-    .toEqual({ email: "symval-dev", entry: registered });
+  const registered = { ...entry, profileDir: "team-dev", userDataDir: "/chrome" };
+  expect(await resolveGlobalProfile({ "team-dev": registered }, { "team-dev": { name: "Team Dev" } }, "Team Dev"))
+    .toEqual({ email: "team-dev", entry: registered });
 });

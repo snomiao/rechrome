@@ -51,7 +51,8 @@ test('new upstream changes open a merge PR without touching main', () => {
   expect(result.calls).toContain('FETCH_HEAD:refs/heads/automation/official-upstream');
   expect(result.calls).toContain('pr create --repo snomiao/playwright --base main');
   expect(result.calls).not.toContain('--force');
-  expect(result.calls).not.toContain('takusym');
+  // Only the project's own forks are ever targeted.
+  expect([...result.calls.matchAll(/--repo (\S+)/g)].map(m => m[1]).every(repo => repo.startsWith('snomiao/'))).toBe(true);
 });
 test('existing PR is updated without a duplicate', () => {
   const result = runSync({ existing: true });
