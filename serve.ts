@@ -241,6 +241,55 @@ async function resolveProfileDirectory(nameOrEmail: string): Promise<string> {
   return nameOrEmail;
 }
 
+// Free the listening port from stale daemon holders before retrying a failed bind.
+// On Windows the listening socket (created inheritable by Bun.serve) is swept into the
+// detached cliDaemon grandchild via bInheritHandles, so an orphaned cliDaemon from a
+// previous `serve` keeps the port in LISTEN after the old serve dies — the fresh serve
+// then crash-loops on EADDRINUSE. A clean restart releases the port, so a failed bind
+// only happens when such a stale holder exists; killing orphaned daemon holders here is
+// safe because a freshly-starting serve owns no live sessions of its own yet (the user's
+// Chrome tabs persist regardless — the cliDaemon only drives them).
+// Command lines freeStalePort may kill: an orphaned cliDaemon or a previous rech serve.
+const STALE_HOLDER_PATTERN = String.raw`cliDaemon\.js|rech(rome)?(\.ts)?"?\s+serve`;
+async function freeStalePort(port: number): Promise<void> {
+  try {
+    if (process.platform === "win32") {
+      // Two-phase, narrow-first: (1) kill the port's actual listed owner if it's a live
+      // rech serve / cliDaemon process — never an unrelated app that happens to hold the
+      // port; (2) only if the port is STILL held — the inherited-handle case, where the
+      // socket lives in a child while netstat attributes it to a now-dead owner — fall back
+      // to killing orphaned cliDaemon holders. The fallback is the only recovery for that
+      // case (the live holder can't be mapped from the port), but it runs only when the
+      // precise kill failed, so the broad sweep is a logged last resort, not the default.
+      const ps = [
+        "$ErrorActionPreference='SilentlyContinue';",
+        `$o=(Get-NetTCPConnection -LocalPort ${port} -State Listen).OwningProcess;`,
+        "$c=(Get-CimInstance Win32_Process -Filter \"ProcessId=$o\").CommandLine;",
+        `if($o -and $c -match '${STALE_HOLDER_PATTERN}'){ Stop-Process -Id $o -Force; Start-Sleep -Milliseconds 400 }`,
+        `elseif($o){ Write-Output (\"freeStalePort: port ${port} is held by an unrelated process ($o); not killing it\") };`,
+        // Phase 2 only for the leaked-handle case: the listed owner is dead, not a live other app.
+        `$o=(Get-NetTCPConnection -LocalPort ${port} -State Listen).OwningProcess;`,
+        "if($o -and -not (Get-Process -Id $o)){",
+        "  $h=Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*cliDaemon.js*' };",
+        "  Write-Output (\"freeStalePort: port still held; killing cliDaemon holders: \" + ($h.ProcessId -join ','));",
+        "  $h | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }",
+        "}",
+      ].join(" ");
+      const r = Bun.spawnSync(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], { windowsHide: true });
+      const out = r.stdout?.toString().trim();
+      if (out) log(out);
+    } else {
+      // Same rule off Windows: only kill holders whose command line is a rech serve / cliDaemon.
+      const r = Bun.spawnSync(["sh", "-c", `for p in $(lsof -ti tcp:${port} -sTCP:LISTEN 2>/dev/null); do if ps -o command= -p "$p" | grep -Eq '${STALE_HOLDER_PATTERN}'; then kill -9 "$p"; else echo "freeStalePort: port ${port} is held by an unrelated process ($p); not killing it"; fi; done`]);
+      const out = r.stdout?.toString().trim();
+      if (out) log(out);
+    }
+  } catch {
+    // best effort — the retry will surface a clear error if the port is still held
+  }
+  await new Promise(r => setTimeout(r, 800)); // let the OS release the socket before retry
+}
+
 // --- Foreground/orphan self-exit ---------------------------------------------------
 // A foreground `rech serve` (run directly by an agent, NOT under oxmgr/pm2) has no
 // process-manager safety net: when the agent that spawned it exits, the OS re-parents
@@ -307,9 +356,13 @@ export async function serve() {
   const legacy: Listener = { name: "legacy", host: listenHost, port, key, profiles: "*" };
   const policies = new Map<string, Listener>();
   const servers = new Map<string, ReturnType<typeof Bun.serve>>();
-  const startServer = (initial: Listener) => Bun.serve({
+  const startServer = (initial: Listener, reusePort = false) => Bun.serve({
     hostname: initial.host,
     port: initial.port,
+    // reusePort is used only as a last-resort fallback (see bindAtStartup below): if an orphaned
+    // holder can't be killed, binding with SO_REUSEADDR keeps serve up (degraded, port-shared)
+    // instead of crash-looping on EADDRINUSE. The normal path binds a clean, exclusive socket.
+    reusePort,
     tls,
     error(err) {
       log(`unhandled error: ${err.message}`);
@@ -680,14 +733,42 @@ export async function serve() {
     },
   });
 
+  // A leaked listening-socket handle in an orphaned cliDaemon can keep a port in LISTEN after a
+  // prior serve exits: Bun.serve creates the socket inheritable and Bun.spawn sweeps it into the
+  // detached daemon grandchild via bInheritHandles, so the socket outlives its creating serve.
+  // netstat then attributes the port to the now-dead *creator*, not the live holder, so we can't
+  // map port -> killable PID — freeStalePort kills the orphan by its cliDaemon signature instead.
+  // Startup only: a freshly-starting serve owns no live sessions, so clearing stale holders is
+  // safe. Hot reloads never kill anything (see reconcile). As an absolute last resort, bind with
+  // reusePort so a holder we genuinely can't kill degrades to "up but sharing the port" rather
+  // than a permanent EADDRINUSE crash-loop.
+  const isEaddrInUse = (e: any) => String(e?.code ?? e?.message ?? "").includes("EADDRINUSE");
+  const MAX_BIND_ATTEMPTS = 4;
+  const bindAtStartup = async (listener: Listener) => {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return startServer(listener);
+      } catch (e: any) {
+        if (!isEaddrInUse(e)) throw e;
+        if (attempt === MAX_BIND_ATTEMPTS) {
+          log(`port ${listener.port} still held after ${attempt - 1} cleanup attempts — binding with reusePort (last resort)`);
+          return startServer(listener, true);
+        }
+        log(`port ${listener.port} in use — clearing stale daemon holders and retrying (attempt ${attempt}/${MAX_BIND_ATTEMPTS - 1})`);
+        await freeStalePort(listener.port);
+      }
+    }
+  };
+
   // Stage all new sockets before changing policy. Bind failure leaves existing
-  // listeners and browser sessions intact; never kill a process holding another port.
-  const reconcile = async (listeners: Listener[]) => {
+  // listeners and browser sessions intact; never kill a process holding another port
+  // once serving (stale-holder recovery runs only at startup).
+  const reconcile = async (listeners: Listener[], startup = false) => {
     const staged = new Map<string, ReturnType<typeof Bun.serve>>();
     try {
       for (const listener of listeners) {
         const address = listenerAddress(listener);
-        if (!servers.has(address)) staged.set(address, startServer(listener));
+        if (!servers.has(address)) staged.set(address, startup ? await bindAtStartup(listener) : startServer(listener));
       }
     } catch (error) {
       for (const server of staged.values()) server.stop(true);
@@ -702,17 +783,17 @@ export async function serve() {
   };
   let applied = "";
   let configured = false;
-  const reload = async () => {
+  const reload = async (startup = false) => {
     const config = await readListeners();
     if (!config && configured) throw new Error("listeners.json disappeared; refusing to restore unrestricted legacy access");
     const listeners = config?.listeners ?? [legacy];
     const fingerprint = JSON.stringify(listeners);
     if (applied === fingerprint) return;
-    await reconcile(listeners);
+    await reconcile(listeners, startup);
     configured ||= !!config;
     applied = fingerprint;
   };
-  await reload();
+  await reload(true);
   let reloading = false;
   let lastError = "";
   setInterval(async () => {
