@@ -990,6 +990,31 @@ export function normalizeCommandArgs(args: string[]): string[] {
 // --profile at/after the subcommand belongs to the forwarded CLI (e.g. playwright-cli's own
 // `open --profile <dir>`, a user-data-dir path) and must pass through untouched. Throws on a
 // missing value; accepts multiple occurrences (last one wins).
+/**
+ * `rech [--profile X] [--isolate] pw <args>` forwards <args> to playwright-cli verbatim, so
+ * `rech pw --version` or `rech pw status` reach playwright instead of rech. `--` works the
+ * same after a rech flag (`rech --profile X -- status`); a bare leading `--` cannot, because
+ * Bun consumes the `--` right after the script path. The separator counts only when
+ * everything before it is a rech global flag; otherwise it belongs to the playwright command
+ * (`rech open -- x`). Returns its index, or -1.
+ */
+export function rechSeparatorIndex(args: string[]): number {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--" || a === "pw" || a === "playwright") return i;
+    if (a === "--profile") { i++; continue; }
+    if (a.startsWith("--profile=") || a === "--isolate" || a === "--isolated") continue;
+    return -1;
+  }
+  return -1;
+}
+
+/** rechrome's own version, from the package.json shipped next to this file. */
+export function rechromeVersion(): string {
+  try { return JSON.parse(readFileSync(join(import.meta.dir, "package.json"), "utf8")).version ?? "unknown"; }
+  catch { return "unknown"; }
+}
+
 export function extractGlobalProfileArg(args: string[]): { args: string[]; selector?: string } {
   const rest = [...args];
   let selector: string | undefined;
@@ -2471,6 +2496,9 @@ Usage:
   rech url ls                  List every listener × profile URL (keys hidden)
   rech connect <url>           Check a shared URL answers, then save it for this project
   rech <playwright-args...>    Run Playwright CLI command (requires ${ENV_KEY})
+  rech pw <playwright-args...> Forward verbatim to playwright-cli, even when a name clashes
+                               with rech's own (rech pw --version, rech pw status)
+  rech --version               rechrome's version
   rech --isolate <args...>     Run in a throwaway session (sugar for -s=<random>) so a
                                fragile single-shot flow (OAuth/login) never shares tabs
                                with the worktree's default session
@@ -2635,6 +2663,9 @@ if (import.meta.main) {
     } finally {
       if (cmd !== "serve") envWatcher?.close();
     }
+  } else if (cmd === "--version") {
+    console.log(rechromeVersion()); // playwright-cli's own: rech pw --version
+    envWatcher?.close();
   } else if (cmd === "help" || cmd === "--help" || cmd === "-h" || args.length === 0) {
     printHelp();
     envWatcher?.close();
@@ -2649,6 +2680,10 @@ if (import.meta.main) {
     // the leading-flags-only rule that protects the forwarded CLI's own --profile).
     let profileSelector: string | undefined;
     let overrideEnv: Record<string, string> | undefined;
+    // Everything after rech's `pw` (or `--`) goes to playwright-cli untouched; only the flags before it are rech's.
+    const separator = rechSeparatorIndex(args);
+    const forwarded = separator === -1 ? [] : args.slice(separator + 1);
+    if (separator !== -1) args = args.slice(0, separator);
     try {
       const extracted = extractGlobalProfileArg(args);
       profileSelector = extracted.selector;
@@ -2688,6 +2723,7 @@ if (import.meta.main) {
       args.splice(isolateIdx, 1);
       args.push(`-s=iso-${randomBytes(8).toString("hex")}`);
     }
+    args = [...forwarded, ...args];
     await run(url, args, overrideEnv);
     envWatcher?.close();
   }
