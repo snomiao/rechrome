@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { validateListeners, authorizeProfileRequest, canReadProfileFile, profileOutputPrefix, normalizePrefix, serviceUrl, type Listener } from "./listeners.ts";
+import { validateListeners, authorizeProfileRequest, canReadProfileFile, profileOutputPrefix, normalizePrefix, serviceUrl, allowProfiles, denyProfiles, rotateListenerKey, setPublicUrl, normalizePublicUrl, type Listener, type ListenerConfig } from "./listeners.ts";
 
 test("normalizes prefixes and preserves them in credential-free API URLs", () => {
   for (const value of ["rechrome", "/rechrome", "/rechrome/"]) expect(normalizePrefix(value)).toBe("/rechrome/");
@@ -34,4 +34,49 @@ test("file paths must belong to a permitted profile", () => {
   expect(canReadProfileFile(listener, profileOutputPrefix("qa") + "screenshot.png")).toBe(true);
   expect(canReadProfileFile(listener, profileOutputPrefix("personal") + "screenshot.png")).toBe(false);
   expect(canReadProfileFile(listener, "screenshot.png")).toBe(false);
+});
+
+const managementAnd = (...scoped: Array<Partial<Listener> & { name: string }>): ListenerConfig => ({
+  version: 1,
+  listeners: [
+    { name: "local", host: "127.0.0.1", port: 13775, key: "m".repeat(16), profiles: "*" },
+    ...scoped.map((l, i) => ({ host: "127.0.0.1", port: 13776 + i, key: String(i).repeat(24), profiles: ["qa"], ...l }) as Listener),
+  ],
+});
+
+test("allow and deny edit a scoped allowlist, deduplicated, never emptying it", () => {
+  const config = managementAnd({ name: "share" });
+  expect(allowProfiles(config, "share", ["dev", "qa", "dev"])).toEqual(["dev"]);
+  expect(config.listeners[1].profiles).toEqual(["qa", "dev"]);
+  expect(denyProfiles(config, "share", ["qa", "nope"])).toEqual(["qa"]);
+  expect(config.listeners[1].profiles).toEqual(["dev"]);
+  expect(() => denyProfiles(config, "share", ["dev"])).toThrow(/rech listener remove share/);
+  expect(() => allowProfiles(config, "missing", ["qa"])).toThrow(/Unknown listener/);
+});
+
+test("the management listener cannot be edited, re-keyed, or narrowed", () => {
+  const config = managementAnd({ name: "share" });
+  for (const edit of [() => allowProfiles(config, "local", ["qa"]), () => denyProfiles(config, "local", ["qa"]), () => rotateListenerKey(config, "local")])
+    expect(edit).toThrow(/management listener/);
+});
+
+test("rotate-key replaces the key with a fresh valid one", () => {
+  const config = managementAnd({ name: "share" });
+  const before = config.listeners[1].key;
+  const after = rotateListenerKey(config, "share");
+  expect(after).not.toBe(before);
+  expect(config.listeners[1].key).toBe(after);
+  expect(() => validateListeners(config)).not.toThrow();
+});
+
+test("public URLs are plain http(s) bases, normalized with a trailing slash, and can be cleared", () => {
+  expect(normalizePublicUrl("https://host.example.ts.net/rechrome")).toBe("https://host.example.ts.net/rechrome/");
+  expect(normalizePublicUrl("http://proxy.lan:8080")).toBe("http://proxy.lan:8080/");
+  for (const bad of ["ftp://x/", "https://KEY@host/", "https://host/?profile=qa", "https://host/#key=x", "not a url"])
+    expect(() => normalizePublicUrl(bad)).toThrow();
+  const config = managementAnd({ name: "share" });
+  expect(setPublicUrl(config, "share", "https://h.ts.net/rechrome").publicUrl).toBe("https://h.ts.net/rechrome/");
+  expect(validateListeners(JSON.parse(JSON.stringify(config))).listeners[1].publicUrl).toBe("https://h.ts.net/rechrome/");
+  expect(setPublicUrl(config, "share", null).publicUrl).toBeUndefined();
+  expect(() => validateListeners({ ...config, listeners: [{ ...config.listeners[1], publicUrl: "https://KEY@h/" }] })).toThrow();
 });

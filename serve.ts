@@ -9,6 +9,8 @@ import {
   getOrCreateUrl,
   authCheck,
   RECH_DIR,
+  LEGACY_RECH_DIR,
+  migrateLegacyDataDir,
   HOME,
   PASSTHROUGH_ENV_KEYS,
   resolvePlaywrightCli,
@@ -263,11 +265,14 @@ export function shouldExitOrphanedServe(opts: {
 }
 
 export async function serve() {
+  // The daemon owns logs/ and output/, so it migrates them before writing anything.
+  const migrated = migrateLegacyDataDir();
   const url = await getOrCreateUrl();
   const { key, port } = parseUrl(url);
 
   const workDir = join(RECH_DIR, "output");
   mkdirSync(workDir, { recursive: true });
+  if (migrated.length) log(`Moved ${migrated.length} legacy entries from ${LEGACY_RECH_DIR} to ${RECH_DIR}`);
 
   // Foreground/orphan self-exit: a serve whose parent has been re-parented to init
   // (ppid 1) is a leaked foreground serve. Poll for that, track the last real /run,
@@ -323,10 +328,12 @@ export async function serve() {
       const scoped = listener.profiles !== "*";
       const reqUrl = new URL(req.url);
       const prefix = normalizePrefix(listener.prefix);
+      // Accept the path with or without the prefix, so a proxy works whether it keeps the
+      // mount path (target .../rechrome) or strips it (bare port). The key, not the prefix,
+      // guards every route.
       if (prefix !== "/") {
         if (reqUrl.pathname === prefix.slice(0, -1)) reqUrl.pathname = "/";
         else if (reqUrl.pathname.startsWith(prefix)) reqUrl.pathname = "/" + reqUrl.pathname.slice(prefix.length);
-        else return new Response("Not found", { status: 404 });
       }
 
       // Serve files from output dir
@@ -656,7 +663,7 @@ export async function serve() {
           outputFiles.push(f);
         } else {
           const basename = f.split("/").pop()!;
-          for (const subdir of [".playwright-cli", ".rech-multi-tab"]) {
+          for (const subdir of [".playwright-cli", ".playwright-cli-multi-tab"]) {
             // Forward-slash for the wire: join() would use "\" on the Windows daemon, which
             // a POSIX client can't treat as a separator (it builds a literal-backslash path).
             const subpath = `${subdir}/${basename}`;

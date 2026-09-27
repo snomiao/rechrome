@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { findTailscaleServeRoute, tailscaleConnectionUrl } from "./rechrome.ts";
+import { findTailscaleServeRoute, rebaseConnectionUrl } from "./rechrome.ts";
 
 // Shape of `tailscale serve status --json`.
 const serve = {
@@ -32,7 +32,7 @@ test("keeps a non-default HTTPS port and accepts a bare host:port proxy", () => 
 });
 
 test("remote URL carries the listener key in the fragment and only the profile query", () => {
-  const url = new URL(tailscaleConnectionUrl("https://node.example.ts.net/rechrome/", "http://KEY123@127.0.0.1:13776/rechrome/?profile=Profile+5&token=bridge"));
+  const url = new URL(rebaseConnectionUrl("https://node.example.ts.net/rechrome/", "http://KEY123@127.0.0.1:13776/rechrome/?profile=Profile+5&token=bridge"));
   expect(url.origin + url.pathname).toBe("https://node.example.ts.net/rechrome/");
   expect(url.searchParams.get("profile")).toBe("Profile 5");
   expect(url.searchParams.has("token")).toBe(false);
