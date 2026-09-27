@@ -249,8 +249,12 @@ async function resolveProfileDirectory(nameOrEmail: string): Promise<string> {
 // only happens when such a stale holder exists; killing orphaned daemon holders here is
 // safe because a freshly-starting serve owns no live sessions of its own yet (the user's
 // Chrome tabs persist regardless — the cliDaemon only drives them).
-// Command lines freeStalePort may kill: an orphaned cliDaemon or a previous rech serve.
-const STALE_HOLDER_PATTERN = String.raw`cliDaemon\.js|rech(rome)?(\.ts)?"?\s+serve`;
+// Command lines freeStalePort may kill: a previous rech serve, or a cliDaemon started from
+// THIS install's playwright (lib/ or vendor/ under this directory) — never another app's
+// Playwright daemon, which runs from its own node_modules.
+const escapeRegex = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const OWN_CLI_DAEMON = import.meta.dir.split(/[\\/]/).map(escapeRegex).join(String.raw`[\\/]`) + String.raw`[\\/].*cliDaemon\.js`;
+const STALE_HOLDER_PATTERN = OWN_CLI_DAEMON + String.raw`|rech(rome)?(\.ts)?"?\s+serve`;
 async function freeStalePort(port: number): Promise<void> {
   try {
     if (process.platform === "win32") {
@@ -265,12 +269,13 @@ async function freeStalePort(port: number): Promise<void> {
         "$ErrorActionPreference='SilentlyContinue';",
         `$o=(Get-NetTCPConnection -LocalPort ${port} -State Listen).OwningProcess;`,
         "$c=(Get-CimInstance Win32_Process -Filter \"ProcessId=$o\").CommandLine;",
-        `if($o -and $c -match '${STALE_HOLDER_PATTERN}'){ Stop-Process -Id $o -Force; Start-Sleep -Milliseconds 400 }`,
+        `if($o -and $c -match '${STALE_HOLDER_PATTERN.replaceAll("'", "''")}'){ Stop-Process -Id $o -Force; Start-Sleep -Milliseconds 400 }`,
         `elseif($o){ Write-Output (\"freeStalePort: port ${port} is held by an unrelated process ($o); not killing it\") };`,
         // Phase 2 only for the leaked-handle case: the listed owner is dead, not a live other app.
         `$o=(Get-NetTCPConnection -LocalPort ${port} -State Listen).OwningProcess;`,
         "if($o -and -not (Get-Process -Id $o)){",
-        "  $h=Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*cliDaemon.js*' };",
+        // Exclude this PowerShell itself: its own command line contains the pattern.
+        `  $h=Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -match '${OWN_CLI_DAEMON.replaceAll("'", "''")}' };`,
         "  Write-Output (\"freeStalePort: port still held; killing cliDaemon holders: \" + ($h.ProcessId -join ','));",
         "  $h | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }",
         "}",
@@ -280,7 +285,7 @@ async function freeStalePort(port: number): Promise<void> {
       if (out) log(out);
     } else {
       // Same rule off Windows: only kill holders whose command line is a rech serve / cliDaemon.
-      const r = Bun.spawnSync(["sh", "-c", `for p in $(lsof -ti tcp:${port} -sTCP:LISTEN 2>/dev/null); do if ps -o command= -p "$p" | grep -Eq '${STALE_HOLDER_PATTERN}'; then kill -9 "$p"; else echo "freeStalePort: port ${port} is held by an unrelated process ($p); not killing it"; fi; done`]);
+      const r = Bun.spawnSync(["sh", "-c", `for p in $(lsof -ti tcp:${port} -sTCP:LISTEN 2>/dev/null); do if ps -o command= -p "$p" | grep -Eq '${STALE_HOLDER_PATTERN.replaceAll("'", "'\\''")}'; then kill -9 "$p"; else echo "freeStalePort: port ${port} is held by an unrelated process ($p); not killing it"; fi; done`]);
       const out = r.stdout?.toString().trim();
       if (out) log(out);
     }
@@ -744,12 +749,25 @@ export async function serve() {
   // than a permanent EADDRINUSE crash-loop.
   const isEaddrInUse = (e: any) => String(e?.code ?? e?.message ?? "").includes("EADDRINUSE");
   const MAX_BIND_ATTEMPTS = 4;
+  // A leaked socket (or a wedged serve) accepts connections but never answers. Anything that
+  // responds is a live server — possibly a healthy rech serve — so it is never killed, and the
+  // port is not shared with it via reusePort either.
+  const answersHttp = (listener: Listener) => {
+    const host = ["0.0.0.0", "::"].includes(listener.host) ? "127.0.0.1" : listener.host.includes(":") ? `[${listener.host}]` : listener.host;
+    return fetch(`${tls ? "https" : "http"}://${host}:${listener.port}/`, {
+      signal: AbortSignal.timeout(1500), tls: { rejectUnauthorized: false },
+    } as RequestInit).then(() => true, () => false);
+  };
   const bindAtStartup = async (listener: Listener) => {
     for (let attempt = 1; ; attempt++) {
       try {
         return startServer(listener);
       } catch (e: any) {
         if (!isEaddrInUse(e)) throw e;
+        if (await answersHttp(listener)) {
+          log(`port ${listener.port} is held by a live server that answers requests — not touching it`);
+          throw e;
+        }
         if (attempt === MAX_BIND_ATTEMPTS) {
           log(`port ${listener.port} still held after ${attempt - 1} cleanup attempts — binding with reusePort (last resort)`);
           return startServer(listener, true);
