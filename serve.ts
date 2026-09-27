@@ -302,9 +302,10 @@ function conflictingHolders(port: number, host: string): PortHolder[] {
   }
   const v6 = (a: string) => a.includes(":");
   const wildcard = (a: string) => a === "0.0.0.0" || a === "::" || a === "*";
+  // A `::` listener is dual-stack on Windows and most Linux setups: it conflicts with IPv4 binds too.
   return holders.filter(h => h.pid !== process.pid && (
-    wildcard(host) ? (h.address === "*" || host === "::" || !v6(h.address))
-      : h.address === host || h.address === "*" || (wildcard(h.address) && v6(h.address) === v6(host))));
+    wildcard(host) ? (h.address === "*" || h.address === "::" || host === "::" || !v6(h.address))
+      : h.address === host || h.address === "*" || h.address === "::" || (h.address === "0.0.0.0" && !v6(host))));
 }
 
 // Free the conflicting address from stale rech holders before retrying a failed bind.
