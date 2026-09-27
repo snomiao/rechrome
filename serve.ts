@@ -254,7 +254,8 @@ async function resolveProfileDirectory(nameOrEmail: string): Promise<string> {
 // Playwright daemon, which runs from its own node_modules.
 const escapeRegex = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const OWN_CLI_DAEMON = import.meta.dir.split(/[\\/]/).map(escapeRegex).join(String.raw`[\\/]`) + String.raw`[\\/].*cliDaemon\.js`;
-const STALE_HOLDER_PATTERN = OWN_CLI_DAEMON + String.raw`|rech(rome)?(\.ts)?"?\s+serve`;
+const RECH_SERVE = String.raw`rech(rome)?(\.ts)?"?\s+serve`;
+const STALE_HOLDER_PATTERN = `${OWN_CLI_DAEMON}|${RECH_SERVE}`;
 async function freeStalePort(port: number): Promise<void> {
   try {
     if (process.platform === "win32") {
@@ -274,10 +275,18 @@ async function freeStalePort(port: number): Promise<void> {
         // Phase 2 only for the leaked-handle case: the listed owner is dead, not a live other app.
         `$o=(Get-NetTCPConnection -LocalPort ${port} -State Listen).OwningProcess;`,
         "if($o -and -not (Get-Process -Id $o)){",
+        // A cliDaemon's parent (playwright-cli) exits right after spawning it, so a live one
+        // can't be told from an orphan by ancestry. They are only provably orphaned when no
+        // other rech serve is running: exclude this serve and its own wrappers (oxmgr, cmd).
+        `  $self=@(); $x=${process.pid}; while($x){ $self+=$x; $x=(Get-CimInstance Win32_Process -Filter \"ProcessId=$x\").ParentProcessId; if($self -contains $x){ break } };`,
+        `  $live=@(Get-CimInstance Win32_Process | Where-Object { $self -notcontains $_.ProcessId -and $_.ProcessId -ne $PID -and $_.CommandLine -match '${RECH_SERVE.replaceAll("'", "''")}' });`,
+        "  if($live.Count){ Write-Output (\"freeStalePort: port still held, but another rech serve is running (\" + ($live.ProcessId -join ',') + \"); not sweeping cliDaemons\") }",
+        "  else {",
         // Exclude this PowerShell itself: its own command line contains the pattern.
-        `  $h=Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -match '${OWN_CLI_DAEMON.replaceAll("'", "''")}' };`,
-        "  Write-Output (\"freeStalePort: port still held; killing cliDaemon holders: \" + ($h.ProcessId -join ','));",
-        "  $h | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }",
+        `    $h=Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -match '${OWN_CLI_DAEMON.replaceAll("'", "''")}' };`,
+        "    Write-Output (\"freeStalePort: port still held; killing orphaned cliDaemon holders: \" + ($h.ProcessId -join ','));",
+        "    $h | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }",
+        "  }",
         "}",
       ].join(" ");
       const r = Bun.spawnSync(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], { windowsHide: true });
@@ -752,11 +761,14 @@ export async function serve() {
   // A leaked socket (or a wedged serve) accepts connections but never answers. Anything that
   // responds is a live server — possibly a healthy rech serve — so it is never killed, and the
   // port is not shared with it via reusePort either.
-  const answersHttp = (listener: Listener) => {
+  const answersHttp = async (listener: Listener) => {
     const host = ["0.0.0.0", "::"].includes(listener.host) ? "127.0.0.1" : listener.host.includes(":") ? `[${listener.host}]` : listener.host;
-    return fetch(`${tls ? "https" : "http"}://${host}:${listener.port}/`, {
+    // Try both schemes: the holder's TLS setting may differ from this serve's.
+    const probe = (scheme: string) => fetch(`${scheme}://${host}:${listener.port}/`, {
       signal: AbortSignal.timeout(1500), tls: { rejectUnauthorized: false },
     } as RequestInit).then(() => true, () => false);
+    const answers = await Promise.all([probe("http"), probe("https")]);
+    return answers.includes(true);
   };
   const bindAtStartup = async (listener: Listener) => {
     for (let attempt = 1; ; attempt++) {
