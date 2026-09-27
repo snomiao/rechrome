@@ -27,7 +27,8 @@ test("open without a profile is refused instead of silently launching a headless
   }));
   const key = "k".repeat(24);
   const child = Bun.spawn([process.execPath, join(root, "rechrome.ts"), "serve"], {
-    cwd: root, env: { ...process.env, HOME: root, USERPROFILE: root, RECHROME_URL: `http://${key}@127.0.0.1:${port}`, PLAYWRIGHT_CLI: `${process.execPath} ${join(root, "fake-cli.ts")}` },
+    // The developer's .env.local (loaded into this test process by other test files) must not leak in.
+    cwd: root, env: { ...Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith("PLAYWRIGHT_MCP_") && !k.startsWith("RECH") )), HOME: root, USERPROFILE: root, RECHROME_URL: `http://${key}@127.0.0.1:${port}`, PLAYWRIGHT_CLI: `${process.execPath} ${join(root, "fake-cli.ts")}` },
     stdin: "ignore", stdout: "ignore", stderr: "pipe",
   });
   const base = `http://127.0.0.1:${port}/`;

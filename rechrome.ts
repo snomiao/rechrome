@@ -88,7 +88,44 @@ const globalEnvFile = join(HOME || "~", ".env.local");
 
 // Capture inherited values once so explicit environment overrides survive reloads,
 // while values loaded from files can still change when those files are edited.
-const inheritedEnvKeys = new Set(Object.keys(process.env));
+/**
+ * A KEY=value line for an env file. A value with "#" (every connection URL's #key=…) or
+ * whitespace is double-quoted: Bun's own .env loader treats an unquoted "#" as a comment and
+ * would drop the key. rech's loader strips the quotes again.
+ */
+export function envAssignment(key: string, value: string): string {
+  return /[#\s]/.test(value) ? `${key}="${value}"` : `${key}=${value}`;
+}
+
+/** Parse KEY=value lines the way Bun's .env loader does (unquoted values end at "#"). */
+function parseBunEnvFile(text: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const line of text.split("\n")) {
+    const m = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_.-]*)\s*=\s*(.*)$/);
+    if (!m) continue;
+    const raw = m[2].trim();
+    const quoted = raw.match(/^(["'`])(.*)\1/);
+    out[m[1]] = quoted ? quoted[2] : raw.replace(/\s*#.*$/, "").trim();
+  }
+  return out;
+}
+
+/**
+ * Keys Bun itself loaded from the current folder's .env files before rech started. They look
+ * like shell exports, but are file values: counting them as inherited would let a folder's
+ * .env.local beat its .rechrome/.env.local, and a keyless (cut at "#") URL beat a good one.
+ */
+export function bunAutoloadedKeys(env: Record<string, string | undefined>, files: string[]): Set<string> {
+  const keys = new Set<string>();
+  for (const text of files)
+    for (const [key, value] of Object.entries(parseBunEnvFile(text))) if (env[key] === value) keys.add(key);
+  return keys;
+}
+
+const bunLoaded = bunAutoloadedKeys(process.env,
+  [".env", `.env.${process.env.NODE_ENV || "development"}`, ".env.local", `.env.${process.env.NODE_ENV || "development"}.local`]
+    .map(name => { try { return readFileSync(join(process.cwd(), name), "utf8"); } catch { return ""; } }));
+const inheritedEnvKeys = new Set(Object.keys(process.env).filter(key => !bunLoaded.has(key)));
 
 // Walk CWD→root loading env files nearest-first; inherited environment wins over files.
 // At each level .rechrome/.env.local is checked before .env.local (rechrome-specific overrides general).
@@ -437,7 +474,7 @@ export async function getOrCreateUrl(persist = true): Promise<string> {
   const key = randomBytes(12).toString("base64url"); // 16 chars
   const url = `http://${key}@127.0.0.1:${DEFAULT_PORT}`;
   if (persist) {
-    const newLine = `${ENV_KEY}=${url}`;
+    const newLine = envAssignment(ENV_KEY, url);
     // Write to ~/.env.local so it's not shadowed by project .env.local
     const envRaw = await file(globalEnvFile).text().catch(() => "");
     const lines = envRaw.trimEnd().split("\n").filter(l => !l.startsWith(`${ENV_KEY}=`));
@@ -2048,7 +2085,7 @@ export async function daemonInstall(serveUrl: string): Promise<void> {
   const envRaw = await file(globalEnvFile).text().catch(() => "");
   const lines = envRaw.trimEnd().split("\n");
   const filtered = lines.filter(l => !l.startsWith(`${ENV_KEY}=`));
-  await Bun.write(globalEnvFile, [...filtered, `${ENV_KEY}=${keepProfileParam(serveUrl, lines.find(l => l.startsWith(`${ENV_KEY}=`))?.slice(ENV_KEY.length + 1))}`, ""].join("\n"));
+  await Bun.write(globalEnvFile, [...filtered, envAssignment(ENV_KEY, keepProfileParam(serveUrl, lines.find(l => l.startsWith(`${ENV_KEY}=`))?.slice(ENV_KEY.length + 1))), ""].join("\n"));
 
   const home = HOME;
   const bunBin = Bun.which("bun") ?? process.execPath;
@@ -2434,14 +2471,15 @@ async function provisionProfile(name: string, opts: { headed?: boolean } = {}): 
   rechUrl.searchParams.set("load_extension", dist);
 
 
-  const newLine = `RECHROME_URL=${registeredProfileUrl(rechUrl.toString())}`;
+  const profileUrl = registeredProfileUrl(rechUrl.toString());
+  const newLine = envAssignment(ENV_KEY, profileUrl);
 
   // [3/3] Register in the token registry so `rech status` lists it and the daemon can resolve it.
   await saveTokenEntry(name, { extensionId: EXTENSION_ID, token, profileDir: name, userDataDir, loadExtension: dist });
   console.log(`\n[3/3] Registered "${name}" in ${TOKENS_FILE}`);
 
   console.log(`\nDone! RECHROME_URL for "${name}":\n\n  ${newLine}\n`);
-  console.log(`Use it per-call:\n  ${newLine.replace("RECHROME_URL=", "RECHROME_URL='")}' rech open https://example.com\n`);
+  console.log(`Use it per-call:\n  ${ENV_KEY}='${profileUrl}' rech open https://example.com\n`);
   console.log(`Or save it to a project .env.local to make it the default.`);
 }
 
@@ -2598,7 +2636,7 @@ async function saveProjectUrl(url: string): Promise<string> {
   if (!existsSync(gitignore)) await Bun.write(gitignore, "*\n");
   const envPath = join(dataDir, ".env.local");
   const lines = (await file(envPath).text().catch(() => "")).split("\n").filter(l => l.trim() && !l.startsWith(`${ENV_KEY}=`));
-  await writeFile(envPath, [...lines, `${ENV_KEY}=${url}`, ""].join("\n"), { mode: 0o600 });
+  await writeFile(envPath, [...lines, envAssignment(ENV_KEY, url), ""].join("\n"), { mode: 0o600 });
   await chmod(envPath, 0o600);
   return envPath;
 }
@@ -2948,7 +2986,7 @@ async function setup(opts: SetupOptions = {}): Promise<void> {
     console.log(`        rech setup --profile ${JSON.stringify(profileEmail)} --listen local --prefix=rechrome`);
     console.log(`      then expose it with tailscale serve (setup prints the command and the remote URL).`);
   }
-  const newLine = `RECHROME_URL=${registeredProfileUrl(rechUrl.toString())}`;
+  const newLine = envAssignment(ENV_KEY, registeredProfileUrl(rechUrl.toString()));
 
   console.log("\n○ [5/5] Connection verified. Save connection configuration:");
   console.log(`\n${newLine}\n`);

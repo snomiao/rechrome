@@ -308,13 +308,13 @@ test("profile rm <name> removes a profile; flags pass through", async () => {
 
 test("a new share link is named after its profile, not a hash", async () => {
   const { profileSlug, uniqueShareName } = await import("./rechrome.ts");
-  expect(profileSlug("snomiao@gmail.com")).toBe("snomiao");
-  expect(profileSlug("Taku.Y@corp.jp")).toBe("taku-y");
+  expect(profileSlug("personal@example.com")).toBe("personal");
+  expect(profileSlug("Jane.Doe@example.com")).toBe("jane-doe");
   expect(profileSlug("Profile 25")).toBe("profile-25");
   expect(profileSlug("@@@")).toBe("profile");
-  const taken = [L("snomiao", ["a@x"]), { ...L("other", ["b@x"]), prefix: "/rechrome/snomiao-2/" }];
-  expect(uniqueShareName("snomiao", taken)).toBe("snomiao-3");
-  expect(uniqueShareName("taku", taken)).toBe("taku");
+  const taken = [L("personal", ["a@x"]), { ...L("other", ["b@x"]), prefix: "/rechrome/personal-2/" }];
+  expect(uniqueShareName("personal", taken)).toBe("personal-3");
+  expect(uniqueShareName("work", taken)).toBe("work");
 });
 
 test("a new link never takes a reserved name or a mount a proxy already serves", async () => {

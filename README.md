@@ -74,6 +74,8 @@ between calls; another worktree gets its own. `-s=<name>` opens a named sub-sess
 `<project>` is the git worktree root (submodules count as their parent project), or the current
 directory outside git. rechrome reads `RECHROME_URL` from the nearest `.rechrome/.env.local` or
 `.env.local` walking up from the current directory; an explicit environment variable wins.
+When editing a file by hand, quote the URL (`RECHROME_URL="…#key=…"`): unquoted, a `#` starts a
+comment for some .env loaders. rech quotes it when it saves one.
 
 ### 4. Use it from another machine
 
