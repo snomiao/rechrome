@@ -51,6 +51,12 @@ test("multiple sockets enforce profile/file policies and reload without browser 
     const direct = (path: string, key = qa.key) => fetch(`http://127.0.0.1:${portA}${path}`, { headers: { Authorization: `Bearer ${key}` } });
     expect((await direct("/ping")).ok).toBe(true);
     expect((await direct("/ping", personal.key)).status).toBe(401);
+    // A browser opening a shared URL gets the connect page; the CLI's own root probe gets the plain banner.
+    const page = await fetch(`http://127.0.0.1:${portA}/rechrome/`, { headers: { Accept: "text/html,application/xhtml+xml" } });
+    expect(page.headers.get("content-type")).toContain("text/html");
+    expect(page.headers.get("cache-control")).toBe("no-store");
+    expect(await page.text()).toContain("rechrome connect");
+    expect(await (await fetch(`http://127.0.0.1:${portA}/rechrome/`)).text()).toBe("rech server\n");
     // A look-alike prefix is not stripped, so it misses /ping and gets only the unauthenticated banner.
     expect(await (await direct("/rechrome-other/ping")).text()).toBe("rech server\n");
     expect((await get({ ...qa, key: personal.key })).status).toBe(401);

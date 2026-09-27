@@ -94,7 +94,8 @@ rech share you@example.com                       # prints the URL to share — i
 `rech listener add` prints these follow-up lines with your port filled in. For scripts,
 `rech listener port share` prints the port (`$(rech listener port share)` in bash or PowerShell).
 
-On the other machine, inside the project that should use it:
+On the other machine, inside the project that should use it (or just open the link in a
+browser: it shows these commands, per shell, with a Copy button):
 
 ```bash
 rech connect 'https://host.example.ts.net/rechrome/?profile=you%40example.com#key=…'
