@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { parseUrl, authCheck, DEFAULT_PORT, ENV_KEY, deriveIdentity, normalizeRemote, normalizeCommandArgs, resolveChromeProfileSelector, resolveGlobalProfile, extractGlobalProfileArg } from "./rech.ts";
+import { parseUrl, authCheck, DEFAULT_PORT, ENV_KEY, deriveIdentity, normalizeRemote, normalizeCommandArgs, withDefaultScheme, resolveChromeProfileSelector, resolveGlobalProfile, extractGlobalProfileArg } from "./rech.ts";
 import { isUnderDir, splitCommand, shortClientLabel, isIsoSession } from "./serve.ts";
 
 describe("parseUrl", () => {
@@ -38,6 +38,40 @@ describe("parseUrl", () => {
       profileDirectory: "Profile 1",
       userDataDir: "/tmp/ud",
     });
+  });
+
+  test("base has no path for a root URL", () => {
+    expect(parseUrl("http://k@localhost:13775").base).toBe("http://localhost:13775");
+    expect(parseUrl("http://k@localhost:13775/").base).toBe("http://localhost:13775");
+  });
+
+  test("keeps a reverse-proxy path prefix and reads the key from #key=", () => {
+    const result = parseUrl("https://host.ts.net/rechrome/?profile=p#key=HASHKEY");
+    expect(result).toMatchObject({ key: "HASHKEY", base: "https://host.ts.net:443/rechrome", profileDirectory: "p" });
+  });
+
+  test("userinfo key wins over #key=", () => {
+    expect(parseUrl("https://USER@host/#key=HASH").key).toBe("USER");
+  });
+});
+
+describe("withDefaultScheme", () => {
+  test("adds https:// to a bare host and http:// to localhost", () => {
+    expect(withDefaultScheme("hello.com")).toBe("https://hello.com");
+    expect(withDefaultScheme("hello.com/a?b=1")).toBe("https://hello.com/a?b=1");
+    expect(withDefaultScheme("localhost:3000")).toBe("http://localhost:3000");
+    expect(withDefaultScheme("127.0.0.1:8080/x")).toBe("http://127.0.0.1:8080/x");
+  });
+
+  test("leaves URLs with a scheme alone", () => {
+    for (const u of ["https://a.com", "http://a.com", "about:blank", "file:///tmp/x", "data:text/html,hi"])
+      expect(withDefaultScheme(u)).toBe(u);
+  });
+
+  test("normalizeCommandArgs applies it to the open/goto target only", () => {
+    expect(normalizeCommandArgs(["open", "hello.com"])).toEqual(["open", "https://hello.com"]);
+    expect(normalizeCommandArgs(["goto", "--headed", "a.io"])).toEqual(["goto", "--headed", "https://a.io"]);
+    expect(normalizeCommandArgs(["eval", "hello.com"])).toEqual(["eval", "hello.com"]);
   });
 });
 

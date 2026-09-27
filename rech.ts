@@ -161,11 +161,21 @@ export function parseUrl(raw: string) {
   const scheme = u.protocol.replace(":", "");
   const protocol = scheme === "https" ? "https" : "http";
   const defaultPort = scheme === "https" ? 443 : scheme === "http" ? 80 : DEFAULT_PORT;
+  const host = u.hostname;
+  const port = parseInt(u.port) || defaultPort;
+  // The daemon may sit behind a reverse proxy under a path prefix (e.g. tailscale serve
+  // `https://host/rechrome/`). `base` is origin + that prefix, with no trailing slash, so
+  // endpoints are `${base}/run`, `${base}/ping`, ...
+  const prefix = u.pathname.replace(/\/+$/, "");
+  // The bearer key is normally the userinfo (`http://KEY@host`); a `#key=KEY` fragment is also
+  // accepted so the URL can be pasted into a browser without the userinfo being stripped.
+  const hashKey = new URLSearchParams(u.hash.slice(1)).get("key") ?? "";
   return {
-    key: u.username,
-    host: u.hostname,
-    port: parseInt(u.port) || defaultPort,
+    key: decodeURIComponent(u.username) || hashKey,
+    host,
+    port,
     protocol,
+    base: `${protocol}://${host.includes(":") ? `[${host}]` : host}:${port}${prefix}`,
     extensionId: u.searchParams.get("extension_id") ?? undefined,
     extensionToken: u.searchParams.get("token") ?? undefined,
     profileDirectory: u.searchParams.get("profile") ?? undefined,
@@ -595,7 +605,7 @@ async function callServe(
   overrideEnv?: Record<string, string>,
   precomputedIdentity?: { key: string; label: string; profile?: string },
 ): Promise<{ status: number; stdout: string; stderr: string; files?: string[]; existingSession?: boolean }> {
-  const { key, host, port, protocol, extensionId, extensionToken, profileDirectory, userDataDir, loadExtension } = parseUrl(url);
+  const { key, base, host, port, protocol, extensionId, extensionToken, profileDirectory, userDataDir, loadExtension } = parseUrl(url);
   // Reuse the caller's identity when provided — computing it shells out to `git` several times,
   // and run() has already done so for its log line. Recomputing here would double those git
   // spawns (and, on Windows, the console-window flashes) on every `rech open`.
@@ -606,7 +616,7 @@ async function callServe(
   const effectiveProfile = overrideEnv?.["PLAYWRIGHT_MCP_PROFILE_DIRECTORY"] || resolveEffectiveProfile(profileDirectory);
   if (effectiveProfile) identity.profile = effectiveProfile;
   const env = { ...(await getClientEnv({ extensionId, extensionToken, profileDirectory, userDataDir, loadExtension })), ...overrideEnv };
-  const res = await fetch(`${protocol}://${host}:${port}/run`, {
+  const res = await fetch(`${base}/run`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
     body: JSON.stringify({ args, identity, env }),
@@ -637,13 +647,31 @@ async function callServe(
     console.error(`[rech] rech-client -> rech-server[ok]\n  -x: bearer key rejected (used: ${key.slice(0, 4)}...) -> playwright[unknown]`);
     process.exit(1);
   }
-  return res.json();
+  const text = await res.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    // Not the daemon answering (e.g. a reverse proxy 404 because the URL's path prefix is wrong).
+    console.error(`[rech] rech-client -> ${base}/run\n  -x: HTTP ${res.status}, not a rech-server response: ${text.slice(0, 200).trim()}`);
+    process.exit(1);
+  }
 }
 
 export function normalizeCommandArgs(args: string[]): string[] {
   const normalized = [...args];
   if (normalized[0] === "tabs" || normalized[0] === "list") normalized[0] = "tab-list";
+  // `rech open hello.com`: newer daemons only accept HTTP(S)/about:blank for navigation, so give a
+  // bare host (no scheme) an https:// scheme like a browser address bar would.
+  if (["open", "goto", "tab-new"].includes(normalized[0])) {
+    const i = normalized.findIndex((a, idx) => idx > 0 && !a.startsWith("-"));
+    if (i > 0) normalized[i] = withDefaultScheme(normalized[i]);
+  }
   return normalized;
+}
+
+export function withDefaultScheme(target: string): string {
+  if (/^[a-z][a-z0-9+.-]*:/i.test(target) && !/^[^/]+:\d+(\/|$)/.test(target)) return target;
+  return /^(localhost|127\.|\[::1\])/i.test(target) ? `http://${target}` : `https://${target}`;
 }
 
 // Pull a global `--profile <val>` / `--profile=<val>` out of the leading flags of an argv.
@@ -681,7 +709,7 @@ async function run(url: string, args: string[], overrideEnv?: Record<string, str
   // Match the underlying CLI's command names while accepting the short forms humans
   // naturally try. Keep this client-side so old and new serve daemons behave alike.
   args = normalizeCommandArgs(args);
-  const { host, port, protocol, extensionId, extensionToken, profileDirectory, userDataDir, loadExtension } = parseUrl(url);
+  const { base, host, port, protocol, extensionId, extensionToken, profileDirectory, userDataDir, loadExtension } = parseUrl(url);
   const effectiveProfile = overrideEnv?.["PLAYWRIGHT_MCP_PROFILE_DIRECTORY"] || resolveEffectiveProfile(profileDirectory);
   const displayProfile = effectiveProfile ? await resolveProfileEmail(effectiveProfile) : undefined;
   const identity = await getClientIdentity();
@@ -703,7 +731,9 @@ async function run(url: string, args: string[], overrideEnv?: Record<string, str
     console.error(`[rech] session already has open tabs — listing existing tabs instead of opening a new window`);
   if (stderr) {
     if (stderr.includes('Extension connection timeout')) {
-      const hasToken = !!effectiveEnv["PLAYWRIGHT_MCP_EXTENSION_TOKEN"];
+      // A newer daemon resolves the token itself and says so ("reload ... extension"); only blame a
+      // missing install when neither side had credentials.
+      const hasToken = !!effectiveEnv["PLAYWRIGHT_MCP_EXTENSION_TOKEN"] || /reload the .*extension/i.test(stderr);
       const last = hasToken
         ? `  -x: extension did not connect (reload it at chrome://extensions; then verify its token) -> extension[degraded]`
         : `  -> extension[not installed]  (run: rech setup)`;
@@ -726,7 +756,7 @@ async function run(url: string, args: string[], overrideEnv?: Record<string, str
     const gitignorePath = join(dlDir, ".gitignore");
     if (!existsSync(gitignorePath)) await Bun.write(gitignorePath, "*\n");
     for (const name of files) {
-      const fileRes = await fetch(`${protocol}://${host}:${port}/files/${name}`, {
+      const fileRes = await fetch(`${base}/files/${name}`, {
         headers: { Authorization: `Bearer ${parseUrl(url).key}` },
       });
       if (!fileRes.ok) continue;
@@ -1296,13 +1326,13 @@ async function provisionProfile(name: string, opts: { headed?: boolean } = {}): 
   // [2/3] Daemon URL — reuse the running daemon's key; warn (don't fail) if it isn't up yet.
   console.log(`\n[2/3] Building RECHROME_URL`);
   const url = await getOrCreateUrl();
-  const { host, port, protocol, key } = parseUrl(url);
-  const healthy = await fetch(`${protocol}://${host}:${port}/ping`, {
+  const { base, host, port, protocol, key } = parseUrl(url);
+  const healthy = await fetch(`${base}/ping`, {
     headers: { Authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(2000),
   }).then(r => r.ok).catch(() => false);
   if (!healthy) console.log(`      Note: daemon not reachable at ${host}:${port} — run \`rech setup\` once to start it.`);
 
-  const rechUrl = new URL(`${protocol}://${host}:${port}`);
+  const rechUrl = new URL(base);
   rechUrl.username = key || randomBytes(12).toString("base64url");
   rechUrl.searchParams.set("extension_id", EXTENSION_ID);
   rechUrl.searchParams.set("token", token);
@@ -1369,12 +1399,12 @@ async function setup(opts: { profile?: string; token?: string; yes?: boolean } =
   }
   // Defer persistence until daemon prerequisites have passed.
   const url = await getOrCreateUrl(false);
-  const { host, port, protocol } = parseUrl(url);
+  const { base, host, port, protocol } = parseUrl(url);
 
   const { key: serveKey } = parseUrl(url);
   // First check if server is up at all (unauthenticated root), then verify our key matches
-  const anonPing = await fetch(`${protocol}://${host}:${port}/`, { signal: AbortSignal.timeout(2000) }).catch(() => null);
-  const authPing = anonPing ? await fetch(`${protocol}://${host}:${port}/ping`, {
+  const anonPing = await fetch(`${base}/`, { signal: AbortSignal.timeout(2000) }).catch(() => null);
+  const authPing = anonPing ? await fetch(`${base}/ping`, {
     headers: { Authorization: `Bearer ${serveKey}` },
     signal: AbortSignal.timeout(2000),
   }).catch(() => null) : null;
@@ -1454,7 +1484,7 @@ async function setup(opts: { profile?: string; token?: string; yes?: boolean } =
     let ping = null;
     for (let i = 0; i < 15; i++) {
       await Bun.sleep(1000);
-      ping = await fetch(`${protocol}://${host}:${port}/`, { signal: AbortSignal.timeout(2000) }).catch(() => null);
+      ping = await fetch(`${base}/`, { signal: AbortSignal.timeout(2000) }).catch(() => null);
       if (ping) break;
       process.stdout.write(".");
     }
@@ -1747,13 +1777,13 @@ async function status(): Promise<void> {
     console.log(`serve:    not configured (run \`rech setup\`)`);
     return;
   }
-  const { host, port, protocol } = parseUrl(url);
+  const { base, host, port, protocol } = parseUrl(url);
   const parsed = parseUrl(url);
-  const ping = await fetch(`${protocol}://${host}:${port}/`, { signal: AbortSignal.timeout(2000) }).catch(() => null);
+  const ping = await fetch(`${base}/`, { signal: AbortSignal.timeout(2000) }).catch(() => null);
   // Resolve the daemon's actual bind from its authenticated /ping (cross-platform; lsof is
   // POSIX-only and absent on Windows). bind is "0.0.0.0" (all interfaces) or the loopback IP.
   const pingBody = ping
-    ? await fetch(`${protocol}://${host}:${port}/ping`, {
+    ? await fetch(`${base}/ping`, {
         headers: { Authorization: `Bearer ${parsed.key}` },
         signal: AbortSignal.timeout(2000),
       }).then(r => (r.ok ? r.json() : null)).catch(() => null) as { bind?: string; degraded?: boolean; consecutiveTimeouts?: number } | null
