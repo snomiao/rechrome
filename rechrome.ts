@@ -8,7 +8,7 @@ import { createHash, randomBytes } from "crypto";
 import { mkdirSync, appendFileSync, existsSync, realpathSync, accessSync, cpSync, unlinkSync, readFileSync, readdirSync, renameSync, rmdirSync, constants as fsConstants } from "fs";
 import { hostname, homedir, networkInterfaces } from "os";
 import { isIPv4 } from "net";
-import { join, basename, dirname } from "path";
+import { join, basename, dirname, resolve } from "path";
 import { pathToFileURL } from "url";
 import { createRequire } from "node:module";
 import { spawn as cpSpawn } from "child_process";
@@ -2056,27 +2056,39 @@ let _daemonMgr: DaemonManager | undefined;
 /**
  * The first oxmgr that actually runs. PATH order alone isn't enough: a stale global shim
  * (e.g. bun's, printing "oxmgr binary is missing") can shadow a working build, and npm's
- * `oxmgr.cmd` re-parses argv through cmd.exe, splitting on the `&`s in RECHROME_URL, so only
- * real executables are candidates. RECH_OXMGR names one explicitly.
+ * `oxmgr.cmd` re-parses argv through cmd.exe, so real executables come first. RECH_OXMGR
+ * names one explicitly (a path, or a command looked up on PATH). The successful probe's
+ * output seeds the version cache, so `--version` runs once.
  */
 function findWorkingOxmgr(): string | null {
   const ext = IS_WINDOWS ? ".exe" : "";
-  const dirs = (process.env.PATH ?? "").split(IS_WINDOWS ? ";" : ":").filter(Boolean);
+  // Windows PATH entries may be quoted ("C:\Program Files\x"); quotes break the joined path.
+  const dirs = (process.env.PATH ?? "").split(IS_WINDOWS ? ";" : ":").map(d => d.trim().replace(/^"(.*)"$/, "$1")).filter(Boolean);
+  const override = process.env.RECH_OXMGR;
   const candidates = [
-    process.env.RECH_OXMGR,
+    override && (/[\\/]/.test(override) ? resolve(override) : Bun.which(override)),
     ...dirs.map(d => join(d, `oxmgr${ext}`)),
-    // The vendored binary inside a global npm / bun install of the `oxmgr` package.
+    // The vendored binary inside a global npm / bun install of the `oxmgr` package
+    // (npm: <dir>/node_modules on Windows, <prefix>/lib/node_modules beside <prefix>/bin elsewhere).
     ...dirs.map(d => join(d, "node_modules", "oxmgr", "vendor", `oxmgr${ext}`)),
+    ...(IS_WINDOWS ? [] : dirs.map(d => join(d, "..", "lib", "node_modules", "oxmgr", "vendor", "oxmgr"))),
     join(HOME, ".bun", "install", "global", "node_modules", "oxmgr", "vendor", `oxmgr${ext}`),
   ].filter((p): p is string => !!p && existsSync(p));
   const works = (p: string) => {
-    try { return Bun.spawnSync([p, "--version"], { stdout: "ignore", stderr: "ignore", windowsHide: true }).exitCode === 0; }
-    catch { return false; }
+    try {
+      const r = Bun.spawnSync([p, "--version"], { stdout: "pipe", stderr: "ignore", windowsHide: true });
+      if (r.exitCode !== 0) return false;
+      const m = /(\d+\.\d+\.\d+[^\s]*)/.exec(r.stdout?.toString() ?? "");
+      _oxmgrVersion = m ? m[1]! : null;
+      return true;
+    } catch { return false; }
   };
   const exe = [...new Set(candidates)].find(works);
   if (exe) return exe;
-  // Last resort (Windows): a working shim such as npm's oxmgr.cmd, rather than no oxmgr at all.
-  const shim = IS_WINDOWS ? Bun.which("oxmgr") : null;
+  // Last resort (Windows): a working shim such as npm's oxmgr.cmd, but never over a working
+  // pm2 — cmd.exe re-parses a shim's argv (see runPm).
+  if (!IS_WINDOWS || Bun.which("pm2")) return null;
+  const shim = Bun.which("oxmgr");
   return shim && works(shim) ? shim : null;
 }
 
@@ -2101,6 +2113,10 @@ function daemonManager(): DaemonManager {
 // the managed process (it has no per-var flag like oxmgr's --env), so install
 // passes daemon env this way.
 async function runPm(mgr: DaemonManager, args: string[], env?: Record<string, string>): Promise<number> {
+  // A .cmd/.bat shim runs through cmd.exe, which treats & | < > ^ in an argument as syntax
+  // (e.g. the &s in a RECHROME_URL passed with --env): fail clearly instead of mangling it.
+  if (/\.(cmd|bat)$/i.test(mgr.bin) && args.some(a => /[&|<>^]/.test(a)))
+    throw new Error(`${mgr.bin} is a cmd.exe shim, which would mangle an argument containing & | < > ^. Install the ${mgr.id} executable (or set RECH_OXMGR to it) and try again.`);
   const proc = Bun.spawn([mgr.bin, ...args], {
     stdout: "inherit",
     stderr: "inherit",
