@@ -2116,7 +2116,7 @@ async function runPm(mgr: DaemonManager, args: string[], env?: Record<string, st
   // A .cmd/.bat shim runs through cmd.exe, which treats & | < > ^ in an argument as syntax
   // (e.g. the &s in a RECHROME_URL passed with --env): fail clearly instead of mangling it.
   if (/\.(cmd|bat)$/i.test(mgr.bin) && args.some(a => /[&|<>^]/.test(a)))
-    throw new Error(`${mgr.bin} is a cmd.exe shim, which would mangle an argument containing & | < > ^. Install the ${mgr.id} executable (or set RECH_OXMGR to it) and try again.`);
+    throw new Error(`${mgr.bin} is a cmd.exe shim, which would mangle an argument containing & | < > ^. Install the ${mgr.id} executable${mgr.id === "oxmgr" ? " (or set RECH_OXMGR to it)" : ""} and try again.`);
   const proc = Bun.spawn([mgr.bin, ...args], {
     stdout: "inherit",
     stderr: "inherit",
