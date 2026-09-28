@@ -2053,9 +2053,36 @@ function oxmgrVersion(bin: string): string | null {
 // RECH_DAEMON_MANAGER override — lives in ./daemon-manager.ts (pure + tested);
 // here we just supply the runtime inputs (what's on PATH, the oxmgr version).
 let _daemonMgr: DaemonManager | undefined;
+/**
+ * The first oxmgr that actually runs. PATH order alone isn't enough: a stale global shim
+ * (e.g. bun's, printing "oxmgr binary is missing") can shadow a working build, and npm's
+ * `oxmgr.cmd` re-parses argv through cmd.exe, splitting on the `&`s in RECHROME_URL, so only
+ * real executables are candidates. RECH_OXMGR names one explicitly.
+ */
+function findWorkingOxmgr(): string | null {
+  const ext = IS_WINDOWS ? ".exe" : "";
+  const dirs = (process.env.PATH ?? "").split(IS_WINDOWS ? ";" : ":").filter(Boolean);
+  const candidates = [
+    process.env.RECH_OXMGR,
+    ...dirs.map(d => join(d, `oxmgr${ext}`)),
+    // The vendored binary inside a global npm / bun install of the `oxmgr` package.
+    ...dirs.map(d => join(d, "node_modules", "oxmgr", "vendor", `oxmgr${ext}`)),
+    join(HOME, ".bun", "install", "global", "node_modules", "oxmgr", "vendor", `oxmgr${ext}`),
+  ].filter((p): p is string => !!p && existsSync(p));
+  const works = (p: string) => {
+    try { return Bun.spawnSync([p, "--version"], { stdout: "ignore", stderr: "ignore", windowsHide: true }).exitCode === 0; }
+    catch { return false; }
+  };
+  const exe = [...new Set(candidates)].find(works);
+  if (exe) return exe;
+  // Last resort (Windows): a working shim such as npm's oxmgr.cmd, rather than no oxmgr at all.
+  const shim = IS_WINDOWS ? Bun.which("oxmgr") : null;
+  return shim && works(shim) ? shim : null;
+}
+
 function daemonManager(): DaemonManager {
   if (_daemonMgr) return _daemonMgr;
-  const oxmgrBin = Bun.which("oxmgr");
+  const oxmgrBin = findWorkingOxmgr();
   const pm2Bin = Bun.which("pm2");
   _daemonMgr = pickDaemonManager({
     oxmgrBin,
@@ -2176,7 +2203,7 @@ async function ensureDaemonManager(ask: (q: string, def?: string) => Promise<str
   });
   const code = await proc.exited;
   if (code !== 0) throw new Error(`\`${command.join(" ")}\` failed (exit code ${code}). Resolve the installation error, then rerun setup.`);
-  if (!Bun.which("oxmgr")) {
+  if (!findWorkingOxmgr()) {
     throw new Error("oxmgr was installed but is not on PATH. Add the package manager's global bin directory to PATH, then rerun setup.");
   }
   _daemonMgr = undefined;
@@ -2295,7 +2322,7 @@ async function daemonUninstall(): Promise<void> {
   const mgr = daemonManager();
   for (const name of [PM_PROCESS_NAME, ...LEGACY_PROCESS_NAMES]) await runPm(mgr, ["delete", name]);
   if (mgr.id === "pm2") await runPm(mgr, ["save", "--force"]); // an emptied list must still overwrite the dump
-  else await runPm(mgr, ["service", "uninstall"]);
+  // oxmgr's boot/login service is left installed: every other oxmgr-managed process depends on it.
   console.log(`Removed ${mgr.id} process: ${PM_PROCESS_NAME}`);
 }
 

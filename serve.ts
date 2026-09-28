@@ -496,7 +496,7 @@ export async function serve() {
   if (certPath && keyPath) {
     const renewed = await renewCertIfNeeded(certPath, keyPath);
     if (renewed) { log("Restarting to load renewed TLS cert..."); process.exit(0); }
-    // Check daily; pm2 restarts cleanly after exit(0)
+    // Check daily; the process manager (oxmgr --restart always, or pm2) restarts cleanly after exit(0)
     setInterval(async () => {
       if (await renewCertIfNeeded(certPath, keyPath)) { log("Restarting to load renewed TLS cert..."); process.exit(0); }
     }, 86_400_000);

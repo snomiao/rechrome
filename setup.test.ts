@@ -101,7 +101,8 @@ for (const exposesBinary of [false, true]) {
   test(`successful installer checks oxmgr availability and resumes setup (binary: ${exposesBinary})`, async () => {
     const taskHome = mkdtempSync(join(tmpdir(), "rechrome-installed-test-"));
     const marker = join(taskHome, "manager-called");
-    const managerScript = `await Bun.write(${JSON.stringify(marker)}, "called");\nprocess.exit(23);\n`;
+    // A working oxmgr (answers --version, which rech probes) whose real commands fail deliberately.
+    const managerScript = `if (process.argv.includes("--version")) { console.log("oxmgr 0.5.0"); process.exit(0); }\nawait Bun.write(${JSON.stringify(marker)}, "called");\nprocess.exit(23);\n`;
     writeStub(taskHome, "npm", `import { writeFileSync } from "node:fs";\n${exposesBinary ? stubWriterSource(taskHome, "oxmgr", managerScript) : ""}`);
     try {
       const proc = Bun.spawn([process.execPath, join(import.meta.dir, "rechrome.ts"), "setup", "--profile", "Default", "--yes"], {
