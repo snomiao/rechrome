@@ -1,8 +1,9 @@
 import { readListeners, listenerAddress, authorizeProfileRequest, canReadProfileFile, profileOutputPrefix, normalizePrefix, resolveAllowedProfile, type Listener } from "./listeners.ts";
 import { file } from "bun";
 import { createHash, X509Certificate } from "crypto";
-import { mkdirSync, unlinkSync, accessSync, readdirSync, realpathSync, constants as fsConstants } from "fs";
+import { mkdirSync, lstatSync, chmodSync, unlinkSync, accessSync, readdirSync, realpathSync, constants as fsConstants } from "fs";
 import { join, resolve, relative, isAbsolute } from "path";
+import { tmpdir } from "os";
 import {
   log,
   parseUrl,
@@ -136,8 +137,42 @@ export function inferSilentExtensionFailure(options: {
   return `Extension connection timeout after ${handshakeTimeoutMs}ms. Automatic recovery retry failed; reload the Playwright MCP Bridge extension at chrome://extensions and retry.\n`;
 }
 
-function tmpSocketRoot(): string {
-  return `${(process.env.TMPDIR || "/tmp").replace(/\/$/, "")}/playwright-cli`;
+// Every CLI child must agree on its socket namespace, including probes and reapers.
+export function playwrightCliEnv(
+  overrides: Record<string, string | undefined> = {},
+  runtime = { env: process.env, platform: process.platform, uid: process.getuid?.() },
+): Record<string, string | undefined> {
+  const source = runtime.env;
+  const env: Record<string, string | undefined> = {
+    PATH: source.PATH,
+    HOME: source.HOME || HOME,
+    USERPROFILE: source.USERPROFILE,
+    TMPDIR: source.TMPDIR,
+    DISPLAY: source.DISPLAY,
+    XDG_RUNTIME_DIR: source.XDG_RUNTIME_DIR,
+    DEBUG: source.DEBUG,
+    PWDEBUG: source.PWDEBUG,
+    ...overrides,
+    PLAYWRIGHT_SOCKETS_DIR: source.PLAYWRIGHT_SOCKETS_DIR,
+  };
+  if (runtime.platform === "darwin") {
+    if (runtime.uid === undefined) throw new Error("Cannot determine socket directory owner");
+    const dir = source.PLAYWRIGHT_SOCKETS_DIR || `/tmp/pw-${runtime.uid}`;
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const stat = lstatSync(dir);
+    if (!stat.isDirectory() || stat.uid !== runtime.uid)
+      throw new Error(`Refusing unsafe Playwright socket directory: ${dir}`);
+    chmodSync(dir, 0o700);
+    env.PLAYWRIGHT_SOCKETS_DIR = dir;
+  }
+  return env;
+}
+
+export function tmpSocketRoot(env = playwrightCliEnv()): string {
+  // Match the shipped coreBundle makeSocketPath('cli', session). CLI children do
+  // not inherit USER/USERNAME, so the vendor's fallback username is "default".
+  const userHash = createHash("sha1").update(env.USERNAME || env.USER || "default").digest("hex").slice(0, 8);
+  return join(env.PLAYWRIGHT_SOCKETS_DIR || join(env.TMPDIR || tmpdir(), `pw-${userHash}`), "cli");
 }
 
 // On startup, adopt any iso-* sessions a previous daemon left behind so they still get reaped
@@ -146,15 +181,11 @@ function tmpSocketRoot(): string {
 function adoptOrphanedIsoSessions(): void {
   try {
     const root = tmpSocketRoot();
-    for (const sub of readdirSync(root)) {
-      let entries: string[];
-      try { entries = readdirSync(`${root}/${sub}`); } catch { continue; }
-      for (const f of entries) {
-        const m = f.match(/^([0-9a-f]+-iso-[0-9a-f]+)/) || f.match(/^(iso-[0-9a-f]+)/);
-        if (m && !isoLastUsed.has(m[1])) {
-          isoLastUsed.set(m[1], Date.now());
-          log(`adopted orphaned isolated session for reaping: ${m[1]}`);
-        }
+    for (const f of readdirSync(root)) {
+      const sess = f.endsWith(".sock") ? f.slice(0, -5) : "";
+      if (isIsoSession(sess) && !isoLastUsed.has(sess)) {
+        isoLastUsed.set(sess, Date.now());
+        log(`adopted orphaned isolated session for reaping: ${sess}`);
       }
     }
   } catch {
@@ -174,7 +205,7 @@ function reapIdleIsoSessions(bin: string, binArgs: string[], workDir: string): v
         stdout: "ignore",
         stderr: "ignore",
         windowsHide: true, // hide the CLI child's console; the user's Chrome (a GUI grandchild) stays visible
-        env: { PATH: process.env.PATH, HOME: HOME, USERPROFILE: process.env.USERPROFILE },
+        env: playwrightCliEnv(),
       });
       log(`reaped idle isolated session (idle ${Math.round((now - last) / 1000)}s): ${sess}`);
     } catch (e) {
@@ -566,7 +597,7 @@ export async function serve() {
         const probe = Bun.spawn([pbin, ...pbinArgs, "tab-list", `-s=${target}`], {
           cwd: workDir, stdin: "ignore", stdout: "ignore", stderr: "ignore",
           windowsHide: true,
-          env: { PATH: process.env.PATH, HOME: HOME, USERPROFILE: process.env.USERPROFILE },
+          env: playwrightCliEnv(),
         });
         const probeStatus = await Promise.race([
           probe.exited,
@@ -735,7 +766,7 @@ export async function serve() {
             stdout: "pipe",
             stderr: "pipe",
             windowsHide: true, // hide the CLI child's console; the user's Chrome (a GUI grandchild) stays visible
-            env: { PATH: process.env.PATH, HOME: HOME, USERPROFILE: process.env.USERPROFILE },
+            env: playwrightCliEnv(),
           });
           const [listStatus, listOut] = await Promise.race([
             Promise.all([listProc.exited, new Response(listProc.stdout).text()]),
@@ -764,14 +795,6 @@ export async function serve() {
       }
 
       const childEnv: Record<string, string | undefined> = {
-        PATH: process.env.PATH,
-        HOME: HOME,
-        USERPROFILE: process.env.USERPROFILE,
-        TMPDIR: process.env.TMPDIR,
-        DISPLAY: process.env.DISPLAY,
-        XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR,
-        DEBUG: process.env.DEBUG, // forward debug namespaces (e.g. pw:mcp:relay) for diagnostics
-        PWDEBUG: process.env.PWDEBUG,
         ...(clientName ? { PLAYWRIGHT_MCP_CLIENT_NAME: shortClientLabel(clientName) } : {}),
         ...passthroughEnv,
         // Enable extension bridge when credentials are present
@@ -779,19 +802,15 @@ export async function serve() {
           ? { PLAYWRIGHT_MCP_EXTENSION: "1" }
           : {}),
       };
-      // For open commands: clean up stale sockets so a closed browser can be reopened
-      if (isOpenCmd) {
-        const tmpDir = (process.env.TMPDIR || "/tmp").replace(/\/$/, "");
-        const playwrightTmpDir = `${tmpDir}/playwright-cli`;
+      // Only a remaining open needs cleanup; a successful probe converted it to
+      // goto and its live daemon socket must remain reachable.
+      if (filteredArgs[0] === "open") {
+        const socketRoot = tmpSocketRoot();
         try {
-          const { readdirSync } = await import("fs");
-          for (const sub of readdirSync(playwrightTmpDir)) {
-            const subDir = `${playwrightTmpDir}/${sub}`;
-            for (const f of readdirSync(subDir)) {
-              if (f.startsWith(namespacedSession)) {
-                const sockPath = `${subDir}/${f}`;
-                try { unlinkSync(sockPath); log(`Removed stale socket: ${sockPath}`); } catch {}
-              }
+          for (const f of readdirSync(socketRoot)) {
+            if (f === `${namespacedSession}.sock`) {
+              const sockPath = join(socketRoot, f);
+              try { unlinkSync(sockPath); log(`Removed stale socket: ${sockPath}`); } catch {}
             }
           }
         } catch {}
@@ -804,7 +823,7 @@ export async function serve() {
         stdout: "pipe",
         stderr: "pipe",
         windowsHide: true, // hide the CLI child's console; the user's Chrome (a GUI grandchild) stays visible
-        env: childEnv,
+        env: playwrightCliEnv(childEnv),
       });
 
       const TIMEOUT = 60_000;
@@ -860,7 +879,7 @@ export async function serve() {
             Bun.spawn([bin, ...binArgs, "close", `-s=${namespacedSession}`], {
               cwd: runWorkDir, stdin: "ignore", stdout: "ignore", stderr: "ignore",
               windowsHide: true,
-              env: { PATH: process.env.PATH, HOME: HOME, USERPROFILE: process.env.USERPROFILE },
+              env: playwrightCliEnv(),
             });
           } catch {}
           sessionTimeouts.delete(namespacedSession);
