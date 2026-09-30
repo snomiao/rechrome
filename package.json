@@ -30,7 +30,8 @@
   "type": "module",
   "scripts": {
     "serve": "bun run rechrome.ts serve",
-    "test": "bun test",
+    "test": "bun test ./*.test.ts ./*.spec.ts ./scripts/*.test.ts",
+    "build-playwright": "bash scripts/build-playwright.sh",
     "vendor-cli": "bash scripts/vendor-cli.sh",
     "prepare": "bash scripts/vendor-cli.sh --prepare",
     "check-pack": "bash scripts/check-pack.sh",
