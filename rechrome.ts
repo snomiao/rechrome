@@ -876,13 +876,16 @@ async function findInstalledExtension(
   // Read each profile's settings once so we can prioritize stable-ID matches over path fallbacks.
   const perProfile: Array<{ prof: string; settings: Record<string, any> }> = [];
   for (const prof of profiles) {
-    const prefsPath = join(userDataDir, prof, "Secure Preferences");
-    const f = file(prefsPath);
-    if (!(await f.exists())) continue;
-    try {
-      const data = JSON.parse(await f.text());
-      perProfile.push({ prof, settings: (data?.extensions?.settings ?? {}) as Record<string, any> });
-    } catch {}
+    const settings: Record<string, any> = {};
+    // Chrome may store unpacked extensions in either preferences file.
+    // Secure Preferences wins when both contain the same extension.
+    for (const name of ["Preferences", "Secure Preferences"]) {
+      try {
+        const data = await file(join(userDataDir, prof, name)).json();
+        Object.assign(settings, data?.extensions?.settings ?? {});
+      } catch {}
+    }
+    perProfile.push({ prof, settings });
   }
   // Pass 1: stable ID match (manifest `key` set, path-independent). This must win over any path
   // fallback so a stale legacy install sitting on a known path can't shadow the current extension.
@@ -3076,7 +3079,7 @@ async function setup(opts: SetupOptions = {}): Promise<void> {
     try {
       const probe = await callServe(
         rechUrl.toString(),
-        [`-s=${probeSession}`, "open", "about:blank", "--wait", "none"],
+        [`-s=${probeSession}`, "open", "about:blank"],
         probeEnv,
         probeIdentity,
         true,
