@@ -1240,12 +1240,26 @@ export async function promptChoice<T>(
   } finally { rl.close(); }
 }
 
-/** Registered profiles as choices, one per Chrome profile (data dir + folder; aliases collapse). */
-function registeredProfileChoices(registry: Record<string, TokenEntry>): { label: string; value: string }[] {
+/**
+ * One picker entry per Chrome profile: its Chrome name and signed-in email (from Local State,
+ * for profiles in the default user data dir), then the folder, e.g. `Work · you@example.com  [Profile 2]`.
+ */
+export function registeredProfileChoices(registry: Record<string, TokenEntry>, cache: Record<string, ChromeProfileInfo> | null = null): { label: string; value: string }[] {
+  const defaultDirs = CHROME_LOCAL_STATE_PATHS().map(path => dirname(path));
   return canonicalProfileKeys(registry).map(key => {
-    const dir = registry[key].profileDir;
-    return { label: key === dir ? key : `${key}  [${dir}]`, value: key };
+    const { profileDir: dir, userDataDir } = registry[key];
+    const info = !userDataDir || defaultDirs.includes(userDataDir) ? cache?.[dir] : undefined;
+    const names = [info?.name, info?.user_name, key].filter((n): n is string => !!n && n !== dir);
+    const shown = [...new Set(names)];
+    return { label: shown.length ? `${shown.join(" · ")}  [${dir}]` : dir, value: key };
   });
+}
+
+/** Chrome profiles (default user data dir) that rech has not registered yet: `[folder, info]`. */
+export function unregisteredChromeProfiles(registry: Record<string, TokenEntry>, cache: Record<string, ChromeProfileInfo> | null): [string, ChromeProfileInfo][] {
+  const defaultDirs = CHROME_LOCAL_STATE_PATHS().map(path => dirname(path));
+  const registered = new Set(Object.values(registry).filter(e => !e.userDataDir || defaultDirs.includes(e.userDataDir)).map(e => e.profileDir));
+  return Object.entries(cache ?? {}).filter(([dir]) => !registered.has(dir));
 }
 
 /**
@@ -1427,6 +1441,26 @@ async function shareNewLink(profile: string, opts: { local?: boolean; save?: boo
   return shareSet([profile], { ...opts, host, tailscaleServe, defaultName: name, prefix: `/rechrome/${name}/`, again: `rech share ${JSON.stringify(profile)}` });
 }
 
+/** A scoped listener's full link (contains its key): its public URL when recorded, else its own address. */
+export function listenerLink(listener: Listener, local = false): string {
+  const profiles = listener.profiles as string[];
+  const only = profiles.length === 1 ? `?profile=${encodeURIComponent(profiles[0])}` : "";
+  const direct = `http://${listener.key}@${listenerAddress(listener)}${normalizePrefix(listener.prefix)}${only}`;
+  return listener.publicUrl && !local ? rebaseConnectionUrl(listener.publicUrl, direct) : registeredProfileUrl(direct);
+}
+
+/** The links already handed out (stderr: stdout stays the one URL this command prints). */
+function printExistingLinks(listeners: Listener[], local = false): void {
+  const scoped = listeners.filter(l => l.profiles !== "*" && l.profiles.length);
+  if (!scoped.length) return;
+  console.error("Already shared (secret links):");
+  for (const l of scoped) {
+    console.error(`  ${l.name}: ${(l.profiles as string[]).join(", ")}${!l.publicUrl && isLoopback(l.host) ? "   (this machine only: no proxy recorded)" : ""}`);
+    console.error(`    ${listenerLink(l, local)}`);
+  }
+  console.error("");
+}
+
 async function printProfileUri(selector?: string, listener?: string, opts: { local?: boolean; save?: boolean; all?: boolean } = {}): Promise<void> {
   if (opts.all) {
     if (selector) throw new Error("Pass a profile or --all, not both.");
@@ -1437,14 +1471,41 @@ async function printProfileUri(selector?: string, listener?: string, opts: { loc
   const registry = await readTokenRegistry();
   const cache = await readChromeProfileCache();
   const cancelled = () => new Error("Cancelled; nothing shared.");
+  let config = await readListeners();
   const current = resolveEffectiveProfile(url ? parseUrl(url).profileDirectory : undefined);
-  const pickProfile = async (question: string, choices = registeredProfileChoices(registry)) => {
+  const sharedOn = (key: string) => ((config?.listeners ?? []).filter(l => l.profiles !== "*" && (l.profiles as string[]).includes(key))).map(l => l.name);
+  // Chrome profiles rech doesn't manage yet are listed too; picking one runs setup for it first.
+  const SETUP = "\0setup:";
+  const pickProfile = async (question: string, choices = [
+    ...registeredProfileChoices(registry, cache).map(c => {
+      const on = sharedOn(c.value);
+      return on.length ? { ...c, label: `${c.label}  (shared: ${on.join(", ")})` } : c;
+    }),
+    ...unregisteredChromeProfiles(registry, cache).map(([dir, info]) => ({
+      label: `${[...new Set([info.name, info.user_name].filter(Boolean))].join(" · ") || dir}  [${dir}]  (not set up: runs rech setup)`,
+      value: `${SETUP}${dir}`,
+    })),
+  ]) => {
     const def = Math.max(0, choices.findIndex(c => c.value === current || registry[c.value]?.profileDir === current));
-    return (await promptChoice(question, choices, def)) ?? (() => { throw cancelled(); })();
+    const picked = (await promptChoice(question, choices, def)) ?? (() => { throw cancelled(); })();
+    if (!picked.startsWith(SETUP)) return picked;
+    const dir = picked.slice(SETUP.length);
+    console.error(`[rech] ${dir} isn't set up yet; running rech setup --profile ${JSON.stringify(dir)} first.`);
+    await setup({ profile: dir });
+    const after = await readTokenRegistry();
+    const key = unregisteredChromeProfiles(after, { [dir]: {} }).length ? undefined : canonicalProfileKeys(after).find(k => after[k].profileDir === dir);
+    if (process.exitCode || !key) throw new Error(`Setup didn't register ${dir}; nothing shared. Retry with: rech setup --profile ${JSON.stringify(dir)}`);
+    Object.assign(registry, after);
+    config = await readListeners(); // setup may have added a listener: never write back a stale copy
+    return key;
   };
   if (!selector) {
-    // No profile given: ask, defaulting to the current one (?profile= in the URL, else PLAYWRIGHT_MCP_PROFILE_DIRECTORY).
-    if (interactive && Object.keys(registry).length) selector = await pickProfile("Share which profile?");
+    // No profile given: show what is already shared, then ask, defaulting to the current one
+    // (?profile= in the URL, else PLAYWRIGHT_MCP_PROFILE_DIRECTORY).
+    if (interactive && Object.keys(registry).length) {
+      printExistingLinks(config?.listeners ?? [], opts.local);
+      selector = await pickProfile("Share which profile?");
+    }
     else {
       selector = current;
       if (!selector) throw new Error("No current profile to share. Name one: rech share <profile>   (see rech profile; rech share ls lists what is shared)");
@@ -1467,7 +1528,6 @@ async function printProfileUri(selector?: string, listener?: string, opts: { loc
       } else throw error;
     }
   }
-  const config = await readListeners();
   const listeners = config?.listeners ?? [];
   // On a host, share through a scoped listener by default, never the management key.
   if (!listener && config) {
@@ -2819,8 +2879,11 @@ async function connect(url: string): Promise<void> {
     throw new Error(`Connected, but listener "${body.listener}" does not allow profile "${parsed.profileDirectory}".`);
   const saved = await saveProjectUrl(url);
   console.log(`Connected to ${serviceUrl(url)}${body.listener ? ` (listener ${body.listener})` : ""}. Saved RECHROME_URL to ${saved}`);
-  if (Array.isArray(body.profiles) && body.profiles.length > 1 && !parsed.profileDirectory)
-    console.log(`This link shares ${body.profiles.length} profiles: ${body.profiles.join(", ")}.\nPick one per command: rech --profile <name> open https://example.com   (see them again with rech profile)`);
+  if (Array.isArray(body.profiles) && body.profiles.length > 1) {
+    console.log(`This link shares ${body.profiles.length} profiles:`);
+    for (const p of body.profiles) console.log(`  ${p}${p === parsed.profileDirectory ? "  (default)" : ""}`);
+    console.log(`${parsed.profileDirectory ? "Use another" : "Pick one"} per command: rech --profile <name> open https://example.com   (see them again with rech profile)`);
+  }
 }
 
 export function detectSetupAgent(env: Record<string, string | undefined> = process.env): "Codex" | "Claude Code" | null {

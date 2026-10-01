@@ -411,7 +411,7 @@ export const LANDING_HEADERS = {
   "Cache-Control": "no-store",
   "Referrer-Policy": "no-referrer",
   "X-Content-Type-Options": "nosniff",
-  "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+  "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
 };
 
 /**
@@ -439,6 +439,8 @@ button { flex: none; font: inherit; font-size: .9rem; padding: 4px 12px; border-
 button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .warn { color: var(--warn); font-weight: 600; }
 .small { font-size: .85rem; }
+#plist { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 16px; }
+#plist button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); font-weight: 600; }
 a { color: var(--accent); }
 </style></head>
 <body><main>
@@ -447,31 +449,37 @@ a { color: var(--accent); }
 On your computer, inside the project folder that should use it, run:</p>
 <p id="nokey" class="warn" hidden>This link is missing its key (the part after #key=). Ask for the full link from <code>rech share</code>.</p>
 <div id="cmds"></div>
+<div id="profiles" hidden><p>Profiles this link can use (pick one to make it the default in the command above):</p><div id="plist"></div></div>
 <p class="small">Needs <a href="https://bun.sh">Bun</a>. Then try <code>rechrome open https://example.com</code>.
 This link contains a secret key: anyone with it can use this browser profile, so share it privately.</p>
 </main>
 <script>
 (() => {
-  const url = location.href;
+  let url = location.href;
+  const key = (location.hash.match(/[#&]key=([^&]*)/) || [])[1];
   if (!/[#&?]key=/.test(location.hash)) document.getElementById("nokey").hidden = false;
   const posix = s => "'" + s.replace(/'/g, "'\\\\''") + "'";
   const pwsh = s => '"' + s.replace(/[\`"$]/g, c => "\`" + c) + '"';
   const cmd = s => '"' + s.replace(/"/g, "%22") + '"';
   const shells = [
-    ["macOS / Linux", "bun i -g rechrome && rechrome connect " + posix(url)],
-    ["Windows PowerShell", "bun i -g rechrome; rechrome connect " + pwsh(url)],
-    ["Windows cmd", "bun i -g rechrome && rechrome connect " + cmd(url)],
+    ["macOS / Linux", u => "bun i -g rechrome && rechrome connect " + posix(u)],
+    ["Windows PowerShell", u => "bun i -g rechrome; rechrome connect " + pwsh(u)],
+    ["Windows cmd", u => "bun i -g rechrome && rechrome connect " + cmd(u)],
   ];
   const mask = s => s.replace(/(key=)[^&"'\`]+/, "$1…");
   const root = document.getElementById("cmds");
-  for (const [label, text] of shells) {
+  const rows = [];
+  for (const [label, build] of shells) {
     const row = document.createElement("div"); row.className = "row";
     const name = document.createElement("div"); name.className = "label"; name.textContent = label;
     const line = document.createElement("div"); line.className = "cmd";
-    const code = document.createElement("code"); code.textContent = mask(text);
+    const code = document.createElement("code");
+    const entry = { code, text: "", update() { this.text = build(url); code.textContent = mask(this.text); } };
+    entry.update(); rows.push(entry);
     const button = document.createElement("button"); button.type = "button"; button.textContent = "Copy";
     button.setAttribute("aria-label", "Copy the " + label + " command");
     button.addEventListener("click", async () => {
+      const text = entry.text;
       try { await navigator.clipboard.writeText(text); }
       catch {
         // Plain-HTTP pages (e.g. a LAN address) have no clipboard API: copy via a hidden textarea.
@@ -482,6 +490,31 @@ This link contains a secret key: anyone with it can use this browser profile, so
     });
     line.append(code, button); row.append(name, line); root.append(row);
   }
+  // The key never leaves the browser except to this listener's own /ping, which lists what it
+  // allows. Picking a profile only rewrites ?profile= in the command (the key works for all).
+  if (!key || typeof fetch !== "function") return;
+  const path = location.href.split("#")[0].split("?")[0], base = path.endsWith("/") ? path : path + "/";
+  fetch(base + "ping", { headers: { Authorization: "Bearer " + decodeURIComponent(key) } })
+    .then(r => r.ok ? r.json() : null)
+    .then(body => {
+      const profiles = body && Array.isArray(body.profiles) ? body.profiles : [];
+      if (!profiles.length) return;
+      const list = document.getElementById("plist"), buttons = [];
+      const select = p => {
+        const u = new URL(url); u.searchParams.set("profile", p); url = u.href;
+        for (const b of buttons) b.setAttribute("aria-pressed", String(b.textContent === p));
+        for (const r of rows) r.update();
+      };
+      const current = new URL(url).searchParams.get("profile");
+      for (const p of profiles) {
+        const b = document.createElement("button"); b.type = "button"; b.textContent = p;
+        b.setAttribute("aria-pressed", String(p === current));
+        b.addEventListener("click", async () => select(p));
+        buttons.push(b); list.append(b);
+      }
+      document.getElementById("profiles").hidden = false;
+    })
+    .catch(() => {});
 })();
 </script>
 </body></html>
