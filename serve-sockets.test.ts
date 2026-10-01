@@ -37,7 +37,7 @@ test("non-darwin preserves default socket selection and command environment", ()
     expect(env.PATH).toBe("/bin");
     expect(env.DEBUG).toBe("pw:*");
     expect(env.PLAYWRIGHT_MCP_EXTENSION).toBe("1");
-    expect(tmpSocketRoot(env)).toBe("/tmp/test/pw-7505d64a/cli");
+    expect(tmpSocketRoot(env)).toBe(join("/tmp/test", "pw-7505d64a", "cli"));
     expect(playwrightCliEnv({}, { platform, uid, env: { PLAYWRIGHT_SOCKETS_DIR: "/custom" } }).PLAYWRIGHT_SOCKETS_DIR).toBe("/custom");
   }
 });
