@@ -2766,6 +2766,9 @@ async function provisionExtensionToken(opts: {
     `--profile-directory=${profileDir}`,
     `--load-extension=${dist}`,
     `--disable-extensions-except=${dist}`,
+    // Chromium 137+ ignores --load-extension unless this feature is off (Chrome for Testing
+    // too): the extension silently never loads and status.html is an error page.
+    "--disable-features=DisableLoadExtensionCommandLineSwitch",
     "--remote-debugging-port=0",
     "--no-first-run",
     "--no-default-browser-check",
@@ -2773,40 +2776,70 @@ async function provisionExtensionToken(opts: {
   ];
   if (!opts.headed) args.push("--headless=new");
   if (process.platform === "linux") args.push("--no-sandbox");
+  // Headless can't answer a Keychain prompt, so first launch could stall on it (as Playwright does).
+  if (process.platform === "darwin") args.push("--use-mock-keychain");
   args.push("about:blank");
   const proc = Bun.spawn([chromeBin, ...args], { stdout: "ignore", stderr: "ignore", windowsHide: true });
   let cdp: CDPClient | null = null;
+  // Every step is bounded: a stuck Chrome must end in an error, never a silent hang.
+  const within = <T>(ms: number, what: string, work: Promise<T>) => Promise.race([work,
+    Bun.sleep(ms).then(() => { throw new Error(`${what} took over ${ms / 1000}s`); })]);
   try {
     // Chrome writes the chosen port to DevToolsActivePort once the debug server is up.
     let port: number | null = null;
-    for (let i = 0; i < 100; i++) {
+    for (let i = 0; i < 300; i++) {
       await Bun.sleep(100);
       const line = (await file(portFile).text().catch(() => "")).split("\n")[0]?.trim();
       if (line && /^\d+$/.test(line)) { port = parseInt(line); break; }
       if (proc.exitCode !== null) throw new Error("Chrome exited before opening the DevTools port");
     }
-    if (!port) throw new Error("Chrome DevTools port not found (extension may have failed to load)");
-    const ver = await (await fetch(`http://127.0.0.1:${port}/json/version`)).json();
+    if (!port) throw new Error("Chrome didn't open its DevTools port within 30s");
+    const ver = await (await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(5000) })).json();
     cdp = new CDPClient(ver.webSocketDebuggerUrl as string);
-    await cdp.open();
-    const { targetId } = await cdp.send("Target.createTarget", { url: `chrome-extension://${EXTENSION_ID}/status.html` });
+    await within(5000, "Connecting to Chrome DevTools", cdp.open());
+    // Wait for the extension's service worker: if it never shows, the extension didn't load.
+    const extensionUrl = `chrome-extension://${EXTENSION_ID}/`;
+    let loaded = false;
+    for (let i = 0; i < 50 && !loaded; i++) {
+      const { targetInfos } = await cdp.send("Target.getTargets");
+      loaded = (targetInfos as { url: string }[]).some(t => t.url.startsWith(extensionUrl));
+      if (!loaded) await Bun.sleep(200);
+    }
+    if (!loaded) throw new Error(`The extension at ${dist} didn't load in Chrome for Testing (no ${extensionUrl} target within 10s)`);
+    const { targetId } = await cdp.send("Target.createTarget", { url: `${extensionUrl}status.html` });
     const { sessionId } = await cdp.send("Target.attachToTarget", { targetId, flatten: true });
     // The extension page may still be loading; retry the write until localStorage reflects it.
-    let ok = false;
+    let ok = false, last = "";
     const expr = `(()=>{try{localStorage.setItem('auth-token',${JSON.stringify(token)});return localStorage.getItem('auth-token');}catch(e){return 'ERR:'+e.message}})()`;
-    for (let i = 0; i < 50; i++) {
-      const r = await cdp.send("Runtime.evaluate", { expression: expr, returnByValue: true }, sessionId).catch(() => null);
-      if (r?.result?.value === token) { ok = true; break; }
-      await Bun.sleep(100);
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      const r = await within(3000, "Runtime.evaluate", cdp.send("Runtime.evaluate", { expression: expr, returnByValue: true }, sessionId)).catch(e => ({ error: String(e) }));
+      const value = (r as any)?.result?.value;
+      if (value === token) { ok = true; break; }
+      last = typeof value === "string" ? value : (r as any)?.error ?? (r as any)?.result?.description ?? "";
+      await Bun.sleep(200);
     }
-    if (!ok) throw new Error(`Could not seed auth token into chrome-extension://${EXTENSION_ID}/ (is the extension loading?)`);
+    if (!ok) throw new Error(`Could not seed auth token into ${extensionUrl}${last ? ` (${last})` : ""}`);
     // Graceful close flushes localStorage to the profile's leveldb before we kill Chrome.
-    await cdp.send("Browser.close").catch(() => {});
+    await within(5000, "Browser.close", cdp.send("Browser.close")).catch(() => {});
+    await within(5000, "Chrome exit", proc.exited).catch(() => {});
   } finally {
     cdp?.close();
-    try { proc.kill(); } catch {}
-    await proc.exited.catch(() => {});
+    await stopThrowawayChrome(proc, userDataDir);
   }
+}
+
+/**
+ * Stop a Chrome we launched on a throwaway user-data-dir: SIGTERM, then SIGKILL, then any helper
+ * still holding that exact --user-data-dir (scoped to it, so never the user's own Chrome).
+ */
+async function stopThrowawayChrome(proc: ReturnType<typeof Bun.spawn>, userDataDir: string): Promise<void> {
+  if (proc.exitCode === null) {
+    try { proc.kill(); } catch {}
+    const exited = await Promise.race([proc.exited.then(() => true, () => true), Bun.sleep(3000).then(() => false)]);
+    if (!exited) { try { proc.kill("SIGKILL"); } catch {} await Promise.race([proc.exited.catch(() => {}), Bun.sleep(2000)]); }
+  }
+  if (process.platform !== "win32") Bun.spawnSync(["pkill", "-9", "-f", `--user-data-dir=${userDataDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}( |$)`], { stdout: "ignore", stderr: "ignore" });
 }
 
 async function provisionProfile(name: string, opts: { headed?: boolean } = {}): Promise<void> {
