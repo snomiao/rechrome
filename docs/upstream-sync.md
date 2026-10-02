@@ -23,7 +23,9 @@ new PR on a later run if upstream commits are still missing; disable the workflo
 to pause updates.
 
 Use merge commits when accepting these PRs. Then update rechrome's submodule pins
-and regenerate `extension/` and `vendor-src/` in a separate reviewed change. The
+and regenerate `extension/` in a separate reviewed change. `vendor-src/` follows on its own:
+the weekly `refresh-vendor.yml` (Wednesdays) bumps the pins to the forks' main, rebuilds it and
+opens a PR, and release CI refuses to publish while `vendor-src/SOURCE` and the pins disagree. The
 schedule does not publish packages, rebuild unreviewed upstream code, or silently
 replace our fork with Microsoft's HEAD. The legacy playwright-multi-tab submodule
 is not part of the current CLI/extension update path.
