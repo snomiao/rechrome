@@ -382,18 +382,27 @@ export function buildListenChoices(interfaces: ReturnType<typeof networkInterfac
 const TAILSCALE_ENV = { ...process.env, TAILSCALE_BE_CLI: "1" };
 const tailscaleBinary = () => Bun.which("tailscale") || (existsSync("/Applications/Tailscale.app/Contents/MacOS/Tailscale") ? "/Applications/Tailscale.app/Contents/MacOS/Tailscale" : null);
 
+/** Run the Tailscale CLI read-only: its output, or why it gave none (missing, failed, slow). */
+async function runTailscaleDetailed(args: string[]): Promise<{ output: string } | { error: string; missing?: true }> {
+  const binary = tailscaleBinary();
+  if (!binary) return { error: "not installed", missing: true };
+  try {
+    const proc = Bun.spawn([binary, ...args], { env: TAILSCALE_ENV, stdout: "pipe", stderr: "pipe" });
+    let timedOut = false;
+    const timeout = setTimeout(() => { timedOut = true; proc.kill(); }, 2000);
+    try {
+      const [output, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+      if (await proc.exited === 0) return { output };
+      const reason = timedOut ? "no answer within 2s" : (stderr.trim() || output.trim()).split("\n")[0] || `exit ${proc.exitCode}`;
+      return { error: `\`tailscale ${args.join(" ")}\`: ${reason}` };
+    } finally { clearTimeout(timeout); }
+  } catch (error) { return { error: String(error) }; }
+}
+
 /** Run the Tailscale CLI read-only; null when it is missing, disconnected, or slow. */
 async function runTailscale(args: string[]): Promise<string | null> {
-  const binary = tailscaleBinary();
-  if (!binary) return null;
-  try {
-    const proc = Bun.spawn([binary, ...args], { env: TAILSCALE_ENV, stdout: "pipe", stderr: "ignore" });
-    const timeout = setTimeout(() => proc.kill(), 2000);
-    try {
-      const output = await new Response(proc.stdout).text();
-      return await proc.exited === 0 ? output : null;
-    } finally { clearTimeout(timeout); }
-  } catch { return null; }
+  const result = await runTailscaleDetailed(args);
+  return "output" in result ? result.output : null;
 }
 
 export async function detectListenChoices(): Promise<ListenChoice[]> {
@@ -514,32 +523,71 @@ async function removeTailscaleServeRoutes(listener: { port: number; prefix?: str
   }
 }
 
+type HealthListener = Pick<Listener, "name" | "port" | "prefix" | "profiles">;
+
+/**
+ * Read-only Tailscale Serve health for the listeners: `absent` (no Tailscale here), `unresponsive`
+ * (installed, but its CLI doesn't answer — e.g. not running, or the Mac app's GUI binary), or
+ * `ok` with each shared listener's route plus the routes to re-point or remove.
+ */
+export type TailscaleHealth =
+  | { state: "absent" }
+  | { state: "unresponsive"; error: string }
+  | { state: "ok"; routes: { listener: string; port: number; url: string | null }[]; repair: ServeRepair[]; stale: ServeStale[] };
+
+export async function inspectTailscaleServe(listeners: HealthListener[]): Promise<TailscaleHealth> {
+  const [serve, status] = await Promise.all([runTailscaleDetailed(["serve", "status", "--json"]), runTailscale(["status", "--json"])]);
+  if (!("output" in serve)) return serve.missing ? { state: "absent" } : { state: "unresponsive", error: serve.error };
+  let serveStatus: unknown, dnsName: string | null = null;
+  try { serveStatus = JSON.parse(serve.output || "null"); } catch { return { state: "unresponsive", error: "`tailscale serve status --json` printed no JSON" }; }
+  try { dnsName = (JSON.parse(status ?? "null")?.Self?.DNSName as string | undefined)?.replace(/\.$/, "") || null; } catch { /* not connected */ }
+  const routes = listeners.filter(l => l.profiles !== "*")
+    .map(l => ({ listener: l.name, port: l.port, url: findTailscaleServeRoute(dnsName, serveStatus, l.port, normalizePrefix(l.prefix)) }));
+  return { state: "ok", routes, ...planTailscaleServeRepairs(serveStatus, listeners) };
+}
+
+const httpsPortOf = (hostPort: string) => hostPort.split(/:(?=\d+$)/)[1] ?? "443";
+
+/** Problems in a health report, one line each with the command that fixes it; empty when healthy. */
+export function tailscaleHealthProblems(health: TailscaleHealth): string[] {
+  if (health.state === "absent") return [];
+  if (health.state === "unresponsive") return [`Tailscale is installed but its CLI doesn't answer, so Serve routes go unchecked: ${health.error}`];
+  return [
+    ...health.repair.map(r => `${r.hostPort}${r.mount} proxies to 127.0.0.1:${r.from}, but the listener is on ${r.to} (clients get HTTP 502). Fix: tailscale serve --bg --https=${httpsPortOf(r.hostPort)} --set-path=${r.mount} ${r.proxy}`),
+    ...health.stale.map(st => `${st.hostPort}${st.mount} proxies to 127.0.0.1:${st.port}, where no listener runs (clients get HTTP 502). Remove it: tailscale serve --https=${httpsPortOf(st.hostPort)} --set-path=${st.mount} off`),
+  ];
+}
+
+/** The `tailscale:` block of `rech status` / `rech share ls`: each shared listener's route, then problems. */
+export function formatTailscaleHealth(health: TailscaleHealth): string[] {
+  if (health.state === "absent") return [];
+  const lines = health.state === "ok"
+    ? health.routes.map(r => r.url ? `✓ ${r.listener} → ${r.url} (127.0.0.1:${r.port})` : `- ${r.listener}: no Tailscale Serve route (fine if another proxy exposes it)`)
+    : [];
+  lines.push(...tailscaleHealthProblems(health).map(p => `⚠ ${p}`));
+  return lines.map((line, i) => `${i ? " ".repeat(11) : "tailscale: "}${line}`);
+}
+
 /**
  * Daemon health check: keep Tailscale Serve routes pointed at the listeners' current ports.
  * Re-points a moved listener's route on this node; only reports stale routes (removing a
- * route is the user's call). Returns log lines, empty when healthy or Tailscale is absent.
+ * route is the user's call) and a Tailscale CLI that doesn't answer. Returns log lines, empty
+ * when healthy or Tailscale is absent.
  */
-export async function checkTailscaleServe(listeners: { port: number; prefix?: string }[]): Promise<string[]> {
+export async function checkTailscaleServe(listeners: HealthListener[]): Promise<string[]> {
+  const health = await inspectTailscaleServe(listeners);
   const binary = tailscaleBinary();
-  if (!binary) return [];
-  const raw = await runTailscale(["serve", "status", "--json"]);
-  if (!raw) return [];
-  let serveStatus: unknown;
-  try { serveStatus = JSON.parse(raw); } catch { return []; }
-  const { repair, stale } = planTailscaleServeRepairs(serveStatus, listeners);
+  if (health.state !== "ok" || !binary) return tailscaleHealthProblems(health).map(p => `tailscale serve: ${p}`);
   const lines: string[] = [];
-  for (const r of repair) {
-    const httpsPort = r.hostPort.split(/:(?=\d+$)/)[1] ?? "443";
-    const args = ["serve", "--bg", `--https=${httpsPort}`, `--set-path=${r.mount}`, r.proxy];
+  for (const r of health.repair) {
+    const args = ["serve", "--bg", `--https=${httpsPortOf(r.hostPort)}`, `--set-path=${r.mount}`, r.proxy];
     const proc = Bun.spawn([binary, ...args], { env: TAILSCALE_ENV, stdout: "ignore", stderr: "pipe", windowsHide: true });
     const ok = await proc.exited === 0;
     lines.push(ok
       ? `tailscale serve: re-pointed ${r.hostPort}${r.mount} from 127.0.0.1:${r.from} to ${r.to}`
       : `tailscale serve: ${r.hostPort}${r.mount} points at 127.0.0.1:${r.from}, listener is on ${r.to}; re-pointing failed (${(await new Response(proc.stderr).text()).trim()}). Run: tailscale ${args.join(" ")}`);
   }
-  for (const s of stale) {
-    lines.push(`tailscale serve: ${s.hostPort}${s.mount} proxies to 127.0.0.1:${s.port}, where no listener runs (clients get HTTP 502). Remove it: tailscale serve --https=${s.hostPort.split(/:(?=\d+$)/)[1] ?? "443"} --set-path=${s.mount} off`);
-  }
+  lines.push(...tailscaleHealthProblems({ ...health, repair: [] }).map(p => `tailscale serve: ${p}`));
   return lines;
 }
 
@@ -2952,6 +3000,8 @@ async function urlList(): Promise<void> {
   printTable(rows);
   const wide = config.listeners.filter(l => l.profiles !== "*" && l.profiles.length > 1);
   if (wide.length) console.log(`\nOne key covers several profiles on: ${wide.map(l => `${l.name} (${(l.profiles as string[]).length})`).join(", ")}. Anyone with such a link can use each of them.`);
+  const tailscale = formatTailscaleHealth(await inspectTailscaleServe(config.listeners));
+  if (tailscale.length) console.log(`\n${tailscale.join("\n")}`);
   console.log(`\nPrint a full URL (contains the secret key): rech share <profile>, or rech share --all`);
 }
 
@@ -3403,7 +3453,11 @@ async function status(): Promise<void> {
     : null;
   // Show the URL this client connects to; through a proxy, the daemon's bind is on another port.
   const details = [pingBody?.listener && `listener ${pingBody.listener}`, pingBody?.bind && `bind ${pingBody.bind}`].filter(Boolean).join(", ");
-  console.log(`serve:    ${ping ? `running  ${serviceUrl(url)}${details ? `  (${details})` : ""}` : `not reachable at ${serviceUrl(url)}`}`);
+  // Any HTTP answer is not the daemon: a proxy's 404/502 means the link's listener is gone or moved.
+  const answered = pingResponse?.ok || pingResponse?.status === 401;
+  console.log(`serve:    ${!ping ? `not reachable at ${serviceUrl(url)}`
+    : answered ? `running  ${serviceUrl(url)}${details ? `  (${details})` : ""}`
+    : `✗ ${serviceUrl(url)} answers HTTP ${pingResponse?.status ?? ping.status}, not a rechrome daemon — this link's listener was likely removed or moved; ask its host for a fresh link (\`rech share <profile>\`), then \`rech connect '<url>'\``}`);
   if (pingResponse?.status === 401)
     console.log(`auth:     ✗ key rejected — ask the host for a fresh URL (\`rech share <profile>\`), then \`rech connect '<url>'\``);
   // daemonManager().id — there is no PM_BIN constant. Referencing one threw a
@@ -3426,7 +3480,11 @@ async function status(): Promise<void> {
   const current = effective ? await resolveProfileEmail(effective).catch(() => effective) : undefined;
   const allowed = pingBody?.profiles === "*" ? "all registered profiles" : pingBody?.profiles?.join(", ");
   console.log(`profile:  ${current ?? "(none selected; add ?profile= to the URL or pass --profile)"}${allowed ? `  — this listener serves: ${allowed}` : ""}`);
-  if (isHost) console.log(`\nMore: rech profile (profiles) · rech share ls (who can connect, and where)`);
+  if (isHost) {
+    const listeners = (await readListeners().catch(() => null))?.listeners ?? [];
+    for (const line of formatTailscaleHealth(await inspectTailscaleServe(listeners))) console.log(line);
+    console.log(`\nMore: rech profile (profiles) · rech share ls (who can connect, and where)`);
+  }
 }
 
 

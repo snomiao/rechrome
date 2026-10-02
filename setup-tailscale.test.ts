@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { findTailscaleServeRoute, planTailscaleServeRepairs, rebaseConnectionUrl } from "./rechrome.ts";
+import { findTailscaleServeRoute, formatTailscaleHealth, planTailscaleServeRepairs, rebaseConnectionUrl, tailscaleHealthProblems } from "./rechrome.ts";
 
 // Shape of `tailscale serve status --json`.
 const serve = {
@@ -53,4 +53,23 @@ test("the Serve health check re-points a moved listener's route and flags a remo
     stale: [{ hostPort: "node.example.ts.net:443", mount: "/rechrome", port: 13776 }],
   });
   expect(planTailscaleServeRepairs(serve, [])).toEqual({ repair: [], stale: [] });
+});
+
+test("rech status / share ls show each shared listener's route and every Serve problem with its fix", () => {
+  const stale = { hostPort: "node.example.ts.net:443", mount: "/rechrome", port: 13776 };
+  expect(formatTailscaleHealth({ state: "ok", routes: [
+    { listener: "taku", port: 13777, url: "https://node.example.ts.net/rechrome/taku/" },
+    { listener: "lan", port: 13780, url: null },
+  ], repair: [], stale: [stale] })).toEqual([
+    "tailscale: ✓ taku → https://node.example.ts.net/rechrome/taku/ (127.0.0.1:13777)",
+    "           - lan: no Tailscale Serve route (fine if another proxy exposes it)",
+    "           ⚠ node.example.ts.net:443/rechrome proxies to 127.0.0.1:13776, where no listener runs (clients get HTTP 502). Remove it: tailscale serve --https=443 --set-path=/rechrome off",
+  ]);
+  expect(formatTailscaleHealth({ state: "absent" })).toEqual([]);
+});
+
+test("an installed Tailscale whose CLI doesn't answer is reported, not mistaken for no Tailscale", () => {
+  const health = { state: "unresponsive", error: "`tailscale serve status --json`: The Tailscale GUI failed to start" } as const;
+  expect(tailscaleHealthProblems(health)).toEqual(["Tailscale is installed but its CLI doesn't answer, so Serve routes go unchecked: `tailscale serve status --json`: The Tailscale GUI failed to start"]);
+  expect(formatTailscaleHealth(health)[0]).toStartWith("tailscale: ⚠ Tailscale is installed but its CLI doesn't answer");
 });
