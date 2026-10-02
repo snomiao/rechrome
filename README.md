@@ -211,6 +211,8 @@ prompting for stdin, then uses the default configuration save location.
 > the extension auto-loaded and the token auto-seeded — zero GUI, zero TTY. It is *not* your real
 > Chrome (branded Google Chrome 149+ rejects `--load-extension`), so it has no logins/cookies; use it
 > for clean QA fixtures, and `rech setup` for your real, logged-in Chrome.
+> After provisioning, `rech --profile <name> open https://example.com` automatically launches
+> that managed browser with the bridge loaded; no separate browser launch is needed.
 
 ## Configuration
 
