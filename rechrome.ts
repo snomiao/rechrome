@@ -2712,45 +2712,90 @@ function findChromiumForTesting(): string | null {
 // Minimal Chrome DevTools Protocol client over a WebSocket — just enough to create a
 // target, attach to it, and evaluate JS. Used to seed the auth token into a managed
 // profile's extension localStorage without pulling in the full Playwright dependency.
-class CDPClient {
+export class CDPClient {
   private ws: WebSocket;
   private nextId = 0;
-  private pending = new Map<number, { resolve: (v: any) => void; reject: (e: any) => void }>();
+  private pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>();
   private opened: Promise<void>;
-  constructor(url: string) {
+  constructor(url: string, private timeoutMs = 30_000) {
     this.ws = new WebSocket(url);
     this.opened = new Promise<void>((resolve, reject) => {
-      this.ws.addEventListener("open", () => resolve(), { once: true });
-      this.ws.addEventListener("error", () => reject(new Error("CDP WebSocket error")), { once: true });
+      const timer = setTimeout(() => { reject(new Error("CDP WebSocket connection timed out")); this.close(); }, timeoutMs);
+      this.ws.addEventListener("open", () => { clearTimeout(timer); resolve(); }, { once: true });
+      const fail = () => {
+        clearTimeout(timer);
+        const error = new Error("CDP WebSocket closed or failed");
+        reject(error);
+        for (const p of this.pending.values()) p.reject(error);
+        this.pending.clear();
+      };
+      this.ws.addEventListener("error", fail);
+      this.ws.addEventListener("close", fail);
     });
     this.ws.addEventListener("message", (ev: MessageEvent) => {
       let msg: any;
       try { msg = JSON.parse(typeof ev.data === "string" ? ev.data : ""); } catch { return; }
       const p = msg.id != null ? this.pending.get(msg.id) : undefined;
       if (!p) return;
-      this.pending.delete(msg.id);
       if (msg.error) p.reject(new Error(msg.error.message || JSON.stringify(msg.error)));
       else p.resolve(msg.result);
     });
   }
   async open(): Promise<void> { await this.opened; }
   send(method: string, params: Record<string, any> = {}, sessionId?: string): Promise<any> {
+    if (this.ws.readyState !== WebSocket.OPEN) return Promise.reject(new Error("CDP WebSocket is not open"));
     const id = ++this.nextId;
-    const payload: any = { id, method, params };
-    if (sessionId) payload.sessionId = sessionId;
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      this.ws.send(JSON.stringify(payload));
-      setTimeout(() => { if (this.pending.delete(id)) reject(new Error(`CDP ${method} timed out`)); }, 15_000);
+      const finish = (callback: (value: any) => void, value: any) => {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        callback(value);
+      };
+      const timer = setTimeout(() => finish(reject, new Error(`CDP ${method} timed out`)), this.timeoutMs);
+      this.pending.set(id, { resolve: v => finish(resolve, v), reject: e => finish(reject, e) });
+      try { this.ws.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) })); }
+      catch (error) { finish(reject, error); }
     });
   }
-  close(): void { try { this.ws.close(); } catch {} }
+  close(): void {
+    for (const p of this.pending.values()) p.reject(new Error("CDP client closed"));
+    this.pending.clear();
+    try { this.ws.close(); } catch {}
+  }
+}
+
+async function waitForExit(exited: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout>;
+  try {
+    return await Promise.race([exited.then(() => true), new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), timeoutMs); })]);
+  } finally { clearTimeout(timer!); }
+}
+
+export async function seedExtensionToken(cdp: Pick<CDPClient, "send">, token: string): Promise<void> {
+  const { targetId } = await cdp.send("Target.createTarget", { url: `chrome-extension://${EXTENSION_ID}/status.html` });
+  const { sessionId } = await cdp.send("Target.attachToTarget", { targetId, flatten: true });
+  // The extension page may still be loading; retry the write until localStorage reflects it.
+  let ok = false;
+  const expr = `(()=>{try{if(location.origin!==${JSON.stringify(`chrome-extension://${EXTENSION_ID}`)})return 'ERR:Extension page not loaded';localStorage.setItem('auth-token',${JSON.stringify(token)});return localStorage.getItem('auth-token');}catch(e){return 'ERR:'+e.message}})()`;
+  let lastError = "Extension page is not ready";
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    const r = await cdp.send("Runtime.evaluate", { expression: expr, returnByValue: true }, sessionId);
+    lastError = r?.exceptionDetails?.text || String(r?.result?.value ?? "No evaluation result");
+    if (r?.result?.value === token) { ok = true; break; }
+    // A target opened before the extension finishes loading can remain on Chrome's
+    // error document forever. Evaluating it again cannot finish the navigation.
+    const navigation = await cdp.send("Page.navigate", { url: `chrome-extension://${EXTENSION_ID}/status.html` }, sessionId);
+    if (navigation.errorText) lastError = navigation.errorText;
+    await Bun.sleep(1_000);
+  }
+  if (!ok) throw new Error(`Could not seed auth token into chrome-extension://${EXTENSION_ID}/: ${lastError}`);
 }
 
 // Launch a throwaway Chrome against a dedicated user-data-dir with the unpacked extension
 // loaded, then seed `token` into the extension's localStorage (the value `connect.html` checks
 // for token-bypass). Headless by default; never touches the user's real Chrome/profiles.
-async function provisionExtensionToken(opts: {
+export async function provisionExtensionToken(opts: {
   userDataDir: string; profileDir: string; dist: string; token: string; headed?: boolean;
 }): Promise<void> {
   // Branded Google Chrome 149+ rejects --load-extension ("not allowed in Google Chrome"), so a
@@ -2770,42 +2815,79 @@ async function provisionExtensionToken(opts: {
     "--no-first-run",
     "--no-default-browser-check",
     "--disable-background-timer-throttling",
+    "--disable-background-networking",
+    "--disable-component-update",
+    "--disable-search-engine-choice-screen",
+    // Match Playwright's unattended macOS launch: no interactive keychain prompt.
+    "--password-store=basic",
+    "--use-mock-keychain",
   ];
   if (!opts.headed) args.push("--headless=new");
   if (process.platform === "linux") args.push("--no-sandbox");
   args.push("about:blank");
-  const proc = Bun.spawn([chromeBin, ...args], { stdout: "ignore", stderr: "ignore", windowsHide: true });
+  // Own a separate process group so escalation cannot touch the user's Chrome.
+  const proc = cpSpawn(chromeBin, args, { detached: process.platform !== "win32", stdio: ["ignore", "ignore", "pipe"], windowsHide: true });
+  let stderr = "";
+  proc.stderr?.on("data", data => { stderr = (stderr + data.toString()).slice(-8_192); });
+  let launchError: Error | undefined;
+  const exited = new Promise<void>(resolve => {
+    proc.once("exit", () => resolve());
+    proc.once("error", error => { launchError = error; resolve(); });
+  });
+  const signal = (value: NodeJS.Signals) => {
+    if (!proc.pid) return;
+    try {
+      if (process.platform === "win32") proc.kill(value);
+      else process.kill(-proc.pid, value);
+    } catch {}
+  };
+  const interrupted = (value: NodeJS.Signals) => {
+    signal("SIGKILL");
+    console.error(`Profile provisioning interrupted (${value})`);
+    process.exit(value === "SIGINT" ? 130 : 143);
+  };
+  const onInt = () => interrupted("SIGINT");
+  const onTerm = () => interrupted("SIGTERM");
+  process.once("SIGINT", onInt);
+  process.once("SIGTERM", onTerm);
   let cdp: CDPClient | null = null;
+  let phase = "Chrome startup";
   try {
     // Chrome writes the chosen port to DevToolsActivePort once the debug server is up.
     let port: number | null = null;
-    for (let i = 0; i < 100; i++) {
+    for (let i = 0; i < 600; i++) {
       await Bun.sleep(100);
       const line = (await file(portFile).text().catch(() => "")).split("\n")[0]?.trim();
       if (line && /^\d+$/.test(line)) { port = parseInt(line); break; }
-      if (proc.exitCode !== null) throw new Error("Chrome exited before opening the DevTools port");
+      if (launchError) throw launchError;
+      if (proc.exitCode !== null || proc.signalCode !== null) throw new Error(`Chrome exited before opening the DevTools port (${proc.exitCode ?? proc.signalCode})`);
     }
     if (!port) throw new Error("Chrome DevTools port not found (extension may have failed to load)");
-    const ver = await (await fetch(`http://127.0.0.1:${port}/json/version`)).json();
+    phase = "Chrome DevTools discovery";
+    const ver = await (await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(30_000) })).json();
+    phase = "Chrome DevTools connection";
     cdp = new CDPClient(ver.webSocketDebuggerUrl as string);
     await cdp.open();
-    const { targetId } = await cdp.send("Target.createTarget", { url: `chrome-extension://${EXTENSION_ID}/status.html` });
-    const { sessionId } = await cdp.send("Target.attachToTarget", { targetId, flatten: true });
-    // The extension page may still be loading; retry the write until localStorage reflects it.
-    let ok = false;
-    const expr = `(()=>{try{localStorage.setItem('auth-token',${JSON.stringify(token)});return localStorage.getItem('auth-token');}catch(e){return 'ERR:'+e.message}})()`;
-    for (let i = 0; i < 50; i++) {
-      const r = await cdp.send("Runtime.evaluate", { expression: expr, returnByValue: true }, sessionId).catch(() => null);
-      if (r?.result?.value === token) { ok = true; break; }
-      await Bun.sleep(100);
-    }
-    if (!ok) throw new Error(`Could not seed auth token into chrome-extension://${EXTENSION_ID}/ (is the extension loading?)`);
+    phase = "Extension token seeding";
+    await seedExtensionToken(cdp, token);
     // Graceful close flushes localStorage to the profile's leveldb before we kill Chrome.
+    phase = "Chrome shutdown";
     await cdp.send("Browser.close").catch(() => {});
+    if (!await waitForExit(exited, 30_000)) throw new Error("Chrome did not exit after flushing the auth token");
+    if (readExtensionTokenFromProfile(userDataDir, profileDir, EXTENSION_ID) !== token)
+      throw new Error("Chrome exited without persisting the extension auth token");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`${phase}: ${message}${stderr.trim() ? `\nChrome stderr:\n${stderr.trim()}` : ""}`.replaceAll(token, "[redacted]"));
   } finally {
     cdp?.close();
-    try { proc.kill(); } catch {}
-    await proc.exited.catch(() => {});
+    signal("SIGTERM");
+    if (!await waitForExit(exited, 2_000)) signal("SIGKILL");
+    // Also reap helpers that survived the browser parent exiting.
+    signal("SIGKILL");
+    await waitForExit(exited, 2_000);
+    process.removeListener("SIGINT", onInt);
+    process.removeListener("SIGTERM", onTerm);
   }
 }
 
@@ -2825,7 +2907,7 @@ async function provisionProfile(name: string, opts: { headed?: boolean } = {}): 
   console.log(`      extension:     ${dist}`);
   console.log(`      Launching ${opts.headed ? "headed" : "headless"} Chrome to seed the auth token...`);
   await provisionExtensionToken({ userDataDir, profileDir: name, dist, token, headed: opts.headed });
-  console.log(`      Token seeded (${token.slice(0, 6)}…)`);
+  console.log("      Token seeded");
 
   // [2/3] Daemon URL — reuse the running daemon's key; warn (don't fail) if it isn't up yet.
   console.log(`\n[2/3] Building RECHROME_URL`);
