@@ -21,7 +21,7 @@ async function render(href: string, ping?: (url: string, init: { headers: Record
   });
   new Function("location", "document", "navigator", "setTimeout", "fetch", script)({ href, hash: new URL(href).hash }, document, navigator, () => {}, fetch);
   await pinged; await Bun.sleep(0);
-  const rows = byId.cmds.children.map(row => ({ label: row.children[0].textContent, shown: row.children[1].children[0].textContent, button: row.children[1].children[1] }));
+  const rows = byId.cmds.children.map(row => ({ shown: row.children[0].children[0].textContent, button: row.children[0].children[1] }));
   for (const row of rows) await row.button.click!();
   const profiles = (byId.plist?.children ?? []).map(b => b as El & { textContent: string });
   return { rows, copied, noKeyWarning: byId.nokey?.hidden === false, profiles, profilesShown: byId.profiles?.hidden === false };
@@ -29,28 +29,26 @@ async function render(href: string, ping?: (url: string, init: { headers: Record
 
 const shared = "https://host.example.ts.net/rechrome/?profile=you%40example.com#key=SECRETkey_0123456789";
 
-test("a shared URL shows one install-and-connect command per shell, key masked, copied whole", async () => {
+test("a shared URL shows one two-line install-and-connect block for every shell, key masked, copied whole", async () => {
   const { rows, copied, noKeyWarning } = await render(shared);
-  expect(rows.map(r => r.label)).toEqual(["macOS / Linux", "Windows PowerShell", "Windows cmd"]);
-  expect(copied).toEqual([
-    `bun i -g rechrome && rechrome connect '${shared}'`,
-    `bun i -g rechrome; rechrome connect "${shared}"`,
-    `bun i -g rechrome && rechrome connect "${shared}"`,
-  ]);
-  for (const row of rows) {
-    expect(row.shown).not.toContain("SECRETkey");
-    expect(row.shown).toContain("#key=…");
-  }
+  expect(rows.length).toBe(1);
+  expect(copied).toEqual([`bun i -g rechrome\nrechrome connect "${shared.replace("%40", "@")}"`]);
+  expect(rows[0].shown).not.toContain("SECRETkey");
+  expect(rows[0].shown).toContain("#key=…");
   expect(noKeyWarning).toBe(false);
 });
 
-test("the macOS/Linux command survives a shell even with quotes and $ in the URL", async () => {
-  const tricky = "https://h.example/rechrome/?profile=o'neil$HOME#key=k'$(id)";
+test("the copied URL survives sh (and PowerShell, if installed) even with shell metacharacters", async () => {
+  const tricky = "https://h.example/rechrome/?profile=o'neil$HOME!`id`\\\"x@y#key=SECRETkey_0123456789";
   const { copied } = await render(tricky);
-  const arg = copied[0].slice("bun i -g rechrome && rechrome connect ".length);
-  const echoed = Bun.spawnSync(["sh", "-c", `printf %s ${arg}`]).stdout.toString();
-  expect(echoed).toBe(tricky);
-  expect(copied[1]).toContain("o'neil`$HOME");   // PowerShell: $ escaped with a backtick
+  const arg = copied[0].split("\n")[1].slice("rechrome connect ".length);
+  const same = (got: string) => {
+    const [want, have] = [new URL(tricky), new URL(got)];
+    expect(have.searchParams.get("profile")).toBe(want.searchParams.get("profile"));
+    expect(have.hash).toBe(want.hash);
+  };
+  same(Bun.spawnSync(["sh", "-c", `printf %s ${arg}`]).stdout.toString());
+  if (Bun.which("pwsh")) same(Bun.spawnSync(["pwsh", "-NoProfile", "-Command", `[Console]::Write(${arg})`]).stdout.toString());
 });
 
 test("a link without its key warns instead of pretending to work", async () => {
@@ -77,7 +75,7 @@ test("the page lists the link's profiles from its own /ping, and picking one rew
   copied.length = 0;
   await profiles[1].click!();
   await rows[0].button.click!();
-  expect(copied[0]).toBe(`bun i -g rechrome && rechrome connect 'https://host.example.ts.net/rechrome/team/?profile=b%40example.com#key=SECRETkey_0123456789'`);
+  expect(copied[0]).toBe(`bun i -g rechrome\nrechrome connect "https://host.example.ts.net/rechrome/team/?profile=b@example.com#key=SECRETkey_0123456789"`);
 });
 
 test("a key the listener rejects shows no profile list", async () => {

@@ -415,8 +415,8 @@ export const LANDING_HEADERS = {
 };
 
 /**
- * The page a shared connection URL shows in a browser: install-and-connect commands to copy,
- * one per shell. It is static; the script reads the full URL (with its #key) from the address
+ * The page a shared connection URL shows in a browser: two install-and-connect lines to copy,
+ * identical for every shell. It is static; the script reads the full URL (with its #key) from the address
  * bar, shows it with the key masked, and copies it whole.
  */
 export function landingPage(): string {
@@ -432,7 +432,6 @@ main { max-width: 760px; margin: 0 auto; padding: 40px 16px 56px; }
 h1 { font-size: 1.6rem; margin: 0 0 8px; }
 p { margin: 0 0 16px; color: var(--muted); }
 .row { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; margin: 0 0 12px; }
-.label { font-size: .8rem; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin-bottom: 6px; }
 .cmd { display: flex; gap: 10px; align-items: flex-start; }
 code { flex: 1; font: 13px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace; word-break: break-all; white-space: pre-wrap; }
 button { flex: none; font: inherit; font-size: .9rem; padding: 4px 12px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); cursor: pointer; }
@@ -446,7 +445,8 @@ a { color: var(--accent); }
 <body><main>
 <h1>Connect to a shared Chrome</h1>
 <p>Someone shared a Chrome profile with you through <a href="https://github.com/snomiao/rechrome">rechrome</a>.
-On your computer, inside the project folder that should use it, run:</p>
+On your computer, inside the project folder that should use it, run these two lines
+(the same in macOS/Linux terminals, PowerShell and cmd):</p>
 <p id="nokey" class="warn" hidden>This link is missing its key (the part after #key=). Ask for the full link from <code>rech share</code>.</p>
 <div id="cmds"></div>
 <div id="profiles" hidden><p>Profiles this link can use (pick one to make it the default in the command above):</p><div id="plist"></div></div>
@@ -458,38 +458,31 @@ This link contains a secret key: anyone with it can use this browser profile, so
   let url = location.href;
   const key = (location.hash.match(/[#&]key=([^&]*)/) || [])[1];
   if (!/[#&?]key=/.test(location.hash)) document.getElementById("nokey").hidden = false;
-  const posix = s => "'" + s.replace(/'/g, "'\\\\''") + "'";
-  const pwsh = s => '"' + s.replace(/[\`"$]/g, c => "\`" + c) + '"';
-  const cmd = s => '"' + s.replace(/"/g, "%22") + '"';
-  const shells = [
-    ["macOS / Linux", u => "bun i -g rechrome && rechrome connect " + posix(u)],
-    ["Windows PowerShell", u => "bun i -g rechrome; rechrome connect " + pwsh(u)],
-    ["Windows cmd", u => "bun i -g rechrome && rechrome connect " + cmd(u)],
-  ];
-  const mask = s => s.replace(/(key=)[^&"'\`]+/, "$1…");
+  // One command for every shell: two lines (no && vs ; split), one double-quoted URL. Characters a
+  // shell expands inside double quotes ($ \` " \\ !) are percent-encoded, which the URL reads the same;
+  // %40 goes back to a readable @ (valid in a query, and one less % for cmd to try to expand).
+  const quote = s => '"' + s.replace(/%40/g, "@").replace(/[$\`"\\\\!]/g, c => "%" + c.charCodeAt(0).toString(16).toUpperCase()) + '"';
+  const build = u => "bun i -g rechrome\\nrechrome connect " + quote(u);
+  const mask = s => s.replace(/(key=)[^&"\\n]+/, "$1…");
   const root = document.getElementById("cmds");
-  const rows = [];
-  for (const [label, build] of shells) {
-    const row = document.createElement("div"); row.className = "row";
-    const name = document.createElement("div"); name.className = "label"; name.textContent = label;
-    const line = document.createElement("div"); line.className = "cmd";
-    const code = document.createElement("code");
-    const entry = { code, text: "", update() { this.text = build(url); code.textContent = mask(this.text); } };
-    entry.update(); rows.push(entry);
-    const button = document.createElement("button"); button.type = "button"; button.textContent = "Copy";
-    button.setAttribute("aria-label", "Copy the " + label + " command");
-    button.addEventListener("click", async () => {
-      const text = entry.text;
-      try { await navigator.clipboard.writeText(text); }
-      catch {
-        // Plain-HTTP pages (e.g. a LAN address) have no clipboard API: copy via a hidden textarea.
-        const area = document.createElement("textarea"); area.value = text; document.body.append(area);
-        area.select(); document.execCommand("copy"); area.remove();
-      }
-      button.textContent = "Copied"; setTimeout(() => { button.textContent = "Copy"; }, 1500);
-    });
-    line.append(code, button); row.append(name, line); root.append(row);
-  }
+  const row = document.createElement("div"); row.className = "row";
+  const line = document.createElement("div"); line.className = "cmd";
+  const code = document.createElement("code");
+  const entry = { text: "", update() { this.text = build(url); code.textContent = mask(this.text); } };
+  entry.update();
+  const button = document.createElement("button"); button.type = "button"; button.textContent = "Copy";
+  button.setAttribute("aria-label", "Copy the commands");
+  button.addEventListener("click", async () => {
+    const text = entry.text;
+    try { await navigator.clipboard.writeText(text); }
+    catch {
+      // Plain-HTTP pages (e.g. a LAN address) have no clipboard API: copy via a hidden textarea.
+      const area = document.createElement("textarea"); area.value = text; document.body.append(area);
+      area.select(); document.execCommand("copy"); area.remove();
+    }
+    button.textContent = "Copied"; setTimeout(() => { button.textContent = "Copy"; }, 1500);
+  });
+  line.append(code, button); row.append(line); root.append(row);
   // The key never leaves the browser except to this listener's own /ping, which lists what it
   // allows. Picking a profile only rewrites ?profile= in the command (the key works for all).
   if (!key || typeof fetch !== "function") return;
@@ -503,7 +496,7 @@ This link contains a secret key: anyone with it can use this browser profile, so
       const select = p => {
         const u = new URL(url); u.searchParams.set("profile", p); url = u.href;
         for (const b of buttons) b.setAttribute("aria-pressed", String(b.textContent === p));
-        for (const r of rows) r.update();
+        entry.update();
       };
       const current = new URL(url).searchParams.get("profile");
       for (const p of profiles) {
