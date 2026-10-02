@@ -17,6 +17,7 @@ import {
   resolvePlaywrightCli,
   readTokenRegistry,
   readChromeProfileCache,
+  checkTailscaleServe,
 } from "./rechrome.ts";
 
 const TAILSCALE_BIN = process.env.TAILSCALE_BIN || "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
@@ -1041,4 +1042,19 @@ export async function serve() {
     } finally { reloading = false; }
   }, 1000);
   log("Connection credentials remain in local configuration; listener changes reload automatically");
+  // Keep Tailscale Serve routes on the listeners' current ports: right away, after every listener
+  // change, and every few minutes (routes can be edited by hand). Each finding is logged once.
+  let checkedFor = "", lastReport = "", lastCheck = 0, checking = false;
+  setInterval(async () => {
+    if (checking || (applied === checkedFor && Date.now() - lastCheck < 5 * 60_000)) return;
+    checking = true;
+    try {
+      const listeners = JSON.parse(applied || "[]") as Listener[];
+      const lines = await checkTailscaleServe(listeners);
+      const report = lines.join("\n");
+      if (report && report !== lastReport) for (const line of lines) log(line);
+      lastReport = report; checkedFor = applied; lastCheck = Date.now();
+    } catch (error) { log(`tailscale serve health check failed: ${error}`); }
+    finally { checking = false; }
+  }, 2000);
 }

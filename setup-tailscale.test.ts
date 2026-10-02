@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { findTailscaleServeRoute, rebaseConnectionUrl } from "./rechrome.ts";
+import { findTailscaleServeRoute, planTailscaleServeRepairs, rebaseConnectionUrl } from "./rechrome.ts";
 
 // Shape of `tailscale serve status --json`.
 const serve = {
@@ -37,4 +37,20 @@ test("remote URL carries the listener key in the fragment and only the profile q
   expect(url.searchParams.get("profile")).toBe("Profile 5");
   expect(url.searchParams.has("token")).toBe(false);
   expect(url.hash).toBe("#key=KEY123");
+});
+
+test("the Serve health check re-points a moved listener's route and flags a removed one's leftover", () => {
+  const serve = { Web: { "node.example.ts.net:443": { Handlers: {
+    "/rechrome": { Proxy: "http://127.0.0.1:13776/rechrome" },          // removed listener: stale
+    "/rechrome/taku": { Proxy: "http://127.0.0.1:13790/rechrome/taku" }, // listener moved to 13777
+    "/rechrome/ok": { Proxy: "http://127.0.0.1:13778/rechrome/ok" },     // healthy
+    "/webcode": { Proxy: "http://127.0.0.1:3001/webcode/" },             // not ours
+    "/": { Proxy: "http://127.0.0.1:9999" },                             // root: never touched
+  } } } };
+  const listeners = [{ port: 13775, prefix: "/" }, { port: 13777, prefix: "/rechrome/taku/" }, { port: 13778, prefix: "/rechrome/ok/" }];
+  expect(planTailscaleServeRepairs(serve, listeners)).toEqual({
+    repair: [{ hostPort: "node.example.ts.net:443", mount: "/rechrome/taku", from: 13790, to: 13777, proxy: "http://127.0.0.1:13777/rechrome/taku" }],
+    stale: [{ hostPort: "node.example.ts.net:443", mount: "/rechrome", port: 13776 }],
+  });
+  expect(planTailscaleServeRepairs(serve, [])).toEqual({ repair: [], stale: [] });
 });

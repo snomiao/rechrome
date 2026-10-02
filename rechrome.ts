@@ -377,6 +377,9 @@ export function buildListenChoices(interfaces: ReturnType<typeof networkInterfac
   return choices.sort((a, b) => rank[a.kind] - rank[b.kind]);
 }
 
+// The Mac app's binary only acts as the CLI when it is told to (or has a terminal): from a
+// daemon it tries to start the GUI and fails. Harmless for the standalone CLI.
+const TAILSCALE_ENV = { ...process.env, TAILSCALE_BE_CLI: "1" };
 const tailscaleBinary = () => Bun.which("tailscale") || (existsSync("/Applications/Tailscale.app/Contents/MacOS/Tailscale") ? "/Applications/Tailscale.app/Contents/MacOS/Tailscale" : null);
 
 /** Run the Tailscale CLI read-only; null when it is missing, disconnected, or slow. */
@@ -384,7 +387,7 @@ async function runTailscale(args: string[]): Promise<string | null> {
   const binary = tailscaleBinary();
   if (!binary) return null;
   try {
-    const proc = Bun.spawn([binary, ...args], { stdout: "pipe", stderr: "ignore" });
+    const proc = Bun.spawn([binary, ...args], { env: TAILSCALE_ENV, stdout: "pipe", stderr: "ignore" });
     const timeout = setTimeout(() => proc.kill(), 2000);
     try {
       const output = await new Response(proc.stdout).text();
@@ -443,6 +446,101 @@ export async function detectTailscaleServe(port: number, prefix: string): Promis
   try { serveStatus = JSON.parse(serve ?? "null"); } catch { /* no Serve config */ }
   const routeUrl = findTailscaleServeRoute(dnsName, serveStatus, port, prefix);
   return { dnsName, routeUrl, ...serveMountsAndFunnel(serveStatus, routeUrl ? new URL(routeUrl).hostname : dnsName) };
+}
+
+type ServeHandler = { hostPort: string; mount: string; target: URL };
+
+/** Every Serve route that proxies to a loopback HTTP port. */
+function loopbackServeHandlers(serveStatus: unknown): ServeHandler[] {
+  const web = (serveStatus as { Web?: Record<string, { Handlers?: Record<string, { Proxy?: string }> }> } | null)?.Web ?? {};
+  const handlers: ServeHandler[] = [];
+  for (const [hostPort, config] of Object.entries(web)) {
+    for (const [path, handler] of Object.entries(config.Handlers ?? {})) {
+      if (!handler.Proxy) continue;
+      let target: URL;
+      try { target = new URL(/^[a-z]+:\/\//i.test(handler.Proxy) ? handler.Proxy : `http://${handler.Proxy}`); } catch { continue; }
+      if (!["127.0.0.1", "localhost", "[::1]"].includes(target.hostname) || !target.port) continue;
+      handlers.push({ hostPort, mount: path.replace(/\/+$/, "") || "/", target });
+    }
+  }
+  return handlers;
+}
+
+export type ServeRepair = { hostPort: string; mount: string; from: number; to: number; proxy: string };
+export type ServeStale = { hostPort: string; mount: string; port: number };
+
+/**
+ * Health check for Tailscale Serve against listeners.json. `repair`: a route on a listener's own
+ * mount that proxies to another port (the listener moved), re-pointed at the listener's port.
+ * `stale`: a route next to a listener's mount (same first path segment, e.g. /rechrome beside
+ * /rechrome/taku) whose port no listener uses — a removed listener's leftover, which answers 502.
+ * Root ("/") mounts are never touched: they could be anything.
+ */
+export function planTailscaleServeRepairs(serveStatus: unknown, listeners: { port: number; prefix?: string }[]): { repair: ServeRepair[]; stale: ServeStale[] } {
+  const ports = new Set(listeners.map(l => l.port));
+  const mounts = new Map<string, number>();
+  for (const l of listeners) {
+    const mount = normalizePrefix(l.prefix).replace(/\/+$/, "");
+    if (mount) mounts.set(mount, l.port);
+  }
+  const roots = new Set([...mounts.keys()].map(m => m.split("/")[1]));
+  const repair: ServeRepair[] = [], stale: ServeStale[] = [];
+  for (const { hostPort, mount, target } of loopbackServeHandlers(serveStatus)) {
+    const port = Number(target.port), want = mounts.get(mount);
+    if (want !== undefined) {
+      if (port !== want) {
+        const proxy = new URL(target); proxy.port = String(want);
+        repair.push({ hostPort, mount, from: port, to: want, proxy: proxy.href.replace(/\/$/, mount === "/" ? "/" : "") });
+      }
+    } else if (mount !== "/" && roots.has(mount.split("/")[1]) && !ports.has(port)) {
+      stale.push({ hostPort, mount, port });
+    }
+  }
+  return { repair, stale };
+}
+
+/** Drop the Serve routes that proxy to a removed listener, so they don't linger answering 502. */
+async function removeTailscaleServeRoutes(listener: { port: number; prefix?: string }): Promise<void> {
+  const binary = tailscaleBinary(), raw = binary && await runTailscale(["serve", "status", "--json"]);
+  if (!binary || !raw) return;
+  let serveStatus: unknown;
+  try { serveStatus = JSON.parse(raw); } catch { return; }
+  const mount = normalizePrefix(listener.prefix).replace(/\/+$/, "") || "/";
+  for (const h of loopbackServeHandlers(serveStatus)) {
+    if (Number(h.target.port) !== listener.port || h.mount !== mount) continue;
+    const args = ["serve", `--https=${h.hostPort.split(/:(?=\d+$)/)[1] ?? "443"}`, `--set-path=${h.mount}`, "off"];
+    const ok = await Bun.spawn([binary, ...args], { env: TAILSCALE_ENV, stdout: "ignore", stderr: "inherit", windowsHide: true }).exited === 0;
+    console.log(ok ? `Removed its Tailscale Serve route ${h.hostPort}${h.mount}.` : `Remove its Tailscale Serve route yourself: tailscale ${args.join(" ")}`);
+  }
+}
+
+/**
+ * Daemon health check: keep Tailscale Serve routes pointed at the listeners' current ports.
+ * Re-points a moved listener's route on this node; only reports stale routes (removing a
+ * route is the user's call). Returns log lines, empty when healthy or Tailscale is absent.
+ */
+export async function checkTailscaleServe(listeners: { port: number; prefix?: string }[]): Promise<string[]> {
+  const binary = tailscaleBinary();
+  if (!binary) return [];
+  const raw = await runTailscale(["serve", "status", "--json"]);
+  if (!raw) return [];
+  let serveStatus: unknown;
+  try { serveStatus = JSON.parse(raw); } catch { return []; }
+  const { repair, stale } = planTailscaleServeRepairs(serveStatus, listeners);
+  const lines: string[] = [];
+  for (const r of repair) {
+    const httpsPort = r.hostPort.split(/:(?=\d+$)/)[1] ?? "443";
+    const args = ["serve", "--bg", `--https=${httpsPort}`, `--set-path=${r.mount}`, r.proxy];
+    const proc = Bun.spawn([binary, ...args], { env: TAILSCALE_ENV, stdout: "ignore", stderr: "pipe", windowsHide: true });
+    const ok = await proc.exited === 0;
+    lines.push(ok
+      ? `tailscale serve: re-pointed ${r.hostPort}${r.mount} from 127.0.0.1:${r.from} to ${r.to}`
+      : `tailscale serve: ${r.hostPort}${r.mount} points at 127.0.0.1:${r.from}, listener is on ${r.to}; re-pointing failed (${(await new Response(proc.stderr).text()).trim()}). Run: tailscale ${args.join(" ")}`);
+  }
+  for (const s of stale) {
+    lines.push(`tailscale serve: ${s.hostPort}${s.mount} proxies to 127.0.0.1:${s.port}, where no listener runs (clients get HTTP 502). Remove it: tailscale serve --https=${s.hostPort.split(/:(?=\d+$)/)[1] ?? "443"} --set-path=${s.mount} off`);
+  }
+  return lines;
 }
 
 /** The same connection (key and profile) at another base URL, e.g. where a proxy exposes the listener. */
@@ -1408,7 +1506,7 @@ async function exposeWithTailscaleServe(listener: Listener): Promise<string | nu
   const mount = prefix === "/" ? "/" : prefix.slice(0, -1);
   const args = ["serve", "--bg", `--set-path=${mount}`, `http://127.0.0.1:${listener.port}${mount === "/" ? "" : mount}`];
   console.error(`Running: tailscale ${args.join(" ")}`);
-  const proc = Bun.spawn([binary, ...args], { stdout: "ignore", stderr: "inherit", windowsHide: true });
+  const proc = Bun.spawn([binary, ...args], { env: TAILSCALE_ENV, stdout: "ignore", stderr: "inherit", windowsHide: true });
   if (await proc.exited !== 0) {
     console.error(`tailscale serve failed. Run it yourself, then rech share again:\n  tailscale ${args.join(" ")}`);
     return null;
@@ -1669,7 +1767,9 @@ async function callServe(
     return JSON.parse(text);
   } catch {
     // Not the daemon answering, e.g. a reverse proxy's 404 because the URL's path prefix is wrong.
-    const detail = `HTTP ${res.status} from ${serviceUrl(url, "run")} is not a rechrome daemon response: ${text.slice(0, 200).trim()}`;
+    let detail = `HTTP ${res.status} from ${serviceUrl(url, "run")} is not a rechrome daemon response: ${text.slice(0, 200).trim()}`;
+    if (res.status === 502 || res.status === 503 || res.status === 504)
+      detail += `\n  The proxy is up but nothing answers behind it: this link's listener was likely removed or moved. Ask its owner for a fresh link (\`rech share\`), then \`rechrome connect <link>\`.`;
     if (throwOnFailure) throw new Error(detail);
     console.error(`[rech] rech-client -> ${serviceUrl(url, "run")}\n  -x: ${detail}`);
     process.exit(1);
@@ -2759,6 +2859,7 @@ async function removeListener(name: string): Promise<void> {
   config.listeners = config.listeners.filter(l => l !== listener);
   await writeListeners(config);
   console.log("Listener removed from configuration; daemon reloads automatically.");
+  await removeTailscaleServeRoutes(listener);
 }
 
 async function resolveProfileKeys(selectors: string[]): Promise<string[]> {
