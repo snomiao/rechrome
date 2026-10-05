@@ -112,6 +112,11 @@ Hard-won notes — a source edit not taking effect at runtime is almost always o
 - **The connect flow has two paths: token-bypass and Allow-click.** The daemon uses **token-bypass**
   (auto-connect, no UI click). A test that only drives the Allow-click path (`clickAllowAndSelect`)
   misses bypass-only bugs — cover token-bypass explicitly.
+- **The npm tarball's CLI (`vendor/`) is unpacked from the committed `vendor-src/`**, which must be
+  built from the pinned submodules: `vendor-src/SOURCE` records the commits, and release CI fails
+  (`scripts/check-vendor-src.sh`) on a mismatch. The weekly `refresh-vendor.yml` bumps the pins to
+  the forks' main + rebuilds + opens a PR when a fork moved. Bumping a pin by hand? Also run
+  `scripts/build-playwright.sh && scripts/refresh-vendor-src.sh` (or trigger the workflow).
 - **A daemon (`serve`) change needs the daemon restarted** (`oxmgr restart rechrome`) to take
   effect; the daemon runs the `serve` source directly (no build step). Restarting it does not touch
   Chrome or live browser sessions.

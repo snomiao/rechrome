@@ -317,7 +317,7 @@ git clone https://github.com/snomiao/rechrome.git
 cd rechrome
 bun install       # `prepare` also builds vendor/ from vendor-src/, so the checkout has a working CLI
 bun link          # makes this checkout the global rechrome / rech
-bun test ./*.test.ts ./*.spec.ts ./scripts/*.test.ts   # rechrome's own tests (plain `bun test` also finds the vendored forks' suites)
+bun run test      # rechrome's own tests (plain `bun test` also finds the vendored forks' suites)
 ```
 
 To use a different playwright-cli, set `PLAYWRIGHT_CLI=<cmd>` in `.env.local` (for example a

@@ -7,6 +7,11 @@
 #
 #   vendor-src/playwright-core.tgz   <- npm-packed patched playwright-core (honors its .npmignore)
 #   vendor-src/playwright-cli.js     <- thin multi-tab CLI wrapper
+#   vendor-src/SOURCE                <- the lib/ commits it was built from (checked by
+#                                       scripts/check-vendor-src.sh at release)
+#
+# Normally run by .github/workflows/refresh-vendor.yml, which bumps the pins to the forks' main and
+# opens a PR whenever a fork moved.
 #
 # Requires the lib/ submodules checked out and playwright-core already built.
 set -euo pipefail
@@ -28,6 +33,9 @@ mkdir -p "$SRC"
 cp "$WRAPPER_SRC" "$SRC/playwright-cli.js"
 TGZ="$(cd "$CORE_SRC" && npm pack --pack-destination "$SRC" --silent | tail -1)"
 mv "$SRC/$TGZ" "$SRC/playwright-core.tgz"
+for sub in playwright playwright-cli; do
+  echo "$sub $(git -C "$ROOT/lib/$sub" rev-parse HEAD)"
+done > "$SRC/SOURCE"
 
 echo "refresh-vendor-src: wrote vendor-src/playwright-core.tgz ($(du -h "$SRC/playwright-core.tgz" | cut -f1)) + playwright-cli.js"
 echo "  -> commit vendor-src/ so the release picks it up"
