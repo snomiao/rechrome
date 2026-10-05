@@ -64,6 +64,9 @@ test("share prints, saves, or lists connection URLs; connect takes a shared URL"
   await expect(run(["url", "qa"])).rejects.toThrow(/Unknown argument|url/);
   expect(await run(["connect", "https://h.ts.net/rechrome/?profile=qa#key=k"])).toEqual([["connect", "https://h.ts.net/rechrome/?profile=qa#key=k"]]);
   await expect(run(["connect"])).rejects.toThrow();
+  expect(await run(["connect", "--global", "u#key=k"])).toEqual([["connect", "u#key=k", { global: true, project: undefined }]]);
+  expect(await run(["connect", "--project", "u#key=k"])).toEqual([["connect", "u#key=k", { global: undefined, project: true }]]);
+  await expect(run(["connect", "--global", "--project", "u#key=k"])).rejects.toThrow();
 });
 
 test("listener port, allow, deny, rotate-key and set", async () => {
