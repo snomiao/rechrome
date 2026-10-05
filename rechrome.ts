@@ -84,6 +84,8 @@ async function saveTokenEntry(profileEmail: string, entry: TokenEntry): Promise<
 }
 
 const envFile = join(import.meta.dir, ".env.local");
+/** Machine-wide RECHROME_URL from `rech connect --global`: read from every folder, after the project's own files. */
+export const GLOBAL_ENV_FILE = join(RECH_DIR, ".env.local");
 const globalEnvFile = join(HOME || "~", ".env.local");
 
 // Capture inherited values once so explicit environment overrides survive reloads,
@@ -127,10 +129,15 @@ const bunLoaded = bunAutoloadedKeys(process.env,
     .map(name => { try { return readFileSync(join(process.cwd(), name), "utf8"); } catch { return ""; } }));
 const inheritedEnvKeys = new Set(Object.keys(process.env).filter(key => !bunLoaded.has(key)));
 
+/** Where RECHROME_URL came from: "environment", an env file's path, or undefined when unset. */
+export let rechromeUrlSource: string | undefined;
+
 // Walk CWD→root loading env files nearest-first; inherited environment wins over files.
 // At each level .rechrome/.env.local is checked before .env.local (rechrome-specific overrides general).
-export async function loadNearestEnv(extraFallbacks: string[] = []) {
+// The machine-wide file comes last, so it also applies outside $HOME (e.g. an agent's /tmp scratch dir).
+export async function loadNearestEnv(extraFallbacks: string[] = [GLOBAL_ENV_FILE]) {
   const seen = new Set<string>(inheritedEnvKeys);
+  rechromeUrlSource = seen.has(ENV_KEY) ? "environment" : undefined;
   const applyFile = async (path: string) => {
     const raw = await file(path).text().catch(() => "");
     for (const line of raw.split("\n")) {
@@ -138,6 +145,7 @@ export async function loadNearestEnv(extraFallbacks: string[] = []) {
       if (!m || m[1].startsWith("#")) continue;
       if (seen.has(m[1])) continue;
       seen.add(m[1]);
+      if (m[1] === ENV_KEY) rechromeUrlSource = path;
       process.env[m[1]] = m[2].replace(/^["']|["']$/g, "");
     }
   };
@@ -3044,14 +3052,42 @@ async function saveProjectUrl(url: string): Promise<string> {
   mkdirSync(dataDir, { recursive: true });
   const gitignore = join(dataDir, ".gitignore");
   if (!existsSync(gitignore)) await Bun.write(gitignore, "*\n");
-  const envPath = join(dataDir, ".env.local");
+  return writeEnvUrl(join(dataDir, ".env.local"), url);
+}
+
+/** Write RECHROME_URL to ~/.rechrome/.env.local: the default for every project without its own. */
+async function saveGlobalUrl(url: string): Promise<string> {
+  mkdirSync(dirname(GLOBAL_ENV_FILE), { recursive: true });
+  return writeEnvUrl(GLOBAL_ENV_FILE, url);
+}
+
+/** Replace RECHROME_URL in an env file, keeping its other lines; owner-only, since the URL holds a key. */
+async function writeEnvUrl(envPath: string, url: string): Promise<string> {
   const lines = (await file(envPath).text().catch(() => "")).split("\n").filter(l => l.trim() && !l.startsWith(`${ENV_KEY}=`));
   await writeFile(envPath, [...lines, envAssignment(ENV_KEY, url), ""].join("\n"), { mode: 0o600 });
   await chmod(envPath, 0o600);
   return envPath;
 }
 
-async function connect(url: string): Promise<void> {
+/**
+ * What would shadow the machine-wide RECHROME_URL from `cwd`: the shell's own RECHROME_URL, or the
+ * nearest project env file that sets one (searched the way loadNearestEnv walks). Null when none does.
+ */
+export function nearerUrlSource(cwd: string, inherited: boolean, globalFile = GLOBAL_ENV_FILE): string | null {
+  if (inherited) return "your shell's RECHROME_URL";
+  const globalReal = (() => { try { return realpathSync(globalFile); } catch { return globalFile; } })();
+  for (let dir = cwd; ; dir = dirname(dir)) {
+    for (const path of [join(dir, ".rechrome", ".env.local"), join(dir, ".env.local")]) {
+      if (path === globalFile || path === globalReal) return null;
+      const text = (() => { try { return readFileSync(path, "utf8"); } catch { return ""; } })();
+      if (text.split("\n").some(line => line.trimStart().startsWith(`${ENV_KEY}=`))) return path;
+    }
+    if (dirname(dir) === dir) return null;
+  }
+}
+
+async function connect(url: string, opts: { global?: boolean; project?: boolean } = {}): Promise<void> {
+  if (opts.global && opts.project) throw new Error("Pass --global or --project, not both.");
   const parsed = parseUrl(url);
   if (!parsed.key) throw new Error("That URL has no key (#key=…). Ask the host for the full URL from: rech share <profile>");
   const response = await fetch(serviceUrl(url, "ping"), { headers: { Authorization: `Bearer ${parsed.key}` }, signal: AbortSignal.timeout(5000) })
@@ -3061,8 +3097,24 @@ async function connect(url: string): Promise<void> {
   const body = await response.json().catch(() => ({})) as { listener?: string; profiles?: string[] | "*" };
   if (parsed.profileDirectory && Array.isArray(body.profiles) && !body.profiles.includes(parsed.profileDirectory))
     throw new Error(`Connected, but listener "${body.listener}" does not allow profile "${parsed.profileDirectory}".`);
-  const saved = await saveProjectUrl(url);
-  console.log(`Connected to ${serviceUrl(url)}${body.listener ? ` (listener ${body.listener})` : ""}. Saved RECHROME_URL to ${saved}`);
+  // Where to save: the flag, else ask in a terminal (this project by default), else this project.
+  let global = !!opts.global;
+  if (!opts.global && !opts.project && isInteractive()) {
+    const { dataDir } = await getClientIdentity();
+    const choice = await promptChoice("Use this link for:", [
+      { label: `This project only  (${join(dataDir, ".env.local")})`, value: "project" },
+      { label: `Every project on this machine without its own link  (${GLOBAL_ENV_FILE})`, value: "global" },
+    ], 0);
+    if (!choice) throw new Error("Cancelled; nothing saved.");
+    global = choice === "global";
+  }
+  // A machine running its own daemon would stop reaching its own Chrome from every project without a link.
+  if (global && !(await isLocalDaemon(url)) && (await readListeners().catch(() => null))?.listeners.length)
+    console.error(`[rech] warning: this machine runs its own rech daemon. Projects without their own RECHROME_URL will now use ${serviceUrl(url)}, not this machine's Chrome. Undo: remove ${ENV_KEY} from ${GLOBAL_ENV_FILE}`);
+  const saved = global ? await saveGlobalUrl(url) : await saveProjectUrl(url);
+  console.log(`Connected to ${serviceUrl(url)}${body.listener ? ` (listener ${body.listener})` : ""}. Saved RECHROME_URL ${global ? "for every project on this machine" : "for this project"}: ${saved}`);
+  const shadow = global ? nearerUrlSource(process.cwd(), inheritedEnvKeys.has(ENV_KEY)) : null;
+  if (shadow) console.log(`Note: here, ${shadow} takes precedence over it. Remove that, or run rech connect --project to update it.`);
   if (Array.isArray(body.profiles) && body.profiles.length > 1) {
     console.log(`This link shares ${body.profiles.length} profiles:`);
     for (const p of body.profiles) console.log(`  ${p}${p === parsed.profileDirectory ? "  (default)" : ""}`);
@@ -3491,6 +3543,7 @@ async function status(): Promise<void> {
   console.log(`serve:    ${!ping ? `not reachable at ${serviceUrl(url)}`
     : answered ? `running  ${serviceUrl(url)}${details ? `  (${details})` : ""}`
     : `✗ ${serviceUrl(url)} answers HTTP ${pingResponse?.status ?? ping.status}, not a rechrome daemon — this link's listener was likely removed or moved; ask its host for a fresh link (\`rech share <profile>\`), then \`rech connect '<url>'\``}`);
+  if (rechromeUrlSource) console.log(`config:   ${rechromeUrlSource === "environment" ? "RECHROME_URL from the environment" : rechromeUrlSource}${rechromeUrlSource === GLOBAL_ENV_FILE ? "  (machine-wide)" : ""}`);
   if (pingResponse?.status === 401)
     console.log(`auth:     ✗ key rejected — ask the host for a fresh URL (\`rech share <profile>\`), then \`rech connect '<url>'\``);
   // daemonManager().id — there is no PM_BIN constant. Referencing one threw a
@@ -3533,7 +3586,7 @@ export type RechHandlers = {
   printProfileUri(selector?: string, listener?: string, opts?: { local?: boolean; save?: boolean; all?: boolean }): Promise<void>;
   urlList(): Promise<void>;
   shareProfiles(selectors: string[], opts: { listener?: string; local?: boolean; save?: boolean }): Promise<void>;
-  connect(url: string): Promise<void>;
+  connect(url: string, opts?: { global?: boolean; project?: boolean }): Promise<void>;
   listenerPort(name?: string): Promise<void>;
   allowListener(name: string, profiles: string[]): Promise<void>;
   denyListener(name: string, profiles: string[]): Promise<void>;
@@ -3628,10 +3681,14 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
         }
         return handlers.printProfileUri(profiles[0], a.listener, a.all ? { local: a.local, save: a.save, all: true } : { local: a.local, save: a.save });
       })
-    .command("connect <url>", "Use a URL from another machine in this project (checks it first)", y => y
+    .command("connect <url>", "Use a URL from another machine (checks it first; asks: this project or every project)", y => y
       .positional("url", { type: "string", demandOption: true, describe: "The URL printed by `rech share <profile>` on the machine with Chrome. Quote it: it contains #" })
-      .example("rech connect 'https://host.example.ts.net/rechrome/?profile=you%40example.com#key=…'", ""),
-      a => handlers.connect(a.url))
+      .option("project", { type: "boolean", describe: "Save it for this project only (.rechrome/.env.local); the default without a terminal" })
+      .option("global", { type: "boolean", describe: "Save it for every project on this machine without its own link (~/.rechrome/.env.local)" })
+      .conflicts("project", "global")
+      .example("rech connect 'https://host.example.ts.net/rechrome/?profile=you%40example.com#key=…'", "")
+      .example("rech connect --global '<url>'", "An agent machine: one link for every folder, /tmp included"),
+      a => a.global || a.project ? handlers.connect(a.url, { global: a.global, project: a.project }) : handlers.connect(a.url))
     .command(["listener", "listeners"], "Control who can connect: listeners, allowed profiles, keys, public URLs", y => y
       .command(["ls", "list", "$0"], "List listeners (keys hidden)", {}, () => handlers.listListeners())
       .command("add <name>", "Expose registered profiles on an address (local for a proxy, lan, tailscale, IP)", y => y
