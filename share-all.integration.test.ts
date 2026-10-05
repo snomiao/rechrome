@@ -53,7 +53,12 @@ test("share --all: one snapshot link, profiles picked on the host, never the man
     const ownListener = ownConfig.listeners.find((l: any) => l.name === "personal");
     expect(ownListener.host).toBe("127.0.0.1");
     expect(ownListener.key).not.toBe(one.key);
-    expect((await rech(["share", "personal"], hostEnv)).stdout.trim()).toBe(own.stdout.trim());   // now shared: same link
+    const reshared = await rech(["share", "personal"], hostEnv);
+    expect(reshared.stdout.trim()).toBe(own.stdout.trim());   // now shared: same link
+    // ...but still loopback-only with no proxy: say so and how to expose it, not a bare 127.0.0.1 URL.
+    expect(reshared.stderr).toContain("this link only works on this machine");
+    expect(reshared.stderr).toContain(`rech listener set ${ownListener.name} --public-url`);
+    expect((await rech(["share", "personal", "--local"], hostEnv)).stderr).not.toContain("only works on this machine");
     ownConfig.listeners = ownConfig.listeners.filter((l: any) => l !== ownListener && l.name !== ownListener.name);
     await writeFile(listenersPath, JSON.stringify(ownConfig));   // keep the rest of this test's setup unchanged
 

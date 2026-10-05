@@ -1509,11 +1509,7 @@ async function shareSet(snapshot: string[], opts: { listener?: string; local?: b
   // A one-profile link names its profile, so the other machine needs no --profile.
   const only = snapshot.length === 1 ? `?profile=${encodeURIComponent(snapshot[0])}` : "";
   const local = `http://${listener.key}@${listenerAddress(listener)}${normalizePrefix(listener.prefix)}${only}`;
-  let ready = false;
-  for (let i = 0; i < 20 && !ready; i++) {
-    ready = await fetch(serviceUrl(local, "ping"), { headers: { Authorization: `Bearer ${listener.key}` }, signal: AbortSignal.timeout(1000) }).then(r => r.ok).catch(() => false);
-    if (!ready) await Bun.sleep(250);
-  }
+  const ready = await waitForListener(listener);
   if (!ready) console.error(`[rech] warning: listener "${name}" is not answering yet; check the daemon with rech status.`);
   if (opts.tailscaleServe && !listener.publicUrl) {
     const publicUrl = await exposeWithTailscaleServe(listener);
@@ -1570,6 +1566,32 @@ async function exposeWithTailscaleServe(listener: Listener): Promise<string | nu
   return (await detectTailscaleServe(listener.port, prefix)).routeUrl;
 }
 
+/** The daemon reloads listeners.json about every second: wait (up to ~5s) until this listener answers. */
+async function waitForListener(listener: Listener): Promise<boolean> {
+  const url = `http://${listener.key}@${listenerAddress(listener)}${normalizePrefix(listener.prefix)}`;
+  for (let i = 0; i < 20; i++) {
+    if (await fetch(serviceUrl(url, "ping"), { headers: { Authorization: `Bearer ${listener.key}` }, signal: AbortSignal.timeout(1000) }).then(r => r.ok).catch(() => false)) return true;
+    await Bun.sleep(250);
+  }
+  return false;
+}
+
+/**
+ * Ask how other machines will reach a link: "tailscale-serve", a detected network address
+ * (plain HTTP), "127.0.0.1" for the user's own proxy, or `extra` choices; null when cancelled.
+ */
+async function askReachability(question: string, extra: { label: string; value: string }[] = []): Promise<string | null> {
+  const serve = !!tailscaleBinary();
+  // With Tailscale Serve on offer, a plain-HTTP Tailscale IP would only be a worse duplicate.
+  const networks = (await detectListenChoices()).filter(c => c.kind !== "local" && !(serve && c.kind === "tailscale"));
+  return promptChoice(question, [
+    ...(serve ? [{ label: "Tailscale: HTTPS, only your tailnet", value: "tailscale-serve" }] : []),
+    ...networks.map(c => ({ label: `${c.label.split(" — ")[0]} network: http://${c.address}, plain HTTP`, value: c.address })),
+    { label: "My own reverse proxy", value: "127.0.0.1" },
+    ...extra,
+  ], 0);
+}
+
 /**
  * Give one profile its own link. In a terminal, ask how the other machines will reach it
  * (Tailscale Serve, a detected network, or the user's own proxy); without one, create a
@@ -1580,14 +1602,7 @@ async function shareNewLink(profile: string, opts: { local?: boolean; save?: boo
   const name = uniqueShareName(profileSlug(profile), (await requireListeners()).listeners, served);
   let host = "127.0.0.1", tailscaleServe = false;
   if (isInteractive()) {
-    const serve = !!tailscaleBinary();
-    // With Tailscale Serve on offer, a plain-HTTP Tailscale IP would only be a worse duplicate.
-    const networks = (await detectListenChoices()).filter(c => c.kind !== "local" && !(serve && c.kind === "tailscale"));
-    const how = await promptChoice(`How will your other machines reach it?`, [
-      ...(serve ? [{ label: "Tailscale: HTTPS, only your tailnet", value: "tailscale-serve" }] : []),
-      ...networks.map(c => ({ label: `${c.label.split(" — ")[0]} network: http://${c.address}, plain HTTP`, value: c.address })),
-      { label: "My own reverse proxy", value: "127.0.0.1" },
-    ], 0);
+    const how = await askReachability(`How will your other machines reach it?`);
     if (!how) throw new Error("Cancelled; nothing shared.");
     tailscaleServe = how === "tailscale-serve";
     host = tailscaleServe ? "127.0.0.1" : how;
@@ -1725,6 +1740,31 @@ async function printProfileUri(selector?: string, listener?: string, opts: { loc
   if (config && pending && pending.profiles !== "*" && !pending.publicUrl && isLoopback(pending.host) && tailscaleBinary()) {
     const serve = await detectTailscaleServe(pending.port, normalizePrefix(pending.prefix));
     if (serve.routeUrl && !serve.funnel) { pending.publicUrl = serve.routeUrl; await writeListeners(config); }
+  }
+  // Still only reachable from this machine (no proxy recorded or detected): a link like that is
+  // useless to hand out, so ask how other machines reach it, or say how to expose it.
+  if (config && pending && pending.profiles !== "*" && !pending.publicUrl && isLoopback(pending.host) && !opts.local) {
+    const steps = () => { for (const line of listenerNextSteps(pending, profile)) console.error(line); };
+    if (!interactive) {
+      console.error(`[rech] this link only works on this machine: listener "${pending.name}" is on ${listenerAddress(pending)} and no proxy is recorded.`);
+      steps();
+    } else {
+      const KEEP = "\0keep";
+      const how = await askReachability(`Link "${pending.name}" only works on this machine (${listenerAddress(pending)}). How will your other machines reach it?`,
+        [{ label: "Nothing: keep it on this machine", value: KEEP }]);
+      if (!how) throw cancelled();
+      if (how === "tailscale-serve") {
+        const routeUrl = await exposeWithTailscaleServe(pending);
+        if (routeUrl) { pending.publicUrl = routeUrl; await writeListeners(config); }
+      } else if (how === "127.0.0.1") steps();
+      else if (how !== KEEP) {
+        // Same key and prefix, now bound on that network; links already handed out change host.
+        pending.host = how;
+        await writeListeners(config);
+        if (!(await waitForListener(pending))) console.error(`[rech] warning: listener "${pending.name}" is not answering on ${listenerAddress(pending)} yet; check the daemon with rech status.`);
+        uri = profileConnectionUri(profile, undefined, config.listeners, pending.name);
+      }
+    }
   }
   const publicUrl = pending?.publicUrl;
   if (publicUrl && !opts.local) uri = rebaseConnectionUrl(publicUrl, uri);
