@@ -1,7 +1,7 @@
 import { readListeners, listenerAddress, authorizeProfileRequest, canReadProfileFile, profileOutputPrefix, normalizePrefix, resolveAllowedProfile, type Listener } from "./listeners.ts";
 import { file } from "bun";
 import { createHash, X509Certificate } from "crypto";
-import { mkdirSync, lstatSync, chmodSync, unlinkSync, accessSync, readdirSync, realpathSync, constants as fsConstants } from "fs";
+import { mkdirSync, lstatSync, statSync, chmodSync, unlinkSync, accessSync, readdirSync, realpathSync, constants as fsConstants } from "fs";
 import { join, resolve, relative, isAbsolute } from "path";
 import { tmpdir } from "os";
 import {
@@ -87,9 +87,11 @@ const recentSessions = new Map<string, number>();
 // while afterwards: snapshots echo input values (passwords included). See fill-secret.ts.
 const secretMasker = new SecretMasker();
 const TEXT_OUTPUT = /\.(?:ya?ml|json|md|txt|log)$/i;
-// Commands whose snapshot files are still being checked for password values; /files waits for
-// them so a concurrent download can't fetch a file before it is scrubbed.
-const pendingScrubs = new Set<Promise<void>>();
+// /run commands in flight. A snapshot file exists on disk before its command has checked it for
+// password values, so text downloads (/files) wait until no command is in flight.
+const runsInFlight = new Set<Promise<void>>();
+// Artifacts that could not be checked AND could not be deleted: never served.
+const deniedFiles = new Set<string>();
 function noteSession(sess: string, now: number): void {
   recentSessions.set(sess, now);
   if (recentSessions.size > 64) {
@@ -611,8 +613,10 @@ export async function serve() {
         if (!(await f.exists())) return new Response("Not found", { status: 404 });
         const real = realpathSync(resolved);
         if (!isUnderDir(realpathSync(workDir), real) || !canReadProfileFile(listener, relative(realpathSync(workDir), real).replaceAll("\\", "/"))) return new Response("Forbidden", { status: 403 });
+        if (deniedFiles.has(real)) return new Response("Forbidden", { status: 403 });
         if (TEXT_OUTPUT.test(real)) {
-          if (pendingScrubs.size) await Promise.all(pendingScrubs);
+          while (runsInFlight.size) await Promise.all(runsInFlight); // re-check: new runs may start
+          if (deniedFiles.has(real)) return new Response("Forbidden", { status: 403 });
           if (!(await f.exists())) return new Response("Not found", { status: 404 }); // withheld
           return new Response(maskPasswordLines(secretMasker.mask(await f.text())));
         }
@@ -657,6 +661,10 @@ export async function serve() {
       const denied = authCheck(req, key);
       if (denied) return denied;
       markActivity(); // a real command: this serve is not idle
+      let runDone = () => {};
+      const running = new Promise<void>((r) => { runDone = r; });
+      runsInFlight.add(running);
+      try { return await (async () => {
 
       const body = await req.json();
       let scopedProfile: string | undefined;
@@ -929,13 +937,6 @@ export async function serve() {
       // Fails closed: a snapshot that can't be fully checked is withheld, not passed through.
       const rawOutput = `${stdout}\n${stderr}`; // artifact paths come from the unmasked text
       const snapshotOut = hasSnapshot(rawOutput);
-      let scrubDone = () => {};
-      const scrubbing = snapshotOut ? new Promise<void>((r) => { scrubDone = r; }) : undefined;
-      if (scrubbing) {
-        pendingScrubs.add(scrubbing);
-        // Safety net if an unexpected throw skips the finally below.
-        setTimeout(() => { scrubDone(); pendingScrubs.delete(scrubbing); }, 90_000).unref?.();
-      }
       let withheld = "";
       if (snapshotOut) {
         try {
@@ -1006,25 +1007,24 @@ export async function serve() {
         }
       }
 
-      // Snapshot files echo input values: scrub them on disk too, not only on download. A file
-      // that can't be checked or scrubbed is deleted and not published.
-      try {
-        if (snapshotOut || secretMasker.active) for (const f of [...outputFiles]) {
-          if (!TEXT_OUTPUT.test(f)) continue;
-          const path = join(runWorkDir, f);
-          try {
-            if (withheld && /\.ya?ml$/i.test(f)) throw new Error("withheld");
-            const text = await file(path).text();
-            const masked = maskPasswordLines(secretMasker.mask(text));
-            if (masked !== text) await Bun.write(path, masked);
-          } catch {
-            try { unlinkSync(path); } catch {}
-            outputFiles.splice(outputFiles.indexOf(f), 1);
-          }
+      // Snapshot files echo input values: scrub them on disk too, not only on download. Only
+      // files this command wrote (a page can merely mention an existing file's name). One that
+      // can't be checked or scrubbed is deleted, or, failing that, never served.
+      if (snapshotOut || secretMasker.active) for (const f of [...outputFiles]) {
+        if (!TEXT_OUTPUT.test(f)) continue;
+        const path = join(runWorkDir, f);
+        let mtimeMs = 0;
+        try { mtimeMs = statSync(path).mtimeMs; } catch { continue; }
+        if (mtimeMs < commandStartedAt - 1000) continue;
+        try {
+          if (withheld && /\.ya?ml$/i.test(f)) throw new Error("withheld");
+          const text = await file(path).text();
+          const masked = maskPasswordLines(secretMasker.mask(text));
+          if (masked !== text) await Bun.write(path, masked);
+        } catch {
+          try { unlinkSync(path); } catch { try { deniedFiles.add(realpathSync(path)); } catch {} }
+          outputFiles.splice(outputFiles.indexOf(f), 1);
         }
-      } finally {
-        scrubDone();
-        if (scrubbing) pendingScrubs.delete(scrubbing);
       }
 
       const rebrand = (s: string) => s.replaceAll("npx playwright-cli", "rech");
@@ -1036,6 +1036,7 @@ export async function serve() {
         // a cross-OS daemon↔client (e.g. Windows daemon serving a Linux container client).
         files: outputFiles.map((p) => (outputPrefix + p).replaceAll("\\", "/")),
       });
+      })(); } finally { runsInFlight.delete(running); runDone(); }
     },
   });
 

@@ -3,7 +3,7 @@
 // the client's output, a snapshot taken right after, or anything left on disk.
 import { expect, test } from "bun:test";
 import { existsSync, readdirSync } from "fs";
-import { mkdtemp, mkdir, readdir, readFile, rm, writeFile } from "fs/promises";
+import { mkdtemp, mkdir, readdir, readFile, rm, utimes, writeFile } from "fs/promises";
 import { homedir, tmpdir } from "os";
 import { join } from "path";
 import { totpCode } from "./fill-secret.ts";
@@ -148,12 +148,17 @@ test("a snapshot that can't be checked for passwords is withheld, not passed thr
   const home = join(root, "home");
   await mkdir(join(home, ".rechrome"), { recursive: true });
   const LEAK = "UNCHECKED-c4n4ry-77";
+  // An older file the page merely mentions: withholding must not delete what the command didn't write.
+  const bystander = join(home, ".rechrome", "output", "settings.yml");
+  await mkdir(join(home, ".rechrome", "output"), { recursive: true });
+  await writeFile(bystander, "keep: me\n");
+  await utimes(bystander, new Date(Date.now() - 3600_000), new Date(Date.now() - 3600_000));
   const fake = join(root, "fake-cli.ts");
   await writeFile(fake, `
     import { mkdirSync, writeFileSync } from "fs";
     mkdirSync(".playwright-cli", { recursive: true });
     writeFileSync(".playwright-cli/page-1.yml", '- textbox "Secret word" [ref=e1]: ${LEAK}\\n');
-    console.log('### Page\\n- Page URL: https://example.com/\\n### Snapshot\\n\`\`\`yaml\\n- textbox "Secret word" [ref=e1]: ${LEAK}\\n\`\`\`\\n### Events\\n- [Snapshot](.playwright-cli/page-1.yml)');
+    console.log('### Page\\n- Page URL: https://example.com/\\n### Snapshot\\n\`\`\`yaml\\n- textbox "Secret word" [ref=e1]: ${LEAK}\\n\`\`\`\\n### Events\\n- [Snapshot](.playwright-cli/page-1.yml) see settings.yml');
   `);
   const reserve = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("") });
   const port = reserve.port!;
@@ -173,10 +178,11 @@ test("a snapshot that can't be checked for passwords is withheld, not passed thr
     expect(res.stdout).toContain("snapshot withheld");
     expect(res.stdout).toContain("### Events"); // the rest of the output survives
     expect(JSON.stringify(res)).not.toContain(LEAK);
-    expect(res.files).toEqual([]);
+    expect(res.files).toEqual(["settings.yml"]); // the snapshot is not published; the old file is untouched
     expect((await fetch(`http://127.0.0.1:${port}/files/.playwright-cli/page-1.yml`, { headers: { Authorization: `Bearer ${key}` } })).status).toBe(404);
     expect(await readFile(serveLog, "utf8") + await readFile(join(root, "serve.err"), "utf8")).not.toContain(LEAK);
     expect(await grepTree(home, LEAK)).toEqual([]);
+    expect(await readFile(bystander, "utf8")).toBe("keep: me\n");
   } finally {
     serve.kill();
     await serve.exited;
