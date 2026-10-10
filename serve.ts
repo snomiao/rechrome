@@ -1013,11 +1013,14 @@ export async function serve() {
         }
       }
 
+      // A file the command was told to write (`snapshot --filename=x.yml`) is its own artifact too.
+      const ownFilenames = filteredArgs.flatMap((a, i) => a.startsWith("--filename=") ? [a.slice(11)] : a === "--filename" && filteredArgs[i + 1] ? [filteredArgs[i + 1]!] : []);
       // Snapshot files echo input values: scrub them on disk too, not only on download. Only
       // files this command wrote (a page can merely mention an existing file's name). One that
       // can't be checked or scrubbed is deleted, or, failing that, never served.
       if (snapshotOut || secretMasker.active) for (const f of [...outputFiles]) {
-        if (!CLI_TEXT_ARTIFACT.test(f.replaceAll("\\", "/"))) continue;
+        const ownFile = ownFilenames.some(n => resolve(runWorkDir, n) === resolve(runWorkDir, f));
+        if (!ownFile && !CLI_TEXT_ARTIFACT.test(f.replaceAll("\\", "/"))) continue;
         const path = join(runWorkDir, f);
         let mtimeMs = 0;
         try { mtimeMs = statSync(path).mtimeMs; } catch { continue; }

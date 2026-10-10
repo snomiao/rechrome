@@ -158,7 +158,8 @@ test("a snapshot that can't be checked for passwords is withheld, not passed thr
     import { mkdirSync, writeFileSync } from "fs";
     mkdirSync(".playwright-cli", { recursive: true });
     writeFileSync(".playwright-cli/page-1.yml", '- textbox "Secret word" [ref=e1]: ${LEAK}\\n');
-    console.log('### Page\\n- Page URL: https://example.com/\\n### Snapshot\\n\`\`\`yaml\\n- textbox "Secret word" [ref=e1]: ${LEAK}\\n\`\`\`\\n### Events\\n- [Snapshot](.playwright-cli/page-1.yml) see settings.yml');
+    if (process.argv.includes("--filename=custom.yaml")) writeFileSync("custom.yaml", '- textbox "Secret word" [ref=e1]: ${LEAK}\\n');
+    console.log('### Page\\n- Page URL: https://example.com/\\n### Snapshot\\n\`\`\`yaml\\n- textbox "Secret word" [ref=e1]: ${LEAK}\\n\`\`\`\\n### Events\\n- [Snapshot](.playwright-cli/page-1.yml) see settings.yml custom.yaml');
   `);
   const reserve = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("") });
   const port = reserve.port!;
@@ -183,6 +184,13 @@ test("a snapshot that can't be checked for passwords is withheld, not passed thr
     expect(await readFile(serveLog, "utf8") + await readFile(join(root, "serve.err"), "utf8")).not.toContain(LEAK);
     expect(await grepTree(home, LEAK)).toEqual([]);
     expect(await readFile(bystander, "utf8")).toBe("keep: me\n");
+    // A snapshot written to an explicit --filename is the command's own artifact: withheld too.
+    const custom = await (await fetch(`http://127.0.0.1:${port}/run`, {
+      method: "POST", headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ args: ["snapshot", "--filename=custom.yaml"], identity: { key: "/withhold-test" } }),
+    })).json() as { stdout: string; files: string[] };
+    expect(JSON.stringify(custom)).not.toContain(LEAK);
+    expect(await grepTree(home, LEAK)).toEqual([]);
   } finally {
     serve.kill();
     await serve.exited;
