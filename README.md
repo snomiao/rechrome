@@ -64,6 +64,39 @@ verbatim: `rech --version` prints rechrome's version, `rech pw --version` playwr
 Commands from the same git worktree share one browser session, so tabs you open persist
 between calls; another worktree gets its own. `-s=<name>` opens a named sub-session.
 
+#### Passwords and 2FA codes: `fill-secret`
+
+`rech fill <ref> <password>` puts the password in the command line, the daemon log and the output.
+`fill-secret` keeps it out of all three:
+
+```bash
+rech fill-secret e7 --from-env SITE_PASSWORD --allow-domain '*.app.example.com'
+rech fill-secret e9 --totp-from-env SITE_TOTP_SEED --env-file ~/secrets/.env --allow-domain '*.app.example.com' --submit
+printf '%s\n' "$PW" | rech fill-secret e7 --from-stdin
+```
+
+The client reads the value (or computes the TOTP code from a base32 seed: SHA1, 6 digits, 30 s; the
+seed never leaves the client) and sends it outside the command's arguments. The daemon hands it to
+the browser over the session's local socket. `--allow-domain` is checked against the host of the
+field's own frame (an allowed page can't lend its host to a cross-origin iframe), and the fill goes
+to that exact element, so it fails rather than types into a page that navigated after the check.
+Snapshots echo input values, so the daemon shows `***` for the value in this and every later output,
+log line and saved snapshot file: passwords until the daemon restarts, TOTP codes for 15 minutes.
+Profile-scoped listeners accept `fill-secret` with its own flags.
+
+Every password field is masked in snapshots, whoever filled it (you, Chrome's autofill, or
+`fill-secret`): when an output carries a snapshot, the daemon reads the live values of all
+`input[type=password]` fields in every frame (plus fields marked as passwords by `autocomplete` or a
+name/id containing "pass", which covers a "show password" toggle) and masks them, and also blanks
+any textbox whose name reads like a password field (password, PIN, パスワード…). If that check can't
+be completed, the snapshot is withheld (inline and as a file) instead of passed through.
+
+Limits: the masking stops accidental echoes, not someone who can run `eval`/`run-code` on the
+session and deliberately reads the field back encoded. A snapshot file is scrubbed right after the
+browser writes it, not before (downloads wait for the scrub). The check reads the page right after
+the snapshot, so a page script that clears or replaces a neutrally-labelled password field in
+between can slip past; closing that needs redaction inside playwright's snapshot code. Not yet supported on a Windows daemon.
+
 ### 3. Where things are kept
 
 | Where | What |
