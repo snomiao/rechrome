@@ -86,12 +86,16 @@ Profile-scoped listeners accept `fill-secret` with its own flags.
 
 Every password field is masked in snapshots, whoever filled it (you, Chrome's autofill, or
 `fill-secret`): when an output carries a snapshot, the daemon reads the live values of all
-`input[type=password]` fields in every frame and masks them, and also blanks any textbox whose name
-reads like a password field (password, PIN, パスワード…) in case the page changed in between.
+`input[type=password]` fields in every frame (plus fields marked as passwords by `autocomplete` or a
+name/id containing "pass", which covers a "show password" toggle) and masks them, and also blanks
+any textbox whose name reads like a password field (password, PIN, パスワード…). If that check can't
+be completed, the snapshot is withheld (inline and as a file) instead of passed through.
 
 Limits: the masking stops accidental echoes, not someone who can run `eval`/`run-code` on the
 session and deliberately reads the field back encoded. A snapshot file is scrubbed right after the
-browser writes it, not before. Not yet supported on a Windows daemon.
+browser writes it, not before (downloads wait for the scrub). The check reads the page right after
+the snapshot, so a page script that clears or replaces a neutrally-labelled password field in
+between can slip past; closing that needs redaction inside playwright's snapshot code. Not yet supported on a Windows daemon.
 
 ### 3. Where things are kept
 

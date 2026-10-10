@@ -16,6 +16,8 @@ const CANARY = 'CANARY-7f3a"q-pw';
 const SEED = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
 // A password the browser filled itself (autofill), never through fill-secret.
 const AUTOFILL = "AUTOFILL-c4n4ry-9e1";
+// A password whose "show password" toggle made it type=text; only its name marks it.
+const REVEALED = "REVEALED-c4n4ry-5b2";
 
 // Compare field contents by checksum: an eval naming the value would itself put it in the log.
 const HASH_JS = "[...v].reduce((h, c) => (h * 31 + c.charCodeAt(0)) | 0, 7)";
@@ -43,7 +45,9 @@ test.skipIf(!hasBrowser)("fill-secret fills the page and leaks the value nowhere
     // Set by script, like autofill: not in the markup. A neutral label, so only the live scan
     // (not the label-based fallback) can catch it.
     ? `<!doctype html><title>autofill</title><label>Secret word <input id=apw type=password></label>` +
-      `<script>document.getElementById("apw").value = ${JSON.stringify(AUTOFILL)}</script>`
+      `<label>Shown word <input id=shown name=user_password type=text></label>` +
+      `<script>document.getElementById("apw").value = ${JSON.stringify(AUTOFILL)};` +
+      `document.getElementById("shown").value = ${JSON.stringify(REVEALED)}</script>`
     : `<!doctype html><title>login</title><form onsubmit="event.preventDefault();document.title='submitted'">` +
       `<label>Password <input id=pw type=password></label><label>Code <input id=code></label><button>Log in</button></form>` +
       `<iframe src="http://localhost:${new URL(req.url).port}/frame"></iframe>`,
@@ -111,7 +115,9 @@ test.skipIf(!hasBrowser)("fill-secret fills the page and leaks the value nowhere
     expect((await rech(fieldHash("#apw"))).out).toContain(`H${hash(AUTOFILL)}`); // really filled
     const autofillSnap = await rech(["snapshot"]);
     expect(autofillSnap.out).toMatch(/textbox "Secret word"[^\n]*: \*\*\*/);
+    expect(autofillSnap.out).toMatch(/textbox "Shown word"[^\n]*: \*\*\*/);
     expect(autofillNav.out + autofillSnap.out).not.toContain(AUTOFILL);
+    expect(autofillNav.out + autofillSnap.out).not.toContain(REVEALED);
 
     for (const out of [opened, refused, framed, filled, totp, snap].map(r => r.out)) {
       expect(out).not.toContain(CANARY);
@@ -122,9 +128,10 @@ test.skipIf(!hasBrowser)("fill-secret fills the page and leaks the value nowhere
     expect(log).not.toContain(CANARY);
     expect(log).not.toContain(SEED);
     expect(log).not.toContain(AUTOFILL);
+    expect(log).not.toContain(REVEALED);
     // Nothing on disk: daemon home (snapshots, downloads), the client's project dir, the browser profile.
     for (const dir of [home, work, udd]) expect(await grepTree(dir, CANARY)).toEqual([]);
-    for (const dir of [home, work]) expect(await grepTree(dir, AUTOFILL)).toEqual([]);
+    for (const dir of [home, work]) for (const v of [AUTOFILL, REVEALED]) expect(await grepTree(dir, v)).toEqual([]);
   } finally {
     await rech(["close"]).catch(() => {});
     serve.kill();
@@ -133,3 +140,46 @@ test.skipIf(!hasBrowser)("fill-secret fills the page and leaks the value nowhere
     await rm(root, { recursive: true, force: true });
   }
 }, 120_000);
+
+// No browser needed: a fake CLI prints a snapshot (inline and as a file) holding a value, and
+// there is no live session to scan, so the daemon must withhold both rather than pass them on.
+test("a snapshot that can't be checked for passwords is withheld, not passed through", async () => {
+  const root = await mkdtemp(join(tmpdir(), "rech-withhold-"));
+  const home = join(root, "home");
+  await mkdir(join(home, ".rechrome"), { recursive: true });
+  const LEAK = "UNCHECKED-c4n4ry-77";
+  const fake = join(root, "fake-cli.ts");
+  await writeFile(fake, `
+    import { mkdirSync, writeFileSync } from "fs";
+    mkdirSync(".playwright-cli", { recursive: true });
+    writeFileSync(".playwright-cli/page-1.yml", '- textbox "Secret word" [ref=e1]: ${LEAK}\\n');
+    console.log('### Page\\n- Page URL: https://example.com/\\n### Snapshot\\n\`\`\`yaml\\n- textbox "Secret word" [ref=e1]: ${LEAK}\\n\`\`\`\\n### Events\\n- [Snapshot](.playwright-cli/page-1.yml)');
+  `);
+  const reserve = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("") });
+  const port = reserve.port!;
+  reserve.stop(true);
+  const key = "k".repeat(24);
+  const serveLog = join(root, "serve.log");
+  const serve = Bun.spawn([process.execPath, join(import.meta.dir, "rechrome.ts"), "serve"], {
+    cwd: home, env: { ...process.env, HOME: home, USERPROFILE: home, RECHROME_URL: `http://${key}@127.0.0.1:${port}`, PLAYWRIGHT_CLI: `${process.execPath} ${fake}` },
+    stdin: "ignore", stdout: Bun.file(serveLog), stderr: Bun.file(join(root, "serve.err")),
+  });
+  try {
+    for (let i = 0; i < 100 && !(await fetch(`http://127.0.0.1:${port}/`).then(r => r.ok).catch(() => false)); i++) await Bun.sleep(100);
+    const res = await (await fetch(`http://127.0.0.1:${port}/run`, {
+      method: "POST", headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ args: ["snapshot"], identity: { key: "/withhold-test" } }),
+    })).json() as { stdout: string; stderr: string; files: string[] };
+    expect(res.stdout).toContain("snapshot withheld");
+    expect(res.stdout).toContain("### Events"); // the rest of the output survives
+    expect(JSON.stringify(res)).not.toContain(LEAK);
+    expect(res.files).toEqual([]);
+    expect((await fetch(`http://127.0.0.1:${port}/files/.playwright-cli/page-1.yml`, { headers: { Authorization: `Bearer ${key}` } })).status).toBe(404);
+    expect(await readFile(serveLog, "utf8") + await readFile(join(root, "serve.err"), "utf8")).not.toContain(LEAK);
+    expect(await grepTree(home, LEAK)).toEqual([]);
+  } finally {
+    serve.kill();
+    await serve.exited;
+    await rm(root, { recursive: true, force: true });
+  }
+}, 60_000);

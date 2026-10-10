@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   SecretMasker, base32Decode, buildFillCode, domainGlobToRegExp, fillSecretWireArgs, hostAllowed,
-  hasSnapshot, maskPasswordLines, parseRunCodeStringArray,
+  hasSnapshot, maskPasswordLines, parseScanResult, withholdSnapshots,
   parseDotenv, parseFillSecretArgs, parseFillSecretWire, readSecretSource, sessionSocketCandidates, totpCode, totpWaitMs,
 } from "./fill-secret.ts";
 import { mkdtempSync, rmSync, writeFileSync } from "fs";
@@ -165,9 +165,18 @@ describe("password fields in snapshots", () => {
     ]);
   });
   test("parses the scan result in json and legacy text form", () => {
-    expect(parseRunCodeStringArray(JSON.stringify({ result: JSON.stringify(["a", "", "b"]) }))).toEqual(["a", "b"]);
-    expect(parseRunCodeStringArray('### Result\n["x"]\n### Ran Playwright code')).toEqual(["x"]);
-    expect(() => parseRunCodeStringArray("garbage")).toThrow();
+    expect(parseScanResult(JSON.stringify({ result: JSON.stringify({ values: ["a", "", "b"], failedFrames: 0 }) }))).toEqual({ values: ["a", "b"], failedFrames: 0 });
+    expect(parseScanResult('### Result\n{"values":["x"],"failedFrames":1}\n### Ran Playwright code')).toEqual({ values: ["x"], failedFrames: 1 });
+    expect(() => parseScanResult("garbage")).toThrow();
+    expect(() => parseScanResult(JSON.stringify({ result: "[\"old-shape\"]" }))).toThrow();
+  });
+  test("withholds inline snapshots it could not check", () => {
+    const out = "### Page\n- Page URL: x\n### Snapshot\n```yaml\n- textbox \"Secret\" [ref=e1]: leak\n```\n### Events\n- e";
+    const w = withholdSnapshots(out, "could not check it");
+    expect(w).not.toContain("leak");
+    expect(w).toContain("### Page");
+    expect(w).toContain("### Events");
+    expect(w).toContain("snapshot withheld");
   });
   test("detects snapshot-bearing output", () => {
     expect(hasSnapshot("### Snapshot\n```yaml")).toBe(true);

@@ -19,7 +19,7 @@ import {
   readChromeProfileCache,
   checkTailscaleServe,
 } from "./rechrome.ts";
-import { SecretMasker, parseFillSecretWire, fillSecretOnSession, passwordValuesOnSession, hasSnapshot, maskPasswordLines } from "./fill-secret.ts";
+import { SecretMasker, parseFillSecretWire, fillSecretOnSession, passwordValuesOnSession, hasSnapshot, maskPasswordLines, withholdSnapshots } from "./fill-secret.ts";
 
 const TAILSCALE_BIN = process.env.TAILSCALE_BIN || "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
 const CERT_RENEW_THRESHOLD_DAYS = 7;
@@ -87,6 +87,9 @@ const recentSessions = new Map<string, number>();
 // while afterwards: snapshots echo input values (passwords included). See fill-secret.ts.
 const secretMasker = new SecretMasker();
 const TEXT_OUTPUT = /\.(?:ya?ml|json|md|txt|log)$/i;
+// Commands whose snapshot files are still being checked for password values; /files waits for
+// them so a concurrent download can't fetch a file before it is scrubbed.
+const pendingScrubs = new Set<Promise<void>>();
 function noteSession(sess: string, now: number): void {
   recentSessions.set(sess, now);
   if (recentSessions.size > 64) {
@@ -608,7 +611,11 @@ export async function serve() {
         if (!(await f.exists())) return new Response("Not found", { status: 404 });
         const real = realpathSync(resolved);
         if (!isUnderDir(realpathSync(workDir), real) || !canReadProfileFile(listener, relative(realpathSync(workDir), real).replaceAll("\\", "/"))) return new Response("Forbidden", { status: 403 });
-        if (TEXT_OUTPUT.test(real)) return new Response(maskPasswordLines(secretMasker.mask(await f.text())));
+        if (TEXT_OUTPUT.test(real)) {
+          if (pendingScrubs.size) await Promise.all(pendingScrubs);
+          if (!(await f.exists())) return new Response("Not found", { status: 404 }); // withheld
+          return new Response(maskPasswordLines(secretMasker.mask(await f.text())));
+        }
         return new Response(f);
       }
 
@@ -919,14 +926,28 @@ export async function serve() {
       // Snapshots print every input's value, password fields included (e.g. ones Chrome
       // autofilled). Read the live password values and mask them before anything is logged,
       // returned or left on disk; the label-based pass catches what the scan misses.
-      const snapshotOut = hasSnapshot(stdout) || hasSnapshot(stderr);
-      if (snapshotOut && status === 0) {
+      // Fails closed: a snapshot that can't be fully checked is withheld, not passed through.
+      const rawOutput = `${stdout}\n${stderr}`; // artifact paths come from the unmasked text
+      const snapshotOut = hasSnapshot(rawOutput);
+      let scrubDone = () => {};
+      const scrubbing = snapshotOut ? new Promise<void>((r) => { scrubDone = r; }) : undefined;
+      if (scrubbing) {
+        pendingScrubs.add(scrubbing);
+        // Safety net if an unexpected throw skips the finally below.
+        setTimeout(() => { scrubDone(); pendingScrubs.delete(scrubbing); }, 90_000).unref?.();
+      }
+      let withheld = "";
+      if (snapshotOut) {
         try {
           for (const v of await passwordValuesOnSession({ socketRoot: tmpSocketRoot(), session: namespacedSession, cwd: runWorkDir })) secretMasker.add(v, Infinity);
-        } catch (error) { log(`password scan skipped: ${secretMasker.mask(error instanceof Error ? error.message : String(error)).split("\n")[0]}`); }
+        } catch (error) {
+          withheld = "could not check it for password values";
+          log(`snapshot withheld: ${secretMasker.mask(error instanceof Error ? error.message : String(error)).split("\n")[0]}`);
+        }
       }
       stdout = maskPasswordLines(secretMasker.mask(stdout));
       stderr = maskPasswordLines(secretMasker.mask(stderr));
+      if (withheld) { stdout = withholdSnapshots(stdout, withheld); stderr = withholdSnapshots(stderr, withheld); }
       log(`exit: ${status}${stdout.trim() ? ` | ${stdout.trim().slice(0, 200)}` : ""}`);
 
       // Relay self-heal (see notes at SESSION_CLOSE_TIMEOUTS). A command that RETURNS usually
@@ -964,12 +985,8 @@ export async function serve() {
       }
 
       // Detect files mentioned in output
-      const filePattern = /[\w./-]+\.(?:png|jpe?g|pdf|json|yml)\b/gi;
-      const mentionedFiles = [
-        ...new Set(
-          [...stdout.matchAll(filePattern), ...stderr.matchAll(filePattern)].map((m) => m[0]),
-        ),
-      ];
+      const filePattern = /[\w./-]+\.(?:png|jpe?g|pdf|json|ya?ml)\b/gi;
+      const mentionedFiles = [...new Set([...rawOutput.matchAll(filePattern)].map((m) => m[0]))];
       const outputFiles: string[] = [];
       for (const f of mentionedFiles) {
         if (!isUnderDir(runWorkDir, f)) continue;
@@ -989,13 +1006,25 @@ export async function serve() {
         }
       }
 
-      // Snapshot files echo input values: scrub them on disk too, not only on download.
-      if (snapshotOut || secretMasker.active) for (const f of outputFiles) {
-        if (!TEXT_OUTPUT.test(f)) continue;
-        const path = join(runWorkDir, f);
-        const text = await file(path).text().catch(() => null);
-        const masked = text === null ? null : maskPasswordLines(secretMasker.mask(text));
-        if (text !== null && masked !== text) await Bun.write(path, masked!);
+      // Snapshot files echo input values: scrub them on disk too, not only on download. A file
+      // that can't be checked or scrubbed is deleted and not published.
+      try {
+        if (snapshotOut || secretMasker.active) for (const f of [...outputFiles]) {
+          if (!TEXT_OUTPUT.test(f)) continue;
+          const path = join(runWorkDir, f);
+          try {
+            if (withheld && /\.ya?ml$/i.test(f)) throw new Error("withheld");
+            const text = await file(path).text();
+            const masked = maskPasswordLines(secretMasker.mask(text));
+            if (masked !== text) await Bun.write(path, masked);
+          } catch {
+            try { unlinkSync(path); } catch {}
+            outputFiles.splice(outputFiles.indexOf(f), 1);
+          }
+        }
+      } finally {
+        scrubDone();
+        if (scrubbing) pendingScrubs.delete(scrubbing);
       }
 
       const rebrand = (s: string) => s.replaceAll("npx playwright-cli", "rech");

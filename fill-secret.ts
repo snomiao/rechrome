@@ -317,29 +317,42 @@ export function fillSecretOnSession(opts: { socketRoot: string; session: string;
 // (or the user typed), which never went through fill-secret. Before a snapshot-bearing output
 // leaves the daemon, read the live password values (all frames) and mask them like secrets.
 
+// Password inputs, plus fields marked as passwords that a "show password" toggle turned into text.
+const PASSWORD_FIELDS = 'input[type=password], input[autocomplete~="current-password" i], input[autocomplete~="new-password" i], input[name*="pass" i], input[id*="pass" i]';
 const PASSWORD_VALUES_CODE = `async page => {
-  const out = [];
+  const values = [];
+  let failedFrames = 0;
   for (const frame of page.frames()) {
-    try { out.push(...await frame.$$eval("input[type=password]", els => els.map(e => e.value))); } catch {}
+    try { values.push(...await frame.$$eval(${JSON.stringify(PASSWORD_FIELDS)}, els => els.map(e => e.value))); } catch { failedFrames++; }
   }
-  return out.filter(Boolean);
+  return { values: values.filter(Boolean), failedFrames };
 }`;
 
-/** Current values of every password input on the session's page. Never logs them. */
+/**
+ * Current values of every password field on the session's page. Never logs them. Throws when
+ * coverage is incomplete (a frame could not be read), so the caller can fail closed.
+ */
 export async function passwordValuesOnSession(opts: { socketRoot: string; session: string; cwd: string }): Promise<string[]> {
   const { isError, text } = await runCodeOnSession({ ...opts, code: PASSWORD_VALUES_CODE, json: true });
   if (isError) throw new Error("password scan failed");
-  return parseRunCodeStringArray(text);
+  const { values, failedFrames } = parseScanResult(text);
+  if (failedFrames) throw new Error(`password scan could not read ${failedFrames} frame(s)`);
+  return values;
 }
 
-/** The run-code result: `{"result": "[...]"}` in json mode, or a `### Result` section from older cliDaemons. */
-export function parseRunCodeStringArray(text: string): string[] {
+/** The run-code result: `{"result": "{...}"}` in json mode, or a `### Result` section from older cliDaemons. */
+export function parseScanResult(text: string): { values: string[]; failedFrames: number } {
   let raw: unknown;
   try { raw = JSON.parse(text).result; } catch { raw = text.match(/### Result\n([^\n]*)/)?.[1]; }
-  let value: unknown = raw;
+  let value: any = raw;
   if (typeof raw === "string") { try { value = JSON.parse(raw); } catch { value = undefined; } }
-  if (!Array.isArray(value)) throw new Error("password scan returned no list");
-  return value.filter((v): v is string => typeof v === "string" && v.length > 0);
+  if (!value || !Array.isArray(value.values) || typeof value.failedFrames !== "number") throw new Error("password scan returned no result");
+  return { values: value.values.filter((v: unknown): v is string => typeof v === "string" && v.length > 0), failedFrames: value.failedFrames };
+}
+
+/** Replace inline snapshot sections when they could not be checked for password values. */
+export function withholdSnapshots(text: string, reason: string): string {
+  return text.replace(/### Snapshot\n[\s\S]*?(?=\n### |$)/g, `### Snapshot\n[rech] snapshot withheld: ${reason}. Retry the command.`);
 }
 
 /** True when a command's output carries a snapshot (inline or as a saved file). */
