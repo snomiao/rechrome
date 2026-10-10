@@ -1,8 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import {
   SecretMasker, base32Decode, buildFillCode, domainGlobToRegExp, fillSecretWireArgs, hostAllowed,
-  parseDotenv, parseFillSecretArgs, parseFillSecretWire, readSecretSource, totpCode, totpWaitMs,
+  parseDotenv, parseFillSecretArgs, parseFillSecretWire, readSecretSource, sessionSocketCandidates, totpCode, totpWaitMs,
 } from "./fill-secret.ts";
+import { mkdtempSync, rmSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import { authorizeProfileRequest } from "./listeners.ts";
 
 // RFC 6238 appendix B, SHA1 seed "12345678901234567890".
@@ -46,12 +49,18 @@ describe("parseFillSecretArgs", () => {
     expect(() => parseFillSecretArgs(["e5", "--from-env", "A", "--from-stdin"])).toThrow("exactly one");
     expect(() => parseFillSecretArgs(["e5", "--from-env", "not a var"])).toThrow("not an environment variable");
     expect(() => parseFillSecretArgs(["e5", "--from-stdin", "--env-file", "x"])).toThrow("--env-file goes with");
+    // An explicitly empty guard (an unset shell var) must not silently become "no guard".
+    expect(() => parseFillSecretArgs(["e5", "--from-stdin", "--allow-domain", ""])).toThrow("empty host");
+    expect(() => parseFillSecretArgs(["e5", "--from-stdin", "--allow-domain=,"])).toThrow("empty host");
   });
   test("the wire args carry the ref and flags, never the var name or value", () => {
     const req = parseFillSecretArgs(["e5", "--from-env", "SALESFORCE_PASSWORD", "--allow-domain", "*.my.salesforce.com", "--submit"]);
     expect(fillSecretWireArgs(req)).toEqual(["fill-secret", "e5", "--allow-domain=*.my.salesforce.com", "--submit"]);
-    expect(parseFillSecretWire(fillSecretWireArgs(req))).toEqual({ ref: "e5", allowDomains: ["*.my.salesforce.com"], submit: true });
+    expect(parseFillSecretWire(fillSecretWireArgs(req))).toEqual({ ref: "e5", allowDomains: ["*.my.salesforce.com"], submit: true, totp: false });
     expect(() => parseFillSecretWire(["fill-secret", "e5", "leaked-value"])).toThrow("(positional)");
+    const totp = parseFillSecretArgs(["e5", "--totp-from-env", "SEED"]);
+    expect(fillSecretWireArgs(totp)).toEqual(["fill-secret", "e5", "--totp"]);
+    expect(parseFillSecretWire(fillSecretWireArgs(totp)).totp).toBe(true);
   });
 });
 
@@ -92,8 +101,20 @@ describe("--allow-domain guard", () => {
   test("the generated code embeds the guard", () => {
     const code = buildFillCode("e5", "v", ["*.a.com"], false);
     expect(code).toContain("fill-secret refused");
-    expect(code).toContain('page.locator("aria-ref=e5")');
+    expect(code).toContain('page.locator("aria-ref=e5").elementHandle(');
+    expect(code).toContain("e.ownerDocument.location.hostname"); // the field's own frame, not the top page
     expect(buildFillCode("#pw", "v", [], true)).toContain('page.locator("#pw")');
+  });
+});
+
+describe("sessionSocketCandidates", () => {
+  test("matches exactly this session, never another client's sub-session with the same suffix", () => {
+    const dir = mkdtempSync(join(tmpdir(), "rech-sock-"));
+    try {
+      for (const n of ["0123456789abcdef-aaaaaaaa.sock", "0123456789abcdef-bbbbbbbb-aaaaaaaa.sock", "aaaaaaaa.sock", "xx-aaaaaaaa.sock", "0123456789abcdef-aaaaaaaa-x.sock"]) writeFileSync(join(dir, n), "");
+      expect(sessionSocketCandidates(dir, "aaaaaaaa").map(p => p.slice(dir.length + 1)).sort()).toEqual(["0123456789abcdef-aaaaaaaa.sock", "aaaaaaaa.sock"]);
+      expect(sessionSocketCandidates(dir, "bbbbbbbb-aaaaaaaa").map(p => p.slice(dir.length + 1))).toEqual(["0123456789abcdef-bbbbbbbb-aaaaaaaa.sock"]);
+    } finally { rmSync(dir, { recursive: true }); }
   });
 });
 
@@ -107,6 +128,9 @@ describe("SecretMasker", () => {
     now = 1001;
     expect(m.active).toBe(false);
     expect(m.mask('pa"ss')).toBe('pa"ss');
+    m.add("pw-forever", Infinity);
+    now = 10 ** 12;
+    expect(m.mask("x pw-forever")).toBe("x ***");
   });
 });
 
@@ -114,7 +138,7 @@ describe("profile-scoped listener", () => {
   const listener = { name: "s", host: "127.0.0.1", port: 1, key: "k".repeat(24), profiles: ["p"], prefix: "/" } as any;
   const body = (args: string[]) => ({ identity: { key: "/w", profile: "p" }, args });
   test("allows fill-secret with its own flags only", () => {
-    expect(authorizeProfileRequest(listener, body(["fill-secret", "e5", "--allow-domain=*.a.com", "--submit"]))).toBe("p");
+    expect(authorizeProfileRequest(listener, body(["fill-secret", "e5", "--allow-domain=*.a.com", "--submit", "--totp"]))).toBe("p");
     expect(() => authorizeProfileRequest(listener, body(["fill-secret", "e5", "--filename=/etc/passwd"]))).toThrow("option overrides");
     expect(() => authorizeProfileRequest(listener, body(["fill", "e5", "--allow-domain=x.com"]))).toThrow("option overrides");
   });

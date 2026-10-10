@@ -77,11 +77,16 @@ printf '%s\n' "$PW" | rech fill-secret e7 --from-stdin
 
 The client reads the value (or computes the TOTP code from a base32 seed: SHA1, 6 digits, 30 s; the
 seed never leaves the client) and sends it outside the command's arguments. The daemon hands it to
-the browser over the session's local socket, checks the page host against `--allow-domain` and fills
-in one step, and shows `***` wherever the value would appear, in this command's output and, for
-15 minutes, in later snapshots, `eval` results and saved snapshot files too, since snapshots echo
-input values. Profile-scoped listeners accept `fill-secret` (with `--allow-domain`/`--submit`).
-Not yet supported on a Windows daemon.
+the browser over the session's local socket. `--allow-domain` is checked against the host of the
+field's own frame (an allowed page can't lend its host to a cross-origin iframe), and the fill goes
+to that exact element, so it fails rather than types into a page that navigated after the check.
+Snapshots echo input values, so the daemon shows `***` for the value in this and every later output,
+log line and saved snapshot file: passwords until the daemon restarts, TOTP codes for 15 minutes.
+Profile-scoped listeners accept `fill-secret` with its own flags.
+
+Limits: the masking stops accidental echoes, not someone who can run `eval`/`run-code` on the
+session and deliberately reads the field back encoded. A snapshot file is scrubbed right after the
+browser writes it, not before. Not yet supported on a Windows daemon.
 
 ### 3. Where things are kept
 

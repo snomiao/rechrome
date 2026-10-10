@@ -68,7 +68,12 @@ export function parseFillSecretArgs(args: string[]): FillSecretRequest {
     else if (flag === "--totp-from-env") setSource({ kind: "env", name: value() }, true);
     else if (flag === "--from-stdin") setSource({ kind: "stdin" }, false);
     else if (flag === "--totp-from-stdin") setSource({ kind: "stdin" }, true);
-    else if (flag === "--allow-domain") allowDomains.push(...value().split(",").map(s => s.trim()).filter(Boolean));
+    else if (flag === "--allow-domain") {
+      // An explicitly empty guard (`--allow-domain "$UNSET"`) must not fail open into "no guard".
+      const globs = value().split(",").map(s => s.trim());
+      if (globs.some(g => !g)) throw new Error("--allow-domain got an empty host");
+      allowDomains.push(...globs);
+    }
     else if (flag === "--submit") submit = true;
     else if (flag === "--env-file") envFile = value();
     else if (a.startsWith("-")) throw new Error(`fill-secret: unknown option ${a}`);
@@ -90,7 +95,7 @@ export function parseFillSecretArgs(args: string[]): FillSecretRequest {
 
 /** The args the daemon sees (and logs): the ref and flags, never the secret or where it came from. */
 export function fillSecretWireArgs(req: FillSecretRequest): string[] {
-  return ["fill-secret", req.ref, ...req.allowDomains.map(d => `--allow-domain=${d}`), ...(req.submit ? ["--submit"] : [])];
+  return ["fill-secret", req.ref, ...req.allowDomains.map(d => `--allow-domain=${d}`), ...(req.submit ? ["--submit"] : []), ...(req.totp ? ["--totp"] : [])];
 }
 
 /** Read the raw secret (a value, or a TOTP seed) from the client's env or stdin. */
@@ -179,48 +184,55 @@ export function hostAllowed(host: string, globs: string[]): boolean {
 // ---------- daemon side ----------
 
 /** Parse what the daemon received; the scoped-listener check accepts exactly this shape. */
-export function parseFillSecretWire(args: string[]): { ref: string; allowDomains: string[]; submit: boolean } {
+export function parseFillSecretWire(args: string[]): { ref: string; allowDomains: string[]; submit: boolean; totp: boolean } {
   const [cmd, ref, ...rest] = args;
   if (cmd !== "fill-secret" || !ref || ref.startsWith("-")) throw new Error("fill-secret needs a target ref");
   const allowDomains: string[] = [];
-  let submit = false;
+  let submit = false, totp = false;
   for (const a of rest) {
     if (a === "--submit") submit = true;
+    else if (a === "--totp") totp = true;
     else if (a.startsWith("--allow-domain=")) { const d = a.slice("--allow-domain=".length); domainGlobToRegExp(d); allowDomains.push(d); }
     else throw new Error(`fill-secret: unexpected argument ${a.startsWith("-") ? a : "(positional)"}`);
   }
-  return { ref, allowDomains, submit };
+  return { ref, allowDomains, submit, totp };
 }
 
 /**
- * The run-code function the cliDaemon executes: host check and fill in one step. The value is
- * embedded as a JSON string literal; the cliDaemon echoes this code back in its response, which
- * the daemon masks before anything is logged or returned.
+ * The run-code function the cliDaemon executes. The host check reads the target element's OWN
+ * document (so a cross-origin iframe ref is checked against the iframe, not the top page), and the
+ * fill goes through that same element handle: if the document navigates after the check, the
+ * handle is detached and the fill fails instead of landing on the new page. The value is embedded
+ * as a JSON string literal; the cliDaemon echoes this code back, which the daemon masks.
  */
-const URL_HOST = /^[a-z][a-z0-9+.-]*:\/\/(?:[^@/?#]*@)?(\[[^\]]*\]|[^:/?#]*)/i;
-
 export function buildFillCode(ref: string, value: string, allowDomains: string[], submit: boolean): string {
   const patterns = allowDomains.map(d => domainGlobToRegExp(d).source);
   const locator = /^(f\d+)?e\d+$/.test(ref) ? `page.locator(${JSON.stringify(`aria-ref=${ref}`)})` : `page.locator(${JSON.stringify(ref)})`;
   return `async page => {
-  // run-code's vm sandbox has no URL global; take the host straight from the URL string.
-  const m = new RegExp(${JSON.stringify(URL_HOST.source)}, "i").exec(page.url());
-  const host = m ? m[1].toLowerCase() : "";
-  const allowed = ${JSON.stringify(patterns)};
-  if (allowed.length && !allowed.some(p => new RegExp(p, "i").test(host)))
-    throw new Error("fill-secret refused: page host " + JSON.stringify(host) + " is not allowed by --allow-domain ${allowDomains.join(",").replace(/[^a-z0-9*.,-]/gi, "")}");
-  const target = ${locator};
-  await target.fill(${JSON.stringify(value)}, { timeout: 10000 });
-  ${submit ? `await target.press("Enter", { timeout: 10000 });` : ""}
-  return "filled " + ${JSON.stringify(ref)} + " on " + host;
+  const el = await ${locator}.elementHandle({ timeout: 10000 });
+  try {
+    const host = String(await el.evaluate(e => e.ownerDocument.location.hostname)).toLowerCase();
+    const allowed = ${JSON.stringify(patterns)};
+    if (allowed.length && !allowed.some(p => new RegExp(p, "i").test(host)))
+      throw new Error("fill-secret refused: the field's page host " + JSON.stringify(host) + " is not allowed by --allow-domain ${allowDomains.join(",").replace(/[^a-z0-9*.,-]/gi, "")}");
+    await el.fill(${JSON.stringify(value)}, { timeout: 10000 });
+    ${submit ? `await el.press("Enter", { timeout: 10000 });` : ""}
+    return "filled " + ${JSON.stringify(ref)} + " on " + host;
+  } finally {
+    await el.dispose().catch(() => {});
+  }
 }`;
 }
 
-/** Values to mask, with expiry. Global, not per-session: masking a stray match is harmless. */
+/**
+ * Values to mask, with expiry. Global, not per-session: masking a stray match is harmless.
+ * Passwords are masked for the daemon's lifetime (they stay in the field); TOTP codes for the
+ * default TTL (an expired code is worthless). A daemon restart forgets them.
+ */
 export class SecretMasker {
   private values = new Map<string, number>();
   constructor(private ttlMs = SECRET_MASK_TTL_MS, private now = () => Date.now()) {}
-  add(value: string) { if (value) this.values.set(value, this.now() + this.ttlMs); }
+  add(value: string, ttlMs = this.ttlMs) { if (value) this.values.set(value, this.now() + ttlMs); }
   get active(): boolean { this.prune(); return this.values.size > 0; }
   mask(text: string): string {
     if (!text) return text;
@@ -237,11 +249,15 @@ export class SecretMasker {
   private prune() { const t = this.now(); for (const [v, exp] of this.values) if (exp <= t) this.values.delete(v); }
 }
 
-/** Live cliDaemon sockets for a session: `<root>/<workspaceHash>-<session>.sock` (or older `<session>.sock`). */
+/**
+ * cliDaemon sockets for exactly this session: `<root>/<16-hex workspaceHash>-<session>.sock`, or
+ * older `<session>.sock`. Never a plain suffix match: session `aaaa` must not match another
+ * client's `<hash>-bbbb-aaaa.sock` (its `-s=aaaa` sub-session).
+ */
 export function sessionSocketCandidates(socketRoot: string, session: string): string[] {
   let names: string[] = [];
   try { names = readdirSync(socketRoot); } catch { return []; }
-  return names.filter(n => n === `${session}.sock` || n.endsWith(`-${session}.sock`)).map(n => join(socketRoot, n));
+  return names.filter(n => n === `${session}.sock` || (n.length === session.length + 22 && /^[0-9a-f]{16}-/.test(n) && n.slice(17) === `${session}.sock`)).map(n => join(socketRoot, n));
 }
 
 /** One request/response over a cliDaemon socket (newline-delimited JSON). */
@@ -250,9 +266,10 @@ export function socketRequest(path: string, method: string, params: unknown, tim
     const sock = connect(path);
     let buf = "";
     const timer = setTimeout(() => { sock.destroy(); reject(new Error("timeout")); }, timeoutMs);
+    sock.setEncoding("utf8"); // decode across chunk boundaries, not per chunk
     sock.on("connect", () => sock.write(`${JSON.stringify({ id: 1, method, params })}\n`));
     sock.on("data", (d) => {
-      buf += d.toString();
+      buf += d;
       const nl = buf.indexOf("\n");
       if (nl < 0) return;
       clearTimeout(timer);

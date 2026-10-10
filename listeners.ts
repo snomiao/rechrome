@@ -86,7 +86,7 @@ export function authorizeProfileRequest(listener: Listener, body: any): string {
   if (body.env?.PLAYWRIGHT_MCP_PROFILE_DIRECTORY && body.env.PLAYWRIGHT_MCP_PROFILE_DIRECTORY !== profile) throw new Error("Profile override does not match request identity");
   const args = body.args.filter((a: string) => /^-s=[a-zA-Z0-9_-]{1,64}$/.test(a) === false);
   if (!SCOPED_COMMANDS.has(args[0])) throw new Error("Command is unavailable on profile-scoped listeners; use the local management listener for arbitrary code or host access");
-  if (body.args.filter((a: string) => a.startsWith("-s=")).length > 1 || args.slice(1).some((a: string) => a.startsWith("-") && !(args[0] === "screenshot" && a === "--full-page") && !(args[0] === "fill-secret" && (a === "--submit" || a.startsWith("--allow-domain="))))) throw new Error("CLI option overrides are unavailable on profile-scoped listeners");
+  if (body.args.filter((a: string) => a.startsWith("-s=")).length > 1 || args.slice(1).some((a: string) => a.startsWith("-") && !(args[0] === "screenshot" && a === "--full-page") && !(args[0] === "fill-secret" && (a === "--submit" || a === "--totp" || a.startsWith("--allow-domain="))))) throw new Error("CLI option overrides are unavailable on profile-scoped listeners");
   if (["open", "goto", "tab-new"].includes(args[0]) && args[1] && !/^https?:\/\//i.test(args[1]) && args[1] !== "about:blank") throw new Error("Scoped navigation accepts only HTTP(S) or about:blank");
   return profile;
 }

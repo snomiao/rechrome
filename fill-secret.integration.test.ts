@@ -34,9 +34,12 @@ test.skipIf(!hasBrowser)("fill-secret fills the page and leaks the value nowhere
   const root = await mkdtemp(join(tmpdir(), "rech-fill-secret-"));
   const home = join(root, "home"), work = join(root, "work"), udd = join(root, "udd");
   await Promise.all([mkdir(join(home, ".rechrome"), { recursive: true }), mkdir(work), mkdir(udd)]);
-  const page = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response(
-    `<!doctype html><title>login</title><form onsubmit="event.preventDefault();document.title='submitted'">` +
-    `<label>Password <input id=pw type=password></label><label>Code <input id=code></label><button>Log in</button></form>`,
+  // The login page embeds a cross-origin iframe ("localhost" is another host than "127.0.0.1").
+  const page = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: (req) => new Response(new URL(req.url).pathname === "/frame"
+    ? `<!doctype html><label>Evil <input id=evil></label>`
+    : `<!doctype html><title>login</title><form onsubmit="event.preventDefault();document.title='submitted'">` +
+      `<label>Password <input id=pw type=password></label><label>Code <input id=code></label><button>Log in</button></form>` +
+      `<iframe src="http://localhost:${new URL(req.url).port}/frame"></iframe>`,
     { headers: { "content-type": "text/html" } }) });
   const reserve = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("") });
   const port = reserve.port!;
@@ -67,6 +70,14 @@ test.skipIf(!hasBrowser)("fill-secret fills the page and leaks the value nowhere
     expect(refused.out).toContain("fill-secret refused");
     expect((await rech(["eval", "() => document.querySelector('#pw').value.length"])).out).toContain("0");
 
+    // Guard, reject: an allowed page, but the ref points into a cross-origin iframe.
+    const tree = (await rech(["snapshot"])).out;
+    const evilRef = tree.match(/textbox "Evil" \[ref=(f\d+e\d+)\]/)?.[1];
+    expect(evilRef).toBeDefined();
+    const framed = await rech(["fill-secret", evilRef!, "--from-env", "PW", "--allow-domain", "127.0.0.1"], { PW: CANARY });
+    expect(framed.status).not.toBe(0);
+    expect(framed.out).toContain('host "localhost" is not allowed');
+
     // Guard, accept: the value lands in the field.
     const filled = await rech(["fill-secret", "e3", "--from-env", "PW", "--allow-domain", "127.0.0.1"], { PW: CANARY });
     expect(filled.status).toBe(0);
@@ -87,7 +98,7 @@ test.skipIf(!hasBrowser)("fill-secret fills the page and leaks the value nowhere
     expect(snap.out).toContain('textbox "Password"');
     expect(snap.out).toMatch(/textbox "Password"[^\n]*: \*\*\*/);
 
-    for (const out of [opened, refused, filled, totp, snap].map(r => r.out)) {
+    for (const out of [opened, refused, framed, filled, totp, snap].map(r => r.out)) {
       expect(out).not.toContain(CANARY);
       expect(out).not.toContain(SEED);
     }

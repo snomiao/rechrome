@@ -755,9 +755,9 @@ export async function serve() {
       if (filteredArgs[0] === "fill-secret") {
         const secret = !Array.isArray(body) && typeof body.secret === "string" ? body.secret : "";
         try {
-          const { ref, allowDomains, submit } = parseFillSecretWire(filteredArgs);
+          const { ref, allowDomains, submit, totp } = parseFillSecretWire(filteredArgs);
           if (!secret) throw new Error("fill-secret: the request carried no secret (this client is older than the daemon?)");
-          secretMasker.add(secret);
+          secretMasker.add(secret, totp ? undefined : Infinity);
           const reply = await fillSecretOnSession({ socketRoot: tmpSocketRoot(), session: namespacedSession, cwd: runWorkDir, ref, value: secret, allowDomains, submit });
           // Drop the echoed run-code body (it embeds the value, masked or not, and is noise).
           const text = secretMasker.mask(reply.text).replace(/### Ran Playwright code\n```js\n[\s\S]*?\n```\n?/, "").trim();
