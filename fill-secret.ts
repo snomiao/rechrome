@@ -38,7 +38,7 @@ export const FILL_SECRET_USAGE = `Usage: rech fill-secret <ref> (--from-env VAR 
                         only the code leaves this machine, never the seed
   --totp-from-stdin     the same, seed read from stdin
   --env-file PATH       look VAR up in this dotenv file instead of the environment
-  --allow-domain GLOB   refuse unless the page host matches, e.g. '*.my.salesforce.com' (repeatable)
+  --allow-domain GLOB   refuse unless the page host matches, e.g. '*.app.example.com' (repeatable)
   --submit              press Enter after filling`;
 
 /** Parse `fill-secret` args (without the command itself). Throws a usage error. */

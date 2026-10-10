@@ -70,8 +70,8 @@ between calls; another worktree gets its own. `-s=<name>` opens a named sub-sess
 `fill-secret` keeps it out of all three:
 
 ```bash
-rech fill-secret e7 --from-env SITE_PASSWORD --allow-domain '*.my.salesforce.com'
-rech fill-secret e9 --totp-from-env SITE_TOTP_SEED --env-file ~/secrets/.env --allow-domain '*.my.salesforce.com' --submit
+rech fill-secret e7 --from-env SITE_PASSWORD --allow-domain '*.app.example.com'
+rech fill-secret e9 --totp-from-env SITE_TOTP_SEED --env-file ~/secrets/.env --allow-domain '*.app.example.com' --submit
 printf '%s\n' "$PW" | rech fill-secret e7 --from-stdin
 ```
 

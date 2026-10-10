@@ -76,7 +76,7 @@ test.skipIf(!hasBrowser)("fill-secret fills the page and leaks the value nowhere
     // Refs on this fixed page: e3 = Password, e5 = Code.
 
     // Guard, reject: wrong host, nothing typed.
-    const refused = await rech(["fill-secret", "e3", "--from-env", "PW", "--allow-domain", "*.salesforce.com"], { PW: CANARY });
+    const refused = await rech(["fill-secret", "e3", "--from-env", "PW", "--allow-domain", "*.example.com"], { PW: CANARY });
     expect(refused.status).not.toBe(0);
     expect(refused.out).toContain("fill-secret refused");
     expect((await rech(["eval", "() => document.querySelector('#pw').value.length"])).out).toContain("0");

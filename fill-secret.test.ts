@@ -55,9 +55,9 @@ describe("parseFillSecretArgs", () => {
     expect(() => parseFillSecretArgs(["e5", "--from-stdin", "--allow-domain=,"])).toThrow("empty host");
   });
   test("the wire args carry the ref and flags, never the var name or value", () => {
-    const req = parseFillSecretArgs(["e5", "--from-env", "SALESFORCE_PASSWORD", "--allow-domain", "*.my.salesforce.com", "--submit"]);
-    expect(fillSecretWireArgs(req)).toEqual(["fill-secret", "e5", "--allow-domain=*.my.salesforce.com", "--submit"]);
-    expect(parseFillSecretWire(fillSecretWireArgs(req))).toEqual({ ref: "e5", allowDomains: ["*.my.salesforce.com"], submit: true, totp: false });
+    const req = parseFillSecretArgs(["e5", "--from-env", "SITE_PASSWORD", "--allow-domain", "*.app.example.com", "--submit"]);
+    expect(fillSecretWireArgs(req)).toEqual(["fill-secret", "e5", "--allow-domain=*.app.example.com", "--submit"]);
+    expect(parseFillSecretWire(fillSecretWireArgs(req))).toEqual({ ref: "e5", allowDomains: ["*.app.example.com"], submit: true, totp: false });
     expect(() => parseFillSecretWire(["fill-secret", "e5", "leaked-value"])).toThrow("(positional)");
     const totp = parseFillSecretArgs(["e5", "--totp-from-env", "SEED"]);
     expect(fillSecretWireArgs(totp)).toEqual(["fill-secret", "e5", "--totp"]);
@@ -83,16 +83,16 @@ describe("readSecretSource", () => {
 
 describe("--allow-domain guard", () => {
   test("accepts matching hosts", () => {
-    expect(hostAllowed("taku.my.salesforce.com", ["*.my.salesforce.com"])).toBe(true);
-    expect(hostAllowed("a.b.my.salesforce.com", ["*.my.salesforce.com"])).toBe(true);
-    expect(hostAllowed("LOGIN.salesforce.com", ["login.salesforce.com"])).toBe(true);
+    expect(hostAllowed("team.app.example.com", ["*.app.example.com"])).toBe(true);
+    expect(hostAllowed("a.b.app.example.com", ["*.app.example.com"])).toBe(true);
+    expect(hostAllowed("LOGIN.example.com", ["login.example.com"])).toBe(true);
     expect(hostAllowed("anything.example", [])).toBe(true);
   });
   test("rejects look-alikes", () => {
-    expect(hostAllowed("my.salesforce.com", ["*.my.salesforce.com"])).toBe(false); // apex
-    expect(hostAllowed("evil-my.salesforce.com", ["*.my.salesforce.com"])).toBe(false);
-    expect(hostAllowed("x.my.salesforce.com.evil.com", ["*.my.salesforce.com"])).toBe(false);
-    expect(hostAllowed("loginxsalesforce.com", ["login.salesforce.com"])).toBe(false);
+    expect(hostAllowed("app.example.com", ["*.app.example.com"])).toBe(false); // apex
+    expect(hostAllowed("evil-app.example.com", ["*.app.example.com"])).toBe(false);
+    expect(hostAllowed("x.app.example.com.evil.com", ["*.app.example.com"])).toBe(false);
+    expect(hostAllowed("loginxexample.com", ["login.example.com"])).toBe(false);
   });
   test("rejects malformed globs", () => {
     expect(() => domainGlobToRegExp("*")).toThrow();
@@ -151,7 +151,7 @@ describe("password fields in snapshots", () => {
       '    - textbox "パスワード" [ref=e12]: hunter2',
       '- textbox "Password" [active] [ref=e6]: p:a"ss',
       '- textbox "Enter PIN" [ref=e9]: 1234',
-      '- textbox "Username" [ref=e4]: taku',
+      '- textbox "Username" [ref=e4]: alice',
       '- textbox "Spinner speed" [ref=e1]: 3',
       '- textbox "Password" [ref=e7]',
     ].join("\n");
@@ -159,7 +159,7 @@ describe("password fields in snapshots", () => {
       '    - textbox "パスワード" [ref=e12]: ***',
       '- textbox "Password" [active] [ref=e6]: ***',
       '- textbox "Enter PIN" [ref=e9]: ***',
-      '- textbox "Username" [ref=e4]: taku',
+      '- textbox "Username" [ref=e4]: alice',
       '- textbox "Spinner speed" [ref=e1]: 3',
       '- textbox "Password" [ref=e7]',
     ]);
