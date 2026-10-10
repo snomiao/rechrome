@@ -281,21 +281,17 @@ export function socketRequest(path: string, method: string, params: unknown, tim
   });
 }
 
-/**
- * Fill on the session's live browser. Returns the cliDaemon's reply (NOT yet masked — the
- * caller masks it) or throws an error whose message never contains the value.
- */
-export async function fillSecretOnSession(opts: { socketRoot: string; session: string; cwd: string; ref: string; value: string; allowDomains: string[]; submit: boolean }): Promise<{ isError: boolean; text: string }> {
+/** Run a run-code function on the session's live browser over its cliDaemon socket (no child argv). */
+export async function runCodeOnSession(opts: { socketRoot: string; session: string; cwd: string; code: string; json?: boolean }): Promise<{ isError: boolean; text: string }> {
   // The cliDaemon listens on a named pipe there, which this socket scan can't find.
   if (process.platform === "win32") throw new Error("fill-secret is not supported on a Windows daemon yet");
-  const code = buildFillCode(opts.ref, opts.value, opts.allowDomains, opts.submit);
   const candidates = sessionSocketCandidates(opts.socketRoot, opts.session);
   if (!candidates.length) throw new Error("no browser is open in this session; run `rech open <url>` first");
   const errors: string[] = [];
   for (const path of candidates) {
     let reply: { result?: any; error?: string };
     try {
-      reply = await socketRequest(path, "run", { args: { _: ["run-code", code] }, cwd: opts.cwd });
+      reply = await socketRequest(path, "run", { args: { _: ["run-code", opts.code] }, cwd: opts.cwd, ...(opts.json ? { json: true } : {}) });
     } catch (e) {
       errors.push(e instanceof Error ? e.message : String(e)); // stale socket: try the next one
       continue;
@@ -305,4 +301,55 @@ export async function fillSecretOnSession(opts: { socketRoot: string; session: s
     return { isError: !!r?.isError, text: typeof r === "string" ? r : typeof r?.text === "string" ? r.text : "" };
   }
   throw new Error(`could not reach this session's browser (${errors.join("; ")}); run \`rech open <url>\` first`);
+}
+
+/**
+ * Fill on the session's live browser. Returns the cliDaemon's reply (NOT yet masked — the
+ * caller masks it) or throws an error whose message never contains the value.
+ */
+export function fillSecretOnSession(opts: { socketRoot: string; session: string; cwd: string; ref: string; value: string; allowDomains: string[]; submit: boolean }): Promise<{ isError: boolean; text: string }> {
+  return runCodeOnSession({ ...opts, code: buildFillCode(opts.ref, opts.value, opts.allowDomains, opts.submit) });
+}
+
+// ---------- password fields in snapshots ----------
+//
+// Snapshots print every input's value, and that includes password fields Chrome autofilled
+// (or the user typed), which never went through fill-secret. Before a snapshot-bearing output
+// leaves the daemon, read the live password values (all frames) and mask them like secrets.
+
+const PASSWORD_VALUES_CODE = `async page => {
+  const out = [];
+  for (const frame of page.frames()) {
+    try { out.push(...await frame.$$eval("input[type=password]", els => els.map(e => e.value))); } catch {}
+  }
+  return out.filter(Boolean);
+}`;
+
+/** Current values of every password input on the session's page. Never logs them. */
+export async function passwordValuesOnSession(opts: { socketRoot: string; session: string; cwd: string }): Promise<string[]> {
+  const { isError, text } = await runCodeOnSession({ ...opts, code: PASSWORD_VALUES_CODE, json: true });
+  if (isError) throw new Error("password scan failed");
+  return parseRunCodeStringArray(text);
+}
+
+/** The run-code result: `{"result": "[...]"}` in json mode, or a `### Result` section from older cliDaemons. */
+export function parseRunCodeStringArray(text: string): string[] {
+  let raw: unknown;
+  try { raw = JSON.parse(text).result; } catch { raw = text.match(/### Result\n([^\n]*)/)?.[1]; }
+  let value: unknown = raw;
+  if (typeof raw === "string") { try { value = JSON.parse(raw); } catch { value = undefined; } }
+  if (!Array.isArray(value)) throw new Error("password scan returned no list");
+  return value.filter((v): v is string => typeof v === "string" && v.length > 0);
+}
+
+/** True when a command's output carries a snapshot (inline or as a saved file). */
+export const hasSnapshot = (text: string) => /### Snapshot|\.ya?ml\b/.test(text);
+
+/**
+ * Fallback for when the live scan misses (the page moved on, the scan failed): blank the value
+ * of any snapshot textbox whose accessible name reads like a password field.
+ */
+const PASSWORD_LINE = /^(\s*-\s*textbox\s+"[^"\n]*(?:password|passwd|passcode|\bpin\b|パスワード|暗証)[^"\n]*"[^\n:]*):[ \t]+\S.*$/gim;
+export function maskPasswordLines(text: string): string {
+  return text.replace(PASSWORD_LINE, `$1: ${SECRET_MASK}`);
 }

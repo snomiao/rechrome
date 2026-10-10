@@ -19,7 +19,7 @@ import {
   readChromeProfileCache,
   checkTailscaleServe,
 } from "./rechrome.ts";
-import { SecretMasker, parseFillSecretWire, fillSecretOnSession } from "./fill-secret.ts";
+import { SecretMasker, parseFillSecretWire, fillSecretOnSession, passwordValuesOnSession, hasSnapshot, maskPasswordLines } from "./fill-secret.ts";
 
 const TAILSCALE_BIN = process.env.TAILSCALE_BIN || "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
 const CERT_RENEW_THRESHOLD_DAYS = 7;
@@ -608,7 +608,7 @@ export async function serve() {
         if (!(await f.exists())) return new Response("Not found", { status: 404 });
         const real = realpathSync(resolved);
         if (!isUnderDir(realpathSync(workDir), real) || !canReadProfileFile(listener, relative(realpathSync(workDir), real).replaceAll("\\", "/"))) return new Response("Forbidden", { status: 403 });
-        if (secretMasker.active && TEXT_OUTPUT.test(real)) return new Response(secretMasker.mask(await f.text()));
+        if (TEXT_OUTPUT.test(real)) return new Response(maskPasswordLines(secretMasker.mask(await f.text())));
         return new Response(f);
       }
 
@@ -916,7 +916,17 @@ export async function serve() {
         handshakeTimeoutMs,
       });
 
-      if (secretMasker.active) { stdout = secretMasker.mask(stdout); stderr = secretMasker.mask(stderr); }
+      // Snapshots print every input's value, password fields included (e.g. ones Chrome
+      // autofilled). Read the live password values and mask them before anything is logged,
+      // returned or left on disk; the label-based pass catches what the scan misses.
+      const snapshotOut = hasSnapshot(stdout) || hasSnapshot(stderr);
+      if (snapshotOut && status === 0) {
+        try {
+          for (const v of await passwordValuesOnSession({ socketRoot: tmpSocketRoot(), session: namespacedSession, cwd: runWorkDir })) secretMasker.add(v, Infinity);
+        } catch (error) { log(`password scan skipped: ${secretMasker.mask(error instanceof Error ? error.message : String(error)).split("\n")[0]}`); }
+      }
+      stdout = maskPasswordLines(secretMasker.mask(stdout));
+      stderr = maskPasswordLines(secretMasker.mask(stderr));
       log(`exit: ${status}${stdout.trim() ? ` | ${stdout.trim().slice(0, 200)}` : ""}`);
 
       // Relay self-heal (see notes at SESSION_CLOSE_TIMEOUTS). A command that RETURNS usually
@@ -980,11 +990,12 @@ export async function serve() {
       }
 
       // Snapshot files echo input values: scrub them on disk too, not only on download.
-      if (secretMasker.active) for (const f of outputFiles) {
+      if (snapshotOut || secretMasker.active) for (const f of outputFiles) {
         if (!TEXT_OUTPUT.test(f)) continue;
         const path = join(runWorkDir, f);
         const text = await file(path).text().catch(() => null);
-        if (text !== null && secretMasker.mask(text) !== text) await Bun.write(path, secretMasker.mask(text));
+        const masked = text === null ? null : maskPasswordLines(secretMasker.mask(text));
+        if (text !== null && masked !== text) await Bun.write(path, masked!);
       }
 
       const rebrand = (s: string) => s.replaceAll("npx playwright-cli", "rech");

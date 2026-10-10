@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   SecretMasker, base32Decode, buildFillCode, domainGlobToRegExp, fillSecretWireArgs, hostAllowed,
+  hasSnapshot, maskPasswordLines, parseRunCodeStringArray,
   parseDotenv, parseFillSecretArgs, parseFillSecretWire, readSecretSource, sessionSocketCandidates, totpCode, totpWaitMs,
 } from "./fill-secret.ts";
 import { mkdtempSync, rmSync, writeFileSync } from "fs";
@@ -141,5 +142,36 @@ describe("profile-scoped listener", () => {
     expect(authorizeProfileRequest(listener, body(["fill-secret", "e5", "--allow-domain=*.a.com", "--submit", "--totp"]))).toBe("p");
     expect(() => authorizeProfileRequest(listener, body(["fill-secret", "e5", "--filename=/etc/passwd"]))).toThrow("option overrides");
     expect(() => authorizeProfileRequest(listener, body(["fill", "e5", "--allow-domain=x.com"]))).toThrow("option overrides");
+  });
+});
+
+describe("password fields in snapshots", () => {
+  test("masks password-labelled textbox values, leaves the rest", () => {
+    const yaml = [
+      '    - textbox "パスワード" [ref=e12]: hunter2',
+      '- textbox "Password" [active] [ref=e6]: p:a"ss',
+      '- textbox "Enter PIN" [ref=e9]: 1234',
+      '- textbox "Username" [ref=e4]: taku',
+      '- textbox "Spinner speed" [ref=e1]: 3',
+      '- textbox "Password" [ref=e7]',
+    ].join("\n");
+    expect(maskPasswordLines(yaml).split("\n")).toEqual([
+      '    - textbox "パスワード" [ref=e12]: ***',
+      '- textbox "Password" [active] [ref=e6]: ***',
+      '- textbox "Enter PIN" [ref=e9]: ***',
+      '- textbox "Username" [ref=e4]: taku',
+      '- textbox "Spinner speed" [ref=e1]: 3',
+      '- textbox "Password" [ref=e7]',
+    ]);
+  });
+  test("parses the scan result in json and legacy text form", () => {
+    expect(parseRunCodeStringArray(JSON.stringify({ result: JSON.stringify(["a", "", "b"]) }))).toEqual(["a", "b"]);
+    expect(parseRunCodeStringArray('### Result\n["x"]\n### Ran Playwright code')).toEqual(["x"]);
+    expect(() => parseRunCodeStringArray("garbage")).toThrow();
+  });
+  test("detects snapshot-bearing output", () => {
+    expect(hasSnapshot("### Snapshot\n```yaml")).toBe(true);
+    expect(hasSnapshot("- [Snapshot](.playwright-cli/page-1.yml)")).toBe(true);
+    expect(hasSnapshot("### Result\n42")).toBe(false);
   });
 });

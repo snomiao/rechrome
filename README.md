@@ -84,6 +84,11 @@ Snapshots echo input values, so the daemon shows `***` for the value in this and
 log line and saved snapshot file: passwords until the daemon restarts, TOTP codes for 15 minutes.
 Profile-scoped listeners accept `fill-secret` with its own flags.
 
+Every password field is masked in snapshots, whoever filled it (you, Chrome's autofill, or
+`fill-secret`): when an output carries a snapshot, the daemon reads the live values of all
+`input[type=password]` fields in every frame and masks them, and also blanks any textbox whose name
+reads like a password field (password, PIN, パスワード…) in case the page changed in between.
+
 Limits: the masking stops accidental echoes, not someone who can run `eval`/`run-code` on the
 session and deliberately reads the field back encoded. A snapshot file is scrubbed right after the
 browser writes it, not before. Not yet supported on a Windows daemon.

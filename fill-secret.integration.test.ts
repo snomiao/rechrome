@@ -14,6 +14,8 @@ const hasBrowser = existsSync(CLI) && existsSync(browsersDir) && readdirSync(bro
 
 const CANARY = 'CANARY-7f3a"q-pw';
 const SEED = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+// A password the browser filled itself (autofill), never through fill-secret.
+const AUTOFILL = "AUTOFILL-c4n4ry-9e1";
 
 // Compare field contents by checksum: an eval naming the value would itself put it in the log.
 const HASH_JS = "[...v].reduce((h, c) => (h * 31 + c.charCodeAt(0)) | 0, 7)";
@@ -37,6 +39,11 @@ test.skipIf(!hasBrowser)("fill-secret fills the page and leaks the value nowhere
   // The login page embeds a cross-origin iframe ("localhost" is another host than "127.0.0.1").
   const page = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: (req) => new Response(new URL(req.url).pathname === "/frame"
     ? `<!doctype html><label>Evil <input id=evil></label>`
+    : new URL(req.url).pathname === "/autofill"
+    // Set by script, like autofill: not in the markup. A neutral label, so only the live scan
+    // (not the label-based fallback) can catch it.
+    ? `<!doctype html><title>autofill</title><label>Secret word <input id=apw type=password></label>` +
+      `<script>document.getElementById("apw").value = ${JSON.stringify(AUTOFILL)}</script>`
     : `<!doctype html><title>login</title><form onsubmit="event.preventDefault();document.title='submitted'">` +
       `<label>Password <input id=pw type=password></label><label>Code <input id=code></label><button>Log in</button></form>` +
       `<iframe src="http://localhost:${new URL(req.url).port}/frame"></iframe>`,
@@ -98,6 +105,14 @@ test.skipIf(!hasBrowser)("fill-secret fills the page and leaks the value nowhere
     expect(snap.out).toContain('textbox "Password"');
     expect(snap.out).toMatch(/textbox "Password"[^\n]*: \*\*\*/);
 
+    // An autofilled password (never passed through fill-secret) is masked in snapshots too.
+    const autofillNav = await rech(["goto", `http://127.0.0.1:${page.port}/autofill`]);
+    expect(autofillNav.status).toBe(0);
+    expect((await rech(fieldHash("#apw"))).out).toContain(`H${hash(AUTOFILL)}`); // really filled
+    const autofillSnap = await rech(["snapshot"]);
+    expect(autofillSnap.out).toMatch(/textbox "Secret word"[^\n]*: \*\*\*/);
+    expect(autofillNav.out + autofillSnap.out).not.toContain(AUTOFILL);
+
     for (const out of [opened, refused, framed, filled, totp, snap].map(r => r.out)) {
       expect(out).not.toContain(CANARY);
       expect(out).not.toContain(SEED);
@@ -106,8 +121,10 @@ test.skipIf(!hasBrowser)("fill-secret fills the page and leaks the value nowhere
     expect(log).toContain("run: rech fill-secret e3");
     expect(log).not.toContain(CANARY);
     expect(log).not.toContain(SEED);
+    expect(log).not.toContain(AUTOFILL);
     // Nothing on disk: daemon home (snapshots, downloads), the client's project dir, the browser profile.
     for (const dir of [home, work, udd]) expect(await grepTree(dir, CANARY)).toEqual([]);
+    for (const dir of [home, work]) expect(await grepTree(dir, AUTOFILL)).toEqual([]);
   } finally {
     await rech(["close"]).catch(() => {});
     serve.kill();
