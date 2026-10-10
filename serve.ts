@@ -1,8 +1,8 @@
 import { readListeners, listenerAddress, authorizeProfileRequest, canReadProfileFile, profileOutputPrefix, normalizePrefix, resolveAllowedProfile, type Listener } from "./listeners.ts";
 import { file } from "bun";
 import { createHash, X509Certificate } from "crypto";
-import { mkdirSync, lstatSync, statSync, chmodSync, unlinkSync, accessSync, readdirSync, realpathSync, constants as fsConstants } from "fs";
-import { join, resolve, relative, isAbsolute } from "path";
+import { mkdirSync, lstatSync, statSync, chmodSync, unlinkSync, accessSync, readdirSync, realpathSync, existsSync, readFileSync, constants as fsConstants } from "fs";
+import { join, resolve, relative, isAbsolute, sep } from "path";
 import { tmpdir } from "os";
 import {
   log,
@@ -87,9 +87,12 @@ const recentSessions = new Map<string, number>();
 // while afterwards: snapshots echo input values (passwords included). See fill-secret.ts.
 const secretMasker = new SecretMasker();
 const TEXT_OUTPUT = /\.(?:ya?ml|json|md|txt|log)$/i;
-// /run commands in flight. A snapshot file exists on disk before its command has checked it for
-// password values, so text downloads (/files) wait until no command is in flight.
-const runsInFlight = new Set<Promise<void>>();
+// /run commands in flight, with the (real) output dir each writes to once known. A snapshot file
+// exists on disk before its command has checked it for password values, so a text download waits
+// until no command writing to its directory is in flight.
+const runsInFlight = new Map<Promise<void>, string | undefined>();
+// Only the CLI's own artifacts are ever scrubbed or deleted, never a file a page merely names.
+const CLI_TEXT_ARTIFACT = /(^|\/)\.playwright-cli(-multi-tab)?\/[^/]+\.(?:ya?ml|json|md|txt|log)$/;
 // Artifacts that could not be checked AND could not be deleted: never served.
 const deniedFiles = new Set<string>();
 function noteSession(sess: string, now: number): void {
@@ -615,10 +618,12 @@ export async function serve() {
         if (!isUnderDir(realpathSync(workDir), real) || !canReadProfileFile(listener, relative(realpathSync(workDir), real).replaceAll("\\", "/"))) return new Response("Forbidden", { status: 403 });
         if (deniedFiles.has(real)) return new Response("Forbidden", { status: 403 });
         if (TEXT_OUTPUT.test(real)) {
-          while (runsInFlight.size) await Promise.all(runsInFlight); // re-check: new runs may start
+          const busy = () => [...runsInFlight].filter(([, dir]) => !dir || real.startsWith(dir + sep)).map(([p]) => p);
+          for (let pending = busy(); pending.length; pending = busy()) await Promise.all(pending); // re-check: new runs may start
+          // Synchronous from the last check on: no await, so no new run can start and write here.
           if (deniedFiles.has(real)) return new Response("Forbidden", { status: 403 });
-          if (!(await f.exists())) return new Response("Not found", { status: 404 }); // withheld
-          return new Response(maskPasswordLines(secretMasker.mask(await f.text())));
+          if (!existsSync(real)) return new Response("Not found", { status: 404 }); // withheld
+          return new Response(maskPasswordLines(secretMasker.mask(readFileSync(real, "utf8"))));
         }
         return new Response(f);
       }
@@ -663,7 +668,7 @@ export async function serve() {
       markActivity(); // a real command: this serve is not idle
       let runDone = () => {};
       const running = new Promise<void>((r) => { runDone = r; });
-      runsInFlight.add(running);
+      runsInFlight.set(running, undefined); // dir not known yet: holds every text download
       try { return await (async () => {
 
       const body = await req.json();
@@ -700,6 +705,7 @@ export async function serve() {
       const outputPrefix = scopedProfile ? profileOutputPrefix(scopedProfile) : "";
       const runWorkDir = scopedProfile ? join(workDir, outputPrefix) : workDir;
       mkdirSync(runWorkDir, { recursive: true });
+      runsInFlight.set(running, realpathSync(runWorkDir));
       let args: string[];
       let sessionId: string;
       let clientName = "";
@@ -1011,7 +1017,7 @@ export async function serve() {
       // files this command wrote (a page can merely mention an existing file's name). One that
       // can't be checked or scrubbed is deleted, or, failing that, never served.
       if (snapshotOut || secretMasker.active) for (const f of [...outputFiles]) {
-        if (!TEXT_OUTPUT.test(f)) continue;
+        if (!CLI_TEXT_ARTIFACT.test(f.replaceAll("\\", "/"))) continue;
         const path = join(runWorkDir, f);
         let mtimeMs = 0;
         try { mtimeMs = statSync(path).mtimeMs; } catch { continue; }
