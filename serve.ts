@@ -1030,8 +1030,10 @@ export async function serve() {
         try {
           // Unchecked: withhold every snapshot file, and anything the command was told to write.
           if (withheld && (ownFile || /\.ya?ml$/i.test(f))) throw new Error("withheld");
-          if (!TEXT_OUTPUT.test(f)) continue; // binary (e.g. a screenshot): nothing to mask as text
-          const text = await file(path).text();
+          // Text vs binary by content, not name: `snapshot --filename=x.png` writes text.
+          const bytes = new Uint8Array(await file(path).arrayBuffer());
+          if (bytes.subarray(0, 8192).includes(0)) continue; // binary (e.g. a screenshot)
+          const text = new TextDecoder().decode(bytes);
           const masked = maskPasswordLines(secretMasker.mask(text));
           if (masked !== text) await Bun.write(path, masked);
         } catch {

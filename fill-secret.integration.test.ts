@@ -118,6 +118,9 @@ test.skipIf(!hasBrowser)("fill-secret fills the page and leaks the value nowhere
     expect(autofillSnap.out).toMatch(/textbox "Shown word"[^\n]*: \*\*\*/);
     expect(autofillNav.out + autofillSnap.out).not.toContain(AUTOFILL);
     expect(autofillNav.out + autofillSnap.out).not.toContain(REVEALED);
+    // A snapshot saved under a binary-looking name is still text and still masked.
+    const pngSnap = await rech(["snapshot", "--filename=leak.png"]);
+    expect(pngSnap.out).not.toContain(AUTOFILL);
 
     for (const out of [opened, refused, framed, filled, totp, snap].map(r => r.out)) {
       expect(out).not.toContain(CANARY);
@@ -158,8 +161,8 @@ test("a snapshot that can't be checked for passwords is withheld, not passed thr
     import { mkdirSync, writeFileSync } from "fs";
     mkdirSync(".playwright-cli", { recursive: true });
     writeFileSync(".playwright-cli/page-1.yml", '- textbox "Secret word" [ref=e1]: ${LEAK}\\n');
-    for (const n of ["custom.yaml", "state.txt"]) if (process.argv.includes("--filename=" + n)) writeFileSync(n, '- textbox "Secret word" [ref=e1]: ${LEAK}\\n');
-    console.log('### Page\\n- Page URL: https://example.com/\\n### Snapshot\\n\`\`\`yaml\\n- textbox "Secret word" [ref=e1]: ${LEAK}\\n\`\`\`\\n### Events\\n- [Snapshot](.playwright-cli/page-1.yml) see settings.yml custom.yaml state.txt');
+    for (const n of ["custom.yaml", "state.txt", "leak.png"]) if (process.argv.includes("--filename=" + n)) writeFileSync(n, '- textbox "Secret word" [ref=e1]: ${LEAK}\\n');
+    console.log('### Page\\n- Page URL: https://example.com/\\n### Snapshot\\n\`\`\`yaml\\n- textbox "Secret word" [ref=e1]: ${LEAK}\\n\`\`\`\\n### Events\\n- [Snapshot](.playwright-cli/page-1.yml) see settings.yml custom.yaml state.txt leak.png');
   `);
   const reserve = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("") });
   const port = reserve.port!;
@@ -196,6 +199,7 @@ test("a snapshot that can't be checked for passwords is withheld, not passed thr
       body: JSON.stringify({ args: ["snapshot", "--filename=state.txt"], identity: { key: "/withhold-test" } }),
     })).json() as { stdout: string; files: string[] };
     expect(txt.files).not.toContain("state.txt");
+    expect(await grepTree(home, LEAK)).toEqual([]);
     expect(await grepTree(home, LEAK)).toEqual([]);
   } finally {
     serve.kill();
