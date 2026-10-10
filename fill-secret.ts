@@ -1,0 +1,291 @@
+// `rech fill-secret`: type a password or TOTP code into a page without the value ever
+// reaching an argv, a log line, or command output.
+//
+// The secret lives with the client (an env var or stdin), so the client reads it and sends it
+// in its own JSON body field, `secret`, never in `args`. The daemon (`serve`) then:
+//   - logs only the args (ref + flags), never `secret`;
+//   - hands the value to the session's cliDaemon over its local unix socket as a run-code
+//     message, so no child process carries it in argv;
+//   - checks the page host and fills in one step, so --allow-domain can't be raced by a
+//     navigation between a separate check and the fill;
+//   - masks the value as *** in that command's output, and keeps masking it in every later
+//     output and served text file (snapshots echo input values, passwords included) for
+//     SECRET_MASK_TTL_MS.
+import { createHmac } from "crypto";
+import { connect } from "net";
+import { readdirSync } from "fs";
+import { join } from "path";
+
+export const SECRET_MASK = "***";
+export const SECRET_MASK_TTL_MS = 15 * 60_000;
+
+// ---------- client side ----------
+
+export type FillSecretRequest = {
+  ref: string;
+  source: { kind: "env" | "stdin"; name?: string; envFile?: string };
+  totp: boolean;
+  allowDomains: string[];
+  submit: boolean;
+};
+
+export const FILL_SECRET_USAGE = `Usage: rech fill-secret <ref> (--from-env VAR | --from-stdin | --totp-from-env VAR | --totp-from-stdin)
+                         [--env-file <path>] [--allow-domain <glob>]... [--submit]
+  Fills <ref> (from \`rech snapshot\`) with a secret the daemon never logs or echoes.
+  --from-env VAR        the value of env var VAR on this machine
+  --from-stdin          the first line of stdin
+  --totp-from-env VAR   the current 6-digit TOTP code (RFC 6238, SHA1, 30s) for the base32 seed in VAR;
+                        only the code leaves this machine, never the seed
+  --totp-from-stdin     the same, seed read from stdin
+  --env-file PATH       look VAR up in this dotenv file instead of the environment
+  --allow-domain GLOB   refuse unless the page host matches, e.g. '*.my.salesforce.com' (repeatable)
+  --submit              press Enter after filling`;
+
+/** Parse `fill-secret` args (without the command itself). Throws a usage error. */
+export function parseFillSecretArgs(args: string[]): FillSecretRequest {
+  let ref: string | undefined;
+  let source: FillSecretRequest["source"] | undefined;
+  let totp = false;
+  const allowDomains: string[] = [];
+  let submit = false;
+  let envFile: string | undefined;
+  const setSource = (s: FillSecretRequest["source"], isTotp: boolean) => {
+    if (source) throw new Error("fill-secret takes exactly one of --from-env, --from-stdin, --totp-from-env, --totp-from-stdin");
+    source = s;
+    totp = isTotp;
+  };
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    const eq = a.indexOf("=");
+    const flag = a.startsWith("--") && eq > 0 ? a.slice(0, eq) : a;
+    const value = () => {
+      if (a.startsWith("--") && eq > 0) return a.slice(eq + 1);
+      const next = args[++i];
+      if (next === undefined || next.startsWith("--")) throw new Error(`${flag} needs a value`);
+      return next;
+    };
+    if (flag === "--from-env") setSource({ kind: "env", name: value() }, false);
+    else if (flag === "--totp-from-env") setSource({ kind: "env", name: value() }, true);
+    else if (flag === "--from-stdin") setSource({ kind: "stdin" }, false);
+    else if (flag === "--totp-from-stdin") setSource({ kind: "stdin" }, true);
+    else if (flag === "--allow-domain") allowDomains.push(...value().split(",").map(s => s.trim()).filter(Boolean));
+    else if (flag === "--submit") submit = true;
+    else if (flag === "--env-file") envFile = value();
+    else if (a.startsWith("-")) throw new Error(`fill-secret: unknown option ${a}`);
+    else if (ref === undefined) ref = a;
+    // A second positional is almost certainly the secret itself typed on the command line,
+    // which is exactly what this command exists to avoid. Don't echo it back.
+    else throw new Error("fill-secret takes the secret from --from-env/--from-stdin, never as an argument");
+  }
+  if (!ref) throw new Error("fill-secret needs a target ref, e.g. e12 (see `rech snapshot`)");
+  if (!source) throw new Error("fill-secret needs --from-env VAR, --from-stdin, --totp-from-env VAR or --totp-from-stdin");
+  if (envFile) {
+    if (source.kind !== "env") throw new Error("--env-file goes with --from-env / --totp-from-env");
+    source.envFile = envFile;
+  }
+  if (source.kind === "env" && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(source.name!)) throw new Error(`fill-secret: "${source.name}" is not an environment variable name`);
+  for (const d of allowDomains) domainGlobToRegExp(d); // validate early
+  return { ref, source, totp, allowDomains, submit };
+}
+
+/** The args the daemon sees (and logs): the ref and flags, never the secret or where it came from. */
+export function fillSecretWireArgs(req: FillSecretRequest): string[] {
+  return ["fill-secret", req.ref, ...req.allowDomains.map(d => `--allow-domain=${d}`), ...(req.submit ? ["--submit"] : [])];
+}
+
+/** Read the raw secret (a value, or a TOTP seed) from the client's env or stdin. */
+export async function readSecretSource(source: FillSecretRequest["source"], env = process.env, stdin: () => Promise<string> = () => Bun.stdin.text()): Promise<string> {
+  if (source.kind === "env") {
+    const v = source.envFile ? parseDotenv(await Bun.file(source.envFile).text().catch(() => { throw new Error(`fill-secret: cannot read ${source.envFile}`); }))[source.name!] : env[source.name!];
+    if (!v) throw new Error(`fill-secret: ${source.name} is not set or empty${source.envFile ? ` in ${source.envFile}` : ""}`);
+    return v;
+  }
+  const text = await stdin();
+  const v = text.replace(/\r?\n[\s\S]*$/, "");
+  if (!v) throw new Error("fill-secret: nothing on stdin");
+  return v;
+}
+
+/** Minimal dotenv: KEY=VALUE, optional `export `, single/double quotes, # comments. */
+export function parseDotenv(text: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const line of text.split(/\r?\n/)) {
+    const m = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
+    if (!m) continue;
+    let v = m[2]!;
+    const q = v[0];
+    if ((q === '"' || q === "'") && v.lastIndexOf(q) > 0) {
+      v = v.slice(1, v.lastIndexOf(q));
+      if (q === '"') v = v.replace(/\\n/g, "\n").replace(/\\(["\\])/g, "$1");
+    } else v = v.replace(/\s+#.*$/, "");
+    out[m[1]!] = v;
+  }
+  return out;
+}
+
+// ---------- TOTP (RFC 6238 / RFC 4226) ----------
+
+export function base32Decode(input: string): Buffer {
+  const s = input.replace(/[\s-]/g, "").replace(/=+$/, "").toUpperCase();
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  let bits = 0, acc = 0;
+  const out: number[] = [];
+  for (const ch of s) {
+    const v = alphabet.indexOf(ch);
+    // Never quote the input: it is the seed.
+    if (v < 0) throw new Error("TOTP seed is not valid base32");
+    acc = (acc << 5) | v;
+    bits += 5;
+    if (bits >= 8) { bits -= 8; out.push((acc >>> bits) & 0xff); }
+  }
+  if (!out.length) throw new Error("TOTP seed is empty");
+  return Buffer.from(out);
+}
+
+export function totpCode(seedBase32: string, timeMs = Date.now(), opts: { digits?: number; period?: number; algorithm?: "sha1" | "sha256" | "sha512" } = {}): string {
+  const { digits = 6, period = 30, algorithm = "sha1" } = opts;
+  const counter = Math.floor(timeMs / 1000 / period);
+  const msg = Buffer.alloc(8);
+  msg.writeBigUInt64BE(BigInt(counter));
+  const mac = createHmac(algorithm, base32Decode(seedBase32)).update(msg).digest();
+  const offset = mac[mac.length - 1]! & 0x0f;
+  const bin = ((mac[offset]! & 0x7f) << 24) | (mac[offset + 1]! << 16) | (mac[offset + 2]! << 8) | mac[offset + 3]!;
+  return String(bin % 10 ** digits).padStart(digits, "0");
+}
+
+/** ms to wait so a code still has at least `minLeftMs` of validity when it reaches the page. */
+export function totpWaitMs(timeMs = Date.now(), period = 30, minLeftMs = 5000): number {
+  const left = period * 1000 - (timeMs % (period * 1000));
+  return left < minLeftMs ? left + 50 : 0;
+}
+
+// ---------- shared ----------
+
+/**
+ * `example.com` matches only that host; `*.example.com` matches any subdomain at any depth
+ * (not the apex). Case-insensitive; ports are not part of the match.
+ */
+export function domainGlobToRegExp(glob: string): RegExp {
+  const g = glob.trim().toLowerCase();
+  if (!/^(\*\.)?[a-z0-9-]+(\.[a-z0-9-]+)*$/.test(g)) throw new Error(`--allow-domain "${glob}" is not a host or *.host glob`);
+  const esc = (s: string) => s.replace(/[.]/g, "\\.");
+  return g.startsWith("*.") ? new RegExp(`^(?:[a-z0-9-]+\\.)+${esc(g.slice(2))}$`, "i") : new RegExp(`^${esc(g)}$`, "i");
+}
+
+export function hostAllowed(host: string, globs: string[]): boolean {
+  return globs.length === 0 || globs.some(g => domainGlobToRegExp(g).test(host));
+}
+
+// ---------- daemon side ----------
+
+/** Parse what the daemon received; the scoped-listener check accepts exactly this shape. */
+export function parseFillSecretWire(args: string[]): { ref: string; allowDomains: string[]; submit: boolean } {
+  const [cmd, ref, ...rest] = args;
+  if (cmd !== "fill-secret" || !ref || ref.startsWith("-")) throw new Error("fill-secret needs a target ref");
+  const allowDomains: string[] = [];
+  let submit = false;
+  for (const a of rest) {
+    if (a === "--submit") submit = true;
+    else if (a.startsWith("--allow-domain=")) { const d = a.slice("--allow-domain=".length); domainGlobToRegExp(d); allowDomains.push(d); }
+    else throw new Error(`fill-secret: unexpected argument ${a.startsWith("-") ? a : "(positional)"}`);
+  }
+  return { ref, allowDomains, submit };
+}
+
+/**
+ * The run-code function the cliDaemon executes: host check and fill in one step. The value is
+ * embedded as a JSON string literal; the cliDaemon echoes this code back in its response, which
+ * the daemon masks before anything is logged or returned.
+ */
+const URL_HOST = /^[a-z][a-z0-9+.-]*:\/\/(?:[^@/?#]*@)?(\[[^\]]*\]|[^:/?#]*)/i;
+
+export function buildFillCode(ref: string, value: string, allowDomains: string[], submit: boolean): string {
+  const patterns = allowDomains.map(d => domainGlobToRegExp(d).source);
+  const locator = /^(f\d+)?e\d+$/.test(ref) ? `page.locator(${JSON.stringify(`aria-ref=${ref}`)})` : `page.locator(${JSON.stringify(ref)})`;
+  return `async page => {
+  // run-code's vm sandbox has no URL global; take the host straight from the URL string.
+  const m = new RegExp(${JSON.stringify(URL_HOST.source)}, "i").exec(page.url());
+  const host = m ? m[1].toLowerCase() : "";
+  const allowed = ${JSON.stringify(patterns)};
+  if (allowed.length && !allowed.some(p => new RegExp(p, "i").test(host)))
+    throw new Error("fill-secret refused: page host " + JSON.stringify(host) + " is not allowed by --allow-domain ${allowDomains.join(",").replace(/[^a-z0-9*.,-]/gi, "")}");
+  const target = ${locator};
+  await target.fill(${JSON.stringify(value)}, { timeout: 10000 });
+  ${submit ? `await target.press("Enter", { timeout: 10000 });` : ""}
+  return "filled " + ${JSON.stringify(ref)} + " on " + host;
+}`;
+}
+
+/** Values to mask, with expiry. Global, not per-session: masking a stray match is harmless. */
+export class SecretMasker {
+  private values = new Map<string, number>();
+  constructor(private ttlMs = SECRET_MASK_TTL_MS, private now = () => Date.now()) {}
+  add(value: string) { if (value) this.values.set(value, this.now() + this.ttlMs); }
+  get active(): boolean { this.prune(); return this.values.size > 0; }
+  mask(text: string): string {
+    if (!text) return text;
+    this.prune();
+    // Longest first, so a value containing another is masked whole.
+    for (const v of [...this.values.keys()].sort((a, b) => b.length - a.length)) {
+      text = text.replaceAll(v, SECRET_MASK);
+      // The cliDaemon echoes the value as a JS string literal; mask that spelling too.
+      const lit = JSON.stringify(v).slice(1, -1);
+      if (lit !== v) text = text.replaceAll(lit, SECRET_MASK);
+    }
+    return text;
+  }
+  private prune() { const t = this.now(); for (const [v, exp] of this.values) if (exp <= t) this.values.delete(v); }
+}
+
+/** Live cliDaemon sockets for a session: `<root>/<workspaceHash>-<session>.sock` (or older `<session>.sock`). */
+export function sessionSocketCandidates(socketRoot: string, session: string): string[] {
+  let names: string[] = [];
+  try { names = readdirSync(socketRoot); } catch { return []; }
+  return names.filter(n => n === `${session}.sock` || n.endsWith(`-${session}.sock`)).map(n => join(socketRoot, n));
+}
+
+/** One request/response over a cliDaemon socket (newline-delimited JSON). */
+export function socketRequest(path: string, method: string, params: unknown, timeoutMs = 30_000): Promise<{ result?: any; error?: string }> {
+  return new Promise((resolve, reject) => {
+    const sock = connect(path);
+    let buf = "";
+    const timer = setTimeout(() => { sock.destroy(); reject(new Error("timeout")); }, timeoutMs);
+    sock.on("connect", () => sock.write(`${JSON.stringify({ id: 1, method, params })}\n`));
+    sock.on("data", (d) => {
+      buf += d.toString();
+      const nl = buf.indexOf("\n");
+      if (nl < 0) return;
+      clearTimeout(timer);
+      sock.destroy();
+      try { resolve(JSON.parse(buf.slice(0, nl))); } catch { reject(new Error("unreadable cliDaemon response")); }
+    });
+    sock.on("error", (e) => { clearTimeout(timer); reject(e); });
+    sock.on("close", () => { clearTimeout(timer); reject(new Error("cliDaemon closed the connection")); });
+  });
+}
+
+/**
+ * Fill on the session's live browser. Returns the cliDaemon's reply (NOT yet masked — the
+ * caller masks it) or throws an error whose message never contains the value.
+ */
+export async function fillSecretOnSession(opts: { socketRoot: string; session: string; cwd: string; ref: string; value: string; allowDomains: string[]; submit: boolean }): Promise<{ isError: boolean; text: string }> {
+  // The cliDaemon listens on a named pipe there, which this socket scan can't find.
+  if (process.platform === "win32") throw new Error("fill-secret is not supported on a Windows daemon yet");
+  const code = buildFillCode(opts.ref, opts.value, opts.allowDomains, opts.submit);
+  const candidates = sessionSocketCandidates(opts.socketRoot, opts.session);
+  if (!candidates.length) throw new Error("no browser is open in this session; run `rech open <url>` first");
+  const errors: string[] = [];
+  for (const path of candidates) {
+    let reply: { result?: any; error?: string };
+    try {
+      reply = await socketRequest(path, "run", { args: { _: ["run-code", code] }, cwd: opts.cwd });
+    } catch (e) {
+      errors.push(e instanceof Error ? e.message : String(e)); // stale socket: try the next one
+      continue;
+    }
+    if (reply.error) throw new Error(reply.error);
+    const r = reply.result;
+    return { isError: !!r?.isError, text: typeof r === "string" ? r : typeof r?.text === "string" ? r.text : "" };
+  }
+  throw new Error(`could not reach this session's browser (${errors.join("; ")}); run \`rech open <url>\` first`);
+}

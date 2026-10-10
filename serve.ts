@@ -19,6 +19,7 @@ import {
   readChromeProfileCache,
   checkTailscaleServe,
 } from "./rechrome.ts";
+import { SecretMasker, parseFillSecretWire, fillSecretOnSession } from "./fill-secret.ts";
 
 const TAILSCALE_BIN = process.env.TAILSCALE_BIN || "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
 const CERT_RENEW_THRESHOLD_DAYS = 7;
@@ -82,6 +83,10 @@ const sessionTimeouts = new Map<string, number>(); // per-session consecutive-ti
 // Most-recently-used non-iso sessions, so the deep health probe can target something real
 // instead of spawning a fresh session (which could open a browser window).
 const recentSessions = new Map<string, number>();
+// Values typed by `fill-secret`, masked in every output, log line and served text file for a
+// while afterwards: snapshots echo input values (passwords included). See fill-secret.ts.
+const secretMasker = new SecretMasker();
+const TEXT_OUTPUT = /\.(?:ya?ml|json|md|txt|log)$/i;
 function noteSession(sess: string, now: number): void {
   recentSessions.set(sess, now);
   if (recentSessions.size > 64) {
@@ -603,6 +608,7 @@ export async function serve() {
         if (!(await f.exists())) return new Response("Not found", { status: 404 });
         const real = realpathSync(resolved);
         if (!isUnderDir(realpathSync(workDir), real) || !canReadProfileFile(listener, relative(realpathSync(workDir), real).replaceAll("\\", "/"))) return new Response("Forbidden", { status: 403 });
+        if (secretMasker.active && TEXT_OUTPUT.test(real)) return new Response(secretMasker.mask(await f.text()));
         return new Response(f);
       }
 
@@ -744,6 +750,27 @@ export async function serve() {
 
       log(`run: rech ${filteredArgs.join(" ")} (session=${namespacedSession})`);
 
+      // fill-secret: the value arrives in body.secret, never in args; it is handed to the live
+      // session over its socket (no child argv) and never logged. See fill-secret.ts.
+      if (filteredArgs[0] === "fill-secret") {
+        const secret = !Array.isArray(body) && typeof body.secret === "string" ? body.secret : "";
+        try {
+          const { ref, allowDomains, submit } = parseFillSecretWire(filteredArgs);
+          if (!secret) throw new Error("fill-secret: the request carried no secret (this client is older than the daemon?)");
+          secretMasker.add(secret);
+          const reply = await fillSecretOnSession({ socketRoot: tmpSocketRoot(), session: namespacedSession, cwd: runWorkDir, ref, value: secret, allowDomains, submit });
+          // Drop the echoed run-code body (it embeds the value, masked or not, and is noise).
+          const text = secretMasker.mask(reply.text).replace(/### Ran Playwright code\n```js\n[\s\S]*?\n```\n?/, "").trim();
+          const status = reply.isError ? 1 : 0;
+          log(`exit: ${status} | fill-secret ${ref}`);
+          return Response.json(reply.isError ? { status, stdout: "", stderr: `${text}\n`, files: [] } : { status, stdout: `${text}\n`, stderr: "", files: [] });
+        } catch (error) {
+          const message = secretMasker.mask(secret ? (error instanceof Error ? error.message : String(error)).replaceAll(secret, "***") : (error instanceof Error ? error.message : String(error)));
+          log(`exit: 1 | fill-secret: ${message.split("\n")[0]}`);
+          return Response.json({ status: 1, stdout: "", stderr: `[rech] ${message}\n`, files: [] });
+        }
+      }
+
       // For open commands, default to about:blank to avoid leaving connect.html visible
       const isOpenCmd = filteredArgs[0] === "open";
       const isOpenNoUrl = isOpenCmd && filteredArgs.length === 1;
@@ -863,7 +890,7 @@ export async function serve() {
           reject(new Error("timeout"));
         }, TIMEOUT);
       });
-      const [status, stdout, rawStderr] = await Promise.race([
+      let [status, stdout, rawStderr] = await Promise.race([
         Promise.all([
           proc.exited,
           new Response(proc.stdout).text(),
@@ -879,7 +906,7 @@ export async function serve() {
       const handshakeTimeoutMs = Number.isFinite(configuredHandshakeTimeout) && configuredHandshakeTimeout > 0
         ? configuredHandshakeTimeout
         : 30_000;
-      const stderr = inferSilentExtensionFailure({
+      let stderr = inferSilentExtensionFailure({
         status,
         stdout,
         stderr: rawStderr,
@@ -889,6 +916,7 @@ export async function serve() {
         handshakeTimeoutMs,
       });
 
+      if (secretMasker.active) { stdout = secretMasker.mask(stdout); stderr = secretMasker.mask(stderr); }
       log(`exit: ${status}${stdout.trim() ? ` | ${stdout.trim().slice(0, 200)}` : ""}`);
 
       // Relay self-heal (see notes at SESSION_CLOSE_TIMEOUTS). A command that RETURNS usually
@@ -949,6 +977,14 @@ export async function serve() {
             }
           }
         }
+      }
+
+      // Snapshot files echo input values: scrub them on disk too, not only on download.
+      if (secretMasker.active) for (const f of outputFiles) {
+        if (!TEXT_OUTPUT.test(f)) continue;
+        const path = join(runWorkDir, f);
+        const text = await file(path).text().catch(() => null);
+        if (text !== null && secretMasker.mask(text) !== text) await Bun.write(path, secretMasker.mask(text));
       }
 
       const rebrand = (s: string) => s.replaceAll("npx playwright-cli", "rech");

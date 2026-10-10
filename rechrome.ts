@@ -4,6 +4,7 @@ import { readListeners, writeListeners, listenerAddress, isLoopback, normalizePr
 import { file } from "bun";
 import yargs from "yargs";
 import { readExtensionTokenFromProfile } from "./extension-token.ts";
+import { FILL_SECRET_USAGE, SECRET_MASK, parseFillSecretArgs, fillSecretWireArgs, readSecretSource, totpCode, totpWaitMs } from "./fill-secret.ts";
 import { createHash, randomBytes } from "crypto";
 import { mkdirSync, appendFileSync, existsSync, realpathSync, accessSync, cpSync, unlinkSync, readFileSync, readdirSync, renameSync, rmdirSync, constants as fsConstants } from "fs";
 import { hostname, homedir, networkInterfaces } from "os";
@@ -1808,6 +1809,7 @@ async function callServe(
   overrideEnv?: Record<string, string>,
   precomputedIdentity?: { key: string; label: string; profile?: string },
   throwOnFailure = false,
+  secret?: string,
 ): Promise<{ status: number; stdout: string; stderr: string; files?: string[]; existingSession?: boolean }> {
   const { key, host, port, protocol, extensionId, extensionToken, profileDirectory, userDataDir, loadExtension } = parseUrl(url);
   // Reuse the caller's identity when provided — computing it shells out to `git` several times,
@@ -1826,7 +1828,8 @@ async function callServe(
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
     // dataDir is a client-local path; the daemon (possibly remote) only needs the session identity.
-    body: JSON.stringify({ args, identity: { key: identity.key, label: identity.label, profile: identity.profile }, env }),
+    // `secret` (fill-secret only) rides in its own field so it is never part of the logged args.
+    body: JSON.stringify({ args, identity: { key: identity.key, label: identity.label, profile: identity.profile }, env, ...(secret ? { secret } : {}) }),
     signal: AbortSignal.timeout(70_000),
   }).catch(async (e) => {
     if (throwOnFailure) throw new Error("Cannot reach the rechrome daemon. Check that it is running.");
@@ -2012,7 +2015,21 @@ async function run(url: string, args: string[], overrideEnv?: Record<string, str
 
   const resolvedEnv = await getClientEnv({ extensionId, extensionToken, profileDirectory: effectiveProfile, userDataDir, loadExtension });
   const effectiveEnv = { ...resolvedEnv, ...overrideEnv };
-  const { status, stdout, stderr, files, existingSession } = await callServe(url, args, overrideEnv, identity);
+  let secret: string | undefined;
+  const cmdIdx = args.findIndex(a => !a.startsWith("-s="));
+  if (args[cmdIdx] === "fill-secret") {
+    try {
+      ({ args, secret } = await prepareFillSecret(args));
+    } catch (err) {
+      console.error(`[rech] ${err instanceof Error ? err.message : String(err)}\n${FILL_SECRET_USAGE}`);
+      process.exit(2);
+    }
+  }
+  const served = await callServe(url, args, overrideEnv, identity, false, secret);
+  // The daemon already masks the value; this is a second line of defence for an older daemon.
+  const scrub = (s: string) => secret && s ? s.replaceAll(secret, SECRET_MASK) : s;
+  const { files, existingSession } = served;
+  const status = served.status, stdout = scrub(served.stdout), stderr = scrub(served.stderr);
 
   const isOpenWithUrl = args[0] === "open" && args.length > 1;
   if (existingSession && isOpenWithUrl) {
@@ -2067,6 +2084,22 @@ async function run(url: string, args: string[], overrideEnv?: Record<string, str
   }
 
   process.exit(status);
+}
+
+/** Swap the client-side fill-secret args for the wire form and read the value (or TOTP code). */
+async function prepareFillSecret(args: string[]): Promise<{ args: string[]; secret: string }> {
+  const sessionArgs = args.filter(a => a.startsWith("-s="));
+  const req = parseFillSecretArgs(args.filter(a => !a.startsWith("-s=")).slice(1));
+  const raw = await readSecretSource(req.source);
+  let secret = raw;
+  if (req.totp) {
+    const wait = totpWaitMs();
+    if (wait) { console.error(`[rech] TOTP code expires in under 5s; waiting ${Math.ceil(wait / 1000)}s for the next one`); await Bun.sleep(wait); }
+    secret = totpCode(raw); // only the code leaves this machine, never the seed
+  }
+  if (!req.allowDomains.length) console.error("[rech] fill-secret: no --allow-domain given; the value will be typed into whatever page is active");
+  const wire = fillSecretWireArgs(req);
+  return { args: [...wire, ...sessionArgs], secret };
 }
 
 export type SetupPhase = "extension" | "token" | "bridge" | "error" | "save" | "ready";
@@ -3653,6 +3686,8 @@ const HELP_EPILOGUE = `Browser commands (sent to this project's Chrome session):
       open, goto, click, fill, screenshot, eval, tab-list…  (\`rech pw --help\` lists all)
       --profile <p>  as another registered profile (email, name or folder); put it first
       --isolate      in a throwaway session, e.g. for a login flow
+  rech fill-secret <ref> --from-env VAR | --totp-from-env VAR [--env-file f] [--allow-domain '*.example.com']
+                     type a password / TOTP code without it reaching argv, logs or output
   rech pw <args>     forward verbatim to playwright-cli, e.g. \`rech pw --version\`
   rech --version     rechrome's version
 

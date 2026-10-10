@@ -64,6 +64,25 @@ verbatim: `rech --version` prints rechrome's version, `rech pw --version` playwr
 Commands from the same git worktree share one browser session, so tabs you open persist
 between calls; another worktree gets its own. `-s=<name>` opens a named sub-session.
 
+#### Passwords and 2FA codes: `fill-secret`
+
+`rech fill <ref> <password>` puts the password in the command line, the daemon log and the output.
+`fill-secret` keeps it out of all three:
+
+```bash
+rech fill-secret e7 --from-env SITE_PASSWORD --allow-domain '*.my.salesforce.com'
+rech fill-secret e9 --totp-from-env SITE_TOTP_SEED --env-file ~/secrets/.env --allow-domain '*.my.salesforce.com' --submit
+printf '%s\n' "$PW" | rech fill-secret e7 --from-stdin
+```
+
+The client reads the value (or computes the TOTP code from a base32 seed: SHA1, 6 digits, 30 s; the
+seed never leaves the client) and sends it outside the command's arguments. The daemon hands it to
+the browser over the session's local socket, checks the page host against `--allow-domain` and fills
+in one step, and shows `***` wherever the value would appear, in this command's output and, for
+15 minutes, in later snapshots, `eval` results and saved snapshot files too, since snapshots echo
+input values. Profile-scoped listeners accept `fill-secret` (with `--allow-domain`/`--submit`).
+Not yet supported on a Windows daemon.
+
 ### 3. Where things are kept
 
 | Where | What |
