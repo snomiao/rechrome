@@ -2018,6 +2018,7 @@ async function run(url: string, args: string[], overrideEnv?: Record<string, str
   let secret: string | undefined;
   const cmdIdx = args.findIndex(a => !a.startsWith("-s="));
   if (args[cmdIdx] === "fill-secret") {
+    if (args.some(a => a === "--help" || a === "-h")) { console.log(FILL_SECRET_USAGE); process.exit(0); }
     try {
       ({ args, secret } = await prepareFillSecret(args));
     } catch (err) {
