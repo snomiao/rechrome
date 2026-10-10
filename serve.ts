@@ -1018,7 +1018,9 @@ export async function serve() {
       // Snapshot files echo input values: scrub them on disk too, not only on download. Only
       // files this command wrote (a page can merely mention an existing file's name). One that
       // can't be checked or scrubbed is deleted, or, failing that, never served.
-      if (snapshotOut || secretMasker.active) for (const f of [...outputFiles]) {
+      // The command's own --filename targets count even when the output doesn't name them.
+      const ownTargets = ownFilenames.filter(n => isUnderDir(runWorkDir, n) && existsSync(join(runWorkDir, n)));
+      if (snapshotOut || secretMasker.active) for (const f of [...new Set([...outputFiles, ...ownTargets])]) {
         const ownFile = ownFilenames.some(n => resolve(runWorkDir, n) === resolve(runWorkDir, f));
         if (!ownFile && !CLI_TEXT_ARTIFACT.test(f.replaceAll("\\", "/"))) continue;
         const path = join(runWorkDir, f);
@@ -1026,13 +1028,15 @@ export async function serve() {
         try { mtimeMs = statSync(path).mtimeMs; } catch { continue; }
         if (mtimeMs < commandStartedAt - 1000) continue;
         try {
-          if (withheld && /\.ya?ml$/i.test(f)) throw new Error("withheld");
+          // Unchecked: withhold every snapshot file, and anything the command was told to write.
+          if (withheld && (ownFile || /\.ya?ml$/i.test(f))) throw new Error("withheld");
+          if (!TEXT_OUTPUT.test(f)) continue; // binary (e.g. a screenshot): nothing to mask as text
           const text = await file(path).text();
           const masked = maskPasswordLines(secretMasker.mask(text));
           if (masked !== text) await Bun.write(path, masked);
         } catch {
           try { unlinkSync(path); } catch { try { deniedFiles.add(realpathSync(path)); } catch {} }
-          outputFiles.splice(outputFiles.indexOf(f), 1);
+          if (outputFiles.includes(f)) outputFiles.splice(outputFiles.indexOf(f), 1);
         }
       }
 

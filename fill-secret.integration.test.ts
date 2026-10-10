@@ -158,8 +158,8 @@ test("a snapshot that can't be checked for passwords is withheld, not passed thr
     import { mkdirSync, writeFileSync } from "fs";
     mkdirSync(".playwright-cli", { recursive: true });
     writeFileSync(".playwright-cli/page-1.yml", '- textbox "Secret word" [ref=e1]: ${LEAK}\\n');
-    if (process.argv.includes("--filename=custom.yaml")) writeFileSync("custom.yaml", '- textbox "Secret word" [ref=e1]: ${LEAK}\\n');
-    console.log('### Page\\n- Page URL: https://example.com/\\n### Snapshot\\n\`\`\`yaml\\n- textbox "Secret word" [ref=e1]: ${LEAK}\\n\`\`\`\\n### Events\\n- [Snapshot](.playwright-cli/page-1.yml) see settings.yml custom.yaml');
+    for (const n of ["custom.yaml", "state.txt"]) if (process.argv.includes("--filename=" + n)) writeFileSync(n, '- textbox "Secret word" [ref=e1]: ${LEAK}\\n');
+    console.log('### Page\\n- Page URL: https://example.com/\\n### Snapshot\\n\`\`\`yaml\\n- textbox "Secret word" [ref=e1]: ${LEAK}\\n\`\`\`\\n### Events\\n- [Snapshot](.playwright-cli/page-1.yml) see settings.yml custom.yaml state.txt');
   `);
   const reserve = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("") });
   const port = reserve.port!;
@@ -190,6 +190,12 @@ test("a snapshot that can't be checked for passwords is withheld, not passed thr
       body: JSON.stringify({ args: ["snapshot", "--filename=custom.yaml"], identity: { key: "/withhold-test" } }),
     })).json() as { stdout: string; files: string[] };
     expect(JSON.stringify(custom)).not.toContain(LEAK);
+    // Whatever its extension.
+    const txt = await (await fetch(`http://127.0.0.1:${port}/run`, {
+      method: "POST", headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ args: ["snapshot", "--filename=state.txt"], identity: { key: "/withhold-test" } }),
+    })).json() as { stdout: string; files: string[] };
+    expect(txt.files).not.toContain("state.txt");
     expect(await grepTree(home, LEAK)).toEqual([]);
   } finally {
     serve.kill();
