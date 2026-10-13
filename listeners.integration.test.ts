@@ -85,14 +85,20 @@ test("multiple sockets enforce profile/file policies and reload without browser 
     const invalid = await (await run(qa, "qa", ["upload"], {}, { ...upload, contentType: "image/png" })).json();
     expect(invalid.status).toBe(1);
     // Real caller: stdin bytes are sent across HTTP, never interpreted as a host path.
-    const uploader = Bun.spawn([process.execPath, join(root, "rechrome.ts"), "--profile", "qa", "upload", "--name", "icon.svg"], {
-      cwd: root, env: { ...process.env, HOME: root, USERPROFILE: root, RECHROME_URL: `http://${qa.key}@127.0.0.1:${portA}/rechrome/?profile=qa` },
-      stdin: "pipe", stdout: "pipe", stderr: "pipe",
-    });
-    uploader.stdin.write(svg); uploader.stdin.end();
-    const [uploadCode, uploadOut, uploadErr] = await Promise.all([uploader.exited, new Response(uploader.stdout).text(), new Response(uploader.stderr).text()]);
-    expect(uploadCode).toBe(0);
-    expect(uploadOut).toContain('uploaded:' + Buffer.from(svg).toString('hex'));
+    for (const uploadArgs of [
+      ["upload", "--name", "icon.svg"],
+      ["-s=shricon", "upload", "--name", "icon.svg"],
+      ["upload", "-s=shricon", "--name", "icon.svg"],
+    ]) {
+      const uploader = Bun.spawn([process.execPath, join(root, "rechrome.ts"), "--profile", "qa", ...uploadArgs], {
+        cwd: root, env: { ...process.env, HOME: root, USERPROFILE: root, RECHROME_URL: `http://${qa.key}@127.0.0.1:${portA}/rechrome/?profile=qa` },
+        stdin: "pipe", stdout: "pipe", stderr: "pipe",
+      });
+      uploader.stdin.write(svg); uploader.stdin.end();
+      const [uploadCode, uploadOut, uploadErr] = await Promise.all([uploader.exited, new Response(uploader.stdout).text(), new Response(uploader.stderr).text()]);
+      expect(uploadCode).toBe(0);
+      expect(uploadOut).toContain('uploaded:' + Buffer.from(svg).toString('hex'));
+    }
     const shot = await (await run(qa, "qa", ["screenshot"])).json();
     expect(shot.files).toHaveLength(1);
     expect(await (await get(qa, `/files/${shot.files[0]}`)).text()).toBe("fixture");

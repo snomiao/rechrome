@@ -2015,7 +2015,7 @@ async function run(url: string, args: string[], overrideEnv?: Record<string, str
   const resolvedEnv = await getClientEnv({ extensionId, extensionToken, profileDirectory: effectiveProfile, userDataDir, loadExtension });
   const effectiveEnv = { ...resolvedEnv, ...overrideEnv };
   let upload: UploadPayload | undefined;
-  if (args[0] === "upload") {
+  if (args.find(a => !/^-s=[a-zA-Z0-9_-]{1,64}$/.test(a)) === "upload") {
     if (process.stdin.isTTY) throw new Error("upload reads stdin; redirect a PNG/SVG file with < icon.png");
     ({ args, upload } = await prepareStdinUpload(args, process.stdin));
   }
