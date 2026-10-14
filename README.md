@@ -364,5 +364,6 @@ still require an explicit operator-approved extension reload.
 
 This source change requires rebuilding the vendored Playwright bundle and
 reloading the updated extension before use. It does not modify a running daemon
-or extension. The draft PR records the outstanding real-browser validation;
-unit checks alone do not establish that the intermittent timeout is fixed.
+or extension. The draft PR records isolated-browser validation and negative
+controls; passing recovery tests does not establish the original intermittent
+timeout's root cause.
