@@ -345,3 +345,25 @@ PRs upstream are welcome. Once these features land in the official packages we w
 ## License
 
 MIT
+
+### Bridge connection diagnostics and recovery
+
+Each connection attempt records fixed phase names (launch, retry, WebSocket
+accepted, initialized, timeout/close) in its own private `.bridge.jsonl` file under
+`~/.cache/ms-playwright/bridge`, or `PLAYWRIGHT_MCP_BRIDGE_LOG_DIR` when configured
+for the Playwright process. Records contain an attempt ID, PID and timing only;
+no URLs, tokens, page text or raw error messages. CLI startup stderr is retained
+separately in a unique `.err` file for each launch and is not the sanitized log.
+
+A failed automated connection page retires itself at its deadline only if it
+still shows the original connection URL. The profile's worker can remove an older
+page for the same attempt and relay; it excludes other attempts, attached tabs,
+and tabs that navigated away. Automatic recovery no longer reloads the extension,
+which could disconnect other working lanes. A genuinely unresponsive worker can
+still require an explicit operator-approved extension reload.
+
+This source change requires rebuilding the vendored Playwright bundle and
+reloading the updated extension before use. It does not modify a running daemon
+or extension. The draft PR records isolated-browser validation and negative
+controls; passing recovery tests does not establish the original intermittent
+timeout's root cause.
