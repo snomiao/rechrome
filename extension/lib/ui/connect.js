@@ -4,18 +4,12 @@
 import { c as clientExports, j as jsxRuntimeExports, r as reactExports, A as AuthTokenSection, T as TabItem, B as Button, g as getOrCreateAuthToken } from "./authToken.js";
 const SUPPORTED_PROTOCOL_VERSION = 2;
 const BACKGROUND_RESPONSE_TIMEOUT_MS = 1e4;
-const SELF_RELOAD_GUARD_KEY = "connect-self-reload-at";
-const SELF_RELOAD_MIN_INTERVAL_MS = 6e4;
-function attemptExtensionSelfReload() {
-  if (new URLSearchParams(window.location.search).get("selfReload") !== "1")
-    return false;
-  const last = Number(localStorage.getItem(SELF_RELOAD_GUARD_KEY) || 0);
-  const now = Date.now();
-  if (now - last < SELF_RELOAD_MIN_INTERVAL_MS)
-    return false;
-  localStorage.setItem(SELF_RELOAD_GUARD_KEY, String(now));
-  chrome.runtime.reload();
-  return true;
+async function retireExpiredAttempt(originalUrl) {
+  const params = new URL(originalUrl).searchParams;
+  if (!/^[0-9a-f-]{36}$/.test(params.get("attempt") || "")) return;
+  const tab = await chrome.tabs.getCurrent();
+  if ((tab == null ? void 0 : tab.id) !== void 0 && tab.url === originalUrl)
+    await chrome.tabs.remove(tab.id);
 }
 async function sendMessageWithTimeout(message, simulateHang = false) {
   let timer;
@@ -41,6 +35,17 @@ const ConnectApp = () => {
     setStatus({ type: "error", message });
   }, []);
   reactExports.useEffect(() => {
+    const originalUrl = window.location.href;
+    const expiry = Number(new URL(originalUrl).searchParams.get("expires"));
+    let connected = false;
+    const onConnected = () => {
+      connected = true;
+    };
+    window.addEventListener("bridge-connected", onConnected);
+    const expiryTimer = Number.isFinite(expiry) && expiry > 0 ? setTimeout(() => {
+      if (!connected) void retireExpiredAttempt(originalUrl).catch(() => {
+      });
+    }, Math.max(0, Math.min(expiry - Date.now(), 2147483647))) : void 0;
     const runAsync = async () => {
       const params = new URLSearchParams(window.location.search);
       const relayUrl = params.get("mcpRelayUrl");
@@ -89,13 +94,12 @@ const ConnectApp = () => {
       let response;
       try {
         response = await sendMessageWithTimeout(
-          { type: "connectionRequested", mcpRelayUrl: relayUrl, protocolVersion: requestedVersion },
+          { type: "connectionRequested", mcpRelayUrl: relayUrl, protocolVersion: requestedVersion, recoveryAttempt },
           params.get("testHangOnce") === "1" && !recoveryAttempt
         );
       } catch (error) {
         if (hasAutomationToken && !recoveryAttempt) {
-          const reloading = attemptExtensionSelfReload();
-          setError(reloading ? "Extension service worker is not responding. Reloading extension and retrying…" : "Extension service worker is not responding. Retrying once…");
+          setError("Extension service worker is not responding. Retrying once…");
           return;
         }
         setError(`Extension service worker did not recover: ${error.message}`);
@@ -108,7 +112,7 @@ const ConnectApp = () => {
       const expectedToken = getOrCreateAuthToken();
       const token = params.get("token");
       if (token === expectedToken) {
-        await handleConnectToTab(void 0, info);
+        connected = !!await handleConnectToTab(void 0, info);
         return;
       }
       if (token) {
@@ -125,7 +129,11 @@ const ConnectApp = () => {
       chrome.runtime.sendMessage({ type: "keepalive" }).catch(() => {
       });
     }, 2e4);
-    return () => clearInterval(keepalive);
+    return () => {
+      clearInterval(keepalive);
+      clearTimeout(expiryTimer);
+      window.removeEventListener("bridge-connected", onConnected);
+    };
   }, []);
   const loadTabs = reactExports.useCallback(async () => {
     const response = await chrome.runtime.sendMessage({ type: "getTabs" });
@@ -144,6 +152,8 @@ const ConnectApp = () => {
       });
       if (response == null ? void 0 : response.success) {
         setStatus({ type: "connected", message: `"${clientName}" connected.` });
+        window.dispatchEvent(new Event("bridge-connected"));
+        return true;
       } else {
         setStatus({
           type: "error",
@@ -154,8 +164,7 @@ const ConnectApp = () => {
       const recoveryAttempt = new URLSearchParams(window.location.search).get("recoveryAttempt") === "1";
       const hasAutomationToken = !!new URLSearchParams(window.location.search).get("token");
       if (hasAutomationToken && !recoveryAttempt) {
-        const reloading = attemptExtensionSelfReload();
-        setError(reloading ? "Extension service worker stopped during connection. Reloading extension and retrying…" : "Extension service worker stopped during connection. Retrying once…");
+        setError("Extension service worker stopped during connection. Retrying once…");
         return;
       }
       setStatus({
@@ -163,6 +172,7 @@ const ConnectApp = () => {
         message: `"${clientName}" failed to connect: ${e}`
       });
     }
+    return false;
   }, [clientInfo, setError]);
   reactExports.useEffect(() => {
     const listener = (message) => {
