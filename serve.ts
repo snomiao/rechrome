@@ -1,8 +1,8 @@
 import { readListeners, listenerAddress, authorizeProfileRequest, canReadProfileFile, profileOutputPrefix, normalizePrefix, resolveAllowedProfile, type Listener } from "./listeners.ts";
 import { file } from "bun";
 import { createHash, X509Certificate } from "crypto";
-import { mkdirSync, lstatSync, chmodSync, unlinkSync, accessSync, readdirSync, realpathSync, constants as fsConstants } from "fs";
-import { join, resolve, relative, isAbsolute } from "path";
+import { mkdirSync, lstatSync, statSync, chmodSync, unlinkSync, accessSync, readdirSync, realpathSync, existsSync, readFileSync, constants as fsConstants } from "fs";
+import { join, resolve, relative, isAbsolute, sep } from "path";
 import { tmpdir } from "os";
 import {
   log,
@@ -19,6 +19,7 @@ import {
   readChromeProfileCache,
   checkTailscaleServe,
 } from "./rechrome.ts";
+import { SecretMasker, parseFillSecretWire, fillSecretOnSession, passwordValuesOnSession, hasSnapshot, maskPasswordLines, withholdSnapshots } from "./fill-secret.ts";
 
 const TAILSCALE_BIN = process.env.TAILSCALE_BIN || "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
 const CERT_RENEW_THRESHOLD_DAYS = 7;
@@ -82,6 +83,18 @@ const sessionTimeouts = new Map<string, number>(); // per-session consecutive-ti
 // Most-recently-used non-iso sessions, so the deep health probe can target something real
 // instead of spawning a fresh session (which could open a browser window).
 const recentSessions = new Map<string, number>();
+// Values typed by `fill-secret`, masked in every output, log line and served text file for a
+// while afterwards: snapshots echo input values (passwords included). See fill-secret.ts.
+const secretMasker = new SecretMasker();
+const TEXT_OUTPUT = /\.(?:ya?ml|json|md|txt|log)$/i;
+// /run commands in flight, with the (real) output dir each writes to once known. A snapshot file
+// exists on disk before its command has checked it for password values, so a text download waits
+// until no command writing to its directory is in flight.
+const runsInFlight = new Map<Promise<void>, string | undefined>();
+// Only the CLI's own artifacts are ever scrubbed or deleted, never a file a page merely names.
+const CLI_TEXT_ARTIFACT = /(^|\/)\.playwright-cli(-multi-tab)?\/[^/]+\.(?:ya?ml|json|md|txt|log)$/;
+// Artifacts that could not be checked AND could not be deleted: never served.
+const deniedFiles = new Set<string>();
 function noteSession(sess: string, now: number): void {
   recentSessions.set(sess, now);
   if (recentSessions.size > 64) {
@@ -603,6 +616,15 @@ export async function serve() {
         if (!(await f.exists())) return new Response("Not found", { status: 404 });
         const real = realpathSync(resolved);
         if (!isUnderDir(realpathSync(workDir), real) || !canReadProfileFile(listener, relative(realpathSync(workDir), real).replaceAll("\\", "/"))) return new Response("Forbidden", { status: 403 });
+        if (deniedFiles.has(real)) return new Response("Forbidden", { status: 403 });
+        if (TEXT_OUTPUT.test(real)) {
+          const busy = () => [...runsInFlight].filter(([, dir]) => !dir || real.startsWith(dir + sep)).map(([p]) => p);
+          for (let pending = busy(); pending.length; pending = busy()) await Promise.all(pending); // re-check: new runs may start
+          // Synchronous from the last check on: no await, so no new run can start and write here.
+          if (deniedFiles.has(real)) return new Response("Forbidden", { status: 403 });
+          if (!existsSync(real)) return new Response("Not found", { status: 404 }); // withheld
+          return new Response(maskPasswordLines(secretMasker.mask(readFileSync(real, "utf8"))));
+        }
         return new Response(f);
       }
 
@@ -644,6 +666,10 @@ export async function serve() {
       const denied = authCheck(req, key);
       if (denied) return denied;
       markActivity(); // a real command: this serve is not idle
+      let runDone = () => {};
+      const running = new Promise<void>((r) => { runDone = r; });
+      runsInFlight.set(running, undefined); // dir not known yet: holds every text download
+      try { return await (async () => {
 
       const body = await req.json();
       let scopedProfile: string | undefined;
@@ -679,6 +705,7 @@ export async function serve() {
       const outputPrefix = scopedProfile ? profileOutputPrefix(scopedProfile) : "";
       const runWorkDir = scopedProfile ? join(workDir, outputPrefix) : workDir;
       mkdirSync(runWorkDir, { recursive: true });
+      runsInFlight.set(running, realpathSync(runWorkDir));
       let args: string[];
       let sessionId: string;
       let clientName = "";
@@ -743,6 +770,27 @@ export async function serve() {
       }
 
       log(`run: rech ${filteredArgs.join(" ")} (session=${namespacedSession})`);
+
+      // fill-secret: the value arrives in body.secret, never in args; it is handed to the live
+      // session over its socket (no child argv) and never logged. See fill-secret.ts.
+      if (filteredArgs[0] === "fill-secret") {
+        const secret = !Array.isArray(body) && typeof body.secret === "string" ? body.secret : "";
+        try {
+          const { ref, allowDomains, submit, totp } = parseFillSecretWire(filteredArgs);
+          if (!secret) throw new Error("fill-secret: the request carried no secret (this client is older than the daemon?)");
+          secretMasker.add(secret, totp ? undefined : Infinity);
+          const reply = await fillSecretOnSession({ socketRoot: tmpSocketRoot(), session: namespacedSession, cwd: runWorkDir, ref, value: secret, allowDomains, submit });
+          // Drop the echoed run-code body (it embeds the value, masked or not, and is noise).
+          const text = secretMasker.mask(reply.text).replace(/### Ran Playwright code\n```js\n[\s\S]*?\n```\n?/, "").trim();
+          const status = reply.isError ? 1 : 0;
+          log(`exit: ${status} | fill-secret ${ref}`);
+          return Response.json(reply.isError ? { status, stdout: "", stderr: `${text}\n`, files: [] } : { status, stdout: `${text}\n`, stderr: "", files: [] });
+        } catch (error) {
+          const message = secretMasker.mask(secret ? (error instanceof Error ? error.message : String(error)).replaceAll(secret, "***") : (error instanceof Error ? error.message : String(error)));
+          log(`exit: 1 | fill-secret: ${message.split("\n")[0]}`);
+          return Response.json({ status: 1, stdout: "", stderr: `[rech] ${message}\n`, files: [] });
+        }
+      }
 
       // For open commands, default to about:blank to avoid leaving connect.html visible
       const isOpenCmd = filteredArgs[0] === "open";
@@ -863,7 +911,7 @@ export async function serve() {
           reject(new Error("timeout"));
         }, TIMEOUT);
       });
-      const [status, stdout, rawStderr] = await Promise.race([
+      let [status, stdout, rawStderr] = await Promise.race([
         Promise.all([
           proc.exited,
           new Response(proc.stdout).text(),
@@ -879,7 +927,7 @@ export async function serve() {
       const handshakeTimeoutMs = Number.isFinite(configuredHandshakeTimeout) && configuredHandshakeTimeout > 0
         ? configuredHandshakeTimeout
         : 30_000;
-      const stderr = inferSilentExtensionFailure({
+      let stderr = inferSilentExtensionFailure({
         status,
         stdout,
         stderr: rawStderr,
@@ -889,6 +937,24 @@ export async function serve() {
         handshakeTimeoutMs,
       });
 
+      // Snapshots print every input's value, password fields included (e.g. ones Chrome
+      // autofilled). Read the live password values and mask them before anything is logged,
+      // returned or left on disk; the label-based pass catches what the scan misses.
+      // Fails closed: a snapshot that can't be fully checked is withheld, not passed through.
+      const rawOutput = `${stdout}\n${stderr}`; // artifact paths come from the unmasked text
+      const snapshotOut = hasSnapshot(rawOutput);
+      let withheld = "";
+      if (snapshotOut) {
+        try {
+          for (const v of await passwordValuesOnSession({ socketRoot: tmpSocketRoot(), session: namespacedSession, cwd: runWorkDir })) secretMasker.add(v, Infinity);
+        } catch (error) {
+          withheld = "could not check it for password values";
+          log(`snapshot withheld: ${secretMasker.mask(error instanceof Error ? error.message : String(error)).split("\n")[0]}`);
+        }
+      }
+      stdout = maskPasswordLines(secretMasker.mask(stdout));
+      stderr = maskPasswordLines(secretMasker.mask(stderr));
+      if (withheld) { stdout = withholdSnapshots(stdout, withheld); stderr = withholdSnapshots(stderr, withheld); }
       log(`exit: ${status}${stdout.trim() ? ` | ${stdout.trim().slice(0, 200)}` : ""}`);
 
       // Relay self-heal (see notes at SESSION_CLOSE_TIMEOUTS). A command that RETURNS usually
@@ -926,12 +992,8 @@ export async function serve() {
       }
 
       // Detect files mentioned in output
-      const filePattern = /[\w./-]+\.(?:png|jpe?g|pdf|json|yml)\b/gi;
-      const mentionedFiles = [
-        ...new Set(
-          [...stdout.matchAll(filePattern), ...stderr.matchAll(filePattern)].map((m) => m[0]),
-        ),
-      ];
+      const filePattern = /[\w./-]+\.(?:png|jpe?g|pdf|json|ya?ml)\b/gi;
+      const mentionedFiles = [...new Set([...rawOutput.matchAll(filePattern)].map((m) => m[0]))];
       const outputFiles: string[] = [];
       for (const f of mentionedFiles) {
         if (!isUnderDir(runWorkDir, f)) continue;
@@ -951,6 +1013,35 @@ export async function serve() {
         }
       }
 
+      // A file the command was told to write (`snapshot --filename=x.yml`) is its own artifact too.
+      const ownFilenames = filteredArgs.flatMap((a, i) => a.startsWith("--filename=") ? [a.slice(11)] : a === "--filename" && filteredArgs[i + 1] ? [filteredArgs[i + 1]!] : []);
+      // Snapshot files echo input values: scrub them on disk too, not only on download. Only
+      // files this command wrote (a page can merely mention an existing file's name). One that
+      // can't be checked or scrubbed is deleted, or, failing that, never served.
+      // The command's own --filename targets count even when the output doesn't name them.
+      const ownTargets = ownFilenames.filter(n => isUnderDir(runWorkDir, n) && existsSync(join(runWorkDir, n)));
+      if (snapshotOut || secretMasker.active) for (const f of [...new Set([...outputFiles, ...ownTargets])]) {
+        const ownFile = ownFilenames.some(n => resolve(runWorkDir, n) === resolve(runWorkDir, f));
+        if (!ownFile && !CLI_TEXT_ARTIFACT.test(f.replaceAll("\\", "/"))) continue;
+        const path = join(runWorkDir, f);
+        let mtimeMs = 0;
+        try { mtimeMs = statSync(path).mtimeMs; } catch { continue; }
+        if (mtimeMs < commandStartedAt - 1000) continue;
+        try {
+          // Unchecked: withhold every snapshot file, and anything the command was told to write.
+          if (withheld && (ownFile || /\.ya?ml$/i.test(f))) throw new Error("withheld");
+          // Text vs binary by content, not name: `snapshot --filename=x.png` writes text.
+          const bytes = new Uint8Array(await file(path).arrayBuffer());
+          if (bytes.subarray(0, 8192).includes(0)) continue; // binary (e.g. a screenshot)
+          const text = new TextDecoder().decode(bytes);
+          const masked = maskPasswordLines(secretMasker.mask(text));
+          if (masked !== text) await Bun.write(path, masked);
+        } catch {
+          try { unlinkSync(path); } catch { try { deniedFiles.add(realpathSync(path)); } catch {} }
+          if (outputFiles.includes(f)) outputFiles.splice(outputFiles.indexOf(f), 1);
+        }
+      }
+
       const rebrand = (s: string) => s.replaceAll("npx playwright-cli", "rech");
       return Response.json({
         status,
@@ -960,6 +1051,7 @@ export async function serve() {
         // a cross-OS daemon↔client (e.g. Windows daemon serving a Linux container client).
         files: outputFiles.map((p) => (outputPrefix + p).replaceAll("\\", "/")),
       });
+      })(); } finally { runsInFlight.delete(running); runDone(); }
     },
   });
 

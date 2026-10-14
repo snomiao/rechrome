@@ -11,7 +11,7 @@ test("multiple sockets enforce profile/file policies and reload without browser 
   const portA = a.port!, portB = b.port!;
   a.stop(true); b.stop(true);
   await mkdir(join(root, ".rechrome"));
-  for (const name of ["rechrome.ts", "serve.ts", "listeners.ts", "extension-token.ts", "daemon-manager.ts"])
+  for (const name of ["rechrome.ts", "serve.ts", "listeners.ts", "extension-token.ts", "daemon-manager.ts", "fill-secret.ts"])
     await copyFile(join(import.meta.dir, name), join(root, name));
   // The copied sources import packages (e.g. yargs); resolve them from the repo's node_modules.
   await symlink(join(import.meta.dir, "node_modules"), join(root, "node_modules"), "junction");

@@ -8,6 +8,7 @@ rechrome.js
 daemon-manager.js
 extension-token.js
 listeners.js
+fill-secret.js
 serve.js
 .playwright-cli/
 
