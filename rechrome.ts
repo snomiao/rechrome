@@ -827,16 +827,36 @@ const CHROME_LOCAL_STATE_PATHS = () => {
 
 type ChromeProfileInfo = { user_name?: string; name?: string };
 
+/** Why the last readChromeProfileCache() returned null (undefined when it succeeded). */
+let profileCacheProblem: string | undefined;
+
 export async function readChromeProfileCache(): Promise<Record<string, ChromeProfileInfo> | null> {
+  profileCacheProblem = undefined;
+  const problems: string[] = [];
   for (const statePath of CHROME_LOCAL_STATE_PATHS()) {
     const f = file(statePath);
     if (!(await f.exists())) continue;
     try {
       const data = JSON.parse(await f.text());
-      return data?.profile?.info_cache ?? null;
-    } catch {}
+      if (data?.profile?.info_cache) return data.profile.info_cache;
+      problems.push(`${statePath} has no profile list`);
+    } catch (error) {
+      problems.push(`${statePath} is unreadable (${error instanceof Error ? error.message : String(error)})`);
+    }
   }
+  profileCacheProblem = problems.join("; ") || "Chrome's Local State file was not found";
   return null;
+}
+
+/**
+ * Say so (once per process) when profile emails/names are unavailable, so a bare folder name
+ * like "Profile 1" is never mistaken for the whole story.
+ */
+let warnedProfileCache = false;
+export function warnIfProfileNamesUnavailable(cache: Record<string, ChromeProfileInfo> | null): void {
+  if (cache || warnedProfileCache) return;
+  warnedProfileCache = true;
+  console.error(`[rech] Chrome profile emails and names are unavailable (${profileCacheProblem ?? "Local State not read"}); profiles are shown by folder name only.`);
 }
 
 export function resolveChromeProfileSelector(
@@ -1306,6 +1326,7 @@ async function listRemoteProfiles(url: string): Promise<void> {
 
 async function listProfiles(): Promise<void> {
   const [cache, registry, root] = await Promise.all([readChromeProfileCache(), readTokenRegistry(), findChromeUserDataDir()]);
+  warnIfProfileNamesUnavailable(cache);
   const profiles = buildProfileRows(cache, registry, root);
   const listeners = await readListeners();
   const url = process.env[ENV_KEY];
@@ -1405,7 +1426,7 @@ export function registeredProfileChoices(registry: Record<string, TokenEntry>, c
     const info = !userDataDir || defaultDirs.includes(userDataDir) ? cache?.[dir] : undefined;
     const names = [info?.name, info?.user_name, key].filter((n): n is string => !!n && n !== dir);
     const shown = [...new Set(names)];
-    return { label: shown.length ? `${shown.join(" · ")}  [${dir}]` : dir, value: key };
+    return { label: shown.length ? `${shown.join(" · ")}  [${dir}]` : `${dir}  (no email or name known)`, value: key };
   });
 }
 
@@ -1639,6 +1660,7 @@ async function printProfileUri(selector?: string, listener?: string, opts: { loc
   const interactive = isInteractive();
   const registry = await readTokenRegistry();
   const cache = await readChromeProfileCache();
+  warnIfProfileNamesUnavailable(cache);
   const cancelled = () => new Error("Cancelled; nothing shared.");
   let config = await readListeners();
   const current = resolveEffectiveProfile(url ? parseUrl(url).profileDirectory : undefined);
@@ -3287,7 +3309,7 @@ async function setup(opts: SetupOptions = {}): Promise<void> {
   console.log(`✓ [1/5] Local management daemon verified; requested profile access: ${desiredBind}`);
 
   const cache = await readChromeProfileCache();
-  if (!cache) { console.error("      Chrome profiles not found"); rl?.close(); process.exit(1); }
+  if (!cache) { console.error(`      Chrome profiles not found: ${profileCacheProblem ?? "Local State not read"}`); rl?.close(); process.exit(1); }
   const userDataDir = await findChromeUserDataDir();
 
   async function pickProfile(exclude: Set<string>): Promise<[string, ChromeProfileInfo] | null> {
