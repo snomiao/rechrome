@@ -1,3 +1,4 @@
+import { receiveUpload, readRequestJson } from "./scoped-upload.ts";
 import { readListeners, listenerAddress, authorizeProfileRequest, canReadProfileFile, profileOutputPrefix, normalizePrefix, resolveAllowedProfile, type Listener } from "./listeners.ts";
 import { file } from "bun";
 import { createHash, X509Certificate } from "crypto";
@@ -645,7 +646,9 @@ export async function serve() {
       if (denied) return denied;
       markActivity(); // a real command: this serve is not idle
 
-      const body = await req.json();
+      let body: any;
+      try { body = await readRequestJson(req); }
+      catch { return Response.json({ status: 1, stdout: "", stderr: "Invalid JSON or request exceeds 3 MiB\n" }, { status: 400 }); }
       let scopedProfile: string | undefined;
       let profileEnv: Record<string, string> = {};
       if (scoped) {
@@ -674,7 +677,11 @@ export async function serve() {
           };
           body.identity.key = `scoped:${body.identity.key}`;
           body.env = {}; // Server-owned profile configuration wins over every client override.
-        } catch (error) { return Response.json({ status: 1, stdout: "", stderr: `${error instanceof Error ? error.message : String(error)}\n` }, { status: 403 }); }
+        } catch (error) {
+          if (Array.isArray(body?.args) && body.args.filter((a: unknown) => typeof a !== "string" || !/^-s=[a-zA-Z0-9_-]{1,64}$/.test(a))[0] === "upload")
+            log(`upload: ${JSON.stringify({ listener: listener.name, profile: scopedProfile ?? null, name: typeof body.upload?.name === "string" ? body.upload.name.slice(0, 128) : null, size: null, sha256: null, origin: null, result: "rejected" })}`);
+          return Response.json({ status: 1, stdout: "", stderr: `${error instanceof Error ? error.message : String(error)}\n` }, { status: 403 });
+        }
       }
       const outputPrefix = scopedProfile ? profileOutputPrefix(scopedProfile) : "";
       const runWorkDir = scopedProfile ? join(workDir, outputPrefix) : workDir;
@@ -829,6 +836,27 @@ export async function serve() {
           ? { PLAYWRIGHT_MCP_EXTENSION: "1" }
           : {}),
       };
+      if (filteredArgs[0] === "upload") {
+        const result = await receiveUpload({
+          policy: listener.uploads, payload: body.upload, args: filteredArgs,
+          audit: event => log(`upload: ${JSON.stringify({ listener: listener.name, profile: scopedProfile ?? body.identity?.profile ?? null, ...event })}`),
+          run: async uploadArgs => {
+            const child = Bun.spawn([bin, ...binArgs, ...uploadArgs, `-s=${namespacedSession}`], {
+              cwd: runWorkDir, stdin: "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true, env: playwrightCliEnv(childEnv),
+            });
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            try {
+              const result = Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+              const [status, stdout, stderr] = await Promise.race([result, new Promise<never>((_, reject) => {
+                timer = setTimeout(() => { child.kill(); reject(new Error("Upload command timed out")); }, 30_000);
+              })]);
+              return { status, stdout, stderr };
+            } finally { clearTimeout(timer); }
+          },
+        });
+        return Response.json({ ...result, files: [] });
+      }
+
       // Only a remaining open needs cleanup; a successful probe converted it to
       // goto and its live daemon socket must remain reachable.
       if (filteredArgs[0] === "open") {
