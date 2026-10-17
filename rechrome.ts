@@ -2106,6 +2106,26 @@ async function run(url: string, args: string[], overrideEnv?: Record<string, str
   process.exit(status);
 }
 
+/** The daemon's Playwright CLI predates `open --wait` (rechrome <= 1.35.1 bundled one). */
+export function cliRejectsWaitOption(output: string): boolean {
+  return /Unknown options?:?[^\n]*?['"`]?--wait\b/i.test(output);
+}
+
+/**
+ * setup's bridge probe: open about:blank without waiting for a load. The daemon owns the CLI and
+ * may be older than this client, so feature-check by behavior: if the CLI rejects `--wait`, probe
+ * again without it rather than reporting a broken bridge.
+ */
+export async function probeBridgeOpen<T extends { status: number; stdout: string; stderr: string }>(
+  call: (args: string[]) => Promise<T>,
+  note: (message: string) => void = () => {},
+): Promise<T> {
+  const probe = await call(["open", "about:blank", "--wait", "none"]);
+  if (probe.status === 0 || !cliRejectsWaitOption(`${probe.stderr}\n${probe.stdout}`)) return probe;
+  note("The daemon's Playwright CLI does not support `open --wait`; probing without it (update rechrome on the daemon host).");
+  return call(["open", "about:blank"]);
+}
+
 export type SetupPhase = "extension" | "token" | "bridge" | "error" | "save" | "ready";
 
 export function createSetupGuide(extDistDir: string, profileDisplay: string) {
@@ -3450,12 +3470,9 @@ async function setup(opts: SetupOptions = {}): Promise<void> {
     guide?.takeRetry();
     guide?.update("bridge", "Extension and token detected. Testing the browser connection…");
     try {
-      const probe = await callServe(
-        rechUrl.toString(),
-        [`-s=${probeSession}`, "open", "about:blank", "--wait", "none"],
-        probeEnv,
-        probeIdentity,
-        true,
+      const probe = await probeBridgeOpen(
+        args => callServe(rechUrl.toString(), [`-s=${probeSession}`, ...args], probeEnv, probeIdentity, true),
+        note => console.log(`      ${note}`),
       );
       bridgeVerified = probe.status === 0;
       if (bridgeVerified) {
