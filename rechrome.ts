@@ -2034,7 +2034,16 @@ export function unknownCommandHint(output: string, rechCommands: Iterable<string
   ].join("\n");
 }
 
-async function run(url: string, args: string[], overrideEnv?: Record<string, string>, opts: { verbatim?: boolean } = {}) {
+/**
+ * An `open` whose extension bridge never connected. Typical right after Chrome restarts: the
+ * relay's connect page reaches no live worker, yet a fresh bridge moments later connects at once
+ * (seen 2026-10-17: a timeout, then `rech setup`'s probe connected in 0.1s). Worth one retry.
+ */
+export function isBridgeTimeout(args: string[], result: { status: number; stderr?: string }): boolean {
+  return args.find(a => !a.startsWith("-")) === "open" && result.status !== 0 && /Extension connection timeout/i.test(result.stderr ?? "");
+}
+
+async function run(url: string, args: string[], overrideEnv?: Record<string, string>, opts: { verbatim?: boolean; bridgeRetried?: boolean } = {}) {
   // Match the underlying CLI's command names while accepting the short forms humans
   // naturally try. Keep this client-side so old and new serve daemons behave alike.
   args = normalizeCommandArgs(args);
@@ -2050,6 +2059,13 @@ async function run(url: string, args: string[], overrideEnv?: Record<string, str
   const resolvedEnv = await getClientEnv({ extensionId, extensionToken, profileDirectory: effectiveProfile, userDataDir, loadExtension });
   const effectiveEnv = { ...resolvedEnv, ...overrideEnv };
   const { status, stdout, stderr, files, existingSession } = await callServe(url, args, overrideEnv, identity);
+  if (!opts.bridgeRetried && isBridgeTimeout(args, { status, stderr })) {
+    // Close the failed session so the retry gets a fresh cliDaemon and relay. callServe re-reads
+    // the extension's live token from the profile, so a re-minted token heals here too.
+    console.error(`[rech] the Chrome extension bridge did not answer (common right after Chrome restarts); retrying once with a fresh connection…`);
+    await callServe(url, [...args.filter(a => /^-s=/.test(a)), "close"], overrideEnv, identity).catch(() => {});
+    return run(url, args, overrideEnv, { ...opts, bridgeRetried: true });
+  }
 
   const isOpenWithUrl = args[0] === "open" && args.length > 1;
   if (existingSession && isOpenWithUrl) {
@@ -2069,9 +2085,12 @@ async function run(url: string, args: string[], overrideEnv?: Record<string, str
       // The daemon resolves registered profiles' bridge tokens itself and then asks for a reload;
       // only blame a missing install when neither side had credentials.
       const hasToken = !!effectiveEnv["PLAYWRIGHT_MCP_EXTENSION_TOKEN"] || /reload the .*extension/i.test(stderr);
+      const profileArg = displayProfile ? ` --profile ${JSON.stringify(displayProfile)}` : "";
       const last = hasToken
-        ? `  -x: extension did not connect (reload it at chrome://extensions; then verify its token) -> extension[degraded]`
-        : `  -> extension[not installed]  (run: rech setup)`;
+        ? `  -x: extension did not connect${opts.bridgeRetried ? " (also after an automatic retry)" : ""} -> extension[degraded]\n` +
+          `[rech] reload "Playwright MCP Bridge" at chrome://extensions${displayProfile ? ` in ${displayProfile}'s window` : ""}, then retry; ` +
+          `or run \`rech setup${profileArg}\`, which re-detects the extension and token and verifies the connection.`
+        : `  -> extension[not installed]  (run: rech setup${profileArg})`;
       console.error(`[rech] rech-client -> rech-server[ok] -> playwright[ok]\n${last}`);
     }
     if (stderr.includes("Browser '") && stderr.includes("is not open")) {
