@@ -2605,6 +2605,7 @@ export async function daemonInstall(serveUrl: string): Promise<void> {
     [ENV_KEY]: serveUrl,
     PWMCP_TEST_CONNECTION_TIMEOUT: process.env.PWMCP_TEST_CONNECTION_TIMEOUT || "30000",
     PLAYWRIGHT_CLI: resolvedPlaywrightCli,
+    RECH_SERVE_MANAGED: "1", // the manager restarts it; never idle-self-exit (see serve.ts)
   };
   if (process.env.RECH_HOST) daemonEnv.RECH_HOST = process.env.RECH_HOST;
   if (isReadable(process.env.RECH_TLS_CERT)) daemonEnv.RECH_TLS_CERT = process.env.RECH_TLS_CERT!;

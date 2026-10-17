@@ -169,8 +169,13 @@ describe("shouldExitOrphanedServe", () => {
 });
 
 describe("isManagedServe", () => {
-  test("a serve started with ppid 1 is supervised (launchd / daemonizing manager)", () => {
-    expect(isManagedServe(1, {})).toBe(true);
+  test("a LaunchAgent serve (ppid 1 + launchd job label) is supervised", () => {
+    expect(isManagedServe(1, { XPC_SERVICE_NAME: "dev.rechrome.serve" })).toBe(true);
+  });
+  test("a detached foreground serve (setsid / double fork) is not, despite ppid 1", () => {
+    expect(isManagedServe(1, {})).toBe(false);
+    expect(isManagedServe(1, { XPC_SERVICE_NAME: "0" })).toBe(false);
+    expect(isManagedServe(1, { XPC_SERVICE_NAME: "application.com.apple.Terminal.1234" })).toBe(false);
   });
   test("a serve started by a shell or agent is not, unless RECH_SERVE_MANAGED=1", () => {
     expect(isManagedServe(4242, {})).toBe(false);

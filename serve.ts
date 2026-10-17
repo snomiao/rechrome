@@ -436,11 +436,15 @@ export function parseIdleTimeout(raw: string | undefined, fallback = 5 * 60_000)
   return Number.isFinite(value) ? value : fallback;
 }
 
-// A serve that STARTS with ppid 1 was launched by launchd (a LaunchAgent) or a manager that
-// daemonized it: a supervisor owns its lifetime, so it is never a leaked foreground serve.
-// Only a serve whose parent died AFTER it started is orphaned. RECH_SERVE_MANAGED=1 says so explicitly.
+// A supervisor owns this serve's lifetime, so it is never a leaked foreground serve:
+// RECH_SERVE_MANAGED=1 (set by `rech setup`'s oxmgr/pm2 install), or a LaunchAgent — launchd
+// starts it with ppid 1 and its job label in XPC_SERVICE_NAME. ppid 1 alone is not enough:
+// `setsid rech serve` or `(rech serve &)` also starts with ppid 1 and must still self-exit.
+// Terminal apps set XPC_SERVICE_NAME to "0" or "application.<bundle id>…".
 export function isManagedServe(startPpid: number, env: Record<string, string | undefined> = process.env): boolean {
-  return startPpid === 1 || env.RECH_SERVE_MANAGED === "1";
+  if (env.RECH_SERVE_MANAGED === "1") return true;
+  const label = env.XPC_SERVICE_NAME;
+  return startPpid === 1 && !!label && label !== "0" && !label.startsWith("application.");
 }
 
 // Pure decision predicate (testable). idleTimeoutMs <= 0 disables orphan self-exit.

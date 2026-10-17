@@ -32,6 +32,12 @@ binary that needs the grant:
 2. Open System Settings → Privacy & Security → Full Disk Access and click **+**.
    Press ⌘⇧G, paste the path, and click **Open**. Make sure the switch is on.
 3. Restart the daemon (`oxmgr restart rechrome`), or install the LaunchAgent below.
+4. Check `rech status`. The `chrome: ⚠` line should be gone, and `rech open` should
+   connect.
+
+Full Disk Access is how macOS lifts this restriction for a command-line binary.
+The full launchd → Chrome connection with the grant in place has not been tested
+end to end yet. If `rech open` still fails after step 4, use option B.
 
 `~/Library/LaunchAgents/dev.rechrome.serve.plist`. Replace `/Users/YOU` and check
 the `PATH` (serve needs `node` for the Playwright CLI):
@@ -87,9 +93,10 @@ A serve started directly by an agent shuts itself down after 5 idle minutes once
 its parent has died (its ppid becomes 1), so a leaked serve does not live forever.
 These cases never self-exit:
 
-- a serve that **starts** with ppid 1, which is how launchd and daemonizing
-  managers run it
-- `RECH_SERVE_MANAGED=1`, for supervisors that keep serve as a child
+- a LaunchAgent serve: it starts with ppid 1 and launchd's job label in
+  `XPC_SERVICE_NAME`
+- `RECH_SERVE_MANAGED=1`. `rech setup` sets this for the oxmgr or pm2 daemon. Set
+  it yourself for any other supervisor.
 - `RECH_SERVE_IDLE_TIMEOUT_MS=0`, which disables idle self-exit. Before this
   change, `0` was treated as unset and the 5-minute default still applied.
 
