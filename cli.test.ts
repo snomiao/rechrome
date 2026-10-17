@@ -1,4 +1,4 @@
-import { test, expect } from "bun:test";
+import { describe, test, expect } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
@@ -335,4 +335,59 @@ test("a new link never takes a reserved name or a mount a proxy already serves",
   expect(serveMountsAndFunnel(status, "other.ts.net").funnel).toBe(false);
   expect(serveMountsAndFunnel({ ...status, AllowFunnel: { "node.ts.net:443": false } }, "node.ts.net").funnel).toBe(false);
   expect(serveMountsAndFunnel(null, "node.ts.net")).toEqual({ mounts: [], funnel: false });
+});
+
+// After a Chrome restart the first bridge can time out while a fresh one connects at once.
+describe("open retries once when the extension bridge times out", () => {
+  const timeout = "Extension connection timeout after 30000ms. Automatic recovery retry failed; reload the Playwright MCP Bridge extension at chrome://extensions and retry.\n";
+  async function withDaemon(openResults: Array<{ status: number; stdout: string; stderr: string }>, body: (calls: string[][], url: string) => Promise<void>) {
+    const calls: string[][] = [];
+    const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(req) {
+      if (new URL(req.url).pathname !== "/run") return new Response("rech server\n");
+      const { args } = await req.json() as { args: string[] };
+      calls.push(args);
+      if (args.includes("close")) return Response.json({ status: 0, stdout: "closed\n", stderr: "" });
+      return Response.json(openResults.shift() ?? { status: 1, stdout: "", stderr: "unexpected\n" });
+    } });
+    try { await body(calls, `http://127.0.0.1:${server.port}/#key=stub-key-0123456789`); } finally { server.stop(true); }
+  }
+
+  test("a timed-out open closes the session and succeeds on the retry", async () => {
+    await withDaemon([{ status: 1, stdout: "", stderr: timeout }, { status: 0, stdout: "### Browser opened\n", stderr: "" }], async (calls, url) => {
+      const { code, stdout, stderr } = await runRech(["-s=lane", "open", "about:blank"], { RECHROME_URL: url, HOME: "/nonexistent-home" });
+      expect(code).toBe(0);
+      expect(stdout).toContain("Browser opened");
+      expect(stderr).toContain("retrying once");
+      expect(calls).toEqual([["-s=lane", "open", "about:blank"], ["-s=lane", "close"], ["-s=lane", "open", "about:blank"]]);
+    });
+  });
+
+  test("--isolate keeps one throwaway session across the close and the retry", async () => {
+    await withDaemon([{ status: 1, stdout: "", stderr: timeout }, { status: 0, stdout: "### Browser opened\n", stderr: "" }], async (calls, url) => {
+      const { code } = await runRech(["--isolate", "open", "about:blank"], { RECHROME_URL: url, HOME: "/nonexistent-home" });
+      expect(code).toBe(0);
+      const sessions = calls.map(a => a.find(x => x.startsWith("-s=")));
+      expect(sessions).toHaveLength(3);
+      expect(sessions[0]).toMatch(/^-s=iso-[0-9a-f]+$/);
+      expect(new Set(sessions).size).toBe(1);
+    });
+  });
+
+  test("retries only once, then says how to recover", async () => {
+    await withDaemon([{ status: 1, stdout: "", stderr: timeout }, { status: 1, stdout: "", stderr: timeout }], async (calls, url) => {
+      const { code, stderr } = await runRech(["open", "about:blank"], { RECHROME_URL: url, HOME: "/nonexistent-home" });
+      expect(code).toBe(1);
+      expect(calls.filter(a => a.includes("open"))).toHaveLength(2);
+      expect(stderr).toContain("also after an automatic retry");
+      expect(stderr).toContain("rech setup");
+    });
+  });
+
+  test("other open failures are not retried", async () => {
+    await withDaemon([{ status: 1, stdout: "", stderr: "net::ERR_NAME_NOT_RESOLVED\n" }], async (calls, url) => {
+      const { code } = await runRech(["open", "https://nope.invalid"], { RECHROME_URL: url, HOME: "/nonexistent-home" });
+      expect(code).toBe(1);
+      expect(calls).toHaveLength(1);
+    });
+  });
 });
