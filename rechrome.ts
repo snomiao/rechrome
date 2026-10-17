@@ -827,6 +827,20 @@ const CHROME_LOCAL_STATE_PATHS = () => {
 
 type ChromeProfileInfo = { user_name?: string; name?: string };
 
+/**
+ * macOS privacy (TCC) blocks a process launched by launchd/oxmgr from Chrome's data folder unless
+ * its binary has Full Disk Access; a Terminal or agent session inherits the grant. Turn that EPERM
+ * into the fix. Undefined for any other error (or platform).
+ */
+export function chromeDataAccessHint(error: unknown, execPath = process.execPath, platform = process.platform): string | undefined {
+  const code = (error as { code?: string } | null)?.code;
+  const message = error instanceof Error ? error.message : String(error);
+  if (platform !== "darwin" || !(code === "EPERM" || code === "EACCES" || /EPERM|operation not permitted/i.test(message))) return undefined;
+  return `macOS privacy settings (TCC) block ${execPath} from reading Chrome's profile folder. ` +
+    `Grant it Full Disk Access: System Settings → Privacy & Security → Full Disk Access → +, press ⌘⇧G, paste ${execPath}, ` +
+    `then restart rech serve. Or run rech serve from Terminal, which already has access (see docs/macos-daemon.md).`;
+}
+
 /** Why the last readChromeProfileCache() returned null (undefined when it succeeded). */
 let profileCacheProblem: string | undefined;
 
@@ -841,7 +855,8 @@ export async function readChromeProfileCache(): Promise<Record<string, ChromePro
       if (data?.profile?.info_cache) return data.profile.info_cache;
       problems.push(`${statePath} has no profile list`);
     } catch (error) {
-      problems.push(`${statePath} is unreadable (${error instanceof Error ? error.message : String(error)})`);
+      const hint = chromeDataAccessHint(error);
+      problems.push(`${statePath} is unreadable (${error instanceof Error ? error.message : String(error)})${hint ? `. ${hint}` : ""}`);
     }
   }
   profileCacheProblem = problems.join("; ") || "Chrome's Local State file was not found";
@@ -3596,7 +3611,7 @@ async function status(): Promise<void> {
     ? await fetch(serviceUrl(url, "ping"), { headers: { Authorization: `Bearer ${parsed.key}` }, signal: AbortSignal.timeout(2000) }).catch(() => null)
     : null;
   const pingBody = pingResponse?.ok
-    ? await pingResponse.json().catch(() => null) as { bind?: string; listener?: string; profiles?: string[] | "*"; degraded?: boolean; consecutiveTimeouts?: number } | null
+    ? await pingResponse.json().catch(() => null) as { bind?: string; listener?: string; profiles?: string[] | "*"; degraded?: boolean; consecutiveTimeouts?: number; chromeAccessProblem?: string } | null
     : null;
   // Show the URL this client connects to; through a proxy, the daemon's bind is on another port.
   const details = [pingBody?.listener && `listener ${pingBody.listener}`, pingBody?.bind && `bind ${pingBody.bind}`].filter(Boolean).join(", ");
@@ -3617,6 +3632,8 @@ async function status(): Promise<void> {
   // No oxmgr/pm2 on PATH must not take down `rech status`: report it instead of throwing.
   let mgr: DaemonManager | undefined;
   if (isHost) try { mgr = daemonManager(); } catch { /* reported below */ }
+  if (pingBody?.chromeAccessProblem)
+    console.log(`chrome:   ⚠ daemon ${pingBody.chromeAccessProblem}`);
   if (pingBody?.degraded)
     console.log(`relay:    ⚠ degraded (${pingBody.consecutiveTimeouts} consecutive command timeouts) — if it persists, the daemon self-restarts; ${isHost ? `force it now with \`${mgr?.id ?? "oxmgr"} restart ${PM_PROCESS_NAME}\`` : "the daemon host can restart it"}`);
   if (isHost) {

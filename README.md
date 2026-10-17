@@ -164,6 +164,11 @@ If no supported daemon manager is available, setup asks before installing `oxmgr
 when launched with npx. Pass `--yes` to approve this without prompting,
 for example `bunx rechrome setup --profile Default --yes`.
 
+On macOS, a daemon started by launchd or oxmgr cannot read Chrome's profile folder
+until its bun binary has Full Disk Access. `rech status` and the serve log report
+this and name the binary. See [Keeping rech serve running on macOS](docs/macos-daemon.md)
+for the grant, a LaunchAgent, and the terminal keep-alive alternative.
+
 Agents setting up Chrome on macOS can use the [rechrome setup skill](skills/rechrome-setup/SKILL.md),
 which covers native extension installation with Computer Use and CLI connection verification.
 `rech setup` detects Codex and Claude Code environment hints and prints agent-specific guidance;
