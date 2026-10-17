@@ -362,6 +362,17 @@ describe("open retries once when the extension bridge times out", () => {
     });
   });
 
+  test("--isolate keeps one throwaway session across the close and the retry", async () => {
+    await withDaemon([{ status: 1, stdout: "", stderr: timeout }, { status: 0, stdout: "### Browser opened\n", stderr: "" }], async (calls, url) => {
+      const { code } = await runRech(["--isolate", "open", "about:blank"], { RECHROME_URL: url, HOME: "/nonexistent-home" });
+      expect(code).toBe(0);
+      const sessions = calls.map(a => a.find(x => x.startsWith("-s=")));
+      expect(sessions).toHaveLength(3);
+      expect(sessions[0]).toMatch(/^-s=iso-[0-9a-f]+$/);
+      expect(new Set(sessions).size).toBe(1);
+    });
+  });
+
   test("retries only once, then says how to recover", async () => {
     await withDaemon([{ status: 1, stdout: "", stderr: timeout }, { status: 1, stdout: "", stderr: timeout }], async (calls, url) => {
       const { code, stderr } = await runRech(["open", "about:blank"], { RECHROME_URL: url, HOME: "/nonexistent-home" });
