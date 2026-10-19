@@ -3658,6 +3658,7 @@ const HELP_EPILOGUE = `Browser commands (sent to this project's Chrome session):
 
 Environment:
   ${ENV_KEY}      connection URL; read from the nearest .rechrome/.env.local or .env.local
+  RECHROME_PROFILE  default browser profile selector; --profile overrides it
   RECH_IDENTITY     session key: worktree (default) | branch | cwd
   RECH_TOKEN        extension token for \`rech setup\` (same as --token)
   RECH_SETUP_AGENT  setup hints: codex | claude | none (auto-detected)
@@ -3848,7 +3849,7 @@ if (import.meta.main) {
     if (separator !== -1) args = args.slice(0, separator);
     try {
       const extracted = extractGlobalProfileArg(args);
-      profileSelector = extracted.selector;
+      profileSelector = extracted.selector ?? (process.env.RECHROME_PROFILE?.trim() || undefined);
       args = extracted.args;
     } catch (err) {
       console.error(err instanceof Error ? err.message : String(err));

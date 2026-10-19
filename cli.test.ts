@@ -336,3 +336,32 @@ test("a new link never takes a reserved name or a mount a proxy already serves",
   expect(serveMountsAndFunnel({ ...status, AllowFunnel: { "node.ts.net:443": false } }, "node.ts.net").funnel).toBe(false);
   expect(serveMountsAndFunnel(null, "node.ts.net")).toEqual({ mounts: [], funnel: false });
 });
+
+
+test("RECHROME_PROFILE selects remote profile; flag wins and blank preserves URL default", async () => {
+  const home = mkdtempSync(join(tmpdir(), "rech-profile-env-"));
+  const bodies: any[] = [];
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(req) {
+    if (new URL(req.url).pathname === "/run") {
+      bodies.push(await req.json());
+      return Response.json({ status: 0, stdout: "ok", stderr: "" });
+    }
+    return new Response("rech server\n");
+  } });
+  const env = { HOME: home, USERPROFILE: home, RECHROME_URL: `http://127.0.0.1:${server.port}/?profile=default#key=stub-key-0123456789`, PLAYWRIGHT_MCP_PROFILE_DIRECTORY: "" };
+  try {
+    for (const [args, value, expected] of [
+      [["open", "https://example.com"], "SymphR", "SymphR"],
+      [["--profile", "flag", "open", "https://example.com"], "SymphR", "flag"],
+      [["open", "https://example.com"], "  ", "default"],
+      [["pw", "--profile", "forwarded"], "SymphR", "SymphR"],
+    ] as [string[], string, string][]) {
+      const result = await runRech(args, { ...env, RECHROME_PROFILE: value });
+      expect(result.code).toBe(0);
+      const body = bodies.at(-1);
+      expect(body.identity.profile).toBe(expected);
+      expect(body.env.PLAYWRIGHT_MCP_PROFILE_DIRECTORY).toBe(expected);
+    }
+    expect(bodies.at(-1).args).toEqual(["--profile", "forwarded"]);
+  } finally { server.stop(true); rmSync(home, { recursive: true, force: true }); }
+});
