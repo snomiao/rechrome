@@ -2,7 +2,7 @@ import { describe, test, expect } from "bun:test";
 import { chmodSync, mkdtempSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { explainExtensionNotFound, inferSilentExtensionFailure, isManagedServe, isUnderDir, parseIdleTimeout, provesRelayAlive, resolveProfileDirectory, shouldExitOrphanedServe } from "./serve.ts";
+import { explainExtensionNotFound, inferSilentExtensionFailure, isManagedServe, isUnderDir, parseIdleTimeout, ProfileResolutionError, provesRelayAlive, resolveProfileDirectory, shouldExitOrphanedServe } from "./serve.ts";
 import { chromeDataAccessHint } from "./rechrome.ts";
 
 describe("isUnderDir", () => {
@@ -207,11 +207,23 @@ describe("resolveProfileDirectory", () => {
     writeFileSync(join(dir, "Local State"), JSON.stringify({ profile: { info_cache: { "Profile 7": { user_name: "other@example.com" } } } }));
     expect(await resolveProfileDirectory("other@example.com", {}, [join(dir, "Local State")])).toBe("Profile 7");
   });
-  test("an unreadable Local State does not throw; the name passes through", async () => {
+  test("an unreadable Local State refuses instead of passing the email through as a folder", async () => {
     const dir = mkdtempSync(join(tmpdir(), "rech-ls-"));
     writeFileSync(join(dir, "Local State"), "{}");
     chmodSync(join(dir, "Local State"), 0o000); // exists, but open() fails — as under TCC
-    expect(await resolveProfileDirectory("who@example.com", {}, [join(dir, "Local State")])).toBe("who@example.com");
+    // Passing it through made Chrome create a new empty profile folder named "who@example.com".
+    await expect(resolveProfileDirectory("who@example.com", {}, [join(dir, "Local State")])).rejects.toBeInstanceOf(ProfileResolutionError);
+  });
+  test("an unreadable Local State still resolves registered profiles and folder names", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "rech-ls-"));
+    writeFileSync(join(dir, "Local State"), "{}");
+    chmodSync(join(dir, "Local State"), 0o000);
+    const states = [join(dir, "Local State")];
+    expect(await resolveProfileDirectory("me@example.com", { "me@example.com": { profileDir: "Default" } }, states)).toBe("Default");
+    expect(await resolveProfileDirectory("Profile 4", {}, states)).toBe("Profile 4");
+  });
+  test("a missing Local State (no Chrome installed there) is not an error", async () => {
+    expect(await resolveProfileDirectory("custom-name", {}, ["/nonexistent/Local State"])).toBe("custom-name");
   });
   test("folder names pass through untouched", async () => {
     expect(await resolveProfileDirectory("Profile 3", {}, [])).toBe("Profile 3");
