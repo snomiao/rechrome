@@ -77,6 +77,17 @@
     </div>
   </header>
 
+  <section class="install" id="invite" hidden>
+    <h2>Someone shared a Chrome with you</h2>
+    <div class="cmd">
+      <span class="os">Any shell</span>
+      <code id="cn"></code>
+      <button class="copy" data-target="cn">Copy</button>
+    </div>
+    <p class="what">Run it inside the project folder that should use this browser (it needs <a href="https://bun.sh">Bun</a>).
+      The link is a one-time invite: it registers this machine, then stops working for anyone else. Keep it private until then.</p>
+  </section>
+
   <section class="install">
     <h2>Install</h2>
 
@@ -131,10 +142,20 @@
 </div>
 
 <script>
+  // A rech1_ invite link lands here (this site is the default signal server's origin). The
+  // secret stays in the #fragment: it never reaches the server, and the page only shows it masked.
+  (function () {
+    if (!/^#rech1_[1-9A-HJ-NP-Za-km-z]{28}$/.test(location.hash)) return;
+    var full = "bunx rechrome connect '" + location.href + "'";
+    var el = document.getElementById('cn');
+    el.textContent = full.replace(/(#rech1_[1-9A-HJ-NP-Za-km-z]{4})[1-9A-HJ-NP-Za-km-z]+/, '$1…');
+    el.dataset.full = full;
+    document.getElementById('invite').hidden = false;
+  })();
   document.querySelectorAll('.copy').forEach(function (btn) {
     btn.addEventListener('click', function () {
       var el = document.getElementById(btn.dataset.target);
-      navigator.clipboard.writeText(el.innerText).then(function () {
+      navigator.clipboard.writeText(el.dataset.full || el.innerText).then(function () {
         var prev = btn.textContent;
         btn.textContent = 'Copied'; btn.classList.add('done');
         setTimeout(function () { btn.textContent = prev; btn.classList.remove('done'); }, 1400);
