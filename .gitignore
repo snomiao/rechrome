@@ -17,3 +17,8 @@ vendor/
 
 # Windows: `> nul` / `--outfile nul` from bash/bun creates a literal file
 nul
+secret.js
+shares.js
+e2e.js
+webrtc.js
+signal-relay.js

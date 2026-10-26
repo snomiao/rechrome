@@ -11,23 +11,30 @@ test("multiple sockets enforce profile/file policies and reload without browser 
   const portA = a.port!, portB = b.port!;
   a.stop(true); b.stop(true);
   await mkdir(join(root, ".rechrome"));
-  for (const name of ["rechrome.ts", "serve.ts", "listeners.ts", "extension-token.ts", "daemon-manager.ts", "fill-secret.ts"])
+  for (const name of ["rechrome.ts", "serve.ts", "listeners.ts", "extension-token.ts", "daemon-manager.ts", "fill-secret.ts", "scoped-upload.ts", "shares.ts", "secret.ts", "e2e.ts", "webrtc.ts", "signal-relay.ts"])
     await copyFile(join(import.meta.dir, name), join(root, name));
   // The copied sources import packages (e.g. yargs); resolve them from the repo's node_modules.
   await symlink(join(import.meta.dir, "node_modules"), join(root, "node_modules"), "junction");
   await writeFile(join(root, "fake-cli.ts"), `
-    import { mkdirSync, writeFileSync } from 'fs';
+    import { mkdirSync, writeFileSync, readFileSync } from 'fs';
     if (process.argv.includes('screenshot')) {
       mkdirSync('.playwright-cli', {recursive:true});
       writeFileSync('.playwright-cli/probe.png', 'fixture');
       console.log('.playwright-cli/probe.png');
-    } else console.log('Profile: ' + process.env.PLAYWRIGHT_MCP_PROFILE_DIRECTORY);
+    } else if (process.argv.includes('upload')) {
+      const path = process.argv[process.argv.indexOf('upload') + 1];
+      writeFileSync(${JSON.stringify(join(root, 'last-upload-path'))}, path);
+      console.log('uploaded:' + readFileSync(path).toString('hex'));
+    } else {
+      console.log('Profile: ' + process.env.PLAYWRIGHT_MCP_PROFILE_DIRECTORY);
+      console.log('- 0: (current) [Slack](https://api.slack.com/apps/test)');
+    }
   `);
   await writeFile(join(root, ".rechrome", "profiles.json"), JSON.stringify({
     qa: { profileDir: "QA", extensionId: "a".repeat(32), token: "test-token" },
     personal: { profileDir: "Personal", extensionId: "a".repeat(32), token: "other-token" },
   }));
-  const qa = { name: "qa", host: "127.0.0.1", port: portA, key: "a".repeat(24), profiles: ["qa"], prefix: "/rechrome/" };
+  const qa = { name: "qa", host: "127.0.0.1", port: portA, key: "a".repeat(24), profiles: ["qa"], uploads: { maxBytes: 1024 }, prefix: "/rechrome/" };
   const personal = { name: "personal", host: "127.0.0.1", port: portB, key: "b".repeat(24), profiles: ["personal"], prefix: "/" };
   const configPath = join(root, ".rechrome", "listeners.json");
   const save = (listeners: any[]) => writeFile(configPath, JSON.stringify({ version: 1, listeners }));
@@ -37,9 +44,9 @@ test("multiple sockets enforce profile/file policies and reload without browser 
     stdin: "ignore", stdout: "ignore", stderr: "pipe",
   });
   const get = (l: typeof qa, path = "/ping") => fetch(serviceUrl(`http://127.0.0.1:${l.port}${l.prefix}`, path), { headers: { Authorization: `Bearer ${l.key}` } });
-  const run = (l: typeof qa, profile: string, args: string[], env = {}) => fetch(serviceUrl(`http://127.0.0.1:${l.port}${l.prefix}`, "run"), {
+  const run = (l: typeof qa, profile: string, args: string[], env = {}, upload?: unknown) => fetch(serviceUrl(`http://127.0.0.1:${l.port}${l.prefix}`, "run"), {
     method: "POST", headers: { Authorization: `Bearer ${l.key}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ identity: { key: "/test-worktree", profile }, args, env }),
+    body: JSON.stringify({ identity: { key: "/test-worktree", profile }, args, env, ...(upload ? { upload } : {}) }),
   });
   const waitFor = async (check: () => Promise<boolean>) => {
     for (let i = 0; i < 70; i++) { if (await check().catch(() => false)) return; await Bun.sleep(100); }
@@ -64,6 +71,34 @@ test("multiple sockets enforce profile/file policies and reload without browser 
     expect((await run(qa, "qa", ["run-code", "async page => {}"])).status).toBe(403);
     const result = await (await run(qa, "qa", ["tab-list"], { PLAYWRIGHT_MCP_USER_DATA_DIR: "/personal", PLAYWRIGHT_MCP_EXTENSION_TOKEN: "attacker" })).json();
     expect(result.stdout).toContain("Profile: QA");
+    const svg = '<svg xmlns="http://www.w3.org/2000/svg"><path d="M0 0"/></svg>';
+    const upload = { name: "icon.svg", contentType: "image/svg+xml", data: Buffer.from(svg).toString("base64") };
+    expect((await run(personal, "personal", ["upload"], {}, upload)).status).toBe(403);
+    expect((await run(qa, "qa", ["upload", "/etc/passwd"], {}, upload)).status).toBe(403);
+    expect((await run(qa, "qa", ["eval", "() => 1"])).status).toBe(403);
+    const uploaded = await (await run(qa, "qa", ["upload"], {}, upload)).json();
+    expect(uploaded.status).toBe(0);
+    expect(uploaded.stdout).toContain('uploaded:' + Buffer.from(svg).toString('hex'));
+    const staged = await Bun.file(join(root, 'last-upload-path')).text();
+    expect(await Bun.file(staged).exists()).toBe(false);
+    expect(uploaded.files).toEqual([]);
+    const invalid = await (await run(qa, "qa", ["upload"], {}, { ...upload, contentType: "image/png" })).json();
+    expect(invalid.status).toBe(1);
+    // Real caller: stdin bytes are sent across HTTP, never interpreted as a host path.
+    for (const uploadArgs of [
+      ["upload", "--name", "icon.svg"],
+      ["-s=shricon", "upload", "--name", "icon.svg"],
+      ["upload", "-s=shricon", "--name", "icon.svg"],
+    ]) {
+      const uploader = Bun.spawn([process.execPath, join(root, "rechrome.ts"), "--profile", "qa", ...uploadArgs], {
+        cwd: root, env: { ...process.env, HOME: root, USERPROFILE: root, RECHROME_URL: `http://${qa.key}@127.0.0.1:${portA}/rechrome/?profile=qa` },
+        stdin: "pipe", stdout: "pipe", stderr: "pipe",
+      });
+      uploader.stdin.write(svg); uploader.stdin.end();
+      const [uploadCode, uploadOut, uploadErr] = await Promise.all([uploader.exited, new Response(uploader.stdout).text(), new Response(uploader.stderr).text()]);
+      expect(uploadCode).toBe(0);
+      expect(uploadOut).toContain('uploaded:' + Buffer.from(svg).toString('hex'));
+    }
     const shot = await (await run(qa, "qa", ["screenshot"])).json();
     expect(shot.files).toHaveLength(1);
     expect(await (await get(qa, `/files/${shot.files[0]}`)).text()).toBe("fixture");

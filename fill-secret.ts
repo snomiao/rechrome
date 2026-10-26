@@ -13,7 +13,8 @@
 //     SECRET_MASK_TTL_MS.
 import { createHmac } from "crypto";
 import { connect } from "net";
-import { readdirSync } from "fs";
+import { readdirSync, readFileSync } from "fs";
+import { homedir } from "os";
 import { join } from "path";
 
 export const SECRET_MASK = "***";
@@ -260,6 +261,38 @@ export function sessionSocketCandidates(socketRoot: string, session: string): st
   return names.filter(n => n === `${session}.sock` || (n.length === session.length + 22 && /^[0-9a-f]{16}-/.test(n) && n.slice(17) === `${session}.sock`)).map(n => join(socketRoot, n));
 }
 
+/**
+ * Read `socketPath` from `<baseDaemonDir>/<16-hex workspaceHash>/<session>.session` written by
+ * cliDaemon (including Windows named pipes `\\.\pipe\pw-...`, which do not appear in socketRoot).
+ */
+export function daemonSessionSockets(session: string, env: Record<string, string | undefined> = process.env): string[] {
+  const home = env.HOME || env.USERPROFILE || homedir();
+  const bases = env.PLAYWRIGHT_DAEMON_SESSION_DIR
+    ? [env.PLAYWRIGHT_DAEMON_SESSION_DIR]
+    : process.platform === "win32"
+    ? [...new Set([
+        join(env.USERPROFILE || home, "AppData", "Local", "ms-playwright", "daemon"),
+        ...(env.LOCALAPPDATA ? [join(env.LOCALAPPDATA, "ms-playwright", "daemon")] : []),
+      ])]
+    : process.platform === "darwin"
+    ? [join(home, "Library", "Caches", "ms-playwright", "daemon")]
+    : [join(env.XDG_CACHE_HOME || join(home, ".cache"), "ms-playwright", "daemon")];
+  const out: string[] = [];
+  for (const base of bases) {
+    let hashes: string[] = [];
+    try { hashes = readdirSync(base); } catch { continue; }
+    for (const h of hashes) {
+      if (!/^[0-9a-f]{16}$/.test(h)) continue;
+      try {
+        const cfg = JSON.parse(readFileSync(join(base, h, `${session}.session`), "utf8"));
+        if ((cfg?.name ?? session) === session && typeof cfg?.socketPath === "string" && cfg.socketPath)
+          out.push(cfg.socketPath);
+      } catch {}
+    }
+  }
+  return [...new Set(out)];
+}
+
 /** One request/response over a cliDaemon socket (newline-delimited JSON). */
 export function socketRequest(path: string, method: string, params: unknown, timeoutMs = 30_000): Promise<{ result?: any; error?: string }> {
   return new Promise((resolve, reject) => {
@@ -283,9 +316,7 @@ export function socketRequest(path: string, method: string, params: unknown, tim
 
 /** Run a run-code function on the session's live browser over its cliDaemon socket (no child argv). */
 export async function runCodeOnSession(opts: { socketRoot: string; session: string; cwd: string; code: string; json?: boolean }): Promise<{ isError: boolean; text: string }> {
-  // The cliDaemon listens on a named pipe there, which this socket scan can't find.
-  if (process.platform === "win32") throw new Error("fill-secret is not supported on a Windows daemon yet");
-  const candidates = sessionSocketCandidates(opts.socketRoot, opts.session);
+  const candidates = [...new Set([...sessionSocketCandidates(opts.socketRoot, opts.session), ...daemonSessionSockets(opts.session)])];
   if (!candidates.length) throw new Error("no browser is open in this session; run `rech open <url>` first");
   const errors: string[] = [];
   for (const path of candidates) {

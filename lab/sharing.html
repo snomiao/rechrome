@@ -1,0 +1,403 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Sharing, rethought</title>
+<meta name="description" content="rechrome sharing design: shares, profile binding, sessions, transports (local, LAN, Tailscale, WebRTC), rech1_ base58 secrets and a free signal server." />
+<link rel="stylesheet" href="style.css" />
+<style>
+  .svg-box { fill: var(--panel); stroke: var(--border); stroke-width: 1.5; }
+  .svg-box.hl { stroke: var(--accent); }
+  .svg-box.hl2 { stroke: var(--accent2); }
+  .svg-t { fill: var(--fg); font: 600 14px ui-sans-serif, system-ui, sans-serif; }
+  .svg-s { fill: var(--muted); font: 12px ui-monospace, Menlo, monospace; }
+  .svg-l { stroke: var(--muted); stroke-width: 1.5; fill: none; }
+  .svg-l.dash { stroke-dasharray: 5 4; }
+  .svg-l.acc { stroke: var(--accent); }
+  .svg-ah { fill: var(--muted); }
+  .svg-ah.acc { fill: var(--accent); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="kicker"><a href="./" style="color:inherit;text-decoration:none">rechrome lab</a> · design · 2026-10-22 · built in feat/sharing</div>
+    <h1>Sharing, rethought</h1>
+    <p class="lede">Today one <em>listener</em> carries the address, the secret and the profile allowlist all at once. This note splits it into three layers (share, profiles, sessions), puts them on interchangeable transports (local, LAN, Tailscale, WebRTC), and specifies one short, scanner-friendly link format for all of them.</p>
+  </header>
+
+  <ol class="toc">
+    <li><a href="#today">What exists today</a></li>
+    <li><a href="#model">The model: three layers</a></li>
+    <li><a href="#transports">Transports</a></li>
+    <li><a href="#url">Link format</a></li>
+    <li><a href="#token">The <code>rech1_</code> secret</a></li>
+    <li><a href="#webrtc">WebRTC protocol</a></li>
+    <li><a href="#signal">Signal server on Cloudflare</a></li>
+    <li><a href="#cli">CLI surface</a></li>
+    <li><a href="#migration">Migration</a></li>
+    <li><a href="#open">Open questions</a></li>
+    <li><a href="#plan">Plan</a></li>
+    <li><a href="#lab">Try it: token lab</a></li>
+  </ol>
+
+  <!-- ================================================================ -->
+  <h2 id="today">1. What exists today</h2>
+  <p>Read from <code>listeners.ts</code>, <code>serve.ts</code> and <code>rech share|connect|listener --help</code>:</p>
+  <table>
+    <tr><th>Layer</th><th>Today</th><th>Problem</th></tr>
+    <tr><td>Share URL</td><td>No share object. A URL is built from a listener: <code>publicUrl</code> or address, <code>?profile=</code>, and <code>#key=</code>.</td><td>The key belongs to the listener, so everyone on it holds the same secret. You can't revoke one recipient, and <code>rotate-key</code> breaks every link on the listener. <code>share --all</code> creates a whole new listener on a new port.</td></tr>
+    <tr><td>Profiles</td><td><code>listener.profiles</code>, <code>listener allow/deny</code>. Clients see them via <code>/ping</code> and <code>rech profile</code>.</td><td>The allowlist is per listener, not per recipient. Different profile sets for A and B means two listeners and two ports.</td></tr>
+    <tr><td>Sessions</td><td>Session = hash(<code>identity.key</code>, profile). One <code>-s=</code> passes the scoped filter.</td><td>Recipients aren't separated, and a remote client can't list or close its own sessions.</td></tr>
+    <tr><td>Transport</td><td>HTTP only: loopback, LAN or Tailscale IP, or a reverse proxy.</td><td>The host needs a reachable port, so NAT, CGNAT and remote friends without a VPN are out.</td></tr>
+  </table>
+
+  <!-- ================================================================ -->
+  <h2 id="model">2. The model: three layers</h2>
+  <p>Separate <strong>where it listens</strong> from <strong>who may get in</strong>, and give each recipient their own object.</p>
+
+  <figure>
+    <svg viewBox="0 0 820 300" role="img" aria-label="Transports feed shares; each share binds profiles; each profile has sessions">
+      <defs>
+        <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="svg-ah"/></marker>
+      </defs>
+      <!-- transports -->
+      <text x="20" y="24" class="svg-s">TRANSPORT</text>
+      <rect x="20" y="36" width="170" height="44" rx="8" class="svg-box"/><text x="34" y="63" class="svg-t">local 127.0.0.1</text>
+      <rect x="20" y="92" width="170" height="44" rx="8" class="svg-box"/><text x="34" y="119" class="svg-t">lan / tailscale</text>
+      <rect x="20" y="148" width="170" height="44" rx="8" class="svg-box hl"/><text x="34" y="175" class="svg-t">webrtc (new)</text>
+      <!-- shares -->
+      <text x="260" y="24" class="svg-s">LAYER 1 · SHARE</text>
+      <rect x="260" y="50" width="190" height="64" rx="8" class="svg-box hl2"/><text x="274" y="75" class="svg-t">share “alice”</text><text x="274" y="96" class="svg-s">rech1_7fQx…  exp 7d</text>
+      <rect x="260" y="140" width="190" height="64" rx="8" class="svg-box hl2"/><text x="274" y="165" class="svg-t">share “ci-bot”</text><text x="274" y="186" class="svg-s">rech1_Hm2p…  no exp</text>
+      <!-- profiles -->
+      <text x="520" y="24" class="svg-s">LAYER 2 · PROFILES</text>
+      <rect x="520" y="44" width="130" height="38" rx="8" class="svg-box"/><text x="534" y="68" class="svg-t">work@</text>
+      <rect x="520" y="96" width="130" height="38" rx="8" class="svg-box"/><text x="534" y="120" class="svg-t">personal@</text>
+      <rect x="520" y="160" width="130" height="38" rx="8" class="svg-box"/><text x="534" y="184" class="svg-t">work@</text>
+      <!-- sessions -->
+      <text x="700" y="24" class="svg-s">LAYER 3 · SESSIONS</text>
+      <rect x="700" y="40" width="100" height="22" rx="6" class="svg-box"/><text x="710" y="56" class="svg-s">-s=main</text>
+      <rect x="700" y="66" width="100" height="22" rx="6" class="svg-box"/><text x="710" y="82" class="svg-s">-s=login</text>
+      <rect x="700" y="104" width="100" height="22" rx="6" class="svg-box"/><text x="710" y="120" class="svg-s">-s=main</text>
+      <rect x="700" y="168" width="100" height="22" rx="6" class="svg-box"/><text x="710" y="184" class="svg-s">-s=main</text>
+      <!-- links -->
+      <path d="M190 58 C225 58,225 82,258 82" class="svg-l" marker-end="url(#ah)"/>
+      <path d="M190 114 C225 114,225 86,258 86" class="svg-l" marker-end="url(#ah)"/>
+      <path d="M190 170 C225 170,225 172,258 172" class="svg-l acc" marker-end="url(#ah)"/>
+      <path d="M190 166 C225 166,225 92,258 92" class="svg-l acc dash" marker-end="url(#ah)"/>
+      <path d="M450 76 L518 63" class="svg-l" marker-end="url(#ah)"/>
+      <path d="M450 88 L518 113" class="svg-l" marker-end="url(#ah)"/>
+      <path d="M450 172 L518 179" class="svg-l" marker-end="url(#ah)"/>
+      <path d="M650 60 L698 51" class="svg-l" marker-end="url(#ah)"/>
+      <path d="M650 66 L698 77" class="svg-l" marker-end="url(#ah)"/>
+      <path d="M650 115 L698 115" class="svg-l" marker-end="url(#ah)"/>
+      <path d="M650 179 L698 179" class="svg-l" marker-end="url(#ah)"/>
+      <text x="20" y="240" class="svg-s">A share can be reachable over several transports. Its profiles are a live allowlist.</text>
+      <text x="20" y="262" class="svg-s">Session key = hash(share.id, profile, client identity, -s name), so two shares never collide.</text>
+      <text x="20" y="284" class="svg-s">Both shares bind work@, but alice's sessions and ci-bot's sessions are separate.</text>
+    </svg>
+    <figcaption>Listener = transport. Share = grant. Profiles and sessions hang off the share.</figcaption>
+  </figure>
+
+  <h3>Layer 1: Share</h3>
+  <ul>
+    <li>A share holds a <strong>secret</strong> (<a href="#token"><code>rech1_…</code></a>), a host-side <strong>label/slug</strong> (never in the URL), its profiles, optional <code>expiresAt</code>, and a revoked flag.</li>
+    <li>Many shares can use one listener and one port. <code>serve</code> looks up the share from the presented key.</li>
+    <li>Revoking or rotating affects only that share.</li>
+  </ul>
+  <h3>Layer 2: Profile binding</h3>
+  <ul>
+    <li><code>rech share allow|deny &lt;slug&gt; &lt;profiles…&gt;</code> changes the allowlist. The link stays the same, and connected clients see the change on their next call.</li>
+    <li>On the client, <code>rech profile</code> lists only that share's profiles (display names and emails, never folder paths), via a new <code>GET /profiles</code>.</li>
+    <li>A share created with "every profile" is a <strong>snapshot</strong>, so a profile registered later is never exposed without you knowing.</li>
+  </ul>
+  <h3>Layer 3: Sessions (reuses playwright-cli <code>-s=</code>)</h3>
+  <ul>
+    <li>The share id is added to the session hash, so two recipients can never reach each other's browser state.</li>
+    <li>Scoped <code>session-list</code> (only this share's sessions), <code>close</code> and <code>delete-data</code> are allowed. <code>close-all</code> and <code>kill-all</code> stay blocked.</li>
+    <li>Tab group = <code>&lt;share label&gt; · &lt;client label&gt;</code>, so the host can see in Chrome who is driving which tabs.</li>
+  </ul>
+
+  <!-- ================================================================ -->
+  <h2 id="transports">3. Transports</h2>
+  <table>
+    <tr><th>Kind</th><th>Wire</th><th>Notes</th></tr>
+    <tr><td><code>local</code></td><td>HTTP on 127.0.0.1</td><td>Today's management listener (all profiles, loopback only).</td></tr>
+    <tr><td><code>lan</code></td><td>HTTP on a chosen interface IP or gateway</td><td>Includes reverse proxies via <code>publicUrl</code>.</td></tr>
+    <tr><td><code>tailscale</code></td><td>Same as <code>lan</code></td><td>A convenience alias. We detect the 100.x interface, MagicDNS name and Serve routes, and store it as <code>lan</code> with <code>via: tailscale</code>. The protocol is the same.</td></tr>
+    <tr><td><code>webrtc</code> <span class="tag new">new</span></td><td>Same HTTP API (<code>/ping</code>, <code>/run</code>, <code>/files</code>) tunnelled over an encrypted DataChannel</td><td>The host only makes outbound connections, so no port is opened and NAT punching works. It needs a signal server.</td></tr>
+  </table>
+  <div class="callout">The share, the profile scoping (<code>authorizeProfileRequest</code>, <code>resolveAllowedProfile</code>) and the session hashing are <strong>the same for every transport</strong>. WebRTC is just another way to deliver the same requests.</div>
+
+  <!-- ================================================================ -->
+  <h2 id="url">4. Link format</h2>
+  <p>A link only has to carry two things: <strong>where to rendezvous</strong> and <strong>one secret</strong>. Everything else is derived from the secret or kept on the host.</p>
+  <pre><code>https://rechrome.pages.dev/#rech1_7fQxC9tZp2mVb8wLrN4hdK3kT9aQ</code></pre>
+  <p>That's about 62 characters, compared with about 115 for <code>…/room/#room=r…&amp;s=e1.&lt;64hex&gt;</code>. The secret is in the <code>#fragment</code>, which browsers never send to a server.</p>
+  <h3>One fragment, any origin</h3>
+  <table>
+    <tr><th>Link</th><th>Transport</th></tr>
+    <tr><td><code>https://rechrome.pages.dev/#rech1_…</code></td><td>WebRTC via the default signal host</td></tr>
+    <tr><td><code>https://sig.example.com/#rech1_…</code></td><td>WebRTC via a self-hosted signal host</td></tr>
+    <tr><td><code>http://100.101.2.3:13775/#rech1_…</code></td><td>Direct HTTP (LAN or Tailscale). Bearer = HKDF(S, <code>rech/bearer</code>).</td></tr>
+    <tr><td><code>http://127.0.0.1:13775/#rech1_…</code></td><td>Local</td></tr>
+    <tr><td><code>rech1_…</code> (bare)</td><td>CLI only: the default signal host</td></tr>
+  </table>
+  <p><code>rech connect</code> finds the transport with <strong>one probe</strong>. A rech daemon answers <code>/ping</code> with its usual JSON; a signal host answers <code>{"rech-signal":1}</code>. There's no <code>webrtc://</code> scheme, and every link opens in a browser to a landing page with a copy button. The page reads the fragment in browser JavaScript.</p>
+  <h3>Deliberately not in the URL</h3>
+  <ul>
+    <li><strong>Room id:</strong> derived as HKDF(S, <code>rech/room</code>).</li>
+    <li><strong>Profile:</strong> the share decides. One profile means it's the default; several means <code>rech --profile</code>. Then a URL can never look as though it grants something it doesn't.</li>
+    <li><strong>Slug/label:</strong> host-side only, shown in <code>rech share ls</code>, tab groups, and the client's <code>rech status</code> after connecting.</li>
+  </ul>
+
+  <!-- ================================================================ -->
+  <h2 id="token">5. The <code>rech1_</code> secret</h2>
+  <pre><code>rech1_  7fQxC9tZp2mVb8wLrN4hdK  3kT9aQ
+└─┬──┘  └─────── 22 ───────┘  └─6──┘
+  │     128 random bits,       CRC32 of the 16 secret bytes,
+  │     base58, fixed width    base58, fixed width
+  prefix + format version</code></pre>
+  <table>
+    <tr><th>Choice</th><th>Why</th></tr>
+    <tr><td><code>rech1_</code> prefix</td><td>Unique, so secret scanners can match it with few false positives. <code>sk-</code> would collide with OpenAI-style keys and send leak reports to the wrong place. The <code>1</code> is the format version; the next format becomes <code>rech2_</code>.</td></tr>
+    <tr><td>128 bits</td><td>The server only sees one-way HKDF outputs, and brute-forcing 2¹²⁸ offline isn't feasible. 256-bit hex would add about 40 characters for nothing.</td></tr>
+    <tr><td>base58</td><td>Same length as base62 at 128 bits (22 characters), without the ambiguous <code>0 O I l</code>, so a link read off a screenshot or a call survives. It also selects as one word on double-click (no <code>-</code> or <code>_</code> in the body). Encode fixed-width by left-padding with <code>1</code>.</td></tr>
+    <tr><td>CRC32 checksum</td><td>Scanners can reject look-alikes without contacting any server, and <code>rech connect</code> can say "link copied incompletely" instead of failing later.</td></tr>
+  </table>
+  <p>Regex (gitleaks, TruffleHog, and rech's own log redaction):</p>
+  <pre><code>\brech1_[1-9A-HJ-NP-Za-km-z]{28}\b</code></pre>
+  <h3 id="leaks">Leaks: make the link worthless, catch it early, keep it short-lived</h3>
+  <p>We don't depend on GitHub or any scanner. There are three layers, and none needs anyone else's cooperation.</p>
+  <h3>a. The link is a one-time invite (device pinning)</h3>
+  <ul>
+    <li>On first <code>rech connect</code>, the client <strong>redeems</strong> the invite over the encrypted channel, and the host mints a <strong>device credential</strong>: its own <code>rech1_</code> secret, saved only on that device. (Built this way instead of a client keypair: same property, and every transport, room and key derivation then works the same for invites and devices.)</li>
+    <li>The invite is then <strong>used up</strong>, or allows at most <code>--devices N</code>. Later connections use the device's own secret, which gets its own WebRTC room and its own HTTP bearer.</li>
+    <li>A link pushed to GitHub, pasted in Slack or seen in a screenshot <em>after</em> it was used no longer works. If a stranger uses it first, the real recipient can't connect, an obvious signal to the host, who runs <code>rech share revoke</code>.</li>
+    <li>Optional <code>--approve</code>: each new device waits for the host, like Bluetooth pairing: <code>new device "mbp-alice" wants in on share alice: approve? [y/N]</code>.</li>
+    <li>The device key also becomes the client identity in the <a href="#model">session hash</a>, so one device's sessions belong to that device.</li>
+  </ul>
+  <h3>b. Prevention</h3>
+  <ul>
+    <li><strong>Env-file check (built now):</strong> wherever <code>RECHROME_URL</code> is saved or loaded from, rech checks whether the file is <strong>committed</strong>, <strong>staged</strong> or <strong>not git-ignored</strong> in git, and on Unix whether it's <strong>readable by other users</strong>. It only warns, and the command still runs. It shows in <code>rech status</code> (<code>secret: ⚠ …</code>), after <code>rech connect</code>, and after <code>share --save</code>. A previously committed but since untracked file isn't flagged, because it held an older key.</li>
+    <li><code>rech connect</code> saves to <code>.rechrome/.env.local</code>, whose folder git-ignores itself, and writes files <code>0600</code>.</li>
+    <li>Upstream <strong>gitleaks</strong> and <strong>secretlint</strong> rules (ordinary pull requests, no partner agreement), so pre-commit and CI catch <code>rech1_</code> before a push.</li>
+    <li>Documented recipe for GitHub <strong>custom patterns</strong>: an org can add the regex to its own secret scanning, which alerts that org.</li>
+  </ul>
+  <h3>c. Short lifetimes</h3>
+  <ul>
+    <li><strong>Unused invites expire after 24 h</strong> (<code>--invite-ttl</code>).</li>
+    <li><strong>WebRTC shares expire after 30 days by default</strong> (<code>--expires</code>, <code>rech share renew</code>), since anyone on the internet who has the link can reach them. LAN and Tailscale shares default to no expiry.</li>
+    <li><code>rech share ls</code> shows expiry, devices and last use, so stale shares are easy to spot.</li>
+  </ul>
+  <p class="meta">Not planned: polling GitHub code search ourselves. The GitHub secret scanning partner program needs an application and an always-up endpoint; maybe later, and invites make it mostly unnecessary.</p>
+  <p class="meta">Other secrets could get their own prefixes so a report says exactly which one leaked: <code>rechx1_</code> extension token, <code>rechm1_</code> daemon management key. That's optional; only the share secret is meant to leave the machine.</p>
+
+  <!-- ================================================================ -->
+  <h2 id="webrtc">6. WebRTC protocol</h2>
+  <p>This follows <a href="https://agent-yes.com">agent-yes</a> (<code>lab/ui/cf/worker.ts</code>, <code>lab/ui/e2e.js</code>, <code>ts/share.ts</code>, <code>ts/webrtcRemote.ts</code>), which has already shipped it. We reuse its crypto and relay design but not its link shape.</p>
+
+  <h3>Key derivation (all from the one secret S)</h3>
+  <pre><code>room      = HKDF(S, "rech/room")    → signal room id (server sees it)
+authToken = HKDF(S, "rech/auth")    → room admission (server sees it, one-way)
+bearer    = HKDF(S, "rech/bearer")  → HTTP transports' Authorization header
+th        = SHA-256(offer.sdp ‖ answer.sdp)   (includes both DTLS fingerprints)
+k_h2c, k_c2h = HKDF(S, th, "rech/key/…")      → AES-256-GCM per direction</code></pre>
+  <p>Because the keys depend on <code>th</code>, a signal server that swaps in its own fingerprints ends up with keys that don't match, and the key-confirmation step fails closed. A fully compromised signal server can only block connections and see metadata.</p>
+
+  <figure>
+    <svg viewBox="0 0 820 430" role="img" aria-label="Sequence: host and client join a room on the signal server, exchange SDP, then talk directly over an encrypted DataChannel">
+      <defs>
+        <marker id="ah2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="svg-ah"/></marker>
+        <marker id="ah3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="svg-ah acc"/></marker>
+      </defs>
+      <rect x="40" y="10" width="170" height="40" rx="8" class="svg-box"/><text x="58" y="35" class="svg-t">client (rech)</text>
+      <rect x="325" y="10" width="170" height="40" rx="8" class="svg-box hl2"/><text x="343" y="35" class="svg-t">signal Room DO</text>
+      <rect x="610" y="10" width="170" height="40" rx="8" class="svg-box"/><text x="628" y="35" class="svg-t">host (rech serve)</text>
+      <path d="M125 50 V420" class="svg-l dash"/><path d="M410 50 V420" class="svg-l dash"/><path d="M695 50 V420" class="svg-l dash"/>
+      <path d="M695 80 H414" class="svg-l" marker-end="url(#ah2)"/><text x="440" y="74" class="svg-s">hello{role:host, authToken} (stays, hibernated)</text>
+      <path d="M125 120 H406" class="svg-l" marker-end="url(#ah2)"/><text x="140" y="114" class="svg-s">hello{role:client, authToken}</text>
+      <path d="M410 140 H691" class="svg-l" marker-end="url(#ah2)"/><text x="440" y="134" class="svg-s">peer-join</text>
+      <path d="M695 180 H129" class="svg-l" marker-end="url(#ah2)"/><text x="440" y="174" class="svg-s">offer (+ ICE: STUN, opt. TURN creds)</text>
+      <path d="M125 210 H691" class="svg-l" marker-end="url(#ah2)"/><text x="140" y="204" class="svg-s">answer, candidates</text>
+      <path d="M125 260 H691" class="svg-l acc" marker-end="url(#ah3)" stroke-width="3"/><text x="140" y="252" class="svg-s">DataChannel, direct P2P (DTLS)</text>
+      <path d="M695 290 H129" class="svg-l acc" marker-end="url(#ah3)"/><text x="440" y="284" class="svg-s">confirm{nonce} sealed k_h2c</text>
+      <path d="M125 318 H691" class="svg-l acc" marker-end="url(#ah3)"/><text x="140" y="312" class="svg-s">confirm{nonce, echo} sealed k_c2h</text>
+      <path d="M125 356 H691" class="svg-l acc" marker-end="url(#ah3)"/><text x="140" y="350" class="svg-s">{t:req, id, method:"POST", path:"/run", body}</text>
+      <path d="M695 392 H129" class="svg-l acc" marker-end="url(#ah3)"/><text x="440" y="386" class="svg-s">{t:res} {t:data,seq}… {t:end}</text>
+    </svg>
+    <figcaption>The signal server only relays the handshake. After that, traffic goes peer to peer, sealed with keys the server never had.</figcaption>
+  </figure>
+
+  <h3>Frames (after decryption)</h3>
+  <pre><code>client → host : {t:"req", id, method, path, body?} | {t:"abort", id} | {t:"confirm", nonce, echo?}
+host → client : {t:"res", id, status, ct} | {t:"data", id, seq, chunk} | {t:"end", id, seq, error?}</code></pre>
+  <p>Chunks are 12 KB or less of plaintext, well under the DataChannel message limit. Screenshots under <code>/files/</code> stream as several <code>data</code> frames.</p>
+
+  <h3>Host side</h3>
+  <p><code>rech serve</code> keeps one hibernated signalling socket for each WebRTC-enabled share. A decrypted request is forwarded to that share's listener, so the share's profile allowlist applies exactly as it does over HTTP. Bun has no built-in <code>RTCPeerConnection</code>; agent-yes runs <code>node-datachannel/polyfill</code> under Bun in production.</p>
+  <h3>Client side: a persistent bridge</h3>
+  <p>Each <code>rech</code> command is a separate process, and a fresh handshake per command would cost about 1–3 s. So <code>rech connect</code> starts a small <strong>local bridge</strong> on <code>127.0.0.1</code> (inside the local <code>rech serve</code> if there is one). It holds the DataChannel, and <code>RECHROME_URL</code> points at it. All existing fetch-based commands then work unchanged, which is the same approach as agent-yes's <code>webrtcRemote.ts</code>.</p>
+
+  <!-- ================================================================ -->
+  <h2 id="signal">7. Signal server on Cloudflare</h2>
+  <p><code>rechrome.pages.dev</code> is a static Pages project on the SNOLAB account, Git-connected and serving <code>public/</code>. agent-yes's signal Worker is on the same account.</p>
+  <table>
+    <tr><th>Option</th><th>Effort</th><th>Notes</th></tr>
+    <tr><td>A. Use <code>s.agent-yes.com</code></td><td>none</td><td>Fastest way to build against. rechrome would depend on agent-yes's domain, and its <code>hello</code> carries a different link format.</td></tr>
+    <tr><td><strong>B. <code>rechrome-signal</code> Worker + Pages Function</strong></td><td>small</td><td>Copy the <code>Room</code> Durable Object. <code>functions/</code> on Pages binds it (<code>script_name</code>), since Pages can't define Durable Objects itself. Users only ever see <code>rechrome.pages.dev</code>. <span class="tag new">recommended</span></td></tr>
+    <tr><td>C. Move the site to a Worker with assets</td><td>medium</td><td>One Worker for the site and the signal server, as agent-yes does. Also opens the way to a custom domain later.</td></tr>
+  </table>
+  <h3>Free-tier fit</h3>
+  <ul>
+    <li>SQLite-backed Durable Objects run on Workers Free: <strong>100k requests/day</strong>. Incoming WebSocket messages count 20:1; outgoing messages and pings are free.</li>
+    <li><strong>Idle hibernated objects aren't billed for duration.</strong> Answer the host keepalive with <code>setWebSocketAutoResponse</code> so pings never wake the object. agent-yes found that waking on every ping caused about 99.9% of its Durable Object time.</li>
+    <li>One handshake is a few dozen messages, so thousands of connects per day fit.</li>
+    <li>STUN: <code>stun.cloudflare.com</code>, free and unlimited.</li>
+  </ul>
+  <div class="callout warn"><strong>TURN policy.</strong> Cloudflare TURN's first 1,000 GB/month is free, then $0.05/GB, billed to whoever owns the key. There's no shared central relay. As in agent-yes, the <em>host owner</em> can set <code>CF_TURN_KEY_ID</code>/<code>CF_TURN_API_TOKEN</code> and serve mints 1-hour credentials for each peer. Otherwise it's STUN only, and on a failed connection <code>rech connect</code> suggests Tailscale.</div>
+  <p>Prefer your own? Any server that speaks the <a href="signal-selfhost#protocol">signal protocol</a> works: Cloudflare on your account, a Bun process on a VPS or home box, Docker, or the relay built into <code>rech serve</code>. See the <a href="signal-selfhost">self-hosting tutorial</a>.</p>
+  <p class="meta">Signal server hardening: per-IP rate limits, a cap on peers per room, no message logging, and refusal of any non-<code>hello</code> first frame.</p>
+
+  <!-- ================================================================ -->
+  <h2 id="cli">8. CLI surface</h2>
+  <h3>Host</h3>
+  <pre><code>rech share new work@ personal@ --name alice --via webrtc,tailscale \
+  --expires 7d --devices 1 [--approve] [--invite-ttl 24h]
+  → https://rechrome.pages.dev/#rech1_7fQxC9tZp2mVb8wLrN4hdK3kT9aQ
+  → rech connect rech1_7fQxC9tZp2mVb8wLrN4hdK3kT9aQ
+rech share ls                      # shares, transports, profiles, live sessions
+rech share allow alice ci@         # live allowlist edits; link unchanged
+rech share deny  alice personal@
+rech share rotate alice            # new secret (new room); old link dies
+rech share devices alice           # pinned devices, last use; --rm &lt;device&gt;
+rech share approve alice           # with --approve: let a waiting device in
+rech share renew alice --expires 30d
+rech share revoke alice            # also closes alice's sessions
+rech listener ls|add|set|rm        # transports only (address, port, publicUrl)</code></pre>
+  <h3>Client</h3>
+  <pre><code>rech connect '&lt;url&gt;' | rech1_…   # checksum, probe, pick transport, save RECHROME_URL
+rech profile                       # profiles this share allows
+rech --profile work open https://example.com
+rech -s=login open https://accounts.example.com
+rech session ls | close &lt;name&gt;     # only this share's sessions
+rech status                        # share label, transport, bridge health</code></pre>
+
+  <!-- ================================================================ -->
+  <h2 id="migration">9. Migration: nothing breaks</h2>
+  <ul>
+    <li>Each scoped listener becomes a listener plus one <strong>implicit share</strong> with the same key and profiles, so existing <code>?profile=…#key=…</code> links keep working.</li>
+    <li><code>listener allow/deny/rotate-key</code> become aliases that act on that implicit share.</li>
+    <li><code>share --all</code> becomes a share with every profile (a snapshot), with no new port.</li>
+    <li>A fragment containing <code>key=</code> takes the old code path; a <code>rech1_</code> fragment takes the new one.</li>
+    <li>The session hash only gains the share id for new shares, so live sessions on old links aren't orphaned.</li>
+  </ul>
+
+  <!-- ================================================================ -->
+  <h2 id="open">10. Open questions</h2>
+  <ol>
+    <li><strong>Several clients on one share:</strong> should they see each other's sessions? Proposal: no, separate by client identity; the host sees everything.</li>
+    <li><strong>Per-share command scope:</strong> unlock <code>eval</code> per share (<code>--allow-eval</code>)? It's easy to add but a real trust escalation, so it should be off by default and shown loudly in <code>share ls</code>.</li>
+    <li><strong>Sharing <code>e2e.js</code> with agent-yes:</strong> publish it as a package, or vendor it under <code>lib/</code>? One copy, two projects, no drift.</li>
+    <li><strong>Browser client:</strong> should the landing page also be able to drive a share directly (view tabs, take screenshots) over WebRTC, beyond being a copy-command page?</li>
+  </ol>
+
+  <!-- ================================================================ -->
+  <h2 id="plan">11. Plan</h2>
+  <ol>
+    <li>Split the <code>Share</code> type out of <code>Listener</code> in <code>listeners.ts</code>, look shares up by key, migrate with implicit shares. Add <code>GET /profiles</code>.</li>
+    <li>Add the share id to the session hash, plus scoped <code>session-list</code> and <code>close</code>.</li>
+    <li>The <code>rech1_</code> token: generate, parse, checksum, redact. <span class="tag new">done</span> env-file leak warnings.</li>
+    <li>Host WebRTC bridge in <code>serve</code> (<code>node-datachannel</code>, the <code>e2e.js</code> design), built against option A.</li>
+    <li>Client bridge and transport probe in <code>rech connect</code>.</li>
+    <li><code>rechrome-signal</code> Worker + Pages Function (option B). Deploy only with explicit approval. Self-hosting: <a href="signal-selfhost">tutorial</a>.</li>
+    <li>Invites and device pinning (<code>--devices</code>, <code>--approve</code>), expiry and renewal.</li>
+    <li>Opt-in TURN; gitleaks and secretlint rules upstream.</li>
+  </ol>
+
+  <!-- ================================================================ -->
+  <h2 id="lab">12. Try it: token lab</h2>
+  <p>This runs in your browser with WebCrypto, and nothing leaves the page. It generates a <code>rech1_</code> secret, checks it, and shows what each party gets to see.</p>
+  <div class="card">
+    <div class="row" style="margin-bottom:10px">
+      <button id="gen">Generate secret</button>
+      <button id="copy">Copy link</button>
+      <span id="copied" class="meta"></span>
+    </div>
+    <input type="text" id="tok" spellcheck="false" aria-label="rech1_ token" placeholder="rech1_…" />
+    <p class="meta" style="margin:6px 0 12px">Paste or edit a token to check it; try changing one character.</p>
+    <dl class="kv" id="out"></dl>
+  </div>
+</div>
+
+<script>
+(() => {
+  const ALPHA = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+  const RE = /^rech1_([1-9A-HJ-NP-Za-km-z]{22})([1-9A-HJ-NP-Za-km-z]{6})$/;
+  const enc = new TextEncoder();
+
+  function b58(bytes, width) {
+    let n = 0n;
+    for (const b of bytes) n = (n << 8n) | BigInt(b);
+    let s = "";
+    while (n > 0n) { s = ALPHA[Number(n % 58n)] + s; n /= 58n; }
+    return s.padStart(width, "1");
+  }
+  function unb58(str, len) {
+    let n = 0n;
+    for (const c of str) { const i = ALPHA.indexOf(c); if (i < 0) return null; n = n * 58n + BigInt(i); }
+    const out = new Uint8Array(len);
+    for (let i = len - 1; i >= 0; i--) { out[i] = Number(n & 0xffn); n >>= 8n; }
+    return n === 0n ? out : null; // overflow → not a valid fixed-width encoding
+  }
+  const CRC = (() => { const t = new Uint32Array(256); for (let i = 0; i < 256; i++) { let c = i; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; t[i] = c >>> 0; } return t; })();
+  function crc32(bytes) { let c = 0xffffffff; for (const b of bytes) c = CRC[(c ^ b) & 0xff] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; }
+  const u32 = n => new Uint8Array([n >>> 24, (n >>> 16) & 255, (n >>> 8) & 255, n & 255]);
+
+  function makeToken() {
+    const s = crypto.getRandomValues(new Uint8Array(16));
+    return `rech1_${b58(s, 22)}${b58(u32(crc32(s)), 6)}`;
+  }
+  async function hkdf(secret, label, bytes) {
+    const key = await crypto.subtle.importKey("raw", secret, "HKDF", false, ["deriveBits"]);
+    const bits = await crypto.subtle.deriveBits({ name: "HKDF", hash: "SHA-256", salt: new Uint8Array(), info: enc.encode(label) }, key, bytes * 8);
+    return new Uint8Array(bits);
+  }
+  const hex = b => [...b].map(x => x.toString(16).padStart(2, "0")).join("");
+
+  const $ = id => document.getElementById(id);
+  const row = (k, v, cls = "") => `<dt>${k}</dt><dd class="${cls}">${v}</dd>`;
+  const esc = s => s.replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+  async function render() {
+    const t = $("tok").value.trim();
+    const m = RE.exec(t);
+    if (!m) { $("out").innerHTML = row("format", t ? "not a rech1_ token (prefix, length or a non-base58 character such as 0 O I l)" : "-", t ? "bad" : ""); return; }
+    const s = unb58(m[1], 16), sum = unb58(m[2], 4);
+    const ok = s && sum && hex(sum) === hex(u32(crc32(s)));
+    if (!ok) { $("out").innerHTML = row("format", "ok") + row("checksum", "mismatch: link copied incompletely or mistyped", "bad"); return; }
+    const [room, auth, bearer] = await Promise.all([hkdf(s, "rech/room", 12), hkdf(s, "rech/auth", 32), hkdf(s, "rech/bearer", 24)]);
+    $("out").innerHTML =
+      row("format", "ok", "ok") + row("checksum", "ok (CRC32)", "ok") +
+      row("link", esc(`https://rechrome.pages.dev/#${t}`)) +
+      row("CLI", esc(`rech connect ${t}`)) +
+      row("room id", `${b58(room, 17)} <span class="meta">(signal server sees)</span>`) +
+      row("authToken", `${hex(auth).slice(0, 24)}… <span class="meta">(signal server sees, one-way)</span>`) +
+      row("bearer", `${b58(bearer, 33).slice(0, 16)}… <span class="meta">(HTTP transports)</span>`) +
+      row("AES keys", `<span class="meta">HKDF(S, SHA-256(offer‖answer)): only the two peers have them</span>`);
+  }
+  $("gen").onclick = () => { $("tok").value = makeToken(); render(); };
+  $("copy").onclick = async () => {
+    try { await navigator.clipboard.writeText(`https://rechrome.pages.dev/#${$("tok").value.trim()}`); $("copied").textContent = "copied"; }
+    catch { $("copied").textContent = "clipboard unavailable"; }
+    setTimeout(() => ($("copied").textContent = ""), 1500);
+  };
+  $("tok").oninput = render;
+  $("tok").value = makeToken();
+  render();
+})();
+</script>
+</body>
+</html>

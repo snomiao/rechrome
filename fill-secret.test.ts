@@ -1,10 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import {
-  SecretMasker, base32Decode, buildFillCode, domainGlobToRegExp, fillSecretWireArgs, hostAllowed,
+  SecretMasker, base32Decode, buildFillCode, daemonSessionSockets, domainGlobToRegExp, fillSecretWireArgs, hostAllowed,
   hasSnapshot, maskPasswordLines, parseScanResult, withholdSnapshots,
   parseDotenv, parseFillSecretArgs, parseFillSecretWire, readSecretSource, sessionSocketCandidates, totpCode, totpWaitMs,
 } from "./fill-secret.ts";
-import { mkdtempSync, rmSync, writeFileSync } from "fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { authorizeProfileRequest } from "./listeners.ts";
@@ -115,6 +115,16 @@ describe("sessionSocketCandidates", () => {
       for (const n of ["0123456789abcdef-aaaaaaaa.sock", "0123456789abcdef-bbbbbbbb-aaaaaaaa.sock", "aaaaaaaa.sock", "xx-aaaaaaaa.sock", "0123456789abcdef-aaaaaaaa-x.sock"]) writeFileSync(join(dir, n), "");
       expect(sessionSocketCandidates(dir, "aaaaaaaa").map(p => p.slice(dir.length + 1)).sort()).toEqual(["0123456789abcdef-aaaaaaaa.sock", "aaaaaaaa.sock"]);
       expect(sessionSocketCandidates(dir, "bbbbbbbb-aaaaaaaa").map(p => p.slice(dir.length + 1))).toEqual(["0123456789abcdef-bbbbbbbb-aaaaaaaa.sock"]);
+    } finally { rmSync(dir, { recursive: true }); }
+  });
+  test("reads named pipe / socket paths from cliDaemon .session files (Windows daemon support)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "rech-daemon-sess-"));
+    try {
+      const hashDir = join(dir, "0123456789abcdef");
+      mkdirSync(hashDir, { recursive: true });
+      writeFileSync(join(hashDir, "aaaaaaaa.session"), JSON.stringify({ name: "aaaaaaaa", socketPath: "\\\\.\\pipe\\pw-c509fc7f-cli-0123456789abcdef-aaaaaaaa" }));
+      writeFileSync(join(hashDir, "bbbbbbbb-aaaaaaaa.session"), JSON.stringify({ name: "bbbbbbbb-aaaaaaaa", socketPath: "\\\\.\\pipe\\pw-c509fc7f-cli-0123456789abcdef-bbbbbbbb-aaaaaaaa" }));
+      expect(daemonSessionSockets("aaaaaaaa", { PLAYWRIGHT_DAEMON_SESSION_DIR: dir })).toEqual(["\\\\.\\pipe\\pw-c509fc7f-cli-0123456789abcdef-aaaaaaaa"]);
     } finally { rmSync(dir, { recursive: true }); }
   });
 });
