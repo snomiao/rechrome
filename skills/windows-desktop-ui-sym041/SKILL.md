@@ -9,7 +9,7 @@ description: Operate the Windows desktop on sym041 through the vault lane's winr
 
 Use the vault lane **[dede] on symubu** as the winrpc executor. The controlling lane sends small, exact AHK v2 scripts; dede runs each request and returns its result and a private screenshot path. `WINRPC_URL` and `WINRPC_TOKEN` stay on symubu. Do not copy them to sym003, print them, include them in messages, or invoke CLI help with credential-bearing arguments (a client previously echoed a token in help output). Have dede read the existing private environment in-process and issue HTTP requests without logging authorization headers.
 
-Begin **every outgoing `ay` message with `[rechrome]`**, including status, instructions, and review requests. Identify the requesting host/worktree on first contact. Resolve the current coordinator and vault lane IDs instead of assuming an old PID still belongs to them. Example, with the verified current lane ID:
+Begin **every outgoing `ay` message with your own lane tag**, including status, instructions, and review requests. `[rechrome]` is the example for the rechrome lane; other lanes use their own tags. Identify the requesting host/worktree on first contact. Resolve the current coordinator and vault lane IDs instead of assuming an old PID still belongs to them. Example, with the verified current lane ID:
 
 ```sh
 ssh symubu 'PATH="$HOME/.bun/bin:/usr/bin:/bin" ay send --force <lane-id> "[rechrome] Request and exact next step..."'
@@ -23,10 +23,10 @@ Obtain authorization for the target profile, extension and task. Existing task a
 
 - Windows SSH gives a non-interactive session, often session 0. It is suitable for diagnostics and CLI calls, not launching GUI automation directly. winrpc must already run on the interactive desktop; use `POST /ahk-eval?gui=1` through dede.
 - Read the installed winrpc README and implementation when its behavior is uncertain. The observed installation was `C:\tmp\winrpc`; the source is [symval/winrpc](https://github.com/symval/winrpc).
-- Check `GET /health` and `GET /lock`. Normal `/ahk-eval` requests acquire the cross-process `C:\tmp\im-ui.lock` automatically. The observed TTL was 60 seconds; keep scripts short. Never force-unlock or use `readonly=1` to bypass locking for UI actions.
+- Check `GET /health` and `GET /lock`. Normal `/ahk-eval` requests acquire the cross-process `C:\tmp\im-ui.lock` automatically. The AHK lock was observed to be held per request; keep scripts short. The README's 60-second timeout applies to `/shell`, not a documented AHK lock TTL. Never force-unlock or use `readonly=1` to bypass locking for UI actions.
 - The observed API has no acquire/hold endpoint across requests. Use per-action locks, passive screenshots between actions, and coordinator-confirmed exclusive desktop access. If someone requires a continuous lock, explain this limitation before proceeding. Do not silently claim the lock is held between calls. Passive screenshots do not acquire it.
 - Take a screenshot **before** any action. After each small action, capture another screenshot and inspect it before sending the next action. Send scripts as exact UTF-8 files: semicolons in AHK start comments, so do not flatten scripts into semicolon-separated chat prose.
-- The observed `/screenshot` captured only 1280x720 of a 1920x1080 desktop at 150% scaling. If edges are missing, have dede use a DPI-aware passive capture through `/shell`; do not change display settings. Confirm bounds and scaling before using coordinates. In AHK, use `SetThreadDpiAwarenessContext(-4)` and `CoordMode("Mouse", "Screen")` for coordinates measured from a physical-pixel capture.
+- The observed `/screenshot` captured only 1280x720 of a 1920x1080 desktop at 150% scaling. If edges are missing, have dede use a DPI-aware passive capture through `/shell`; do not change display settings. Confirm bounds and scaling before using coordinates. In AHK v2, call `DllCall("SetThreadDpiAwarenessContext", "ptr", -4, "ptr")` and use `CoordMode("Mouse", "Screen")` for coordinates measured from a physical-pixel capture.
 
 ## Prove the Chrome profile
 
@@ -47,7 +47,7 @@ Direct `SendText` immediately after Ctrl+L lost the initial `chr` from `chrome:/
 
 ## Finish setup and verify
 
-Keep setup output private: it can contain bearer URLs and extension tokens. Do not capture the setup guide indiscriminately. Report sanitized milestones instead.
+Keep setup output private: it can contain bearer URLs and extension tokens. Never capture the setup guide. Report sanitized milestones instead.
 
 Run `rech setup --profile "Profile 1" --listen local` for the established local-only task; preserve the requested listener scope for other tasks. If setup must open GUI pages, run it in the user's interactive session through a **user-level Interactive scheduled task**, not session 0. Use the actual Windows identity SID for the principal; `USERDOMAIN` was `WORKGROUP` and was not a valid account domain. Keep the process alive through token detection, Bridge verification, and registration. Back up configuration before changing its save destination; do not overwrite unrelated defaults or create remote sharing without authorization.
 
