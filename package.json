@@ -26,6 +26,8 @@
     "serve.js",
     "serve.ts",
     "vendor",
+    "scoped-upload.ts",
+    "scoped-upload.js",
     "secret.ts",
     "secret.js",
     "shares.ts",
@@ -44,7 +46,7 @@
     "vendor-cli": "bash scripts/vendor-cli.sh",
     "prepare": "bash scripts/vendor-cli.sh --prepare",
     "check-pack": "bash scripts/check-pack.sh",
-    "prepublishOnly": "bash scripts/vendor-cli.sh && sed 's/\\.ts/\\.js/g' rechrome.ts > rechrome.js && sed 's/\\.ts/\\.js/g' serve.ts > serve.js && bun build extension-token.ts --target=bun --outfile=extension-token.js && bun build daemon-manager.ts --target=bun --outfile=daemon-manager.js && bun build listeners.ts --target=bun --outfile=listeners.js && bun build secret.ts --target=bun --external node-datachannel --outfile=secret.js && bun build shares.ts --target=bun --external node-datachannel --outfile=shares.js && bun build e2e.ts --target=bun --external node-datachannel --outfile=e2e.js && bun build webrtc.ts --target=bun --external node-datachannel --outfile=webrtc.js && bun build signal-relay.ts --target=bun --external node-datachannel --outfile=signal-relay.js && bash scripts/check-pack.sh"
+    "prepublishOnly": "bash scripts/vendor-cli.sh && sed 's/\\.ts/\\.js/g' rechrome.ts > rechrome.js && sed 's/\\.ts/\\.js/g' serve.ts > serve.js && bun build extension-token.ts --target=bun --outfile=extension-token.js && bun build daemon-manager.ts --target=bun --outfile=daemon-manager.js && bun build listeners.ts --target=bun --outfile=listeners.js && bun build scoped-upload.ts --target=bun --outfile=scoped-upload.js && bun build secret.ts --target=bun --external node-datachannel --outfile=secret.js && bun build shares.ts --target=bun --external node-datachannel --outfile=shares.js && bun build e2e.ts --target=bun --external node-datachannel --outfile=e2e.js && bun build webrtc.ts --target=bun --external node-datachannel --outfile=webrtc.js && bun build signal-relay.ts --target=bun --external node-datachannel --outfile=signal-relay.js && bash scripts/check-pack.sh"
   },
   "devDependencies": {
     "@types/bun": "latest",

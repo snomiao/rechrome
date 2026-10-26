@@ -228,6 +228,11 @@ If no supported daemon manager is available, setup asks before installing `oxmgr
 when launched with npx. Pass `--yes` to approve this without prompting,
 for example `bunx rechrome setup --profile Default --yes`.
 
+On macOS, a daemon started by launchd or oxmgr cannot read Chrome's profile folder
+until its bun binary has Full Disk Access. `rech status` and the serve log report
+this and name the binary. See [Keeping rech serve running on macOS](docs/macos-daemon.md)
+for the grant, a LaunchAgent, and the terminal keep-alive alternative.
+
 Agents setting up Chrome on macOS can use the [rechrome setup skill](skills/rechrome-setup/SKILL.md),
 which covers native extension installation with Computer Use and CLI connection verification.
 `rech setup` detects Codex and Claude Code environment hints and prints agent-specific guidance;
@@ -307,6 +312,7 @@ cp .env.example .env.local
 | `PLAYWRIGHT_MCP_EXTENSION_ID`       | Chrome extension ID (client overrides server)                                                                                       | —                |
 | `PLAYWRIGHT_MCP_EXTENSION_TOKEN`    | Chrome extension token — profile-specific, get it from the extension's status page (client overrides server)                        | —                |
 | `PLAYWRIGHT_MCP_USER_DATA_DIR`      | Chrome user data directory — use to pin connections to a specific Chrome install (client overrides server)                          | —                |
+| `RECHROME_PROFILE` | Default profile selector for browser commands, equivalent to `--profile`. An explicit flag wins; blank values are ignored. Remote listeners still enforce their allowlist. | — |
 | `PLAYWRIGHT_MCP_PROFILE_DIRECTORY`  | Chrome profile — accepts directory name (`Profile 2`), display name (`Snowstar`), or **email** (`you@example.com`) (client overrides server) | —         |
 
 > **Multi-profile tip:** Each project's `.env.local` can specify a different Chrome profile via the `?profile=` query param in `RECHROME_URL`. The server resolves display names and email addresses to the actual Chrome profile directory automatically (reads `~/Library/Application Support/Google/Chrome/Local State`).
@@ -317,6 +323,57 @@ cp .env.example .env.local
 > ```
 >
 > Shell-set `PLAYWRIGHT_MCP_*` variables take priority over `.env.local`, so you can always override per-command without editing files.
+
+### Small icon uploads from stdin
+
+Uploads are disabled by default on every listener. The host owner can add an
+`uploads` object to the intended listener entry in `~/.rechrome/listeners.json`:
+
+```json
+"uploads": {
+  "maxBytes": 2097152,
+  "contentTypes": ["image/png", "image/svg+xml"]
+}
+```
+
+The object enables uploads; omitting it disables them. `uploads: {}` uses the
+same defaults shown above. The owner can lower the byte limit or narrow the type
+list, but cannot exceed the hard **2 MiB** limit or enable other types. Do not
+replace the listener's other fields or share its key. Install the updated daemon
+code before enabling this policy; configuration changes then use the usual
+listener reload mechanism.
+
+On the **client machine**, open the website's file chooser with `rech click`, then
+send the icon through stdin in the same profile/session:
+
+```bash
+rech --profile work -s=slack upload --name app-icon.png < ./app-icon.png
+cat ./app-icon.svg | rech --profile work -s=slack upload --name app-icon.svg
+```
+
+`--content-type image/png` or `--content-type image/svg+xml` may be specified;
+otherwise the type is inferred from `--name`. This command is stdin-only: there
+is no positional file path. The shell reads the local file; only its bytes and
+metadata are sent to the listener. Client and server both enforce the byte cap.
+The server checks PNG signatures or UTF-8 SVG markup (rejecting DTD/entities),
+and checks the type against the listener policy. These checks identify the file
+format; they do not sanitize SVG or scan for malware. The host never renders the
+file or resolves anything referenced inside it.
+
+The receiver writes a random `.png`/`.svg` filename with mode 0600 inside a private
+0700 temporary directory, outside the downloadable output tree. It passes only
+that generated path to the existing file-chooser command and removes the directory
+on success, error, or timeout. Neither filenames nor payload fields can select a
+host file. A crash or forced process kill can interrupt cleanup; the files remain
+private OS temporary files. Permission modes apply on POSIX hosts.
+
+Each upload produces one `upload:` JSON audit record with listener, profile,
+original name, byte size, SHA-256, page origin observed immediately before upload,
+and result. It contains no file contents, credentials, page path, query, or fragment.
+Requests rejected before inspection have null values for unavailable fields.
+An HTTP(S) origin must be determined before an upload is attempted. As with other
+browser commands, avoid concurrent tab navigation in the same session. Scoped
+`eval`, `run-code`, host paths, and CLI option overrides remain unavailable.
 
 ### Remote access
 

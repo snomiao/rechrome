@@ -139,6 +139,14 @@ Hard-won notes — a source edit not taking effect at runtime is almost always o
 - **The connect flow has two paths: token-bypass and Allow-click.** The daemon uses **token-bypass**
   (auto-connect, no UI click). A test that only drives the Allow-click path (`clickAllowAndSelect`)
   misses bypass-only bugs — cover token-bypass explicitly.
+- **macOS TCC: a launchd/oxmgr-started serve cannot read `~/Library/Application Support/Google/Chrome`**
+  (EPERM on Local State and the profile's leveldb) unless its bun binary has Full Disk Access; a
+  Terminal/agent-started one inherits the grant. The relay's install check then reports a misleading
+  `Playwright Extension not found`. serve detects this at startup and says so in its log, `/ping`
+  (`rech status` → `chrome: ⚠`) and the failing open. Resolve profiles from `~/.rechrome/profiles.yaml`
+  (never TCC-guarded), not Local State. Reproduce with a throwaway LaunchAgent on another port and a fake
+  `HOME` (symlink its `Library/Application Support/Google/Chrome` to the real one); never bind 13775.
+  See `docs/macos-daemon.md`.
 - **A daemon (`serve`) change needs the daemon restarted** (`oxmgr restart rechrome`) to take
   effect; the daemon runs the `serve` source directly (no build step). Restarting it does not touch
   Chrome or live browser sessions.
