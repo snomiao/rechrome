@@ -828,16 +828,51 @@ const CHROME_LOCAL_STATE_PATHS = () => {
 
 type ChromeProfileInfo = { user_name?: string; name?: string };
 
+/**
+ * macOS privacy (TCC) blocks a process launched by launchd/oxmgr from Chrome's data folder unless
+ * its binary has Full Disk Access; a Terminal or agent session inherits the grant. Turn that EPERM
+ * into the fix. Undefined for any other error (or platform).
+ */
+export function chromeDataAccessHint(error: unknown, execPath = process.execPath, platform = process.platform): string | undefined {
+  const code = (error as { code?: string } | null)?.code;
+  const message = error instanceof Error ? error.message : String(error);
+  if (platform !== "darwin" || !(code === "EPERM" || code === "EACCES" || /EPERM|operation not permitted/i.test(message))) return undefined;
+  return `macOS privacy settings (TCC) block ${execPath} from reading Chrome's profile folder. ` +
+    `Grant it Full Disk Access: System Settings → Privacy & Security → Full Disk Access → +, press ⌘⇧G, paste ${execPath}, ` +
+    `then restart rech serve. Or run rech serve from Terminal, which already has access (see docs/macos-daemon.md).`;
+}
+
+/** Why the last readChromeProfileCache() returned null (undefined when it succeeded). */
+let profileCacheProblem: string | undefined;
+
 export async function readChromeProfileCache(): Promise<Record<string, ChromeProfileInfo> | null> {
+  profileCacheProblem = undefined;
+  const problems: string[] = [];
   for (const statePath of CHROME_LOCAL_STATE_PATHS()) {
     const f = file(statePath);
     if (!(await f.exists())) continue;
     try {
       const data = JSON.parse(await f.text());
-      return data?.profile?.info_cache ?? null;
-    } catch {}
+      if (data?.profile?.info_cache) return data.profile.info_cache;
+      problems.push(`${statePath} has no profile list`);
+    } catch (error) {
+      const hint = chromeDataAccessHint(error);
+      problems.push(`${statePath} is unreadable (${error instanceof Error ? error.message : String(error)})${hint ? `. ${hint}` : ""}`);
+    }
   }
+  profileCacheProblem = problems.join("; ") || "Chrome's Local State file was not found";
   return null;
+}
+
+/**
+ * Say so (once per process) when profile emails/names are unavailable, so a bare folder name
+ * like "Profile 1" is never mistaken for the whole story.
+ */
+let warnedProfileCache = false;
+export function warnIfProfileNamesUnavailable(cache: Record<string, ChromeProfileInfo> | null): void {
+  if (cache || warnedProfileCache) return;
+  warnedProfileCache = true;
+  console.error(`[rech] Chrome profile emails and names are unavailable (${profileCacheProblem ?? "Local State not read"}); profiles are shown by folder name only.`);
 }
 
 export function resolveChromeProfileSelector(
@@ -1307,6 +1342,7 @@ async function listRemoteProfiles(url: string): Promise<void> {
 
 async function listProfiles(): Promise<void> {
   const [cache, registry, root] = await Promise.all([readChromeProfileCache(), readTokenRegistry(), findChromeUserDataDir()]);
+  warnIfProfileNamesUnavailable(cache);
   const profiles = buildProfileRows(cache, registry, root);
   const listeners = await readListeners();
   const url = process.env[ENV_KEY];
@@ -1406,7 +1442,7 @@ export function registeredProfileChoices(registry: Record<string, TokenEntry>, c
     const info = !userDataDir || defaultDirs.includes(userDataDir) ? cache?.[dir] : undefined;
     const names = [info?.name, info?.user_name, key].filter((n): n is string => !!n && n !== dir);
     const shown = [...new Set(names)];
-    return { label: shown.length ? `${shown.join(" · ")}  [${dir}]` : dir, value: key };
+    return { label: shown.length ? `${shown.join(" · ")}  [${dir}]` : `${dir}  (no email or name known)`, value: key };
   });
 }
 
@@ -1640,6 +1676,7 @@ async function printProfileUri(selector?: string, listener?: string, opts: { loc
   const interactive = isInteractive();
   const registry = await readTokenRegistry();
   const cache = await readChromeProfileCache();
+  warnIfProfileNamesUnavailable(cache);
   const cancelled = () => new Error("Cancelled; nothing shared.");
   let config = await readListeners();
   const current = resolveEffectiveProfile(url ? parseUrl(url).profileDirectory : undefined);
@@ -1999,7 +2036,16 @@ export function unknownCommandHint(output: string, rechCommands: Iterable<string
   ].join("\n");
 }
 
-async function run(url: string, args: string[], overrideEnv?: Record<string, string>, opts: { verbatim?: boolean } = {}) {
+/**
+ * An `open` whose extension bridge never connected. Typical right after Chrome restarts: the
+ * relay's connect page reaches no live worker, yet a fresh bridge moments later connects at once
+ * (seen 2026-10-17: a timeout, then `rech setup`'s probe connected in 0.1s). Worth one retry.
+ */
+export function isBridgeTimeout(args: string[], result: { status: number; stderr?: string }): boolean {
+  return args.find(a => !a.startsWith("-")) === "open" && result.status !== 0 && /Extension connection timeout/i.test(result.stderr ?? "");
+}
+
+async function run(url: string, args: string[], overrideEnv?: Record<string, string>, opts: { verbatim?: boolean; bridgeRetried?: boolean } = {}) {
   // Match the underlying CLI's command names while accepting the short forms humans
   // naturally try. Keep this client-side so old and new serve daemons behave alike.
   args = normalizeCommandArgs(args);
@@ -2020,6 +2066,13 @@ async function run(url: string, args: string[], overrideEnv?: Record<string, str
     ({ args, upload } = await prepareStdinUpload(args, process.stdin));
   }
   const { status, stdout, stderr, files, existingSession } = await callServe(url, args, overrideEnv, identity, false, upload);
+  if (!opts.bridgeRetried && isBridgeTimeout(args, { status, stderr })) {
+    // Close the failed session so the retry gets a fresh cliDaemon and relay. callServe re-reads
+    // the extension's live token from the profile, so a re-minted token heals here too.
+    console.error(`[rech] the Chrome extension bridge did not answer (common right after Chrome restarts); retrying once with a fresh connection…`);
+    await callServe(url, [...args.filter(a => /^-s=/.test(a)), "close"], overrideEnv, identity).catch(() => {});
+    return run(url, args, overrideEnv, { ...opts, bridgeRetried: true });
+  }
 
   const isOpenWithUrl = args[0] === "open" && args.length > 1;
   if (existingSession && isOpenWithUrl) {
@@ -2039,9 +2092,12 @@ async function run(url: string, args: string[], overrideEnv?: Record<string, str
       // The daemon resolves registered profiles' bridge tokens itself and then asks for a reload;
       // only blame a missing install when neither side had credentials.
       const hasToken = !!effectiveEnv["PLAYWRIGHT_MCP_EXTENSION_TOKEN"] || /reload the .*extension/i.test(stderr);
+      const profileArg = displayProfile ? ` --profile ${JSON.stringify(displayProfile)}` : "";
       const last = hasToken
-        ? `  -x: extension did not connect (reload it at chrome://extensions; then verify its token) -> extension[degraded]`
-        : `  -> extension[not installed]  (run: rech setup)`;
+        ? `  -x: extension did not connect${opts.bridgeRetried ? " (also after an automatic retry)" : ""} -> extension[degraded]\n` +
+          `[rech] reload "Playwright MCP Bridge" at chrome://extensions${displayProfile ? ` in ${displayProfile}'s window` : ""}, then retry; ` +
+          `or run \`rech setup${profileArg}\`, which re-detects the extension and token and verifies the connection.`
+        : `  -> extension[not installed]  (run: rech setup${profileArg})`;
       console.error(`[rech] rech-client -> rech-server[ok] -> playwright[ok]\n${last}`);
     }
     if (stderr.includes("Browser '") && stderr.includes("is not open")) {
@@ -2074,6 +2130,26 @@ async function run(url: string, args: string[], overrideEnv?: Record<string, str
   }
 
   process.exit(status);
+}
+
+/** The daemon's Playwright CLI predates `open --wait` (rechrome <= 1.35.1 bundled one). */
+export function cliRejectsWaitOption(output: string): boolean {
+  return /Unknown options?:?[^\n]*?['"`]?--wait\b/i.test(output);
+}
+
+/**
+ * setup's bridge probe: open about:blank without waiting for a load. The daemon owns the CLI and
+ * may be older than this client, so feature-check by behavior: if the CLI rejects `--wait`, probe
+ * again without it rather than reporting a broken bridge.
+ */
+export async function probeBridgeOpen<T extends { status: number; stdout: string; stderr: string }>(
+  call: (args: string[]) => Promise<T>,
+  note: (message: string) => void = () => {},
+): Promise<T> {
+  const probe = await call(["open", "about:blank", "--wait", "none"]);
+  if (probe.status === 0 || !cliRejectsWaitOption(`${probe.stderr}\n${probe.stdout}`)) return probe;
+  note("The daemon's Playwright CLI does not support `open --wait`; probing without it (update rechrome on the daemon host).");
+  return call(["open", "about:blank"]);
 }
 
 export type SetupPhase = "extension" | "token" | "bridge" | "error" | "save" | "ready";
@@ -2536,6 +2612,7 @@ export async function daemonInstall(serveUrl: string): Promise<void> {
     [ENV_KEY]: serveUrl,
     PWMCP_TEST_CONNECTION_TIMEOUT: process.env.PWMCP_TEST_CONNECTION_TIMEOUT || "30000",
     PLAYWRIGHT_CLI: resolvedPlaywrightCli,
+    RECH_SERVE_MANAGED: "1", // the manager restarts it; never idle-self-exit (see serve.ts)
   };
   if (process.env.RECH_HOST) daemonEnv.RECH_HOST = process.env.RECH_HOST;
   if (isReadable(process.env.RECH_TLS_CERT)) daemonEnv.RECH_TLS_CERT = process.env.RECH_TLS_CERT!;
@@ -3294,7 +3371,7 @@ async function setup(opts: SetupOptions = {}): Promise<void> {
   console.log(`✓ [1/5] Local management daemon verified; requested profile access: ${desiredBind}`);
 
   const cache = await readChromeProfileCache();
-  if (!cache) { console.error("      Chrome profiles not found"); rl?.close(); process.exit(1); }
+  if (!cache) { console.error(`      Chrome profiles not found: ${profileCacheProblem ?? "Local State not read"}`); rl?.close(); process.exit(1); }
   const userDataDir = await findChromeUserDataDir();
 
   async function pickProfile(exclude: Set<string>): Promise<[string, ChromeProfileInfo] | null> {
@@ -3420,12 +3497,9 @@ async function setup(opts: SetupOptions = {}): Promise<void> {
     guide?.takeRetry();
     guide?.update("bridge", "Extension and token detected. Testing the browser connection…");
     try {
-      const probe = await callServe(
-        rechUrl.toString(),
-        [`-s=${probeSession}`, "open", "about:blank", "--wait", "none"],
-        probeEnv,
-        probeIdentity,
-        true,
+      const probe = await probeBridgeOpen(
+        args => callServe(rechUrl.toString(), [`-s=${probeSession}`, ...args], probeEnv, probeIdentity, true),
+        note => console.log(`      ${note}`),
       );
       bridgeVerified = probe.status === 0;
       if (bridgeVerified) {
@@ -3581,7 +3655,7 @@ async function status(): Promise<void> {
     ? await fetch(serviceUrl(url, "ping"), { headers: { Authorization: `Bearer ${parsed.key}` }, signal: AbortSignal.timeout(2000) }).catch(() => null)
     : null;
   const pingBody = pingResponse?.ok
-    ? await pingResponse.json().catch(() => null) as { bind?: string; listener?: string; profiles?: string[] | "*"; degraded?: boolean; consecutiveTimeouts?: number } | null
+    ? await pingResponse.json().catch(() => null) as { bind?: string; listener?: string; profiles?: string[] | "*"; degraded?: boolean; consecutiveTimeouts?: number; chromeAccessProblem?: string } | null
     : null;
   // Show the URL this client connects to; through a proxy, the daemon's bind is on another port.
   const details = [pingBody?.listener && `listener ${pingBody.listener}`, pingBody?.bind && `bind ${pingBody.bind}`].filter(Boolean).join(", ");
@@ -3602,6 +3676,8 @@ async function status(): Promise<void> {
   // No oxmgr/pm2 on PATH must not take down `rech status`: report it instead of throwing.
   let mgr: DaemonManager | undefined;
   if (isHost) try { mgr = daemonManager(); } catch { /* reported below */ }
+  if (pingBody?.chromeAccessProblem)
+    console.log(`chrome:   ⚠ daemon ${pingBody.chromeAccessProblem}`);
   if (pingBody?.degraded)
     console.log(`relay:    ⚠ degraded (${pingBody.consecutiveTimeouts} consecutive command timeouts) — if it persists, the daemon self-restarts; ${isHost ? `force it now with \`${mgr?.id ?? "oxmgr"} restart ${PM_PROCESS_NAME}\`` : "the daemon host can restart it"}`);
   if (isHost) {

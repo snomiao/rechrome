@@ -19,6 +19,7 @@ import {
   readTokenRegistry,
   readChromeProfileCache,
   checkTailscaleServe,
+  chromeDataAccessHint,
 } from "./rechrome.ts";
 
 const TAILSCALE_BIN = process.env.TAILSCALE_BIN || "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
@@ -120,6 +121,16 @@ export function provesRelayAlive(o: { stdout: string; stderr: string }): boolean
   if (/Browser '[^']*' is not open/i.test(out)) return false;
   if (/is not open, please run open first/i.test(out)) return false;
   return true;
+}
+
+/**
+ * The relay checks Chrome's data folder for the installed extension before connecting. Under
+ * macOS TCC that read fails and it reports "Playwright Extension not found" although the
+ * extension is installed — name the real cause instead of sending the user to reinstall.
+ */
+export function explainExtensionNotFound(output: string, accessProblem: string | undefined): string | undefined {
+  if (!accessProblem || !/Playwright Extension not found in/i.test(output)) return undefined;
+  return `[rech] the extension is probably installed; this daemon ${accessProblem}\n`;
 }
 
 export function inferSilentExtensionFailure(options: {
@@ -256,24 +267,63 @@ export function splitCommand(cmd: string): string[] {
     t.startsWith('"') && t.endsWith('"') ? t.slice(1, -1) : t);
 }
 
-async function resolveProfileDirectory(nameOrEmail: string): Promise<string> {
+/** Why this daemon cannot read Chrome's data folder; reported by /ping so `rech status` shows it. */
+let chromeAccessProblem: string | undefined;
+/** Log (once) why Chrome's data folder is unreadable — under launchd/oxmgr on macOS this is TCC. */
+export function warnChromeDataAccess(path: string, error: unknown): void {
+  if (chromeAccessProblem) return;
+  const message = error instanceof Error ? error.message : String(error);
+  chromeAccessProblem = `cannot read ${path} (${message}). ${chromeDataAccessHint(error) ?? "Profile names and emails cannot be resolved here."}`;
+  log(chromeAccessProblem);
+}
+
+/** A profile name or email could not be mapped to its Chrome folder because Local State is unreadable. */
+export class ProfileResolutionError extends Error {
+  constructor(readonly profile: string, statePath: string, cause: unknown) {
+    const message = cause instanceof Error ? cause.message : String(cause);
+    const hint = chromeDataAccessHint(cause);
+    super(`[rech] cannot find the Chrome folder for profile "${profile}": ${statePath} is unreadable (${message}). Refusing, so Chrome does not create a new empty profile named "${profile}".\n`
+      + `  Register it once (records its folder in ~/.rechrome): rech setup --profile ${JSON.stringify(profile)}\n`
+      + `  Or select the folder directly, e.g. rech --profile "Profile 1" …\n`
+      + (hint ? `  ${hint}\n` : ""));
+    this.name = "ProfileResolutionError";
+  }
+}
+
+export async function resolveProfileDirectory(
+  nameOrEmail: string,
+  registry?: Record<string, { profileDir?: string }>,
+  statePaths: string[] = [
+    join(HOME || "~", "Library/Application Support/Google/Chrome/Local State"),
+    join(HOME || "~", ".config/google-chrome/Local State"),
+    join(HOME || "~", "AppData/Local/Google/Chrome/User Data/Local State"),
+  ],
+): Promise<string> {
   if (/^(Default|Profile \d+)$/i.test(nameOrEmail)) return nameOrEmail;
-  const home = HOME || "~";
-  const candidates = [
-    join(home, "Library/Application Support/Google/Chrome/Local State"),
-    join(home, ".config/google-chrome/Local State"),
-    join(home, "AppData/Local/Google/Chrome/User Data/Local State"),
-  ];
-  for (const statePath of candidates) {
-    const f = file(statePath);
-    if (!(await f.exists())) continue;
-    const data = JSON.parse(await f.text());
-    const cache: Record<string, any> = data?.profile?.info_cache ?? {};
-    for (const [dir, info] of Object.entries(cache)) {
-      if ([info.name, info.user_name, info.gaia_name].includes(nameOrEmail))
-        return dir;
+  // setup recorded each registered profile's folder in ~/.rechrome, which macOS privacy (TCC)
+  // never guards, so a launchd/oxmgr daemon resolves it without touching Chrome's data folder.
+  const entry = (registry ?? await readTokenRegistry().catch(() => ({})) as Record<string, { profileDir?: string }>)[nameOrEmail];
+  if (entry?.profileDir) return entry.profileDir;
+  let unreadable: { path: string; error: unknown } | undefined;
+  for (const statePath of statePaths) {
+    try {
+      // Read without an exists() probe: under TCC the stat fails too, and exists() would report
+      // "missing" and hide the denial.
+      const data = JSON.parse(await file(statePath).text());
+      const cache: Record<string, any> = data?.profile?.info_cache ?? {};
+      for (const [dir, info] of Object.entries(cache)) {
+        if ([info.name, info.user_name, info.gaia_name].includes(nameOrEmail))
+          return dir;
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code === "ENOENT") continue;
+      warnChromeDataAccess(statePath, error);
+      unreadable ??= { path: statePath, error };
     }
   }
+  // Passing an email or display name through would make Chrome create a NEW empty profile folder
+  // literally named after it (--profile-directory=me@example.com) instead of opening the real one.
+  if (unreadable) throw new ProfileResolutionError(nameOrEmail, unreadable.path, unreadable.error);
   return nameOrEmail;
 }
 
@@ -397,15 +447,34 @@ async function freeStalePort(port: number, host: string): Promise<void> {
 // the leak self-heals. /ping is deliberately NOT activity (the tray polls it every 2s
 // and would otherwise keep an orphan alive forever).
 const ORPHAN_POLL_INTERVAL_MS = 15_000;
-const ORPHAN_IDLE_EXIT_MS = Number(process.env.RECH_SERVE_IDLE_TIMEOUT_MS) || 5 * 60_000;
+const ORPHAN_IDLE_EXIT_MS = parseIdleTimeout(process.env.RECH_SERVE_IDLE_TIMEOUT_MS);
+
+// `RECH_SERVE_IDLE_TIMEOUT_MS=0` must disable self-exit; `Number(v) || default` turned 0 back into 5 min.
+export function parseIdleTimeout(raw: string | undefined, fallback = 5 * 60_000): number {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : fallback;
+}
+
+// A supervisor owns this serve's lifetime, so it is never a leaked foreground serve:
+// RECH_SERVE_MANAGED=1 (set by `rech setup`'s oxmgr/pm2 install), or a LaunchAgent — launchd
+// starts it with ppid 1 and its job label in XPC_SERVICE_NAME. ppid 1 alone is not enough:
+// `setsid rech serve` or `(rech serve &)` also starts with ppid 1 and must still self-exit.
+// Terminal apps set XPC_SERVICE_NAME to "0" or "application.<bundle id>…".
+export function isManagedServe(startPpid: number, env: Record<string, string | undefined> = process.env): boolean {
+  if (env.RECH_SERVE_MANAGED === "1") return true;
+  const label = env.XPC_SERVICE_NAME;
+  return startPpid === 1 && !!label && label !== "0" && !label.startsWith("application.");
+}
 
 // Pure decision predicate (testable). idleTimeoutMs <= 0 disables orphan self-exit.
 export function shouldExitOrphanedServe(opts: {
   orphaned: boolean;
   idleMs: number;
   idleTimeoutMs: number;
+  managed?: boolean;
 }): boolean {
-  return opts.idleTimeoutMs > 0 && opts.orphaned && opts.idleMs >= opts.idleTimeoutMs;
+  return !opts.managed && opts.idleTimeoutMs > 0 && opts.orphaned && opts.idleMs >= opts.idleTimeoutMs;
 }
 
 export const LANDING_HEADERS = {
@@ -533,13 +602,23 @@ export async function serve() {
   let orphaned = false;
   let idleSince = Date.now();
   const markActivity = () => { idleSince = Date.now(); };
+  const managed = isManagedServe(process.ppid);
+  if (managed) log("serve is supervised (launchd, a process manager, or RECH_SERVE_MANAGED=1) — idle self-exit disabled");
   setInterval(() => {
     if (process.ppid === 1) orphaned = true;
-    if (shouldExitOrphanedServe({ orphaned, idleMs: Date.now() - idleSince, idleTimeoutMs: ORPHAN_IDLE_EXIT_MS })) {
+    if (shouldExitOrphanedServe({ orphaned, managed, idleMs: Date.now() - idleSince, idleTimeoutMs: ORPHAN_IDLE_EXIT_MS })) {
       log(`orphaned foreground serve idle ${Math.round((Date.now() - idleSince) / 1000)}s — exiting (spawning agent is gone)`);
       process.exit(0);
     }
   }, ORPHAN_POLL_INTERVAL_MS);
+
+  // Say at startup, not on the first failed open, when macOS privacy blocks Chrome's data folder.
+  if (process.platform === "darwin") {
+    const chromeDir = join(HOME, "Library/Application Support/Google/Chrome");
+    try { readdirSync(chromeDir); } catch (error) {
+      if ((error as { code?: string }).code !== "ENOENT") warnChromeDataAccess(chromeDir, error);
+    }
+  }
 
   // Reap idle --isolate sessions so single-shot OAuth/login drives don't leak browser contexts.
   adoptOrphanedIsoSessions();
@@ -615,12 +694,12 @@ export async function serve() {
         // clients / `rech status` can see trouble without an active probe.
         const degraded = consecutiveTimeouts > 0;
         if (scoped || !reqUrl.searchParams.get("deep"))
-          return Response.json({ ok: true, bind: listenHost, listener: listener.name, profiles: listener.profiles, multiListener: true, consecutiveTimeouts, degraded });
+          return Response.json({ ok: true, bind: listenHost, listener: listener.name, profiles: listener.profiles, multiListener: true, consecutiveTimeouts, degraded, chromeAccessProblem });
         // Deep probe: exercise the relay read-only via `tab-list` (opens nothing) against the
         // most-recently-used session — never a fresh one, which could spawn a browser window.
         const target = [...recentSessions.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
         if (!target)
-          return Response.json({ ok: true, bind: listenHost, relay: "idle", consecutiveTimeouts, degraded });
+          return Response.json({ ok: true, bind: listenHost, relay: "idle", consecutiveTimeouts, degraded, chromeAccessProblem });
         const [pbin, ...pbinArgs] = splitCommand(resolvePlaywrightCli());
         const probe = Bun.spawn([pbin, ...pbinArgs, "tab-list", `-s=${target}`], {
           cwd: workDir, stdin: "ignore", stdout: "ignore", stderr: "ignore",
@@ -634,7 +713,7 @@ export async function serve() {
         const healthy = probeStatus !== -1;
         return Response.json({
           ok: healthy, bind: listenHost, relay: healthy ? "healthy" : "degraded",
-          consecutiveTimeouts, degraded: degraded || !healthy,
+          consecutiveTimeouts, degraded: degraded || !healthy, chromeAccessProblem,
         });
       }
       // A browser opening a shared URL gets copyable connect instructions. The key stays in the
@@ -765,7 +844,14 @@ export async function serve() {
 
       // Resolve profile name/email → directory name
       if (!scoped && passthroughEnv.PLAYWRIGHT_MCP_PROFILE_DIRECTORY) {
-        const resolved = await resolveProfileDirectory(passthroughEnv.PLAYWRIGHT_MCP_PROFILE_DIRECTORY);
+        let resolved: string;
+        try {
+          resolved = await resolveProfileDirectory(passthroughEnv.PLAYWRIGHT_MCP_PROFILE_DIRECTORY);
+        } catch (error) {
+          if (!(error instanceof ProfileResolutionError)) throw error;
+          log(`refused unresolvable profile "${error.profile}" (session=${namespacedSession})`);
+          return Response.json({ status: 1, stdout: "", stderr: error.message, files: [] });
+        }
         if (resolved !== passthroughEnv.PLAYWRIGHT_MCP_PROFILE_DIRECTORY)
           log(`profile resolved: "${passthroughEnv.PLAYWRIGHT_MCP_PROFILE_DIRECTORY}" → "${resolved}"`);
         passthroughEnv.PLAYWRIGHT_MCP_PROFILE_DIRECTORY = resolved;
@@ -907,7 +993,8 @@ export async function serve() {
       const handshakeTimeoutMs = Number.isFinite(configuredHandshakeTimeout) && configuredHandshakeTimeout > 0
         ? configuredHandshakeTimeout
         : 30_000;
-      const stderr = inferSilentExtensionFailure({
+      const tccNote = explainExtensionNotFound(`${stdout}\n${rawStderr}`, chromeAccessProblem);
+      const stderr = (tccNote ?? "") + inferSilentExtensionFailure({
         status,
         stdout,
         stderr: rawStderr,
