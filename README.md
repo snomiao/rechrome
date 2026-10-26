@@ -243,6 +243,7 @@ cp .env.example .env.local
 | `PLAYWRIGHT_MCP_EXTENSION_ID`       | Chrome extension ID (client overrides server)                                                                                       | —                |
 | `PLAYWRIGHT_MCP_EXTENSION_TOKEN`    | Chrome extension token — profile-specific, get it from the extension's status page (client overrides server)                        | —                |
 | `PLAYWRIGHT_MCP_USER_DATA_DIR`      | Chrome user data directory — use to pin connections to a specific Chrome install (client overrides server)                          | —                |
+| `RECHROME_PROFILE` | Default profile selector for browser commands, equivalent to `--profile`. An explicit flag wins; blank values are ignored. Remote listeners still enforce their allowlist. | — |
 | `PLAYWRIGHT_MCP_PROFILE_DIRECTORY`  | Chrome profile — accepts directory name (`Profile 2`), display name (`Snowstar`), or **email** (`you@example.com`) (client overrides server) | —         |
 
 > **Multi-profile tip:** Each project's `.env.local` can specify a different Chrome profile via the `?profile=` query param in `RECHROME_URL`. The server resolves display names and email addresses to the actual Chrome profile directory automatically (reads `~/Library/Application Support/Google/Chrome/Local State`).
