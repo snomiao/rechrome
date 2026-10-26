@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { prepareStdinUpload, type UploadPayload } from "./scoped-upload.ts";
 import { readListeners, writeListeners, listenerAddress, isLoopback, normalizePrefix, serviceUrl, allowProfiles, denyProfiles, rotateListenerKey, setPublicUrl, canonicalProfileKeys, planProfileRemoval, type Listener } from "./listeners.ts";
 
 import { file } from "bun";
@@ -1845,6 +1846,7 @@ async function callServe(
   overrideEnv?: Record<string, string>,
   precomputedIdentity?: { key: string; label: string; profile?: string },
   throwOnFailure = false,
+  upload?: UploadPayload,
 ): Promise<{ status: number; stdout: string; stderr: string; files?: string[]; existingSession?: boolean }> {
   const { key, host, port, protocol, extensionId, extensionToken, profileDirectory, userDataDir, loadExtension } = parseUrl(url);
   // Reuse the caller's identity when provided — computing it shells out to `git` several times,
@@ -1863,7 +1865,7 @@ async function callServe(
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
     // dataDir is a client-local path; the daemon (possibly remote) only needs the session identity.
-    body: JSON.stringify({ args, identity: { key: identity.key, label: identity.label, profile: identity.profile }, env }),
+    body: JSON.stringify({ args, identity: { key: identity.key, label: identity.label, profile: identity.profile }, env, ...(upload ? { upload } : {}) }),
     signal: AbortSignal.timeout(70_000),
   }).catch(async (e) => {
     if (throwOnFailure) throw new Error("Cannot reach the rechrome daemon. Check that it is running.");
@@ -2058,7 +2060,12 @@ async function run(url: string, args: string[], overrideEnv?: Record<string, str
 
   const resolvedEnv = await getClientEnv({ extensionId, extensionToken, profileDirectory: effectiveProfile, userDataDir, loadExtension });
   const effectiveEnv = { ...resolvedEnv, ...overrideEnv };
-  const { status, stdout, stderr, files, existingSession } = await callServe(url, args, overrideEnv, identity);
+  let upload: UploadPayload | undefined;
+  if (args.find(a => !/^-s=[a-zA-Z0-9_-]{1,64}$/.test(a)) === "upload") {
+    if (process.stdin.isTTY) throw new Error("upload reads stdin; redirect a PNG/SVG file with < icon.png");
+    ({ args, upload } = await prepareStdinUpload(args, process.stdin));
+  }
+  const { status, stdout, stderr, files, existingSession } = await callServe(url, args, overrideEnv, identity, false, upload);
   if (!opts.bridgeRetried && isBridgeTimeout(args, { status, stderr })) {
     // Close the failed session so the retry gets a fresh cliDaemon and relay. callServe re-reads
     // the extension's live token from the profile, so a re-minted token heals here too.
@@ -3734,6 +3741,7 @@ const HELP_EPILOGUE = `Browser commands (sent to this project's Chrome session):
 
 Environment:
   ${ENV_KEY}      connection URL; read from the nearest .rechrome/.env.local or .env.local
+  RECHROME_PROFILE  default browser profile selector; --profile overrides it
   RECH_IDENTITY     session key: worktree (default) | branch | cwd
   RECH_TOKEN        extension token for \`rech setup\` (same as --token)
   RECH_SETUP_AGENT  setup hints: codex | claude | none (auto-detected)
@@ -3924,7 +3932,7 @@ if (import.meta.main) {
     if (separator !== -1) args = args.slice(0, separator);
     try {
       const extracted = extractGlobalProfileArg(args);
-      profileSelector = extracted.selector;
+      profileSelector = extracted.selector ?? (process.env.RECHROME_PROFILE?.trim() || undefined);
       args = extracted.args;
     } catch (err) {
       console.error(err instanceof Error ? err.message : String(err));
