@@ -1872,6 +1872,23 @@ async function callServe(
   }
 }
 
+/** Probe only the temporary setup session; always release it, including on transport errors. */
+export async function probeSetupBridge(
+  url: string,
+  session: string,
+  env: Record<string, string>,
+  identity: { key: string; label: string; profile?: string },
+  run: typeof callServe = callServe,
+): Promise<Awaited<ReturnType<typeof callServe>>> {
+  try {
+    // The bundled CLI has no --wait option. about:blank needs no page-load override.
+    return await run(url, [`-s=${session}`, "open", "about:blank"], env, identity, true);
+  } finally {
+    // Never claim or close an existing worktree session, or mask the probe error with cleanup errors.
+    await run(url, [`-s=${session}`, "close"], env, identity, true).catch(() => {});
+  }
+}
+
 const BOOLEAN_OPEN_FLAGS = new Set(["--headed", "--persistent", "--in-memory", "--extension"]);
 
 export function normalizeCommandArgs(args: string[]): string[] {
@@ -3413,13 +3430,7 @@ async function setup(opts: SetupOptions = {}): Promise<void> {
     guide?.takeRetry();
     guide?.update("bridge", "Extension and token detected. Testing the browser connection…");
     try {
-      const probe = await callServe(
-        rechUrl.toString(),
-        [`-s=${probeSession}`, "open", "about:blank", "--wait", "none"],
-        probeEnv,
-        probeIdentity,
-        true,
-      );
+      const probe = await probeSetupBridge(rechUrl.toString(), probeSession, probeEnv, probeIdentity);
       bridgeVerified = probe.status === 0;
       if (bridgeVerified) {
         console.log("✓ [4/5] Extension bridge connected successfully");
@@ -3431,9 +3442,6 @@ async function setup(opts: SetupOptions = {}): Promise<void> {
     } catch (error) {
       bridgeError = error instanceof Error ? error.message : String(error);
       console.error(`      Extension bridge verification failed: ${bridgeError}`);
-    } finally {
-      // The isolated probe must never claim or close an existing worktree session.
-      await callServe(rechUrl.toString(), [`-s=${probeSession}`, "close"], probeEnv, probeIdentity, true).catch(() => {});
     }
 
     if (bridgeVerified) break;
