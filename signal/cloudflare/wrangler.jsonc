@@ -1,0 +1,12 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "rech-signal",
+  "main": "worker.ts",
+  "compatibility_date": "2025-05-01",
+  "durable_objects": { "bindings": [{ "name": "ROOMS", "class_name": "Room" }] },
+  // SQLite-backed: required for Durable Objects on the Workers Free plan.
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Room"] }],
+  "observability": { "enabled": true }
+  // Optional custom domain (zone must be on this Cloudflare account):
+  // "routes": [{ "pattern": "signal.example.com", "custom_domain": true }]
+}

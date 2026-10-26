@@ -9,7 +9,8 @@ async function run(argv: string[]) {
   const record = (name: string) => async (...args: unknown[]) => { calls.push([name, ...args]); };
   const handlers = Object.fromEntries(["serve", "status", "listListeners", "addListener", "removeListener", "listProfiles",
     "printProfileUri", "setup", "tray", "provisionProfile", "uninstall",
-    "urlList", "shareProfiles", "removeProfile", "connect", "listenerPort", "allowListener", "denyListener", "rotateKey", "setListener"].map(n => [n, record(n)])) as unknown as RechHandlers;
+    "urlList", "shareProfiles", "removeProfile", "connect", "listenerPort", "allowListener", "denyListener", "rotateKey", "setListener",
+    "shareNew", "shareList", "shareDevices", "shareEdit", "session", "signalServe", "bridge"].map(n => [n, record(n)])) as unknown as RechHandlers;
   await rechCli(argv, handlers).exitProcess(false).parseAsync();
   return calls;
 }
@@ -57,16 +58,40 @@ test("tray and provision-profile", async () => {
 
 test("share prints, saves, or lists connection URLs; connect takes a shared URL", async () => {
   expect(await run(["share", "qa"])).toEqual([["printProfileUri", "qa", undefined, { local: undefined, save: undefined }]]);
-  expect(await run(["share", "ls"])).toEqual([["urlList"]]);
+  expect(await run(["share", "ls"])).toEqual([["shareList"]]);
   expect(await run(["share", "qa", "--listener", "share", "--local", "--save"])).toEqual([["printProfileUri", "qa", "share", { local: true, save: true }]]);
   expect(await run(["share"])).toEqual([["printProfileUri", undefined, undefined, { local: undefined, save: undefined }]]);
-  expect(await run(["share", "list"])).toEqual([["urlList"]]);
+  expect(await run(["share", "list"])).toEqual([["shareList"]]);
   await expect(run(["url", "qa"])).rejects.toThrow(/Unknown argument|url/);
   expect(await run(["connect", "https://h.ts.net/rechrome/?profile=qa#key=k"])).toEqual([["connect", "https://h.ts.net/rechrome/?profile=qa#key=k"]]);
   await expect(run(["connect"])).rejects.toThrow();
   expect(await run(["connect", "--global", "u#key=k"])).toEqual([["connect", "u#key=k", { global: true, project: undefined }]]);
   expect(await run(["connect", "--project", "u#key=k"])).toEqual([["connect", "u#key=k", { global: undefined, project: true }]]);
   await expect(run(["connect", "--global", "--project", "u#key=k"])).rejects.toThrow();
+});
+
+test("share new/devices/approve/allow/deny/rotate/renew/revoke/rm route to share handlers", async () => {
+  expect(await run(["share", "new", "a@x.com", "Profile 5", "--name", "alice", "--via", "webrtc", "--via", "lan", "--expires", "7d", "--devices", "2", "--approve", "--invite-ttl", "1h"]))
+    .toEqual([["shareNew", ["a@x.com", "Profile 5"], { name: "alice", via: ["webrtc", "lan"], signal: undefined, expires: "7d", inviteTtl: "1h", devices: 2, approve: true }]]);
+  expect(await run(["share", "new", "qa", "--signal", "https://sig.example/"]))
+    .toEqual([["shareNew", ["qa"], { name: undefined, via: undefined, signal: "https://sig.example/", expires: undefined, inviteTtl: undefined, devices: undefined, approve: undefined }]]);
+  expect(await run(["share", "devices", "alice"])).toEqual([["shareDevices", "alice", undefined]]);
+  expect(await run(["share", "devices", "alice", "--rm", "abc"])).toEqual([["shareDevices", "alice", "abc"]]);
+  expect(await run(["share", "approve", "alice"])).toEqual([["shareEdit", "approve", "alice", [], { expires: undefined }]]);
+  expect(await run(["share", "allow", "alice", "b@x.com"])).toEqual([["shareEdit", "allow", "alice", ["b@x.com"], { expires: undefined }]]);
+  expect(await run(["share", "renew", "alice", "--expires", "30d"])).toEqual([["shareEdit", "renew", "alice", [], { expires: "30d" }]]);
+  for (const action of ["deny", "rotate", "revoke", "rm"]) expect((await run(["share", action, "alice"]))[0].slice(0, 3)).toEqual(["shareEdit", action, "alice"]);
+  await expect(run(["share", "revoke"])).rejects.toThrow(/Which share/);
+});
+
+test("session, signal and the hidden bridge", async () => {
+  expect(await run(["session"])).toEqual([["session", "ls", undefined]]);
+  expect(await run(["sessions", "list"])).toEqual([["session", "ls", undefined]]);
+  expect(await run(["session", "close", "login"])).toEqual([["session", "close", "login"]]);
+  await expect(run(["session", "explode"])).rejects.toThrow();
+  expect(await run(["signal"])).toEqual([["signalServe", { host: undefined, port: undefined }]]);
+  expect(await run(["signal", "serve", "--host", "0.0.0.0", "--port", "9000"])).toEqual([["signalServe", { host: "0.0.0.0", port: 9000 }]]);
+  expect(await run(["bridge"])).toEqual([["bridge"]]);
 });
 
 test("listener port, allow, deny, rotate-key and set", async () => {
@@ -238,7 +263,8 @@ test("-h shows a command's help, and a parse error shows it too, above the error
   const help = await runRech(["connect", "-h"], env);
   expect(help.code).toBe(0);
   expect(help.stdout).toContain("rech connect <url>");
-  expect(help.stdout).toContain("rech share <profile>");
+  expect(help.stdout).toContain("rech share");
+  expect(help.stdout).toContain("rech1_");
   const missing = await runRech(["connect"], env);
   expect(missing.code).toBe(1);
   expect(missing.stderr).toContain("rech connect <url>");

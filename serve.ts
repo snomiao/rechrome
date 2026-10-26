@@ -1,7 +1,10 @@
 import { receiveUpload, readRequestJson } from "./scoped-upload.ts";
 import { readListeners, listenerAddress, authorizeProfileRequest, canReadProfileFile, profileOutputPrefix, normalizePrefix, resolveAllowedProfile, type Listener } from "./listeners.ts";
+import { WEBRTC, authorizeCredential, credentialForBearer, readShares, redeemInvite, shareProblem, updateShares, webrtcCredentials, type Credential, type ShareConfig } from "./shares.ts";
+import { bearerOf, safeEqual } from "./secret.ts";
+import { WebrtcHost } from "./webrtc.ts";
 import { file } from "bun";
-import { createHash, X509Certificate } from "crypto";
+import { createHash, randomBytes, X509Certificate } from "crypto";
 import { mkdirSync, lstatSync, chmodSync, unlinkSync, accessSync, readdirSync, realpathSync, constants as fsConstants } from "fs";
 import { join, resolve, relative, isAbsolute } from "path";
 import { tmpdir } from "os";
@@ -518,7 +521,7 @@ a { color: var(--accent); }
 <p>Someone shared a Chrome profile with you through <a href="https://github.com/snomiao/rechrome">rechrome</a>.
 On your computer, inside the project folder that should use it, run these two lines
 (the same in macOS/Linux terminals, PowerShell and cmd):</p>
-<p id="nokey" class="warn" hidden>This link is missing its key (the part after #key=). Ask for the full link from <code>rech share</code>.</p>
+<p id="nokey" class="warn" hidden>This link is missing its key (the part after # — #key=… or #rech1_…). Ask for the full link from <code>rech share</code>.</p>
 <div id="cmds"></div>
 <div id="profiles" hidden><p>Profiles this link can use (pick one to make it the default in the command above):</p><div id="plist"></div></div>
 <p class="small">Needs <a href="https://bun.sh">Bun</a>. Then try <code>rechrome open https://example.com</code>.
@@ -528,13 +531,14 @@ This link contains a secret key: anyone with it can use this browser profile, so
 (() => {
   let url = location.href;
   const key = (location.hash.match(/[#&]key=([^&]*)/) || [])[1];
-  if (!/[#&?]key=/.test(location.hash)) document.getElementById("nokey").hidden = false;
+  const invite = /^#rech1_[1-9A-HJ-NP-Za-km-z]{28}$/.test(location.hash);
+  if (!/[#&?]key=/.test(location.hash) && !invite) document.getElementById("nokey").hidden = false;
   // One command for every shell: two lines (no && vs ; split), one double-quoted URL. Characters a
   // shell expands inside double quotes ($ \` " \\ !) are percent-encoded, which the URL reads the same;
   // %40 goes back to a readable @ (valid in a query, and one less % for cmd to try to expand).
   const quote = s => '"' + s.replace(/%40/g, "@").replace(/[$\`"\\\\!]/g, c => "%" + c.charCodeAt(0).toString(16).toUpperCase()) + '"';
   const build = u => "bun i -g rechrome\\nrechrome connect " + quote(u);
-  const mask = s => s.replace(/(key=)[^&"\\n]+/, "$1…");
+  const mask = s => s.replace(/(key=)[^&"\\n]+/, "$1…").replace(/(#rech1_[1-9A-HJ-NP-Za-km-z]{4})[1-9A-HJ-NP-Za-km-z]+/, "$1…");
   const root = document.getElementById("cmds");
   const row = document.createElement("div"); row.className = "row";
   const line = document.createElement("div"); line.className = "cmd";
@@ -643,24 +647,23 @@ export async function serve() {
   const legacy: Listener = { name: "legacy", host: listenHost, port, key, profiles: "*" };
   const policies = new Map<string, Listener>();
   const servers = new Map<string, ReturnType<typeof Bun.serve>>();
-  const startServer = (initial: Listener, reusePort = false) => Bun.serve({
-    hostname: initial.host,
-    port: initial.port,
-    // reusePort is used only as a last-resort fallback (see bindAtStartup below): if an orphaned
-    // holder can't be killed, binding with SO_REUSEADDR keeps serve up (degraded, port-shared)
-    // instead of crash-looping on EADDRINUSE. The normal path binds a clean, exclusive socket.
-    reusePort,
-    tls,
-    error(err) {
-      log(`unhandled error: ${err.message}`);
-      return Response.json({ status: 1, stdout: "", stderr: err.message }, { status: 500 });
-    },
-    async fetch(req, server) {
-      const listener = policies.get(listenerAddress(initial));
-      if (!listener) return new Response("Listener removed", { status: 403 });
-      const key = listener.key;
-      const listenHost = listener.host;
-      const scoped = listener.profiles !== "*";
+  // Shares (shares.json) are reloaded with the listeners below. sessionOwners remembers which
+  // credential drove each session, for `rech session ls` and for closing a revoked share's sessions.
+  let shares: ShareConfig = { version: 1, shares: [] };
+  const sessionOwners = new Map<string, { owner: string; label: string; profile?: string; name: string; lastUsed: number }>();
+  const deviceSeen = new Map<string, number>();
+  const noteDeviceUse = (cred: Credential & { kind: "device" }) => {
+    const now = Date.now();
+    if (now - (deviceSeen.get(cred.device.id) ?? cred.device.lastSeen ?? 0) < 10 * 60_000) return;
+    deviceSeen.set(cred.device.id, now);
+    void updateShares(config => {
+      const device = config.shares.find(s => s.id === cred.share.id)?.devices.find(d => d.id === cred.device.id);
+      if (device) device.lastSeen = now;
+    }).catch(error => log(`could not record device use: ${error}`));
+  };
+
+  const handle = async (req: Request, initialListener: Listener, remoteAddr: () => string): Promise<Response> => {
+      let listener = initialListener;
       const reqUrl = new URL(req.url);
       const prefix = normalizePrefix(listener.prefix);
       // Accept the path with or without the prefix, so a proxy works whether it keeps the
@@ -671,18 +674,70 @@ export async function serve() {
         else if (reqUrl.pathname.startsWith(prefix)) reqUrl.pathname = "/" + reqUrl.pathname.slice(prefix.length);
       }
 
+      // Who is asking: the listener's own key (legacy links, the local management key), or a
+      // share credential (an invite or a device, see shares.ts) offered on this transport. A
+      // share narrows the listener to the share's own profiles.
+      const presented = req.headers.get("authorization")?.replace(/^Bearer /, "") ?? "";
+      const cred = presented && !safeEqual(presented, listener.key) ? credentialForBearer(shares, presented) : null;
+      if (cred) {
+        const route = reqUrl.pathname === "/ping" ? "ping" : reqUrl.pathname === "/redeem" ? "redeem" : "use";
+        const denial = authorizeCredential(cred, listener.name, route);
+        if (denial) return Response.json({ status: 1, stdout: "", stderr: `[rech] ${denial.message}\n`, error: denial.message, pending: denial.pending }, { status: denial.status });
+        if (cred.kind === "device") noteDeviceUse(cred);
+        listener = { ...listener, key: presented, profiles: cred.share.profiles };
+      }
+      const key = listener.key;
+      const listenHost = listener.host;
+      const scoped = listener.profiles !== "*";
+      const owner = cred?.kind === "device" ? `share:${cred.share.id}:${cred.device.id}` : `listener:${listener.name}`;
+
+      if (reqUrl.pathname === "/redeem" && req.method === "POST") {
+        if (cred?.kind !== "invite") return Response.json({ error: "Only an invite link can be redeemed." }, { status: 400 });
+        const { name } = await req.json().catch(() => ({})) as { name?: string };
+        try {
+          const device = await updateShares(config => redeemInvite(config, cred.share.id, String(name ?? "")));
+          shares = await readShares();
+          log(`share ${cred.share.label}: invite redeemed by device ${device.id} (${device.name})${device.approved ? "" : ", waiting for approval"}`);
+          return Response.json({ token: device.token, device: { id: device.id, name: device.name, approved: device.approved }, share: cred.share.label, profiles: cred.share.profiles });
+        } catch (error) { return Response.json({ error: error instanceof Error ? error.message : String(error) }, { status: 403 }); }
+      }
+
+      if (reqUrl.pathname === "/profiles") {
+        const denied = authCheck(req, key);
+        if (denied) return denied;
+        const registry = await readTokenRegistry().catch(() => ({} as Awaited<ReturnType<typeof readTokenRegistry>>));
+        const cache = await readChromeProfileCache().catch(() => null) ?? {};
+        const keys = listener.profiles === "*" ? Object.keys(registry) : listener.profiles;
+        return Response.json({ share: cred?.share.label, profiles: keys.map(k => ({ key: k, name: cache[registry[k]?.profileDir ?? ""]?.name ?? "", registered: !!registry[k] })) });
+      }
+
+      if (reqUrl.pathname === "/sessions") {
+        const denied = authCheck(req, key);
+        if (denied) return denied;
+        let live = new Set<string>();
+        try { live = new Set(readdirSync(tmpSocketRoot()).filter(f => f.endsWith(".sock")).map(f => f.slice(0, -5))); } catch {}
+        const all = listener.profiles === "*" && !cred;
+        const rows = [...sessionOwners.entries()]
+          .filter(([, o]) => all || o.owner === owner)
+          .map(([session, o]) => ({ session: o.name, profile: o.profile, client: o.label, owner: all ? o.owner : undefined, lastUsed: o.lastUsed, live: live.has(session) }))
+          .sort((a, b) => b.lastUsed - a.lastUsed);
+        return Response.json({ sessions: rows });
+      }
+
       // Serve files from output dir
       if (reqUrl.pathname.startsWith("/files/")) {
         const denied = authCheck(req, key);
         if (denied) return denied;
         const name = decodeURIComponent(reqUrl.pathname.slice(7));
         if (!isUnderDir(workDir, name)) return new Response("Forbidden", { status: 403 });
-        if (!canReadProfileFile(listener, name)) return new Response("Forbidden", { status: 403 });
+        const readable = (path: string) => canReadProfileFile(listener, path)
+          && (cred?.kind !== "device" || cred.share.profiles.some(p => path.startsWith(`${profileOutputPrefix(p)}d-${cred.device.id}/`)));
+        if (!readable(name)) return new Response("Forbidden", { status: 403 });
         const resolved = resolve(workDir, name);
         const f = file(resolved);
         if (!(await f.exists())) return new Response("Not found", { status: 404 });
         const real = realpathSync(resolved);
-        if (!isUnderDir(realpathSync(workDir), real) || !canReadProfileFile(listener, relative(realpathSync(workDir), real).replaceAll("\\", "/"))) return new Response("Forbidden", { status: 403 });
+        if (!isUnderDir(realpathSync(workDir), real) || !readable(relative(realpathSync(workDir), real).replaceAll("\\", "/"))) return new Response("Forbidden", { status: 403 });
         return new Response(f);
       }
 
@@ -694,7 +749,10 @@ export async function serve() {
         // clients / `rech status` can see trouble without an active probe.
         const degraded = consecutiveTimeouts > 0;
         if (scoped || !reqUrl.searchParams.get("deep"))
-          return Response.json({ ok: true, bind: listenHost, listener: listener.name, profiles: listener.profiles, multiListener: true, consecutiveTimeouts, degraded, chromeAccessProblem });
+          return Response.json({
+            ok: true, bind: listenHost, listener: listener.name, profiles: listener.profiles, multiListener: true, consecutiveTimeouts, degraded, chromeAccessProblem,
+            ...(cred ? { share: cred.share.label, kind: cred.kind, ...(cred.kind === "device" ? { device: { id: cred.device.id, name: cred.device.name, approved: cred.device.approved } } : {}), expiresAt: cred.share.expiresAt } : {}),
+          });
         // Deep probe: exercise the relay read-only via `tab-list` (opens nothing) against the
         // most-recently-used session — never a fresh one, which could spawn a browser window.
         const target = [...recentSessions.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
@@ -754,7 +812,9 @@ export async function serve() {
             PLAYWRIGHT_MCP_USER_DATA_DIR: entry.userDataDir || "",
             PLAYWRIGHT_MCP_LOAD_EXTENSION: entry.loadExtension || "",
           };
-          body.identity.key = `scoped:${body.identity.key}`;
+          // A share's devices never share browser state with each other or with legacy links.
+          body.identity.key = cred?.kind === "device" ? `share:${cred.share.id}:${cred.device.id}:${body.identity.key}` : `scoped:${body.identity.key}`;
+          if (cred) body.identity.label = cred.share.label;
           body.env = {}; // Server-owned profile configuration wins over every client override.
         } catch (error) {
           if (Array.isArray(body?.args) && body.args.filter((a: unknown) => typeof a !== "string" || !/^-s=[a-zA-Z0-9_-]{1,64}$/.test(a))[0] === "upload")
@@ -762,7 +822,9 @@ export async function serve() {
           return Response.json({ status: 1, stdout: "", stderr: `${error instanceof Error ? error.message : String(error)}\n` }, { status: 403 });
         }
       }
-      const outputPrefix = scopedProfile ? profileOutputPrefix(scopedProfile) : "";
+      // A share device's files live under its own folder, so other devices and links on the same
+      // profile can't fetch them (see the /files check above).
+      const outputPrefix = scopedProfile ? profileOutputPrefix(scopedProfile) + (cred?.kind === "device" ? `d-${cred.device.id}/` : "") : "";
       const runWorkDir = scopedProfile ? join(workDir, outputPrefix) : workDir;
       mkdirSync(runWorkDir, { recursive: true });
       let args: string[];
@@ -771,7 +833,7 @@ export async function serve() {
       let clientEnv: Record<string, string> = {};
       if (Array.isArray(body)) {
         args = body;
-        const clientAddr = `${req.headers.get("x-forwarded-for") || server.requestIP(req)?.address || "unknown"}`;
+        const clientAddr = remoteAddr();
         sessionId = createHash("sha256").update(clientAddr).digest("hex").slice(0, 8);
         clientName = clientAddr;
         log(`session from client IP: ${clientAddr} -> ${sessionId}`);
@@ -792,7 +854,7 @@ export async function serve() {
           clientName = labelBase || keyBase;
           log(`session from identity: ${clientName}${id?.profile ? ` profile:${id.profile}` : ""} [${keyBase}] -> ${sessionId}`);
         } else {
-          const clientAddr = `${req.headers.get("x-forwarded-for") || server.requestIP(req)?.address || "unknown"}`;
+          const clientAddr = remoteAddr();
           sessionId = createHash("sha256").update(clientAddr).digest("hex").slice(0, 8);
           clientName = clientAddr;
           log(`session from client IP fallback: ${clientAddr} -> ${sessionId}`);
@@ -817,6 +879,8 @@ export async function serve() {
       const namespacedSession = clientSession ? `${sessionId}-${clientSession}` : sessionId;
       // Track --isolate sessions so the idle-TTL reaper can close them later.
       const nowMs = Date.now();
+      sessionOwners.set(namespacedSession, { owner, label: cred ? `${cred.share.label}/${(cred as any).device?.name ?? ""}` : clientName, profile: scopedProfile ?? (body as any)?.identity?.profile, name: clientSession || "default", lastUsed: nowMs });
+      if (sessionOwners.size > 512) sessionOwners.delete(sessionOwners.keys().next().value!);
       if (isIsoSession(namespacedSession)) isoLastUsed.set(namespacedSession, nowMs);
       else noteSession(namespacedSession, nowMs); // for the deep health probe to target
 
@@ -1075,6 +1139,33 @@ export async function serve() {
         // a cross-OS daemon↔client (e.g. Windows daemon serving a Linux container client).
         files: outputFiles.map((p) => (outputPrefix + p).replaceAll("\\", "/")),
       });
+  };
+
+  // WebRTC: the same handler, reached over an encrypted DataChannel. Each request carries the
+  // bearer of the credential whose room it came in on, so share checks apply unchanged.
+  const webrtcListener: Listener = { name: WEBRTC, host: "webrtc", port: 0, key: randomBytes(24).toString("base64url"), profiles: [] };
+  const webrtc = new WebrtcHost(async (req, token) => {
+    const headers = new Headers(req.headers);
+    headers.set("Authorization", `Bearer ${bearerOf(token)}`);
+    return handle(new Request(req, { headers }), webrtcListener, () => "webrtc");
+  }, log);
+
+  const startServer = (initial: Listener, reusePort = false) => Bun.serve({
+    hostname: initial.host,
+    port: initial.port,
+    // reusePort is used only as a last-resort fallback (see bindAtStartup below): if an orphaned
+    // holder can't be killed, binding with SO_REUSEADDR keeps serve up (degraded, port-shared)
+    // instead of crash-looping on EADDRINUSE. The normal path binds a clean, exclusive socket.
+    reusePort,
+    tls,
+    error(err) {
+      log(`unhandled error: ${err.message}`);
+      return Response.json({ status: 1, stdout: "", stderr: err.message }, { status: 500 });
+    },
+    async fetch(req, server) {
+      const listener = policies.get(listenerAddress(initial));
+      if (!listener) return new Response("Listener removed", { status: 403 });
+      return handle(req, listener, () => `${req.headers.get("x-forwarded-for") || server.requestIP(req)?.address || "unknown"}`);
     },
   });
 
@@ -1143,12 +1234,42 @@ export async function serve() {
     configured ||= !!config;
     applied = fingerprint;
   };
+  // Shares change independently of listeners (redeem, approve, revoke); a bad shares.json keeps
+  // the previous one, like listeners.json.
+  let appliedShares = "";
+  const reloadShares = async () => {
+    const next = await readShares();
+    // Expiry is time-based: fold "what is live right now" into the fingerprint so an expiring
+    // share or invite closes its rooms and sessions without anyone touching the file.
+    const now = Date.now();
+    const fingerprint = JSON.stringify(next) + JSON.stringify(next.shares.map(s => [!!shareProblem(s, now), !!(s.inviteExpiresAt && now >= s.inviteExpiresAt)]));
+    if (fingerprint === appliedShares) return;
+    const allowed = new Set(next.shares.filter(s => !shareProblem(s, now)).flatMap(s => s.devices.map(d => `share:${s.id}:${d.id}`)));
+    const dropped = [...sessionOwners.entries()].filter(([, o]) => o.owner.startsWith("share:") && !allowed.has(o.owner));
+    shares = next;
+    appliedShares = fingerprint;
+    // A revoked share or a removed device loses its browser sessions too.
+    if (dropped.length) {
+      const [bin, ...binArgs] = splitCommand(resolvePlaywrightCli());
+      for (const [session, o] of dropped) {
+        sessionOwners.delete(session);
+        try { Bun.spawn([bin, ...binArgs, "close", `-s=${session}`], { cwd: workDir, stdin: "ignore", stdout: "ignore", stderr: "ignore", windowsHide: true, env: playwrightCliEnv() }); } catch {}
+        log(`closed session ${session} of ${o.label}: its share was revoked or its device removed`);
+      }
+    }
+    const creds = webrtcCredentials(next);
+    webrtc.sync(creds.map(c => ({ token: c.token, signal: c.share.signal!, label: c.kind === "device" ? `${c.share.label}/${c.device.name}` : `${c.share.label} (invite)` })));
+    if (creds.length || webrtc.size) log(`webrtc: listening for ${creds.length} share credential(s)`);
+  };
+  await reloadShares().catch(error => log(`shares.json rejected: ${error}`));
   await reload(true);
   let reloading = false;
   let lastError = "";
   setInterval(async () => {
     if (reloading) return;
     reloading = true;
+    // Independent: a broken listeners.json must not freeze revocations (and vice versa).
+    try { await reloadShares(); } catch (error) { log(`shares.json reload rejected; previous shares retained: ${error}`); }
     try { await reload(); lastError = ""; }
     catch (error) {
       const message = String(error);

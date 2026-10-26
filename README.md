@@ -77,9 +77,71 @@ directory outside git. rechrome reads `RECHROME_URL` from the nearest `.rechrome
 When editing a file by hand, quote the URL (`RECHROME_URL="…#key=…"`): unquoted, a `#` starts a
 comment for some .env loaders. rech quotes it when it saves one.
 
-### 4. Use it from another machine
+### 4. Share with another machine
 
-The daemon only listens on this machine until you expose a profile. The recommended way is a
+On the host (the machine with Chrome), make an invite:
+
+```bash
+rech share new you@example.com --name alice
+# Share "alice": you@example.com
+# Invite for one device (unused, it expires …; secret: send it privately):
+#   https://rechrome.pages.dev/#rech1_7fQxC9tZp2mVb8wLrN4hdK3kT9aQ
+#   or in a terminal:  rech connect rech1_7fQxC9tZp2mVb8wLrN4hdK3kT9aQ
+```
+
+On the other machine, inside the project that should use it:
+
+```bash
+rech connect 'https://rechrome.pages.dev/#rech1_…'
+rech open https://example.com
+```
+
+By default the two machines meet over **WebRTC**: neither needs an open port, a VPN or a
+domain. A small signal server introduces them, and then traffic flows peer to peer, end-to-end
+encrypted with keys the signal server never sees. The first `rech` command after connecting starts
+a small local bridge that keeps the connection open between commands.
+
+**The link is an invite, not a key.** `rech connect` redeems it once: this machine gets its own
+device credential (saved to `.rechrome/.env.local`) and the invite stops working, so a link that
+leaks after it was used is harmless, and if someone else used it first you'll know. Unused invites
+expire after 24 hours, and WebRTC shares after 30 days unless renewed.
+
+| On the host | |
+|---|---|
+| `rech share new <profile..> [--name n]` | Invite link (`--via webrtc` by default) |
+| `--via lan` · `--via tailscale` · `--via <IP or listener>` | Direct HTTP instead of (or as well as) WebRTC |
+| `--devices 3` · `--approve` | Let 3 devices redeem it · make each new device wait for `rech share approve` |
+| `--expires 7d` · `--invite-ttl 1h` · `--signal <url>` | Lifetimes · your [own signal server](docs/signal-selfhost.md) |
+| `rech share ls` · `rech share devices <share> [--rm <device>]` | Shares, devices, expiry · drop one device |
+| `rech share allow\|deny <share> <profile..>` | Change the profiles; the link and devices stay |
+| `rech share rotate <share>` | A fresh invite; the old one stops working |
+| `rech share renew <share> --expires 30d` · `revoke` · `rm` | Extend · cut it off (closes its sessions) · delete |
+
+| On the other machine | |
+|---|---|
+| `rech profile` | The profiles this share gives you |
+| `rech --profile <name> open <url>` | Pick one when the share has several |
+| `rech -s=<name> open <url>` · `rech session ls` · `rech session close <name>` | Separate browser sessions; list and close them |
+| `rech status` | Transport, share, device, expiry |
+
+Each device gets its own browser sessions, apart from every other device and link. A share allows
+navigation, tabs, snapshots, screenshots and basic interactions, but not `eval`/`run-code` or
+filesystem commands (see [Remote access](#remote-access)).
+
+**WebRTC needs** `node-datachannel`, installed on first use into `~/.rechrome/webrtc`. When a
+direct path can't be found (some corporate networks, symmetric NAT), give the host TURN: set
+`CF_TURN_KEY_ID` and `CF_TURN_API_TOKEN` (a [Cloudflare TURN](https://developers.cloudflare.com/realtime/turn/)
+key; its free tier is 1,000 GB/month) in the daemon's environment, or share `--via tailscale`.
+
+**Keep links out of git.** `rech status`, `rech connect` and `rech share --save` warn when the file
+holding `RECHROME_URL` is committed, staged, not git-ignored, or readable by other users. Links
+use a `rech1_` prefix and a checksum, so secret scanners can match them:
+`\brech1_[1-9A-HJ-NP-Za-km-z]{28}\b`.
+
+#### Listener links (reverse proxies)
+
+Before invites, a profile was shared as a listener's link carrying its key (`#key=…`); these
+keep working. The daemon only listens on this machine until you expose a profile. One way is a
 **scoped listener behind a reverse proxy** — shown with Tailscale Serve, but any proxy that
 forwards to `127.0.0.1:<port>` works. The commands are identical in bash, PowerShell and
 `cmd.exe`.
@@ -130,8 +192,10 @@ profile to your LAN address directly (plain HTTP); share the result of `rech sha
 
 ### 5. Manage access
 
+Invite shares are managed with `rech share` (above). Listener links:
+
 ```bash
-rech share ls                                 # everything shared: listener × profile, local and public URLs (keys hidden)
+rech share ls                                 # shares, then listener × profile, local and public URLs (keys hidden)
 rech share you@example.com                    # print one URL again (add --save to use it in this project)
 rech listener allow share teammate@example.com
 rech listener deny share teammate@example.com
@@ -366,6 +430,8 @@ roll up to their parent), or the current directory outside git. So two worktrees
 get separate sessions, and `git checkout` keeps you in the same one. `RECH_IDENTITY=branch`
 restores the older `<remote>/tree/<branch>` keying and `RECH_IDENTITY=cwd` keys on the exact
 directory. Pass `-s=<name>` for a named sub-session, or `--isolate` for a throwaway one.
+A share device's sessions are additionally keyed by its share and device, so they never meet
+another device's or a listener link's; `rech session ls` lists the ones this link drove.
 
 ## Development
 

@@ -36,6 +36,33 @@ The `rech serve` daemon is **local** — sessions never cross machines, so a mac
 buys nothing functional; the path key is strictly better. A `serve` change needs `oxmgr restart
 rechrome` to take effect (see the build/verify section below).
 
+## Shares, invites & the WebRTC transport
+
+Layers: a **listener** is a transport (an address); a **share** (`~/.rechrome/shares.json`,
+`shares.ts`) is a grant: profiles + transports (`via`: listener names and/or `webrtc`) + an
+invite + devices. Sessions stay playwright-cli `-s=` sessions, namespaced per share device.
+
+- **Every secret is a `rech1_` token** (`secret.ts`: 128-bit base58 + CRC32, scanner regex
+  `\brech1_[1-9A-HJ-NP-Za-km-z]{28}\b`). Everything else is HKDF-derived from it: room id, room
+  auth (what the signal server sees), HTTP bearer `rb_…`, AES keys. Never put the raw token in a
+  header, a log line, argv or a URL query; `rech bridge` gets it via env, not argv.
+- **Invites are single-use** (`--devices N`): redeeming mints a per-device `rech1_` token, and
+  only devices may `/run`. A used invite's room stays open so a second taker hears "already
+  used" (a leak signal), not "host offline". Legacy listener `#key=` links are untouched.
+- **WebRTC = the same HTTP API over an e2e-sealed DataChannel** (`webrtc.ts`, `e2e.ts`, ported
+  from agent-yes). serve's `handle()` serves both sockets and WebRTC; never add a route that
+  only checks transport, always go through `credentialForBearer` + `authorizeCredential`.
+  The client side is a detached loopback bridge per credential (`~/.rechrome/bridges/`), so
+  `transportUrl()` rewrites `RECHROME_URL` and the rest of the client stays plain HTTP.
+- **node-datachannel is native**: trusted dev dependency here; a global install gets it lazily in
+  `~/.rechrome/webrtc` (`loadRTC`). Keep it out of bundles (`--external node-datachannel`).
+- **Signal servers are untrusted** (`signal-relay.ts`, `signal/cloudflare/`, protocol in
+  `docs/signal-selfhost.md`). Deploying the default one (rechrome.pages.dev) touches the user's
+  Cloudflare account: ask first.
+- Test with `share-webrtc.integration.test.ts` (real daemon + CLI in temp HOMEs, loopback ICE via
+  `RECH_ICE_SERVERS=[]`). New modules must also go in the integration tests' copy lists and in
+  package.json `files` + `prepublishOnly`.
+
 ## Never modify node_modules
 
 This repo has **vendored forks** in `./lib/`:

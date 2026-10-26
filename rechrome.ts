@@ -13,8 +13,12 @@ import { join, basename, dirname, resolve } from "path";
 import { pathToFileURL } from "url";
 import { createRequire } from "node:module";
 import { spawn as cpSpawn } from "child_process";
-import { readFile, writeFile, rename, chmod, mkdir } from "node:fs/promises";
+import { readFile, writeFile, rename, chmod, mkdir, stat } from "node:fs/promises";
 import { isDeprecatedPm2Fallback, listsProcess, oxmgrInstallCommand, pickDaemonManager, PM2_DEPRECATION, type DaemonManager } from "./daemon-manager.ts";
+import { DEFAULT_SIGNAL, WEBRTC, createShare, findDevice, findShare, inviteLink, inviteProblem, parseDuration, readShares, updateShares, type Share } from "./shares.ts";
+import { bearerOf, looksLikeToken, newToken, parseToken, redactSecrets } from "./secret.ts";
+import { WebrtcClient, loadRTC, runBridge, spawnBridge } from "./webrtc.ts";
+import { startSignalRelay } from "./signal-relay.ts";
 
 export const ENV_KEY = "RECHROME_URL";
 export const DEFAULT_PORT = 13775;
@@ -322,8 +326,11 @@ export function parseUrl(raw: string) {
   const scheme = u.protocol.replace(":", "");
   const protocol = scheme === "https" ? "https" : "http";
   const defaultPort = scheme === "https" ? 443 : scheme === "http" ? 80 : DEFAULT_PORT;
+  // A rech1_ share link authenticates with the bearer derived from its token (secret.ts).
+  const shareToken = u.hash.slice(1).split("&")[0];
+  const shareBearer = looksLikeToken(shareToken) ? (() => { try { return bearerOf(shareToken); } catch { return undefined; } })() : undefined;
   return {
-    key: fragment.get("key") ?? u.username,
+    key: shareBearer ?? fragment.get("key") ?? u.username,
     prefix: normalizePrefix(u.pathname),
     host: u.hostname,
     port: parseInt(u.port) || defaultPort,
@@ -1329,6 +1336,16 @@ async function removeProfile(selector: string, opts: { yes?: boolean; close?: bo
 
 /** On a client of a remote host, `rech profile` lists what that host's link shares. */
 async function listRemoteProfiles(url: string): Promise<void> {
+  // Newer hosts list names too (/profiles); older ones only /ping.
+  const detailed = await fetch(serviceUrl(url, "profiles"), { headers: { Authorization: `Bearer ${parseUrl(url).key}` }, signal: AbortSignal.timeout(10_000) })
+    .then(r => r.ok ? r.json() : null).catch(() => null) as { share?: string; profiles?: { key: string; name: string }[] } | null;
+  if (detailed?.profiles) {
+    const current = resolveEffectiveProfile(parseUrl(url).profileDirectory);
+    console.log(`Profiles ${detailed.share ? `share "${detailed.share}" gives you` : `shared by ${serviceUrl(url)}`}:`);
+    for (const p of detailed.profiles) console.log(`  ${p.key}${p.name ? `  (${p.name})` : ""}${p.key === current ? "   ← current" : ""}`);
+    console.log(`\nUse one: rech --profile <name> open https://example.com`);
+    return;
+  }
   const response = await fetch(serviceUrl(url, "ping"), { headers: { Authorization: `Bearer ${parseUrl(url).key}` }, signal: AbortSignal.timeout(5000) })
     .catch(error => { throw new Error(`Could not reach ${serviceUrl(url)}: ${error instanceof Error ? error.message : error}`); });
   if (response.status === 401) throw new Error("The host rejected this link's key; ask for a fresh one (rech share on the host), then rech connect '<url>'.");
@@ -1559,7 +1576,7 @@ async function shareSet(snapshot: string[], opts: { listener?: string; local?: b
   if (!listener.publicUrl && isLoopback(listener.host)) for (const line of listenerNextSteps(listener, undefined, opts.again)) console.error(line);
   console.log(uri);
   console.error(snapshot.length === 1 ? `On the other machine: rech connect '<this link>'` : `On the other machine: rech connect '<this link>', then rech --profile <name> open <url>`);
-  if (opts.save) console.error(`Saved RECHROME_URL to ${await saveProjectUrl(uri)}`);
+  if (opts.save) { const saved = await saveProjectUrl(uri); console.error(`Saved RECHROME_URL to ${saved}`); await warnSecretFile(saved); }
 }
 
 /** A readable, URL-safe name for a profile's link: the email's local part or the profile name. */
@@ -1807,7 +1824,7 @@ async function printProfileUri(selector?: string, listener?: string, opts: { loc
   const publicUrl = pending?.publicUrl;
   if (publicUrl && !opts.local) uri = rebaseConnectionUrl(publicUrl, uri);
   console.log(uri);
-  if (opts.save) console.error(`Saved RECHROME_URL to ${await saveProjectUrl(uri)}`);
+  if (opts.save) { const saved = await saveProjectUrl(uri); console.error(`Saved RECHROME_URL to ${saved}`); await warnSecretFile(saved); }
 }
 
 export function sandboxConnectionWarning(env: Record<string, string | undefined> = process.env): string | null {
@@ -1823,6 +1840,8 @@ export function sandboxConnectionWarning(env: Record<string, string | undefined>
  * profiles itself, and must never receive this machine's own extension tokens.
  */
 export async function isLocalDaemon(url: string): Promise<boolean> {
+  // A WebRTC bridge is on loopback but always leads to another machine.
+  if (bridgedUrls.has(url)) return false;
   const { key, host } = parseUrl(url);
   const config = await readListeners().catch(() => null);
   // Before listeners.json existed, a local install pointed at loopback and had its own registry;
@@ -3170,6 +3189,38 @@ async function urlList(): Promise<void> {
   console.log(`\nPrint a full URL (contains the secret key): rech share <profile>, or rech share --all`);
 }
 
+/**
+ * Ways an env file holding a connection secret could leak: tracked or committed in git, not
+ * git-ignored (one `git add .` away), or readable by other users. Warnings only — rech keeps
+ * working; the caller prints them. Empty when the file looks safe or doesn't exist.
+ */
+export async function secretFileWarnings(path: string, platform = process.platform): Promise<string[]> {
+  const warnings: string[] = [];
+  const st = await stat(path).catch(() => null);
+  if (!st?.isFile()) return warnings;
+  const dir = dirname(path), name = basename(path);
+  if (await gitOutput(["rev-parse", "--is-inside-work-tree"], dir) === "true") {
+    const untrack = `git rm --cached ${JSON.stringify(name)} (in ${dir}) and add it to .gitignore`;
+    // Only a currently tracked file counts: an old commit of a since-untracked file held an older key.
+    if (await gitOutput(["ls-files", "--", name], dir)) {
+      if (await gitOutput(["log", "-1", "--format=%h", "--", name], dir))
+        warnings.push(`${path} is committed to git, so its key is in the repo history. Ask the host for a fresh link (they rotate the key), then ${untrack}.`);
+      else warnings.push(`${path} is staged in git; committing it would publish its key. Run ${untrack}.`);
+    }
+    else if (!(await gitOutput(["check-ignore", "--", name], dir)))
+      warnings.push(`${path} is not git-ignored; a \`git add .\` would commit its key. Add it to .gitignore.`);
+  }
+  if (platform !== "win32" && (st.mode & 0o077))
+    warnings.push(`${path} is readable by other users (mode ${(st.mode & 0o777).toString(8)}). Run: chmod 600 ${JSON.stringify(path)}`);
+  return warnings;
+}
+
+/** Print secretFileWarnings for a file that holds RECHROME_URL. Never throws. */
+async function warnSecretFile(path: string | undefined): Promise<void> {
+  if (!path || path === "environment") return;
+  for (const w of await secretFileWarnings(path).catch(() => [])) console.error(`[rech] ⚠ ${w}`);
+}
+
 /** Write RECHROME_URL to this project's .rechrome/.env.local (the folder git-ignores itself). */
 async function saveProjectUrl(url: string): Promise<string> {
   const { dataDir } = await getClientIdentity();
@@ -3210,8 +3261,15 @@ export function nearerUrlSource(cwd: string, inherited: boolean, globalFile = GL
   }
 }
 
-async function connect(url: string, opts: { global?: boolean; project?: boolean } = {}): Promise<void> {
+type ConnectedShare = { share?: string; device?: { id: string; name: string; approved: boolean }; profiles: string[]; webrtc: boolean };
+
+async function connect(url: string, opts: { global?: boolean; project?: boolean } = {}, shared?: ConnectedShare): Promise<void> {
   if (opts.global && opts.project) throw new Error("Pass --global or --project, not both.");
+  // A bare rech1_ token means the default signal server.
+  if (looksLikeToken(url)) url = `${DEFAULT_SIGNAL}#${url.trim()}`;
+  const share = shareLinkParts(url);
+  if (share && !shared) return connectShare(url, share, opts);
+  if (share && shared) return saveConnection(url, opts, shared);
   const parsed = parseUrl(url);
   if (!parsed.key) throw new Error("That URL has no key (#key=…). Ask the host for the full URL from: rech share <profile>");
   const response = await fetch(serviceUrl(url, "ping"), { headers: { Authorization: `Bearer ${parsed.key}` }, signal: AbortSignal.timeout(5000) })
@@ -3237,6 +3295,7 @@ async function connect(url: string, opts: { global?: boolean; project?: boolean 
     console.error(`[rech] warning: this machine runs its own rech daemon. Projects without their own RECHROME_URL will now use ${serviceUrl(url)}, not this machine's Chrome. Undo: remove ${ENV_KEY} from ${GLOBAL_ENV_FILE}`);
   const saved = global ? await saveGlobalUrl(url) : await saveProjectUrl(url);
   console.log(`Connected to ${serviceUrl(url)}${body.listener ? ` (listener ${body.listener})` : ""}. Saved RECHROME_URL ${global ? "for every project on this machine" : "for this project"}: ${saved}`);
+  await warnSecretFile(saved);
   const shadow = global ? nearerUrlSource(process.cwd(), inheritedEnvKeys.has(ENV_KEY)) : null;
   if (shadow) console.log(`Note: here, ${shadow} takes precedence over it. Remove that, or run rech connect --project to update it.`);
   if (Array.isArray(body.profiles) && body.profiles.length > 1) {
@@ -3244,6 +3303,32 @@ async function connect(url: string, opts: { global?: boolean; project?: boolean 
     for (const p of body.profiles) console.log(`  ${p}${p === parsed.profileDirectory ? "  (default)" : ""}`);
     console.log(`${parsed.profileDirectory ? "Use another" : "Pick one"} per command: rech --profile <name> open https://example.com   (see them again with rech profile)`);
   }
+}
+
+/** Save a share device's link (after connectShare redeemed or checked it) and say what it gives. */
+async function saveConnection(url: string, opts: { global?: boolean; project?: boolean }, shared: ConnectedShare): Promise<void> {
+  let global = !!opts.global;
+  if (!opts.global && !opts.project && isInteractive()) {
+    const { dataDir } = await getClientIdentity();
+    const choice = await promptChoice("Use this link for:", [
+      { label: `This project only  (${join(dataDir, ".env.local")})`, value: "project" },
+      { label: `Every project on this machine without its own link  (${GLOBAL_ENV_FILE})`, value: "global" },
+    ], 0);
+    if (!choice) throw new Error("Cancelled; nothing saved.");
+    global = choice === "global";
+  }
+  const saved = global ? await saveGlobalUrl(url) : await saveProjectUrl(url);
+  await warnSecretFile(saved);
+  const via = shared.webrtc ? `WebRTC via ${new URL(url).host}` : serviceUrl(url);
+  console.log(`Connected to share "${shared.share ?? "?"}" (${via}) as device ${shared.device?.name ?? "?"} (${shared.device?.id ?? "?"}).`);
+  console.log(`Saved this device's own link ${global ? "for every project on this machine" : "for this project"}: ${saved}`);
+  console.log(`The invite you used no longer works for anyone else.`);
+  if (shared.device && !shared.device.approved) console.log(`\nThe host must approve this device before it can drive the browser: rech share approve ${shared.share} ${shared.device.id}`);
+  if (shared.profiles.length > 1) {
+    console.log(`\nThis share has ${shared.profiles.length} profiles:`);
+    for (const p of shared.profiles) console.log(`  ${p}`);
+    console.log(`Pick one per command: rech --profile <name> open https://example.com   (see them again with rech profile)`);
+  } else if (shared.profiles.length === 1) console.log(`Profile: ${shared.profiles[0]}. Try: rech open https://example.com`);
 }
 
 export function detectSetupAgent(env: Record<string, string | undefined> = process.env): "Codex" | "Claude Code" | null {
@@ -3641,12 +3726,303 @@ async function setup(opts: SetupOptions = {}): Promise<void> {
     console.error(`\nSetup was saved, but the selected profile did not pass the bridge check. Reload the extension at chrome://extensions and run \`rech setup --profile ${profileEmail}\` again.`);
 }
 
+// ---- shares: invite links, devices, transports (see shares.ts) ----------------------------
+
+const fmtDate = (ms?: number) => ms ? new Date(ms).toISOString().slice(0, 16).replace("T", " ") : "-";
+const fmtDay = (ms?: number) => ms ? new Date(ms).toISOString().slice(0, 10) : "never";
+
+/** A listener to carry a share over lan/tailscale/<IP>/<listener name>; created when missing. */
+async function shareTransportListener(selector: string, profiles: string[], label: string): Promise<string> {
+  const config = await requireListeners();
+  const named = config.listeners.find(l => l.name === selector);
+  if (named) {
+    if (named.profiles === "*") throw new Error(`"${selector}" is the local management listener; share over lan, tailscale or webrtc instead.`);
+    return named.name;
+  }
+  const address = chooseListenAddress(await detectListenChoices(), selector);
+  const existing = config.listeners.find(l => l.host === address && l.profiles !== "*" && normalizePrefix(l.prefix) === "/");
+  if (existing) return existing.name;
+  const listener: Listener = { name: `share-${label}`.slice(0, 40), host: address, port: freeListenerPort(config.listeners), key: randomBytes(24).toString("base64url"), profiles };
+  config.listeners.push(listener);
+  await writeListeners(config);
+  if (!(await waitForListener(listener))) console.error(`[rech] warning: the daemon has not opened ${listenerAddress(listener)} yet; is it running? (rech status)`);
+  return listener.name;
+}
+
+/** Where a share's invite can be used, as full links (each holds the secret). */
+async function shareLinks(share: Share): Promise<{ via: string; link: string }[]> {
+  const listeners = (await readListeners().catch(() => null))?.listeners ?? [];
+  return share.via.map(via => {
+    if (via === WEBRTC) return { via: "webrtc", link: inviteLink(share, share.signal ?? DEFAULT_SIGNAL) };
+    const l = listeners.find(x => x.name === via);
+    if (!l) return { via, link: "(listener removed)" };
+    return { via: l.name, link: inviteLink(share, l.publicUrl ?? `http://${listenerAddress(l)}${normalizePrefix(l.prefix)}`) };
+  });
+}
+
+function printInvite(share: Share, links: { via: string; link: string }[]): void {
+  const expiry = share.inviteExpiresAt ? `unused, it expires ${fmtDate(share.inviteExpiresAt)}` : "it never expires unused";
+  console.log(`Share "${share.label}": ${share.profiles.join(", ")}`);
+  console.log(`Invite for ${share.maxDevices === 1 ? "one device" : `${share.maxDevices} devices`} (${expiry}; secret: send it privately):\n`);
+  for (const { via, link } of links) console.log(`  ${links.length > 1 ? `${via.padEnd(10)} ` : ""}${link}`);
+  const rtc = links.find(l => l.via === "webrtc");
+  if (rtc && share.signal === DEFAULT_SIGNAL) console.log(`\n  or in a terminal:  rech connect ${share.invite}`);
+  console.log(`\nThe other machine runs: rech connect '<link>'`);
+  if (share.approve) console.log(`Each new device waits for you: rech share approve ${share.label}`);
+  console.log(`Share expires: ${fmtDay(share.expiresAt)}${share.expiresAt ? ` (renew: rech share renew ${share.label})` : ""}`);
+}
+
+export type ShareNewOptions = { name?: string; via?: string[]; signal?: string; expires?: string; inviteTtl?: string; devices?: number; approve?: boolean };
+
+async function shareNew(selectors: string[], opts: ShareNewOptions): Promise<void> {
+  if (!selectors.length) throw new Error("Which profiles? rech share new <profile..>   (see rech profile)");
+  const profiles = await resolveProfileKeys(selectors);
+  // An explicit --name must be free; a derived one gets -2, -3… so a second share just works.
+  const taken = new Set((await readShares()).shares.map(s => s.label));
+  const base = profileSlug(profiles[0]).slice(0, 36);
+  let label = (opts.name ?? base).toLowerCase();
+  for (let i = 2; !opts.name && taken.has(label); i++) label = `${base}-${i}`;
+  // Fail on the name before binding any listener for it.
+  if (taken.has(label)) throw new Error(`A share named "${label}" already exists. Pick another --name, or: rech share rotate ${label}`);
+  if (!/^[a-z0-9][a-z0-9_-]{0,39}$/.test(label)) throw new Error(`Share names use a-z, 0-9, "-" and "_" (up to 40), e.g. alice or ci-bot; got "${label}"`);
+  const wanted = (opts.via?.length ? opts.via : [WEBRTC]).flatMap(v => v.split(",")).map(v => v.trim()).filter(Boolean);
+  const via: string[] = [];
+  for (const v of wanted) via.push(v === WEBRTC ? WEBRTC : await shareTransportListener(v, profiles, label));
+  const expires = opts.expires ?? (via.includes(WEBRTC) ? "30d" : "never");
+  const expiresMs = parseDuration(expires);
+  const share = await updateShares(config => createShare(config, {
+    label, profiles, via, signal: opts.signal ?? process.env.RECH_SIGNAL,
+    expiresAt: expiresMs ? Date.now() + expiresMs : undefined,
+    inviteTtlMs: parseDuration(opts.inviteTtl ?? "24h"),
+    maxDevices: opts.devices ?? 1, approve: opts.approve,
+  }));
+  // The daemon answers WebRTC peers with node-datachannel: install it now, not on the first peer.
+  if (via.includes(WEBRTC)) await loadRTC().catch(error => console.error(`[rech] warning: ${error instanceof Error ? error.message : error}`));
+  printInvite(share, await shareLinks(share));
+}
+
+async function shareList(): Promise<void> {
+  const { shares } = await readShares();
+  if (shares.length) {
+    const now = Date.now();
+    const rows = [["SHARE", "PROFILES", "VIA", "DEVICES", "EXPIRES", "STATUS"]];
+    for (const s of shares) {
+      const pending = s.devices.filter(d => !d.approved).length;
+      const status = s.revokedAt ? "revoked" : s.expiresAt && now >= s.expiresAt ? "expired"
+        : inviteProblem(s, now) ? (pending ? `${pending} waiting for approval` : "active") : `invite open${pending ? `, ${pending} waiting` : ""}`;
+      rows.push([s.label, s.profiles.join(", "), s.via.join(", "), `${s.devices.length}/${s.maxDevices}`, fmtDay(s.expiresAt), status]);
+    }
+    printTable(rows);
+    console.log(`\nDevices: rech share devices <share> · invite link again: rech share rotate <share> · stop: rech share revoke <share>\n`);
+  }
+  const listeners = await readListeners().catch(() => null);
+  if (listeners) {
+    if (shares.length) console.log("Listener links (legacy #key=…):");
+    await urlList();
+  } else if (!shares.length) console.log("Nothing shared yet. Share a profile: rech share new <profile>");
+}
+
+async function shareDevices(name: string, remove?: string): Promise<void> {
+  if (remove) {
+    const device = await updateShares(config => {
+      const share = findShare(config, name);
+      const d = findDevice(share, remove);
+      share.devices = share.devices.filter(x => x !== d);
+      return d;
+    });
+    console.log(`Removed ${device.name} (${device.id}) from "${name}"; its sessions close and its link stops working.`);
+    return;
+  }
+  const share = findShare(await readShares(), name);
+  if (!share.devices.length) { console.log(`No device has used "${share.label}" yet.${inviteProblem(share) ? "" : " Its invite is still open."}`); return; }
+  const rows = [["DEVICE", "NAME", "APPROVED", "ADDED", "LAST USED"]];
+  for (const d of share.devices) rows.push([d.id, d.name, d.approved ? "yes" : "waiting", fmtDate(d.addedAt), fmtDate(d.lastSeen)]);
+  printTable(rows);
+}
+
+async function shareEdit(action: string, name: string, args: string[], opts: { expires?: string } = {}): Promise<void> {
+  if (action === "allow" || action === "deny") {
+    if (!args.length) throw new Error(`Which profiles? rech share ${action} ${name} <profile..>`);
+    const keys = await resolveProfileKeys(args);
+    const share = await updateShares(config => {
+      const s = findShare(config, name);
+      const next = action === "allow" ? [...new Set([...s.profiles, ...keys])] : s.profiles.filter(p => !keys.includes(p));
+      if (!next.length) throw new Error(`That would leave "${s.label}" with no profiles; revoke it instead: rech share revoke ${s.label}`);
+      s.profiles = next;
+      return s;
+    });
+    console.log(`"${share.label}" now shares: ${share.profiles.join(", ")} (connected devices see it on their next command; the link is unchanged).`);
+  } else if (action === "rotate") {
+    const share = await updateShares(config => {
+      const s = findShare(config, name);
+      s.invite = newToken();
+      s.inviteExpiresAt = s.inviteTtlMs ? Date.now() + s.inviteTtlMs : undefined;
+      if (s.devices.length >= s.maxDevices) s.maxDevices = s.devices.length + 1;
+      return s;
+    });
+    console.log("New invite; the previous invite link no longer works (devices already connected keep working).\n");
+    printInvite(share, await shareLinks(share));
+  } else if (action === "revoke") {
+    await updateShares(config => { findShare(config, name).revokedAt = Date.now(); });
+    console.log(`Revoked "${name}": its links and devices stop working, and its sessions close. Remove it entirely: rech share rm ${name}`);
+  } else if (action === "rm") {
+    await updateShares(config => { const s = findShare(config, name); config.shares = config.shares.filter(x => x !== s); });
+    console.log(`Removed "${name}".`);
+  } else if (action === "renew") {
+    const ms = parseDuration(opts.expires ?? args[0] ?? "30d");
+    const share = await updateShares(config => {
+      const s = findShare(config, name);
+      if (s.revokedAt) throw new Error(`"${s.label}" was revoked; create a new share instead: rech share new ${s.profiles.join(" ")}`);
+      s.expiresAt = ms ? Date.now() + ms : undefined;
+      return s;
+    });
+    console.log(`"${share.label}" now expires: ${fmtDay(share.expiresAt)}`);
+  } else if (action === "approve") {
+    const approved = await updateShares(config => {
+      const s = findShare(config, name);
+      const targets = args.length ? args.map(a => findDevice(s, a)) : s.devices.filter(d => !d.approved);
+      for (const d of targets) d.approved = true;
+      return targets;
+    });
+    console.log(approved.length ? `Approved: ${approved.map(d => `${d.name} (${d.id})`).join(", ")}` : `No device of "${name}" is waiting for approval.`);
+  }
+}
+
+// ---- client side of a rech1_ link -----------------------------------------------------------
+
+/** A rech1_ link's parts: the token, the origin it points at, and the transport once known. */
+export function shareLinkParts(url: string): { token: string; origin: string; webrtc: boolean; profile?: string } | null {
+  let u: URL;
+  try { u = new URL(url); } catch { return null; }
+  const [token, ...rest] = u.hash.slice(1).split("&");
+  if (!looksLikeToken(token)) return null;
+  const params = new URLSearchParams(rest.join("&"));
+  return { token, origin: `${u.protocol}//${u.host}${normalizePrefix(u.pathname)}`, webrtc: params.get("via") === WEBRTC, profile: u.searchParams.get("profile") ?? undefined };
+}
+
+/** Call a share's HTTP API over whichever transport its link uses (one-shot, for connect). */
+async function shareRequest(origin: string, token: string, webrtc: boolean, method: string, path: string, body?: unknown): Promise<Response> {
+  if (!webrtc) return fetch(serviceUrl(origin, path), {
+    method, headers: { Authorization: `Bearer ${bearerOf(token)}`, ...(body ? { "Content-Type": "application/json" } : {}) },
+    body: body ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(10_000),
+  });
+  const client = new WebrtcClient(token, origin, m => console.error(m));
+  await client.connect();
+  try {
+    const res = await client.request(method, `/${path}`, body ? JSON.stringify(body) : undefined, body ? "application/json" : undefined);
+    return new Response(await res.arrayBuffer(), { status: res.status, headers: res.headers });
+  } finally { client.close(); }
+}
+
+/** `rech connect` for a rech1_ link: find the transport, redeem the invite, save this device's link. */
+async function connectShare(url: string, parts: { token: string; origin: string }, opts: { global?: boolean; project?: boolean }): Promise<void> {
+  const parsed = parseToken(parts.token);
+  if (!parsed.ok) throw new Error(parsed.reason === "checksum"
+    ? "This rech1_ link is damaged (checksum mismatch): it was copied incompletely or mistyped. Ask for it again."
+    : "That is not a complete rech1_ link.");
+  // One unauthenticated probe tells a signal server (WebRTC) from a rech daemon (direct HTTP).
+  // The bearer is a working HTTP credential, so it never goes to a signal server.
+  const get = (auth: boolean) => fetch(serviceUrl(parts.origin, "ping"), { headers: auth ? { Authorization: `Bearer ${bearerOf(parts.token)}` } : {}, signal: AbortSignal.timeout(8000) })
+    .catch(error => { throw new Error(`Could not reach ${parts.origin}: ${error instanceof Error ? error.message : error}`); });
+  const read = async (r: Response) => { const text = await r.text().catch(() => ""); try { return { text, body: JSON.parse(text) }; } catch { return { text, body: null as any }; } };
+  let probe = await get(false);
+  let { text: probeText, body: probeBody } = await read(probe);
+  if (probe.status === 503 && !probeBody && probeText.trim()) throw new Error(probeText.trim());
+  const webrtc = !!probeBody?.["rech-signal"];
+  if (!webrtc && probe.status === 401) ({ text: probeText, body: probeBody } = await read(probe = await get(true)));
+  if (!webrtc && probe.status === 401) throw new Error("The host rejected this link. Ask for a fresh one (rech share rotate <share> on the host).");
+  if (!webrtc && !probe.ok) throw new Error(probeBody?.error ?? `${serviceUrl(parts.origin, "ping")} answered ${probe.status}; is this a rech link?`);
+  if (webrtc) console.error(`[rech] connecting to the host over WebRTC via ${new URL(parts.origin).host}…`);
+  const ping = webrtc ? await (await shareRequest(parts.origin, parts.token, true, "GET", "ping")).json() as any : probeBody;
+  if (ping?.error) throw new Error(ping.error);
+  let token = parts.token, device = ping?.device, profiles: string[] = Array.isArray(ping?.profiles) ? ping.profiles : [];
+  const share = ping?.share;
+  if (ping?.kind === "invite") {
+    const res = await shareRequest(parts.origin, parts.token, webrtc, "POST", "redeem", { name: hostname().replace(/\.local$/, "") });
+    const body = await res.json().catch(() => ({})) as any;
+    if (!res.ok || !body.token) throw new Error(body.error ?? `The host refused this invite (HTTP ${res.status}).`);
+    token = body.token; device = body.device; profiles = body.profiles ?? profiles;
+  }
+  const saved = new URL(parts.origin);
+  if (profiles.length === 1) saved.searchParams.set("profile", profiles[0]);
+  saved.hash = `${token}${webrtc ? `&via=${WEBRTC}` : ""}`;
+  await connect(saved.toString(), opts, { share, device, profiles, webrtc });
+}
+
+// ---- WebRTC client bridge -------------------------------------------------------------------
+
+/** The command that runs this rech (for spawning `rech bridge`). */
+const selfCommand = () => [process.execPath, Bun.main];
+
+/**
+ * For a WebRTC link, the loopback URL of a running bridge to it (started when missing); any other
+ * URL comes back unchanged. Everything downstream then speaks plain HTTP.
+ */
+const bridgedUrls = new Set<string>();
+
+export async function transportUrl(url: string): Promise<string> {
+  const parts = shareLinkParts(url);
+  if (!parts?.webrtc) return url;
+  const info = await spawnBridge(parts.token, parts.origin, selfCommand());
+  const bridged = new URL(`http://127.0.0.1:${info.port}/`);
+  new URL(url).searchParams.forEach((v, k) => bridged.searchParams.set(k, v));
+  bridged.hash = `key=${info.key}`;
+  bridgedUrls.add(bridged.toString());
+  return bridged.toString();
+}
+
+async function bridgeCommand(): Promise<void> {
+  const token = process.env.RECH_BRIDGE_TOKEN, signal = process.env.RECH_BRIDGE_SIGNAL;
+  if (!token || !signal) throw new Error("rech bridge is started by rech itself for WebRTC links.");
+  delete process.env.RECH_BRIDGE_TOKEN;
+  await runBridge(token, signal, { log: m => console.error(m), onStop: () => process.exit(0) });
+}
+
+// ---- sessions (client view) -----------------------------------------------------------------
+
+async function sessionCommand(action: string, name?: string): Promise<void> {
+  const raw = process.env[ENV_KEY];
+  if (!raw) throw new Error(notConnectedMessage());
+  const url = await transportUrl(raw);
+  if (action === "close") {
+    if (!name) throw new Error("Which session? rech session close <name>   (see rech session ls)");
+    return run(url, ["close", `-s=${name}`]);
+  }
+  const res = await fetch(serviceUrl(url, "sessions"), { headers: { Authorization: `Bearer ${parseUrl(url).key}` }, signal: AbortSignal.timeout(10_000) });
+  const body = await res.json().catch(() => null) as { sessions?: { session: string; profile?: string; client?: string; owner?: string; lastUsed: number; live: boolean }[]; stderr?: string } | null;
+  if (!res.ok || !body?.sessions) throw new Error(body?.stderr?.trim() || `The host does not list sessions (HTTP ${res.status}); it may run an older rech.`);
+  if (!body.sessions.length) { console.log("No sessions yet (since the host's daemon started)."); return; }
+  const rows = [["SESSION", "PROFILE", "CLIENT", "LAST USED", "STATE"]];
+  for (const s of body.sessions) rows.push([s.session, s.profile ?? "-", s.client ?? "-", fmtDate(s.lastUsed), s.live ? "open" : "closed"]);
+  printTable(rows);
+  console.log(`\nUse one: rech -s=<session> open https://example.com · close it: rech session close <session>`);
+}
+
+async function signalServe(opts: { host?: string; port?: number }): Promise<void> {
+  const server = startSignalRelay({ host: opts.host ?? "127.0.0.1", port: opts.port ?? 8787, log });
+  console.log(`rech signal server (rech-signal-1) on http://${server.hostname}:${server.port}/`);
+  console.log(`Put HTTPS in front of it, then share through it: rech share new <profile> --signal https://<your-host>/`);
+}
+
 async function status(): Promise<void> {
-  const url = process.env[ENV_KEY];
-  if (!url) {
+  const rawUrl = process.env[ENV_KEY];
+  if (!rawUrl) {
     console.log(`serve:    not configured`);
     console.log(notConnectedMessage().split("\n").slice(1).join("\n"));
     return;
+  }
+  // A WebRTC share link is checked through its local bridge, like every command.
+  const link = shareLinkParts(rawUrl);
+  let url = rawUrl;
+  if (link?.webrtc) {
+    try {
+      url = await transportUrl(rawUrl);
+      console.log(`via:      WebRTC through ${new URL(link.origin).host} (local bridge ${serviceUrl(url)})`);
+    } catch (error) {
+      console.log(`via:      ✗ WebRTC through ${new URL(link.origin).host}: ${error instanceof Error ? error.message : error}`);
+      if (rechromeUrlSource && rechromeUrlSource !== "environment") console.log(`config:   ${rechromeUrlSource}`);
+      return;
+    }
   }
   const parsed = parseUrl(url);
   const ping = await fetch(serviceUrl(url), { signal: AbortSignal.timeout(2000) }).catch(() => null);
@@ -3654,17 +4030,22 @@ async function status(): Promise<void> {
   const pingResponse = ping
     ? await fetch(serviceUrl(url, "ping"), { headers: { Authorization: `Bearer ${parsed.key}` }, signal: AbortSignal.timeout(2000) }).catch(() => null)
     : null;
-  const pingBody = pingResponse?.ok
-    ? await pingResponse.json().catch(() => null) as { bind?: string; listener?: string; profiles?: string[] | "*"; degraded?: boolean; consecutiveTimeouts?: number; chromeAccessProblem?: string } | null
+  const pingBody = pingResponse?.ok || pingResponse?.status === 403
+    ? await pingResponse.json().catch(() => null) as { bind?: string; listener?: string; profiles?: string[] | "*"; degraded?: boolean; consecutiveTimeouts?: number; chromeAccessProblem?: string; share?: string; kind?: string; device?: { id: string; name: string; approved: boolean }; expiresAt?: number; error?: string } | null
     : null;
   // Show the URL this client connects to; through a proxy, the daemon's bind is on another port.
   const details = [pingBody?.listener && `listener ${pingBody.listener}`, pingBody?.bind && `bind ${pingBody.bind}`].filter(Boolean).join(", ");
   // Any HTTP answer is not the daemon: a proxy's 404/502 means the link's listener is gone or moved.
-  const answered = pingResponse?.ok || pingResponse?.status === 401;
+  const answered = pingResponse?.ok || pingResponse?.status === 401 || (pingResponse?.status === 403 && !!pingBody?.error);
   console.log(`serve:    ${!ping ? `not reachable at ${serviceUrl(url)}`
     : answered ? `running  ${serviceUrl(url)}${details ? `  (${details})` : ""}`
     : `✗ ${serviceUrl(url)} answers HTTP ${pingResponse?.status ?? ping.status}, not a rechrome daemon — this link's listener was likely removed or moved; ask its host for a fresh link (\`rech share <profile>\`), then \`rech connect '<url>'\``}`);
   if (rechromeUrlSource) console.log(`config:   ${rechromeUrlSource === "environment" ? "RECHROME_URL from the environment" : rechromeUrlSource}${rechromeUrlSource === GLOBAL_ENV_FILE ? "  (machine-wide)" : ""}`);
+  if (rechromeUrlSource && rechromeUrlSource !== "environment")
+    for (const w of await secretFileWarnings(rechromeUrlSource).catch(() => [])) console.log(`secret:   ⚠ ${w}`);
+  if (pingBody?.share)
+    console.log(`share:    ${pingBody.share}${pingBody.device ? `, device ${pingBody.device.name} (${pingBody.device.id})${pingBody.device.approved ? "" : " — ⚠ waiting for the host's approval"}` : pingBody.kind === "invite" ? " — an unused invite: run rech connect '<link>' to register this device" : ""}${pingBody.expiresAt ? `, expires ${fmtDay(pingBody.expiresAt)}` : ""}`);
+  if (pingResponse?.status === 403 && pingBody?.error) console.log(`auth:     ✗ ${pingBody.error}`);
   if (pingResponse?.status === 401)
     console.log(`auth:     ✗ key rejected — ask the host for a fresh URL (\`rech share <profile>\`), then \`rech connect '<url>'\``);
   // daemonManager().id — there is no PM_BIN constant. Referencing one threw a
@@ -3719,10 +4100,19 @@ export type RechHandlers = {
   tray(action?: string): Promise<void>;
   provisionProfile(name: string, opts: { headed: boolean; experimental: boolean }): Promise<void>;
   uninstall(): Promise<void>;
+  shareNew(profiles: string[], opts: ShareNewOptions): Promise<void>;
+  shareList(): Promise<void>;
+  shareDevices(name: string, remove?: string): Promise<void>;
+  shareEdit(action: string, name: string, args: string[], opts?: { expires?: string }): Promise<void>;
+  session(action: string, name?: string): Promise<void>;
+  signalServe(opts: { host?: string; port?: number }): Promise<void>;
+  bridge(): Promise<void>;
 };
 
+const SHARE_ACTIONS = new Set(["new", "allow", "deny", "rotate", "revoke", "rm", "renew", "approve", "devices"]);
+
 /** Commands rech handles itself; anything else is forwarded verbatim to playwright-cli. */
-export const RECH_COMMANDS = new Set(["serve", "status", "listener", "listeners", "profile", "profiles", "share", "connect", "setup", "tray", "provision-profile", "uninstall"]);
+export const RECH_COMMANDS = new Set(["serve", "status", "listener", "listeners", "profile", "profiles", "share", "connect", "session", "sessions", "signal", "bridge", "setup", "tray", "provision-profile", "uninstall"]);
 
 const portOption = { type: "number", requiresArg: true, describe: "Listener port (1-65535)" } as const;
 
@@ -3750,8 +4140,9 @@ Examples:
   rech setup --profile you@example.com         set up Chrome on this machine
   rech open https://example.com                open a page in this project's session
   rech screenshot                              saved to <project>/.rechrome/output/
-  rech share you@example.com                   URL to give another machine (secret)
-  rech connect '<url>'                         use that URL in this project
+  rech share new you@example.com               invite link for another machine (WebRTC, no open port)
+  rech connect '<link>'                        use that link in this project
+  rech share ls                                shares, devices, expiry
 
 Run \`rech <command> --help\` for a command's options. Tutorial: https://github.com/snomiao/rechrome#tutorial`;
 
@@ -3790,15 +4181,30 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
         throw new Error(`To share "${a.name}" with another machine: rech share ${JSON.stringify(a.name)}. To list profiles: rech profile`);
       })
     // Share with and connect from other machines
-    .command("share [profiles..]", "Print a URL another machine can connect with (secret); `share ls` lists all", y => y
-      .positional("profiles", { type: "string", array: true, describe: "Profile(s): email, name, folder, or a unique part of one. Several = one link for all of them. ls/list lists everything shared" })
+    .command("share [profiles..]", "Share profiles: `share new <profile..>` makes an invite link (WebRTC by default); `share ls` lists all", y => y
+      .positional("profiles", { type: "string", array: true, describe: "new <profile..> | ls | devices|approve|allow|deny|rotate|renew|revoke|rm <share> […]; or a profile for its legacy listener link" })
+      .option("name", { type: "string", requiresArg: true, describe: "With new: the share's name (default: from the first profile)" })
+      .option("via", { type: "string", array: true, requiresArg: true, describe: "With new: webrtc (default) | lan | tailscale | <IP> | <listener>; repeat or comma-separate for several" })
+      .option("signal", { type: "string", requiresArg: true, describe: `With new: signal server for webrtc (default ${DEFAULT_SIGNAL}, or RECH_SIGNAL)` })
+      .option("expires", { type: "string", requiresArg: true, describe: "With new/renew: 30d, 2w, 24h, never (new default: 30d over webrtc, else never)" })
+      .option("invite-ttl", { type: "string", requiresArg: true, describe: "With new: an unused invite stops working after this (default 24h)" })
+      .option("devices", { type: "number", requiresArg: true, describe: "With new: how many devices may redeem the invite (default 1)" })
+      .option("approve", { type: "boolean", describe: "With new: each new device waits for `rech share approve`" })
+      .option("rm", { type: "string", requiresArg: true, describe: "With devices: remove this device" })
       .option("listener", { type: "string", requiresArg: true, describe: "Listener to share through (default: the one that allows the profile)" })
       .option("local", { type: "boolean", describe: "Print the direct listener address even when a public URL is set" })
       .option("save", { type: "boolean", describe: "Also save it as RECHROME_URL in this project's .rechrome/.env.local" })
       .option("all", { type: "boolean", describe: "One link for every registered profile (a snapshot, on its own listener); the other machine picks with --profile" }),
       a => {
         const profiles = (a.profiles ?? []) as string[];
-        if (profiles.length === 1 && ["ls", "list"].includes(profiles[0]) && !a.listener && !a.save && !a.all) return handlers.urlList();
+        const [action, target, ...rest] = profiles;
+        if (action === "new") return handlers.shareNew(profiles.slice(1), { name: a.name, via: a.via as string[] | undefined, signal: a.signal, expires: a.expires, inviteTtl: a.inviteTtl, devices: a.devices, approve: a.approve });
+        if (action && SHARE_ACTIONS.has(action)) {
+          if (!target) throw new Error(`Which share? rech share ${action} <share>   (see rech share ls)`);
+          if (action === "devices") return handlers.shareDevices(target, a.rm);
+          return handlers.shareEdit(action, target, rest, { expires: a.expires });
+        }
+        if (profiles.length === 1 && ["ls", "list"].includes(profiles[0]) && !a.listener && !a.save && !a.all) return handlers.shareList();
         if (profiles.length > 1) {
           if (a.all) throw new Error("Pass profiles or --all, not both.");
           return handlers.shareProfiles(profiles, { listener: a.listener, local: a.local, save: a.save });
@@ -3806,11 +4212,12 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
         return handlers.printProfileUri(profiles[0], a.listener, a.all ? { local: a.local, save: a.save, all: true } : { local: a.local, save: a.save });
       })
     .command("connect <url>", "Use a URL from another machine (checks it first; asks: this project or every project)", y => y
-      .positional("url", { type: "string", demandOption: true, describe: "The URL printed by `rech share <profile>` on the machine with Chrome. Quote it: it contains #" })
+      .positional("url", { type: "string", demandOption: true, describe: "The link from `rech share` on the machine with Chrome (or a bare rech1_ token). Quote it: it contains #" })
       .option("project", { type: "boolean", describe: "Save it for this project only (.rechrome/.env.local); the default without a terminal" })
       .option("global", { type: "boolean", describe: "Save it for every project on this machine without its own link (~/.rechrome/.env.local)" })
       .conflicts("project", "global")
       .example("rech connect 'https://host.example.ts.net/rechrome/?profile=you%40example.com#key=…'", "")
+      .example("rech connect 'https://rechrome.pages.dev/#rech1_…'", "An invite: registers this device, then saves its own link")
       .example("rech connect --global '<url>'", "An agent machine: one link for every folder, /tmp included"),
       a => a.global || a.project ? handlers.connect(a.url, { global: a.global, project: a.project }) : handlers.connect(a.url))
     .command(["listener", "listeners"], "Control who can connect: listeners, allowed profiles, keys, public URLs", y => y
@@ -3841,6 +4248,16 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
       .command("remove <name>", "Remove a listener", y => y.positional("name", { type: "string", demandOption: true }),
         a => handlers.removeListener(a.name))
       .demandCommand(1).strict())
+    .command(["session [action] [name]", "sessions [action] [name]"], "This link's browser sessions on the host: ls (default) | close <name>", y => y
+      .positional("action", { type: "string", choices: ["ls", "list", "close"], default: "ls" })
+      .positional("name", { type: "string", describe: "With close: the session (as `rech session ls` shows it)" }),
+      a => handlers.session(a.action === "list" ? "ls" : a.action!, a.name))
+    .command("signal [action]", "Run a WebRTC signal server for your own shares (see docs/signal-selfhost.md)", y => y
+      .positional("action", { type: "string", choices: ["serve"], default: "serve" })
+      .option("host", { type: "string", requiresArg: true, describe: "Address to bind (default 127.0.0.1; put HTTPS in front)" })
+      .option("port", { ...portOption, describe: "Port (default 8787)" }),
+      a => handlers.signalServe({ host: a.host, port: a.port }))
+    .command("bridge", false, {}, () => handlers.bridge())
     // Daemon and extras
     .command("tray [action]", "Menu-bar icon for the daemon (starts after setup)", y => y
       .positional("action", { type: "string", choices: ["show", "start", "hide", "stop", "quit"] }),
@@ -3876,7 +4293,8 @@ if (import.meta.main) {
     status,
     listListeners, addListener, removeListener, printProfileUri,
     listProfiles: async () => {
-      const url = process.env[ENV_KEY];
+      const raw = process.env[ENV_KEY];
+      const url = raw ? await transportUrl(raw) : raw;
       return url && !(await isLocalDaemon(url)) ? listRemoteProfiles(url) : listProfiles();
     },
     urlList, shareProfiles, removeProfile, connect, listenerPort, allowListener, denyListener, rotateKey, setListener,
@@ -3899,6 +4317,10 @@ if (import.meta.main) {
       await provisionProfile(name, { headed });
     },
     uninstall: daemonUninstall,
+    shareNew, shareList, shareDevices, shareEdit,
+    session: sessionCommand,
+    signalServe: async opts => { await signalServe(opts); await new Promise(() => {}); },
+    bridge: async () => { await bridgeCommand(); await new Promise(() => {}); },
   };
 
   if (cmd && RECH_COMMANDS.has(cmd)) {
@@ -3908,7 +4330,7 @@ if (import.meta.main) {
       console.error(error instanceof Error ? error.message : String(error));
       process.exitCode = 1;
     } finally {
-      if (cmd !== "serve") envWatcher?.close();
+      if (!["serve", "signal", "bridge"].includes(cmd)) envWatcher?.close();
     }
   } else if (cmd === "--version") {
     console.log(rechromeVersion()); // playwright-cli's own: rech pw --version
@@ -3917,11 +4339,16 @@ if (import.meta.main) {
     try { await rechCli(["--help"], handlers).parseAsync(); }
     finally { envWatcher?.close(); }
   } else {
-    const url = process.env[ENV_KEY];
-    if (!url) {
+    const rawUrl = process.env[ENV_KEY];
+    if (!rawUrl) {
       console.error(notConnectedMessage());
       process.exit(1);
     }
+    // A WebRTC share link goes through a local bridge; from here on it is plain HTTP.
+    const url = await transportUrl(rawUrl).catch(error => {
+      console.error(`[rech] ${error instanceof Error ? error.message : error}`);
+      process.exit(1);
+    });
     // --profile: target a registered Chrome profile globally (see extractGlobalProfileArg for
     // the leading-flags-only rule that protects the forwarded CLI's own --profile).
     let profileSelector: string | undefined;
