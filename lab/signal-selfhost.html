@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Self-hosted Signal Server</title>
+<meta name="description" content="How to run your own rech-signal-1 server for rechrome WebRTC shares: Cloudflare Workers, Bun on a server, Tailscale Funnel, Docker, or a quick tunnel." />
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="kicker"><a href="./" style="color:inherit;text-decoration:none">rechrome lab</a> · draft · 2026-10-22</div>
+    <h1>Run your own signal server</h1>
+    <p class="lede">WebRTC shares need a rendezvous where the host and client swap connection details before they talk directly. By default that's <code>rechrome.pages.dev</code>. This tutorial covers running your own: five ways, from a free Cloudflare Worker to a box under your desk.</p>
+  </header>
+
+  <div class="callout">Built in <code>feat/sharing</code>: the Bun relay is <code>rech signal serve</code> (<code>signal-relay.ts</code>), the Cloudflare version is <code>signal/cloudflare/</code>, and hosts pick a server with <code>rech share new … --signal &lt;url&gt;</code> or <code>RECH_SIGNAL</code>. The maintained copy of this tutorial is <code>docs/signal-selfhost.md</code>.</div>
+
+  <ol class="toc">
+    <li><a href="#trust">What you're trusting</a></li>
+    <li><a href="#choose">Choose a way</a></li>
+    <li><a href="#cloudflare">A. Cloudflare Workers</a></li>
+    <li><a href="#vps">B. Bun on a server + Caddy</a></li>
+    <li><a href="#funnel">C. Home box + Tailscale Funnel</a></li>
+    <li><a href="#docker">D. Docker</a></li>
+    <li><a href="#tunnel">E. Quick tunnel (testing)</a></li>
+    <li><a href="#use">Point rech at it</a></li>
+    <li><a href="#verify">Verify</a></li>
+    <li><a href="#protocol">Protocol: rech-signal-1</a></li>
+    <li><a href="#harden">Hardening checklist</a></li>
+  </ol>
+
+  <!-- ================================================================ -->
+  <h2 id="trust">1. What you're trusting (less than you'd think)</h2>
+  <p>A signal server only relays the handshake. It never sees the share secret: it gets a room id and an auth token, both one-way HKDF outputs of the secret. The encryption keys depend on the exchanged SDPs, so the server can't substitute its own. After the handshake, traffic goes peer to peer.</p>
+  <table>
+    <tr><th>A hostile or compromised signal server can</th><th>It cannot</th></tr>
+    <tr><td>Refuse or drop connections (DoS)<br>See which IPs meet in which room and when<br>Count connections</td><td>Read or change browser traffic<br>Learn the share secret or derive keys<br>Join a share or impersonate a host</td></tr>
+  </table>
+  <p>So self-hosting is about <strong>availability</strong> (not depending on our free tier), <strong>metadata</strong> (who connects to whom stays with you), and <strong>policy</strong> (a corporate network that only allows its own hosts), not about who can read your browser.</p>
+
+  <!-- ================================================================ -->
+  <h2 id="choose">2. Choose a way</h2>
+  <table>
+    <tr><th>Way</th><th>Cost</th><th>Needs</th><th>Good for</th></tr>
+    <tr><td><a href="#cloudflare">A. Cloudflare Workers</a></td><td>Free tier</td><td>Cloudflare account</td><td>Always up, no server to run. <span class="tag new">easiest</span></td></tr>
+    <tr><td><a href="#vps">B. Bun + Caddy</a></td><td>A small VPS</td><td>Public IP, a domain</td><td>Full control, any cloud</td></tr>
+    <tr><td><a href="#funnel">C. Tailscale Funnel</a></td><td>Free</td><td>Tailscale, a machine that stays on</td><td>No open ports, no domain. Great for a team that already uses Tailscale.</td></tr>
+    <tr><td><a href="#docker">D. Docker</a></td><td>Varies</td><td>Docker host plus TLS in front</td><td>Existing container platforms (Fly, Render, k8s)</td></tr>
+    <tr><td><a href="#tunnel">E. Quick tunnel</a></td><td>Free</td><td><code>cloudflared</code></td><td>Trying it out. The URL changes on every run.</td></tr>
+  </table>
+  <p class="meta">Whichever you choose, it needs <strong>HTTPS/WSS</strong> when clients are on other networks, and it must allow WebSocket upgrades.</p>
+
+  <!-- ================================================================ -->
+  <h2 id="cloudflare">3. A. Cloudflare Workers (your account)</h2>
+  <p>This is the same design as the default server: one SQLite-backed Durable Object per room, using WebSocket hibernation so an idle host costs nothing. It fits the Workers Free plan (100k requests/day; incoming WebSocket messages count 20:1).</p>
+  <pre><code># 1. get the template (signal/cloudflare/: worker.ts + wrangler.jsonc)
+git clone https://github.com/snomiao/rechrome && cd rechrome/signal/cloudflare
+
+# 2. log in and deploy (wrangler needs Node.js, not Bun, for `wrangler dev`)
+npx wrangler login
+npx wrangler deploy
+# → https://rech-signal.&lt;your-subdomain&gt;.workers.dev</code></pre>
+  <p>For a custom domain whose zone is on the same account, uncomment the route in <code>wrangler.jsonc</code>:</p>
+  <pre><code>"routes": [{ "pattern": "signal.example.com", "custom_domain": true }]</code></pre>
+  
+
+  <!-- ================================================================ -->
+  <h2 id="vps">4. B. Bun on a server + Caddy</h2>
+  <p>The relay is one file with no dependencies beyond Bun. Rooms live in memory and disappear when everyone leaves.</p>
+  <pre><code># on the server
+curl -fsSL https://bun.sh/install | bash
+bunx rechrome signal serve --host 127.0.0.1 --port 8787</code></pre>
+  <p>Put TLS in front. Caddy gets certificates automatically:</p>
+  <pre><code># /etc/caddy/Caddyfile
+signal.example.com {
+  reverse_proxy 127.0.0.1:8787
+}</code></pre>
+  <p>Keep it running with systemd:</p>
+  <pre><code># /etc/systemd/system/rech-signal.service
+[Unit]
+Description=rech signal relay
+After=network-online.target
+
+[Service]
+ExecStart=/home/rech/.bun/bin/bunx rechrome signal serve --host 127.0.0.1 --port 8787
+User=rech
+Restart=always
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target</code></pre>
+  <pre><code>sudo systemctl enable --now rech-signal caddy</code></pre>
+
+  <!-- ================================================================ -->
+  <h2 id="funnel">5. C. Home box + Tailscale Funnel</h2>
+  <p>Funnel gives a machine on your tailnet a public <code>https://&lt;machine&gt;.&lt;tailnet&gt;.ts.net</code> URL, without opening a port or buying a domain. It suits a Mac mini or NAS that stays on.</p>
+  <pre><code>bunx rechrome signal serve --port 8787
+tailscale funnel --bg 8787
+# → https://mini.tail1234.ts.net/  (public; Funnel must be allowed in your tailnet policy)</code></pre>
+  <p class="meta">Why Funnel and not Serve: <code>tailscale serve</code> is tailnet-only. If every client is on your tailnet, skip WebRTC and use a <code>tailscale</code> transport share directly. Funnel is for clients <em>outside</em> the tailnet. On macOS, run the relay as a LaunchAgent so it survives logout (see <code>docs/macos-daemon.md</code> for the pattern).</p>
+
+  <!-- ================================================================ -->
+  <h2 id="docker">6. D. Docker</h2>
+  <pre><code># Dockerfile
+FROM oven/bun:1-alpine
+RUN bun add -g rechrome
+USER bun
+EXPOSE 8787
+CMD ["bunx", "rechrome", "signal", "serve", "--host", "0.0.0.0", "--port", "8787"]</code></pre>
+  <pre><code>docker build -t rech-signal .
+docker run -d --restart=always -p 127.0.0.1:8787:8787 rech-signal</code></pre>
+  <p>Then put TLS in front (Caddy as in B, or your platform's HTTPS). On Fly.io, Render or Railway the platform handles TLS, so expose 8787 and use the HTTPS URL they give you. Run <strong>one instance</strong>: rooms live in memory, so a host and its client must reach the same process. Use sticky sessions or a single replica.</p>
+
+  <!-- ================================================================ -->
+  <h2 id="tunnel">7. E. Quick tunnel (testing only)</h2>
+  <pre><code>bunx rechrome signal serve --port 8787 &amp;
+cloudflared tunnel --url http://127.0.0.1:8787
+# → https://random-words.trycloudflare.com</code></pre>
+  <p class="meta">There's no account and no uptime guarantee, and the hostname changes every run, which invalidates every link made with it. Use it for trying things out, not real shares.</p>
+
+  <!-- ================================================================ -->
+  <h2 id="use">8. Point rech at it</h2>
+  <p>Only the <strong>host</strong> chooses the signal server. Its origin becomes the link, so clients need no setup.</p>
+  <pre><code># one share
+rech share new work@ --signal https://signal.example.com/
+  → https://signal.example.com/#rech1_7fQxC9tZp2mVb8wLrN4hdK3kT9aQ
+
+# default for every new share on this machine
+export RECH_SIGNAL=https://signal.example.com/
+
+# the client side does nothing special:
+rech connect 'https://signal.example.com/#rech1_…'   # probes /ping → {"rech-signal":1} → WebRTC</code></pre>
+  <p>Changing a share's signal server changes its link, like <code>rotate</code>. Existing devices pinned to the share keep working once they learn the new origin from the host over their open channel.</p>
+
+  <!-- ================================================================ -->
+  <h2 id="verify">9. Verify</h2>
+  <pre><code>curl https://signal.example.com/ping
+# {"rech-signal":1}</code></pre>
+  <p>A full round trip (host and client in a test room) with Bun:</p>
+  <pre><code>bun -e '
+const u = "wss://signal.example.com/TestRoom123", p = ["rech-signal-1"];
+const h = new WebSocket(u, p), log = m => console.log(m.data);
+h.onmessage = log;
+h.onopen = () => { h.send(JSON.stringify({ type: "hello", role: "host", auth: "test" }));
+  const c = new WebSocket(u, p); c.onmessage = log;
+  c.onopen = () => { c.send(JSON.stringify({ type: "hello", role: "client", auth: "test" }));
+    setTimeout(() => { c.send(JSON.stringify({ type: "answer", sdp: "hi" })); }, 200);
+    setTimeout(() => process.exit(0), 600); } };'
+# {"type":"welcome","peer":"host","hostPresent":true}
+# {"type":"peer-join","peer":"3f9a1c2e"}
+# {"type":"welcome","peer":"3f9a1c2e","hostPresent":true}
+# {"type":"answer","sdp":"hi","from":"3f9a1c2e"}</code></pre>
+
+  <!-- ================================================================ -->
+  <h2 id="protocol">10. Protocol: <code>rech-signal-1</code></h2>
+  <p>This is all a compatible server has to do. Anything that implements it (Deno, Go, nginx + a script) works with rech.</p>
+  <h3>HTTP</h3>
+  <table>
+    <tr><th>Request</th><th>Response</th></tr>
+    <tr><td><code>GET /ping</code></td><td><code>{"rech-signal":1}</code>, which is how <code>rech connect</code> recognises a signal host</td></tr>
+    <tr><td><code>GET /&lt;room&gt;</code> + <code>Upgrade: websocket</code>, subprotocol <code>rech-signal-1</code></td><td>101, echoing the subprotocol. <code>&lt;room&gt;</code> is 8–32 base58 characters.</td></tr>
+    <tr><td>anything else</td><td>Optional landing page. It must not need the <code>#fragment</code> server-side (it never arrives).</td></tr>
+  </table>
+  <h3>Frames (JSON text)</h3>
+  <table>
+    <tr><th>Direction</th><th>Frame</th><th>Server does</th></tr>
+    <tr><td>any → server, first</td><td><code>{type:"hello", role:"host"|"client", auth}</code></td><td>The first host opens the room and fixes its <code>auth</code>. Later peers must match it. A client with no room gets close 4404.</td></tr>
+    <tr><td>server → peer</td><td><code>{type:"welcome", peer, hostPresent}</code></td><td>Host peer id is <code>"host"</code>; clients get a random id</td></tr>
+    <tr><td>server → host</td><td><code>{type:"peer-join"|"peer-leave", peer}</code></td><td>On client join and leave</td></tr>
+    <tr><td>server → clients</td><td><code>{type:"host-leave"}</code></td><td>When the host disconnects</td></tr>
+    <tr><td>client → host</td><td><code>{type:"answer"|"candidate"|…}</code></td><td>Forward to the host, adding <code>from:&lt;peer&gt;</code></td></tr>
+    <tr><td>host → client</td><td><code>{type:"offer"|"candidate"|…, to:&lt;peer&gt;}</code></td><td>Forward to that client as is</td></tr>
+    <tr><td>any</td><td><code>{"type":"ping"}</code> (exact bytes)</td><td>Reply <code>{"type":"pong"}</code>. On Cloudflare use <code>setWebSocketAutoResponse</code> so pings don't wake the object.</td></tr>
+  </table>
+  <h3>Close codes</h3>
+  <table>
+    <tr><th>Code</th><th>Meaning</th></tr>
+    <tr><td>1008</td><td><code>expected hello</code> or <code>forbidden</code> (auth mismatch). Never echo the auth.</td></tr>
+    <tr><td>1013</td><td><code>room full</code> (reference limit: 32 clients)</td></tr>
+    <tr><td>4404</td><td><code>host offline</code>: the client arrived and no host has the room open</td></tr>
+    <tr><td>1000</td><td><code>replaced by a newer host connection</code> (host restarted)</td></tr>
+  </table>
+  <p class="meta">Room state lives only while someone is connected, so a restarted relay loses nothing that matters: hosts reconnect and reopen their rooms. Payloads are opaque. The server must forward SDP and candidates unchanged and never parse or log them.</p>
+
+  <!-- ================================================================ -->
+  <h2 id="harden">11. Hardening checklist</h2>
+  <ul>
+    <li><strong>TLS always</strong> for anything off-LAN (Caddy, Funnel, the platform, or Cloudflare).</li>
+    <li><strong>Don't log frames.</strong> Access logs are fine, but SDPs contain candidate IPs.</li>
+    <li><strong>Limits:</strong> clients per room (32), message size (64 KB), idle timeout (120 s; hosts ping every 20–60 s).</li>
+    <li><strong>Rate limits</strong> per IP on upgrades. Caddy's <code>rate_limit</code> plugin or Cloudflare WAF rules, for a public relay.</li>
+    <li><strong>Single process</strong> for the in-memory relay (or sticky routing). The Cloudflare version doesn't need this.</li>
+    <li><strong>No TURN here.</strong> If you add TURN, give out short-lived credentials (1 h), since a TURN relay carries real bytes and costs real money.</li>
+    <li><strong>Run unprivileged</strong> (the systemd unit and Dockerfile above do).</li>
+  </ul>
+</div>
+</body>
+</html>

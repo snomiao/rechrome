@@ -566,7 +566,10 @@ class PlaywrightExtension {
   _onMessage(message, sender, sendResponse) {
     switch (message.type) {
       case "connectionRequested":
-        this._pendingConnections.create(sender.tab.id, message.mcpRelayUrl, message.protocolVersion).then(
+        (async () => {
+          if (message.recoveryAttempt) await this._retireSupersededPages(sender);
+          await this._pendingConnections.create(sender.tab.id, message.mcpRelayUrl, message.protocolVersion);
+        })().then(
           () => sendResponse({ success: true }),
           (error) => sendResponse({ success: false, error: error.message })
         );
@@ -605,6 +608,27 @@ class PlaywrightExtension {
       case "keepalive":
         return false;
     }
+  }
+  // The single worker coordinates recovery within this profile. It never reloads
+  // itself or touches live groups: only sibling connect pages for the same relay
+  // attempt can be retired. A different lane/attempt is outside this ownership.
+  async _retireSupersededPages(sender) {
+    var _a;
+    const current = new URL(sender.url || ((_a = sender.tab) == null ? void 0 : _a.url) || "about:blank");
+    const attempt = current.searchParams.get("attempt");
+    const relay = current.searchParams.get("mcpRelayUrl");
+    if (current.protocol !== "chrome-extension:" || current.host !== chrome.runtime.id || current.pathname !== "/connect.html" || !/^[0-9a-f-]{36}$/.test(attempt || "") || !relay) return;
+    const attached = new Set([...this._activeGroups].flatMap((g) => g.connectedTabIds()));
+    const tabs = await chrome.tabs.query({});
+    await Promise.all(tabs.map(async (tab) => {
+      var _a2;
+      if (tab.id === void 0 || tab.id === ((_a2 = sender.tab) == null ? void 0 : _a2.id) || attached.has(tab.id) || !tab.url) return;
+      const other = new URL(tab.url);
+      if (other.protocol !== current.protocol || other.host !== current.host || other.pathname !== current.pathname || other.searchParams.get("attempt") !== attempt || other.searchParams.get("mcpRelayUrl") !== relay) return;
+      const latest = await chrome.tabs.get(tab.id).catch(() => void 0);
+      if ((latest == null ? void 0 : latest.url) === tab.url) await chrome.tabs.remove(tab.id).catch(() => {
+      });
+    }));
   }
   async _connectTab(selectorTabId, tab, clientName) {
     try {
@@ -655,3 +679,6 @@ class PlaywrightExtension {
   }
 }
 new PlaywrightExtension();
+export {
+  PlaywrightExtension
+};
