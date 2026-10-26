@@ -276,6 +276,19 @@ export function warnChromeDataAccess(path: string, error: unknown): void {
   log(chromeAccessProblem);
 }
 
+/** A profile name or email could not be mapped to its Chrome folder because Local State is unreadable. */
+export class ProfileResolutionError extends Error {
+  constructor(readonly profile: string, statePath: string, cause: unknown) {
+    const message = cause instanceof Error ? cause.message : String(cause);
+    const hint = chromeDataAccessHint(cause);
+    super(`[rech] cannot find the Chrome folder for profile "${profile}": ${statePath} is unreadable (${message}). Refusing, so Chrome does not create a new empty profile named "${profile}".\n`
+      + `  Register it once (records its folder in ~/.rechrome): rech setup --profile ${JSON.stringify(profile)}\n`
+      + `  Or select the folder directly, e.g. rech --profile "Profile 1" …\n`
+      + (hint ? `  ${hint}\n` : ""));
+    this.name = "ProfileResolutionError";
+  }
+}
+
 export async function resolveProfileDirectory(
   nameOrEmail: string,
   registry?: Record<string, { profileDir?: string }>,
@@ -290,20 +303,26 @@ export async function resolveProfileDirectory(
   // never guards, so a launchd/oxmgr daemon resolves it without touching Chrome's data folder.
   const entry = (registry ?? await readTokenRegistry().catch(() => ({})) as Record<string, { profileDir?: string }>)[nameOrEmail];
   if (entry?.profileDir) return entry.profileDir;
+  let unreadable: { path: string; error: unknown } | undefined;
   for (const statePath of statePaths) {
     try {
-      const f = file(statePath);
-      if (!(await f.exists())) continue;
-      const data = JSON.parse(await f.text());
+      // Read without an exists() probe: under TCC the stat fails too, and exists() would report
+      // "missing" and hide the denial.
+      const data = JSON.parse(await file(statePath).text());
       const cache: Record<string, any> = data?.profile?.info_cache ?? {};
       for (const [dir, info] of Object.entries(cache)) {
         if ([info.name, info.user_name, info.gaia_name].includes(nameOrEmail))
           return dir;
       }
     } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code === "ENOENT") continue;
       warnChromeDataAccess(statePath, error);
+      unreadable ??= { path: statePath, error };
     }
   }
+  // Passing an email or display name through would make Chrome create a NEW empty profile folder
+  // literally named after it (--profile-directory=me@example.com) instead of opening the real one.
+  if (unreadable) throw new ProfileResolutionError(nameOrEmail, unreadable.path, unreadable.error);
   return nameOrEmail;
 }
 
@@ -818,7 +837,14 @@ export async function serve() {
 
       // Resolve profile name/email → directory name
       if (!scoped && passthroughEnv.PLAYWRIGHT_MCP_PROFILE_DIRECTORY) {
-        const resolved = await resolveProfileDirectory(passthroughEnv.PLAYWRIGHT_MCP_PROFILE_DIRECTORY);
+        let resolved: string;
+        try {
+          resolved = await resolveProfileDirectory(passthroughEnv.PLAYWRIGHT_MCP_PROFILE_DIRECTORY);
+        } catch (error) {
+          if (!(error instanceof ProfileResolutionError)) throw error;
+          log(`refused unresolvable profile "${error.profile}" (session=${namespacedSession})`);
+          return Response.json({ status: 1, stdout: "", stderr: error.message, files: [] });
+        }
         if (resolved !== passthroughEnv.PLAYWRIGHT_MCP_PROFILE_DIRECTORY)
           log(`profile resolved: "${passthroughEnv.PLAYWRIGHT_MCP_PROFILE_DIRECTORY}" → "${resolved}"`);
         passthroughEnv.PLAYWRIGHT_MCP_PROFILE_DIRECTORY = resolved;
