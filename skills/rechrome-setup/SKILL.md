@@ -5,7 +5,7 @@ description: Set up or repair rechrome access to a selected Chrome profile, espe
 
 # Rechrome setup on macOS
 
-For authorized native Windows UI work on sym041, use [Windows desktop UI on sym041](../windows-desktop-ui-sym041/SKILL.md). It documents the delegated winrpc route and profile verification; do not apply the macOS picker shortcuts there.
+For authorized native Windows UI work over winrpc, use [Windows desktop UI](../windows-desktop-ui/SKILL.md). It documents the delegated winrpc route and profile verification; do not apply the macOS picker shortcuts there.
 
 Use this workflow when the user requests rechrome setup for an existing Chrome profile. Complete the CLI and browser steps together; opening the guide alone is not completion.
 

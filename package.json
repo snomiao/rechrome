@@ -14,7 +14,7 @@
     "LICENSE",
     "README.md",
     "skills/rechrome-setup",
-    "skills/windows-desktop-ui-sym041",
+    "skills/windows-desktop-ui",
     "extension-token.js",
     "extension-token.ts",
     "daemon-manager.js",
@@ -26,7 +26,19 @@
     "rechrome.ts",
     "serve.js",
     "serve.ts",
-    "vendor"
+    "vendor",
+    "scoped-upload.ts",
+    "scoped-upload.js",
+    "secret.ts",
+    "secret.js",
+    "shares.ts",
+    "shares.js",
+    "e2e.ts",
+    "e2e.js",
+    "webrtc.ts",
+    "webrtc.js",
+    "signal-relay.ts",
+    "signal-relay.js"
   ],
   "type": "module",
   "scripts": {
@@ -35,11 +47,12 @@
     "vendor-cli": "bash scripts/vendor-cli.sh",
     "prepare": "bash scripts/vendor-cli.sh --prepare",
     "check-pack": "bash scripts/check-pack.sh",
-    "prepublishOnly": "bash scripts/vendor-cli.sh && sed 's/\\.ts/\\.js/g' rechrome.ts > rechrome.js && sed 's/\\.ts/\\.js/g' serve.ts > serve.js && bun build extension-token.ts --target=bun --outfile=extension-token.js && bun build daemon-manager.ts --target=bun --outfile=daemon-manager.js && bun build listeners.ts --target=bun --outfile=listeners.js && bash scripts/check-pack.sh"
+    "prepublishOnly": "bash scripts/vendor-cli.sh && sed 's/\\.ts/\\.js/g' rechrome.ts > rechrome.js && sed 's/\\.ts/\\.js/g' serve.ts > serve.js && bun build extension-token.ts --target=bun --outfile=extension-token.js && bun build daemon-manager.ts --target=bun --outfile=daemon-manager.js && bun build listeners.ts --target=bun --outfile=listeners.js && bun build scoped-upload.ts --target=bun --outfile=scoped-upload.js && bun build secret.ts --target=bun --external node-datachannel --outfile=secret.js && bun build shares.ts --target=bun --external node-datachannel --outfile=shares.js && bun build e2e.ts --target=bun --external node-datachannel --outfile=e2e.js && bun build webrtc.ts --target=bun --external node-datachannel --outfile=webrtc.js && bun build signal-relay.ts --target=bun --external node-datachannel --outfile=signal-relay.js && bash scripts/check-pack.sh"
   },
   "devDependencies": {
     "@types/bun": "latest",
-    "@types/yargs": "^17.0.35"
+    "@types/yargs": "^17.0.35",
+    "node-datachannel": "^0.32.3"
   },
   "release": {
     "branches": [
@@ -48,5 +61,8 @@
   },
   "dependencies": {
     "yargs": "^18.2.0"
-  }
+  },
+  "trustedDependencies": [
+    "node-datachannel"
+  ]
 }
