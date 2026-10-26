@@ -1,9 +1,11 @@
 #!/usr/bin/env bun
+import { prepareStdinUpload, type UploadPayload } from "./scoped-upload.ts";
 import { readListeners, writeListeners, listenerAddress, isLoopback, normalizePrefix, serviceUrl, allowProfiles, denyProfiles, rotateListenerKey, setPublicUrl, canonicalProfileKeys, planProfileRemoval, type Listener } from "./listeners.ts";
 
 import { file } from "bun";
 import yargs from "yargs";
 import { readExtensionTokenFromProfile } from "./extension-token.ts";
+import { FILL_SECRET_USAGE, SECRET_MASK, parseFillSecretArgs, fillSecretWireArgs, readSecretSource, totpCode, totpWaitMs } from "./fill-secret.ts";
 import { createHash, randomBytes } from "crypto";
 import { mkdirSync, appendFileSync, existsSync, realpathSync, accessSync, cpSync, unlinkSync, readFileSync, readdirSync, renameSync, rmdirSync, constants as fsConstants } from "fs";
 import { hostname, homedir, networkInterfaces } from "os";
@@ -12,8 +14,12 @@ import { join, basename, dirname, resolve } from "path";
 import { pathToFileURL } from "url";
 import { createRequire } from "node:module";
 import { spawn as cpSpawn } from "child_process";
-import { readFile, writeFile, rename, chmod, mkdir } from "node:fs/promises";
+import { readFile, writeFile, rename, chmod, mkdir, stat } from "node:fs/promises";
 import { isDeprecatedPm2Fallback, listsProcess, oxmgrInstallCommand, pickDaemonManager, PM2_DEPRECATION, type DaemonManager } from "./daemon-manager.ts";
+import { DEFAULT_SIGNAL, WEBRTC, createShare, findDevice, findShare, inviteLink, inviteProblem, parseDuration, readShares, updateShares, type Share } from "./shares.ts";
+import { bearerOf, looksLikeToken, newToken, parseToken, redactSecrets } from "./secret.ts";
+import { WebrtcClient, loadRTC, runBridge, spawnBridge } from "./webrtc.ts";
+import { startSignalRelay } from "./signal-relay.ts";
 
 export const ENV_KEY = "RECHROME_URL";
 export const DEFAULT_PORT = 13775;
@@ -84,6 +90,8 @@ async function saveTokenEntry(profileEmail: string, entry: TokenEntry): Promise<
 }
 
 const envFile = join(import.meta.dir, ".env.local");
+/** Machine-wide RECHROME_URL from `rech connect --global`: read from every folder, after the project's own files. */
+export const GLOBAL_ENV_FILE = join(RECH_DIR, ".env.local");
 const globalEnvFile = join(HOME || "~", ".env.local");
 
 // Capture inherited values once so explicit environment overrides survive reloads,
@@ -127,10 +135,15 @@ const bunLoaded = bunAutoloadedKeys(process.env,
     .map(name => { try { return readFileSync(join(process.cwd(), name), "utf8"); } catch { return ""; } }));
 const inheritedEnvKeys = new Set(Object.keys(process.env).filter(key => !bunLoaded.has(key)));
 
+/** Where RECHROME_URL came from: "environment", an env file's path, or undefined when unset. */
+export let rechromeUrlSource: string | undefined;
+
 // Walk CWD→root loading env files nearest-first; inherited environment wins over files.
 // At each level .rechrome/.env.local is checked before .env.local (rechrome-specific overrides general).
-export async function loadNearestEnv(extraFallbacks: string[] = []) {
+// The machine-wide file comes last, so it also applies outside $HOME (e.g. an agent's /tmp scratch dir).
+export async function loadNearestEnv(extraFallbacks: string[] = [GLOBAL_ENV_FILE]) {
   const seen = new Set<string>(inheritedEnvKeys);
+  rechromeUrlSource = seen.has(ENV_KEY) ? "environment" : undefined;
   const applyFile = async (path: string) => {
     const raw = await file(path).text().catch(() => "");
     for (const line of raw.split("\n")) {
@@ -138,6 +151,7 @@ export async function loadNearestEnv(extraFallbacks: string[] = []) {
       if (!m || m[1].startsWith("#")) continue;
       if (seen.has(m[1])) continue;
       seen.add(m[1]);
+      if (m[1] === ENV_KEY) rechromeUrlSource = path;
       process.env[m[1]] = m[2].replace(/^["']|["']$/g, "");
     }
   };
@@ -313,8 +327,11 @@ export function parseUrl(raw: string) {
   const scheme = u.protocol.replace(":", "");
   const protocol = scheme === "https" ? "https" : "http";
   const defaultPort = scheme === "https" ? 443 : scheme === "http" ? 80 : DEFAULT_PORT;
+  // A rech1_ share link authenticates with the bearer derived from its token (secret.ts).
+  const shareToken = u.hash.slice(1).split("&")[0];
+  const shareBearer = looksLikeToken(shareToken) ? (() => { try { return bearerOf(shareToken); } catch { return undefined; } })() : undefined;
   return {
-    key: fragment.get("key") ?? u.username,
+    key: shareBearer ?? fragment.get("key") ?? u.username,
     prefix: normalizePrefix(u.pathname),
     host: u.hostname,
     port: parseInt(u.port) || defaultPort,
@@ -377,20 +394,32 @@ export function buildListenChoices(interfaces: ReturnType<typeof networkInterfac
   return choices.sort((a, b) => rank[a.kind] - rank[b.kind]);
 }
 
+// The Mac app's binary only acts as the CLI when it is told to (or has a terminal): from a
+// daemon it tries to start the GUI and fails. Harmless for the standalone CLI.
+const TAILSCALE_ENV = { ...process.env, TAILSCALE_BE_CLI: "1" };
 const tailscaleBinary = () => Bun.which("tailscale") || (existsSync("/Applications/Tailscale.app/Contents/MacOS/Tailscale") ? "/Applications/Tailscale.app/Contents/MacOS/Tailscale" : null);
+
+/** Run the Tailscale CLI read-only: its output, or why it gave none (missing, failed, slow). */
+async function runTailscaleDetailed(args: string[]): Promise<{ output: string } | { error: string; missing?: true }> {
+  const binary = tailscaleBinary();
+  if (!binary) return { error: "not installed", missing: true };
+  try {
+    const proc = Bun.spawn([binary, ...args], { env: TAILSCALE_ENV, stdout: "pipe", stderr: "pipe" });
+    let timedOut = false;
+    const timeout = setTimeout(() => { timedOut = true; proc.kill(); }, 2000);
+    try {
+      const [output, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+      if (await proc.exited === 0) return { output };
+      const reason = timedOut ? "no answer within 2s" : (stderr.trim() || output.trim()).split("\n")[0] || `exit ${proc.exitCode}`;
+      return { error: `\`tailscale ${args.join(" ")}\`: ${reason}` };
+    } finally { clearTimeout(timeout); }
+  } catch (error) { return { error: String(error) }; }
+}
 
 /** Run the Tailscale CLI read-only; null when it is missing, disconnected, or slow. */
 async function runTailscale(args: string[]): Promise<string | null> {
-  const binary = tailscaleBinary();
-  if (!binary) return null;
-  try {
-    const proc = Bun.spawn([binary, ...args], { stdout: "pipe", stderr: "ignore" });
-    const timeout = setTimeout(() => proc.kill(), 2000);
-    try {
-      const output = await new Response(proc.stdout).text();
-      return await proc.exited === 0 ? output : null;
-    } finally { clearTimeout(timeout); }
-  } catch { return null; }
+  const result = await runTailscaleDetailed(args);
+  return "output" in result ? result.output : null;
 }
 
 export async function detectListenChoices(): Promise<ListenChoice[]> {
@@ -443,6 +472,140 @@ export async function detectTailscaleServe(port: number, prefix: string): Promis
   try { serveStatus = JSON.parse(serve ?? "null"); } catch { /* no Serve config */ }
   const routeUrl = findTailscaleServeRoute(dnsName, serveStatus, port, prefix);
   return { dnsName, routeUrl, ...serveMountsAndFunnel(serveStatus, routeUrl ? new URL(routeUrl).hostname : dnsName) };
+}
+
+type ServeHandler = { hostPort: string; mount: string; target: URL };
+
+/** Every Serve route that proxies to a loopback HTTP port. */
+function loopbackServeHandlers(serveStatus: unknown): ServeHandler[] {
+  const web = (serveStatus as { Web?: Record<string, { Handlers?: Record<string, { Proxy?: string }> }> } | null)?.Web ?? {};
+  const handlers: ServeHandler[] = [];
+  for (const [hostPort, config] of Object.entries(web)) {
+    for (const [path, handler] of Object.entries(config.Handlers ?? {})) {
+      if (!handler.Proxy) continue;
+      let target: URL;
+      try { target = new URL(/^[a-z]+:\/\//i.test(handler.Proxy) ? handler.Proxy : `http://${handler.Proxy}`); } catch { continue; }
+      if (!["127.0.0.1", "localhost", "[::1]"].includes(target.hostname) || !target.port) continue;
+      handlers.push({ hostPort, mount: path.replace(/\/+$/, "") || "/", target });
+    }
+  }
+  return handlers;
+}
+
+export type ServeRepair = { hostPort: string; mount: string; from: number; to: number; proxy: string };
+export type ServeStale = { hostPort: string; mount: string; port: number };
+
+/**
+ * Health check for Tailscale Serve against listeners.json. `repair`: a route on a listener's own
+ * mount that proxies to another port (the listener moved), re-pointed at the listener's port.
+ * `stale`: a route next to a listener's mount (same first path segment, e.g. /rechrome beside
+ * /rechrome/taku) whose port no listener uses — a removed listener's leftover, which answers 502.
+ * Root ("/") mounts are never touched: they could be anything.
+ */
+export function planTailscaleServeRepairs(serveStatus: unknown, listeners: { port: number; prefix?: string }[]): { repair: ServeRepair[]; stale: ServeStale[] } {
+  const ports = new Set(listeners.map(l => l.port));
+  const mounts = new Map<string, number>();
+  for (const l of listeners) {
+    const mount = normalizePrefix(l.prefix).replace(/\/+$/, "");
+    if (mount) mounts.set(mount, l.port);
+  }
+  const roots = new Set([...mounts.keys()].map(m => m.split("/")[1]));
+  const repair: ServeRepair[] = [], stale: ServeStale[] = [];
+  for (const { hostPort, mount, target } of loopbackServeHandlers(serveStatus)) {
+    const port = Number(target.port), want = mounts.get(mount);
+    if (want !== undefined) {
+      if (port !== want) {
+        const proxy = new URL(target); proxy.port = String(want);
+        repair.push({ hostPort, mount, from: port, to: want, proxy: proxy.href.replace(/\/$/, mount === "/" ? "/" : "") });
+      }
+    } else if (mount !== "/" && roots.has(mount.split("/")[1]) && !ports.has(port)) {
+      stale.push({ hostPort, mount, port });
+    }
+  }
+  return { repair, stale };
+}
+
+/** Drop the Serve routes that proxy to a removed listener, so they don't linger answering 502. */
+async function removeTailscaleServeRoutes(listener: { port: number; prefix?: string }): Promise<void> {
+  const binary = tailscaleBinary(), raw = binary && await runTailscale(["serve", "status", "--json"]);
+  if (!binary || !raw) return;
+  let serveStatus: unknown;
+  try { serveStatus = JSON.parse(raw); } catch { return; }
+  const mount = normalizePrefix(listener.prefix).replace(/\/+$/, "") || "/";
+  for (const h of loopbackServeHandlers(serveStatus)) {
+    if (Number(h.target.port) !== listener.port || h.mount !== mount) continue;
+    const args = ["serve", `--https=${h.hostPort.split(/:(?=\d+$)/)[1] ?? "443"}`, `--set-path=${h.mount}`, "off"];
+    const ok = await Bun.spawn([binary, ...args], { env: TAILSCALE_ENV, stdout: "ignore", stderr: "inherit", windowsHide: true }).exited === 0;
+    console.log(ok ? `Removed its Tailscale Serve route ${h.hostPort}${h.mount}.` : `Remove its Tailscale Serve route yourself: tailscale ${args.join(" ")}`);
+  }
+}
+
+type HealthListener = Pick<Listener, "name" | "port" | "prefix" | "profiles">;
+
+/**
+ * Read-only Tailscale Serve health for the listeners: `absent` (no Tailscale here), `unresponsive`
+ * (installed, but its CLI doesn't answer — e.g. not running, or the Mac app's GUI binary), or
+ * `ok` with each shared listener's route plus the routes to re-point or remove.
+ */
+export type TailscaleHealth =
+  | { state: "absent" }
+  | { state: "unresponsive"; error: string }
+  | { state: "ok"; routes: { listener: string; port: number; url: string | null }[]; repair: ServeRepair[]; stale: ServeStale[] };
+
+export async function inspectTailscaleServe(listeners: HealthListener[]): Promise<TailscaleHealth> {
+  const [serve, status] = await Promise.all([runTailscaleDetailed(["serve", "status", "--json"]), runTailscale(["status", "--json"])]);
+  if (!("output" in serve)) return serve.missing ? { state: "absent" } : { state: "unresponsive", error: serve.error };
+  let serveStatus: unknown, dnsName: string | null = null;
+  try { serveStatus = JSON.parse(serve.output || "null"); } catch { return { state: "unresponsive", error: "`tailscale serve status --json` printed no JSON" }; }
+  try { dnsName = (JSON.parse(status ?? "null")?.Self?.DNSName as string | undefined)?.replace(/\.$/, "") || null; } catch { /* not connected */ }
+  const routes = listeners.filter(l => l.profiles !== "*")
+    .map(l => ({ listener: l.name, port: l.port, url: findTailscaleServeRoute(dnsName, serveStatus, l.port, normalizePrefix(l.prefix)) }));
+  return { state: "ok", routes, ...planTailscaleServeRepairs(serveStatus, listeners) };
+}
+
+const httpsPortOf = (hostPort: string) => hostPort.split(/:(?=\d+$)/)[1] ?? "443";
+
+/** Problems in a health report, one line each with the command that fixes it; empty when healthy. */
+export function tailscaleHealthProblems(health: TailscaleHealth): string[] {
+  if (health.state === "absent") return [];
+  if (health.state === "unresponsive") return [`Tailscale is installed but its CLI doesn't answer, so Serve routes go unchecked: ${health.error}`];
+  return [
+    ...health.repair.map(r => `${r.hostPort}${r.mount} proxies to 127.0.0.1:${r.from}, but the listener is on ${r.to} (clients get HTTP 502). Fix: tailscale serve --bg --https=${httpsPortOf(r.hostPort)} --set-path=${r.mount} ${r.proxy}`),
+    ...health.stale.map(st => `${st.hostPort}${st.mount} proxies to 127.0.0.1:${st.port}, where no listener runs (clients get HTTP 502). Remove it: tailscale serve --https=${httpsPortOf(st.hostPort)} --set-path=${st.mount} off`),
+  ];
+}
+
+/** The `tailscale:` block of `rech status` / `rech share ls`: each shared listener's route, then problems. */
+export function formatTailscaleHealth(health: TailscaleHealth): string[] {
+  if (health.state === "absent") return [];
+  const lines = health.state === "ok"
+    ? health.routes.map(r => r.url ? `✓ ${r.listener} → ${r.url} (127.0.0.1:${r.port})` : `- ${r.listener}: no Tailscale Serve route (fine if another proxy exposes it)`)
+    : [];
+  lines.push(...tailscaleHealthProblems(health).map(p => `⚠ ${p}`));
+  return lines.map((line, i) => `${i ? " ".repeat(11) : "tailscale: "}${line}`);
+}
+
+/**
+ * Daemon health check: keep Tailscale Serve routes pointed at the listeners' current ports.
+ * Re-points a moved listener's route on this node; only reports stale routes (removing a
+ * route is the user's call) and a Tailscale CLI that doesn't answer. Returns log lines, empty
+ * when healthy or Tailscale is absent.
+ */
+export async function checkTailscaleServe(listeners: HealthListener[]): Promise<string[]> {
+  const health = await inspectTailscaleServe(listeners);
+  const binary = tailscaleBinary();
+  if (health.state !== "ok" || !binary) return tailscaleHealthProblems(health).map(p => `tailscale serve: ${p}`);
+  const lines: string[] = [];
+  for (const r of health.repair) {
+    const args = ["serve", "--bg", `--https=${httpsPortOf(r.hostPort)}`, `--set-path=${r.mount}`, r.proxy];
+    const proc = Bun.spawn([binary, ...args], { env: TAILSCALE_ENV, stdout: "ignore", stderr: "pipe", windowsHide: true });
+    const ok = await proc.exited === 0;
+    lines.push(ok
+      ? `tailscale serve: re-pointed ${r.hostPort}${r.mount} from 127.0.0.1:${r.from} to ${r.to}`
+      : `tailscale serve: ${r.hostPort}${r.mount} points at 127.0.0.1:${r.from}, listener is on ${r.to}; re-pointing failed (${(await new Response(proc.stderr).text()).trim()}). Run: tailscale ${args.join(" ")}`);
+  }
+  lines.push(...tailscaleHealthProblems({ ...health, repair: [] }).map(p => `tailscale serve: ${p}`));
+  return lines;
 }
 
 /** The same connection (key and profile) at another base URL, e.g. where a proxy exposes the listener. */
@@ -673,16 +836,51 @@ const CHROME_LOCAL_STATE_PATHS = () => {
 
 type ChromeProfileInfo = { user_name?: string; name?: string };
 
+/**
+ * macOS privacy (TCC) blocks a process launched by launchd/oxmgr from Chrome's data folder unless
+ * its binary has Full Disk Access; a Terminal or agent session inherits the grant. Turn that EPERM
+ * into the fix. Undefined for any other error (or platform).
+ */
+export function chromeDataAccessHint(error: unknown, execPath = process.execPath, platform = process.platform): string | undefined {
+  const code = (error as { code?: string } | null)?.code;
+  const message = error instanceof Error ? error.message : String(error);
+  if (platform !== "darwin" || !(code === "EPERM" || code === "EACCES" || /EPERM|operation not permitted/i.test(message))) return undefined;
+  return `macOS privacy settings (TCC) block ${execPath} from reading Chrome's profile folder. ` +
+    `Grant it Full Disk Access: System Settings → Privacy & Security → Full Disk Access → +, press ⌘⇧G, paste ${execPath}, ` +
+    `then restart rech serve. Or run rech serve from Terminal, which already has access (see docs/macos-daemon.md).`;
+}
+
+/** Why the last readChromeProfileCache() returned null (undefined when it succeeded). */
+let profileCacheProblem: string | undefined;
+
 export async function readChromeProfileCache(): Promise<Record<string, ChromeProfileInfo> | null> {
+  profileCacheProblem = undefined;
+  const problems: string[] = [];
   for (const statePath of CHROME_LOCAL_STATE_PATHS()) {
     const f = file(statePath);
     if (!(await f.exists())) continue;
     try {
       const data = JSON.parse(await f.text());
-      return data?.profile?.info_cache ?? null;
-    } catch {}
+      if (data?.profile?.info_cache) return data.profile.info_cache;
+      problems.push(`${statePath} has no profile list`);
+    } catch (error) {
+      const hint = chromeDataAccessHint(error);
+      problems.push(`${statePath} is unreadable (${error instanceof Error ? error.message : String(error)})${hint ? `. ${hint}` : ""}`);
+    }
   }
+  profileCacheProblem = problems.join("; ") || "Chrome's Local State file was not found";
   return null;
+}
+
+/**
+ * Say so (once per process) when profile emails/names are unavailable, so a bare folder name
+ * like "Profile 1" is never mistaken for the whole story.
+ */
+let warnedProfileCache = false;
+export function warnIfProfileNamesUnavailable(cache: Record<string, ChromeProfileInfo> | null): void {
+  if (cache || warnedProfileCache) return;
+  warnedProfileCache = true;
+  console.error(`[rech] Chrome profile emails and names are unavailable (${profileCacheProblem ?? "Local State not read"}); profiles are shown by folder name only.`);
 }
 
 export function resolveChromeProfileSelector(
@@ -876,13 +1074,16 @@ async function findInstalledExtension(
   // Read each profile's settings once so we can prioritize stable-ID matches over path fallbacks.
   const perProfile: Array<{ prof: string; settings: Record<string, any> }> = [];
   for (const prof of profiles) {
-    const prefsPath = join(userDataDir, prof, "Secure Preferences");
-    const f = file(prefsPath);
-    if (!(await f.exists())) continue;
-    try {
-      const data = JSON.parse(await f.text());
-      perProfile.push({ prof, settings: (data?.extensions?.settings ?? {}) as Record<string, any> });
-    } catch {}
+    const settings: Record<string, any> = {};
+    // Chrome may store unpacked extensions in either preferences file.
+    // Secure Preferences wins when both contain the same extension.
+    for (const name of ["Preferences", "Secure Preferences"]) {
+      try {
+        const data = await file(join(userDataDir, prof, name)).json();
+        Object.assign(settings, data?.extensions?.settings ?? {});
+      } catch {}
+    }
+    perProfile.push({ prof, settings });
   }
   // Pass 1: stable ID match (manifest `key` set, path-independent). This must win over any path
   // fallback so a stale legacy install sitting on a known path can't shadow the current extension.
@@ -1139,6 +1340,16 @@ async function removeProfile(selector: string, opts: { yes?: boolean; close?: bo
 
 /** On a client of a remote host, `rech profile` lists what that host's link shares. */
 async function listRemoteProfiles(url: string): Promise<void> {
+  // Newer hosts list names too (/profiles); older ones only /ping.
+  const detailed = await fetch(serviceUrl(url, "profiles"), { headers: { Authorization: `Bearer ${parseUrl(url).key}` }, signal: AbortSignal.timeout(10_000) })
+    .then(r => r.ok ? r.json() : null).catch(() => null) as { share?: string; profiles?: { key: string; name: string }[] } | null;
+  if (detailed?.profiles) {
+    const current = resolveEffectiveProfile(parseUrl(url).profileDirectory);
+    console.log(`Profiles ${detailed.share ? `share "${detailed.share}" gives you` : `shared by ${serviceUrl(url)}`}:`);
+    for (const p of detailed.profiles) console.log(`  ${p.key}${p.name ? `  (${p.name})` : ""}${p.key === current ? "   ← current" : ""}`);
+    console.log(`\nUse one: rech --profile <name> open https://example.com`);
+    return;
+  }
   const response = await fetch(serviceUrl(url, "ping"), { headers: { Authorization: `Bearer ${parseUrl(url).key}` }, signal: AbortSignal.timeout(5000) })
     .catch(error => { throw new Error(`Could not reach ${serviceUrl(url)}: ${error instanceof Error ? error.message : error}`); });
   if (response.status === 401) throw new Error("The host rejected this link's key; ask for a fresh one (rech share on the host), then rech connect '<url>'.");
@@ -1152,6 +1363,7 @@ async function listRemoteProfiles(url: string): Promise<void> {
 
 async function listProfiles(): Promise<void> {
   const [cache, registry, root] = await Promise.all([readChromeProfileCache(), readTokenRegistry(), findChromeUserDataDir()]);
+  warnIfProfileNamesUnavailable(cache);
   const profiles = buildProfileRows(cache, registry, root);
   const listeners = await readListeners();
   const url = process.env[ENV_KEY];
@@ -1240,12 +1452,26 @@ export async function promptChoice<T>(
   } finally { rl.close(); }
 }
 
-/** Registered profiles as choices, one per Chrome profile (data dir + folder; aliases collapse). */
-function registeredProfileChoices(registry: Record<string, TokenEntry>): { label: string; value: string }[] {
+/**
+ * One picker entry per Chrome profile: its Chrome name and signed-in email (from Local State,
+ * for profiles in the default user data dir), then the folder, e.g. `Work · you@example.com  [Profile 2]`.
+ */
+export function registeredProfileChoices(registry: Record<string, TokenEntry>, cache: Record<string, ChromeProfileInfo> | null = null): { label: string; value: string }[] {
+  const defaultDirs = CHROME_LOCAL_STATE_PATHS().map(path => dirname(path));
   return canonicalProfileKeys(registry).map(key => {
-    const dir = registry[key].profileDir;
-    return { label: key === dir ? key : `${key}  [${dir}]`, value: key };
+    const { profileDir: dir, userDataDir } = registry[key];
+    const info = !userDataDir || defaultDirs.includes(userDataDir) ? cache?.[dir] : undefined;
+    const names = [info?.name, info?.user_name, key].filter((n): n is string => !!n && n !== dir);
+    const shown = [...new Set(names)];
+    return { label: shown.length ? `${shown.join(" · ")}  [${dir}]` : `${dir}  (no email or name known)`, value: key };
   });
+}
+
+/** Chrome profiles (default user data dir) that rech has not registered yet: `[folder, info]`. */
+export function unregisteredChromeProfiles(registry: Record<string, TokenEntry>, cache: Record<string, ChromeProfileInfo> | null): [string, ChromeProfileInfo][] {
+  const defaultDirs = CHROME_LOCAL_STATE_PATHS().map(path => dirname(path));
+  const registered = new Set(Object.values(registry).filter(e => !e.userDataDir || defaultDirs.includes(e.userDataDir)).map(e => e.profileDir));
+  return Object.entries(cache ?? {}).filter(([dir]) => !registered.has(dir));
 }
 
 /**
@@ -1341,11 +1567,7 @@ async function shareSet(snapshot: string[], opts: { listener?: string; local?: b
   // A one-profile link names its profile, so the other machine needs no --profile.
   const only = snapshot.length === 1 ? `?profile=${encodeURIComponent(snapshot[0])}` : "";
   const local = `http://${listener.key}@${listenerAddress(listener)}${normalizePrefix(listener.prefix)}${only}`;
-  let ready = false;
-  for (let i = 0; i < 20 && !ready; i++) {
-    ready = await fetch(serviceUrl(local, "ping"), { headers: { Authorization: `Bearer ${listener.key}` }, signal: AbortSignal.timeout(1000) }).then(r => r.ok).catch(() => false);
-    if (!ready) await Bun.sleep(250);
-  }
+  const ready = await waitForListener(listener);
   if (!ready) console.error(`[rech] warning: listener "${name}" is not answering yet; check the daemon with rech status.`);
   if (opts.tailscaleServe && !listener.publicUrl) {
     const publicUrl = await exposeWithTailscaleServe(listener);
@@ -1358,7 +1580,7 @@ async function shareSet(snapshot: string[], opts: { listener?: string; local?: b
   if (!listener.publicUrl && isLoopback(listener.host)) for (const line of listenerNextSteps(listener, undefined, opts.again)) console.error(line);
   console.log(uri);
   console.error(snapshot.length === 1 ? `On the other machine: rech connect '<this link>'` : `On the other machine: rech connect '<this link>', then rech --profile <name> open <url>`);
-  if (opts.save) console.error(`Saved RECHROME_URL to ${await saveProjectUrl(uri)}`);
+  if (opts.save) { const saved = await saveProjectUrl(uri); console.error(`Saved RECHROME_URL to ${saved}`); await warnSecretFile(saved); }
 }
 
 /** A readable, URL-safe name for a profile's link: the email's local part or the profile name. */
@@ -1394,12 +1616,38 @@ async function exposeWithTailscaleServe(listener: Listener): Promise<string | nu
   const mount = prefix === "/" ? "/" : prefix.slice(0, -1);
   const args = ["serve", "--bg", `--set-path=${mount}`, `http://127.0.0.1:${listener.port}${mount === "/" ? "" : mount}`];
   console.error(`Running: tailscale ${args.join(" ")}`);
-  const proc = Bun.spawn([binary, ...args], { stdout: "ignore", stderr: "inherit", windowsHide: true });
+  const proc = Bun.spawn([binary, ...args], { env: TAILSCALE_ENV, stdout: "ignore", stderr: "inherit", windowsHide: true });
   if (await proc.exited !== 0) {
     console.error(`tailscale serve failed. Run it yourself, then rech share again:\n  tailscale ${args.join(" ")}`);
     return null;
   }
   return (await detectTailscaleServe(listener.port, prefix)).routeUrl;
+}
+
+/** The daemon reloads listeners.json about every second: wait (up to ~5s) until this listener answers. */
+async function waitForListener(listener: Listener): Promise<boolean> {
+  const url = `http://${listener.key}@${listenerAddress(listener)}${normalizePrefix(listener.prefix)}`;
+  for (let i = 0; i < 20; i++) {
+    if (await fetch(serviceUrl(url, "ping"), { headers: { Authorization: `Bearer ${listener.key}` }, signal: AbortSignal.timeout(1000) }).then(r => r.ok).catch(() => false)) return true;
+    await Bun.sleep(250);
+  }
+  return false;
+}
+
+/**
+ * Ask how other machines will reach a link: "tailscale-serve", a detected network address
+ * (plain HTTP), "127.0.0.1" for the user's own proxy, or `extra` choices; null when cancelled.
+ */
+async function askReachability(question: string, extra: { label: string; value: string }[] = []): Promise<string | null> {
+  const serve = !!tailscaleBinary();
+  // With Tailscale Serve on offer, a plain-HTTP Tailscale IP would only be a worse duplicate.
+  const networks = (await detectListenChoices()).filter(c => c.kind !== "local" && !(serve && c.kind === "tailscale"));
+  return promptChoice(question, [
+    ...(serve ? [{ label: "Tailscale: HTTPS, only your tailnet", value: "tailscale-serve" }] : []),
+    ...networks.map(c => ({ label: `${c.label.split(" — ")[0]} network: http://${c.address}, plain HTTP`, value: c.address })),
+    { label: "My own reverse proxy", value: "127.0.0.1" },
+    ...extra,
+  ], 0);
 }
 
 /**
@@ -1412,19 +1660,32 @@ async function shareNewLink(profile: string, opts: { local?: boolean; save?: boo
   const name = uniqueShareName(profileSlug(profile), (await requireListeners()).listeners, served);
   let host = "127.0.0.1", tailscaleServe = false;
   if (isInteractive()) {
-    const serve = !!tailscaleBinary();
-    // With Tailscale Serve on offer, a plain-HTTP Tailscale IP would only be a worse duplicate.
-    const networks = (await detectListenChoices()).filter(c => c.kind !== "local" && !(serve && c.kind === "tailscale"));
-    const how = await promptChoice(`How will your other machines reach it?`, [
-      ...(serve ? [{ label: "Tailscale: HTTPS, only your tailnet", value: "tailscale-serve" }] : []),
-      ...networks.map(c => ({ label: `${c.label.split(" — ")[0]} network: http://${c.address}, plain HTTP`, value: c.address })),
-      { label: "My own reverse proxy", value: "127.0.0.1" },
-    ], 0);
+    const how = await askReachability(`How will your other machines reach it?`);
     if (!how) throw new Error("Cancelled; nothing shared.");
     tailscaleServe = how === "tailscale-serve";
     host = tailscaleServe ? "127.0.0.1" : how;
   }
   return shareSet([profile], { ...opts, host, tailscaleServe, defaultName: name, prefix: `/rechrome/${name}/`, again: `rech share ${JSON.stringify(profile)}` });
+}
+
+/** A scoped listener's full link (contains its key): its public URL when recorded, else its own address. */
+export function listenerLink(listener: Listener, local = false): string {
+  const profiles = listener.profiles as string[];
+  const only = profiles.length === 1 ? `?profile=${encodeURIComponent(profiles[0])}` : "";
+  const direct = `http://${listener.key}@${listenerAddress(listener)}${normalizePrefix(listener.prefix)}${only}`;
+  return listener.publicUrl && !local ? rebaseConnectionUrl(listener.publicUrl, direct) : registeredProfileUrl(direct);
+}
+
+/** The links already handed out (stderr: stdout stays the one URL this command prints). */
+function printExistingLinks(listeners: Listener[], local = false): void {
+  const scoped = listeners.filter(l => l.profiles !== "*" && l.profiles.length);
+  if (!scoped.length) return;
+  console.error("Already shared (secret links):");
+  for (const l of scoped) {
+    console.error(`  ${l.name}: ${(l.profiles as string[]).join(", ")}${!l.publicUrl && isLoopback(l.host) ? "   (this machine only: no proxy recorded)" : ""}`);
+    console.error(`    ${listenerLink(l, local)}`);
+  }
+  console.error("");
 }
 
 async function printProfileUri(selector?: string, listener?: string, opts: { local?: boolean; save?: boolean; all?: boolean } = {}): Promise<void> {
@@ -1436,15 +1697,43 @@ async function printProfileUri(selector?: string, listener?: string, opts: { loc
   const interactive = isInteractive();
   const registry = await readTokenRegistry();
   const cache = await readChromeProfileCache();
+  warnIfProfileNamesUnavailable(cache);
   const cancelled = () => new Error("Cancelled; nothing shared.");
+  let config = await readListeners();
   const current = resolveEffectiveProfile(url ? parseUrl(url).profileDirectory : undefined);
-  const pickProfile = async (question: string, choices = registeredProfileChoices(registry)) => {
+  const sharedOn = (key: string) => ((config?.listeners ?? []).filter(l => l.profiles !== "*" && (l.profiles as string[]).includes(key))).map(l => l.name);
+  // Chrome profiles rech doesn't manage yet are listed too; picking one runs setup for it first.
+  const SETUP = "\0setup:";
+  const pickProfile = async (question: string, choices = [
+    ...registeredProfileChoices(registry, cache).map(c => {
+      const on = sharedOn(c.value);
+      return on.length ? { ...c, label: `${c.label}  (shared: ${on.join(", ")})` } : c;
+    }),
+    ...unregisteredChromeProfiles(registry, cache).map(([dir, info]) => ({
+      label: `${[...new Set([info.name, info.user_name].filter(Boolean))].join(" · ") || dir}  [${dir}]  (not set up: runs rech setup)`,
+      value: `${SETUP}${dir}`,
+    })),
+  ]) => {
     const def = Math.max(0, choices.findIndex(c => c.value === current || registry[c.value]?.profileDir === current));
-    return (await promptChoice(question, choices, def)) ?? (() => { throw cancelled(); })();
+    const picked = (await promptChoice(question, choices, def)) ?? (() => { throw cancelled(); })();
+    if (!picked.startsWith(SETUP)) return picked;
+    const dir = picked.slice(SETUP.length);
+    console.error(`[rech] ${dir} isn't set up yet; running rech setup --profile ${JSON.stringify(dir)} first.`);
+    await setup({ profile: dir });
+    const after = await readTokenRegistry();
+    const key = unregisteredChromeProfiles(after, { [dir]: {} }).length ? undefined : canonicalProfileKeys(after).find(k => after[k].profileDir === dir);
+    if (process.exitCode || !key) throw new Error(`Setup didn't register ${dir}; nothing shared. Retry with: rech setup --profile ${JSON.stringify(dir)}`);
+    Object.assign(registry, after);
+    config = await readListeners(); // setup may have added a listener: never write back a stale copy
+    return key;
   };
   if (!selector) {
-    // No profile given: ask, defaulting to the current one (?profile= in the URL, else PLAYWRIGHT_MCP_PROFILE_DIRECTORY).
-    if (interactive && Object.keys(registry).length) selector = await pickProfile("Share which profile?");
+    // No profile given: show what is already shared, then ask, defaulting to the current one
+    // (?profile= in the URL, else PLAYWRIGHT_MCP_PROFILE_DIRECTORY).
+    if (interactive && Object.keys(registry).length) {
+      printExistingLinks(config?.listeners ?? [], opts.local);
+      selector = await pickProfile("Share which profile?");
+    }
     else {
       selector = current;
       if (!selector) throw new Error("No current profile to share. Name one: rech share <profile>   (see rech profile; rech share ls lists what is shared)");
@@ -1467,7 +1756,6 @@ async function printProfileUri(selector?: string, listener?: string, opts: { loc
       } else throw error;
     }
   }
-  const config = await readListeners();
   const listeners = config?.listeners ?? [];
   // On a host, share through a scoped listener by default, never the management key.
   if (!listener && config) {
@@ -1512,10 +1800,35 @@ async function printProfileUri(selector?: string, listener?: string, opts: { loc
     const serve = await detectTailscaleServe(pending.port, normalizePrefix(pending.prefix));
     if (serve.routeUrl && !serve.funnel) { pending.publicUrl = serve.routeUrl; await writeListeners(config); }
   }
+  // Still only reachable from this machine (no proxy recorded or detected): a link like that is
+  // useless to hand out, so ask how other machines reach it, or say how to expose it.
+  if (config && pending && pending.profiles !== "*" && !pending.publicUrl && isLoopback(pending.host) && !opts.local) {
+    const steps = () => { for (const line of listenerNextSteps(pending, profile)) console.error(line); };
+    if (!interactive) {
+      console.error(`[rech] this link only works on this machine: listener "${pending.name}" is on ${listenerAddress(pending)} and no proxy is recorded.`);
+      steps();
+    } else {
+      const KEEP = "\0keep";
+      const how = await askReachability(`Link "${pending.name}" only works on this machine (${listenerAddress(pending)}). How will your other machines reach it?`,
+        [{ label: "Nothing: keep it on this machine", value: KEEP }]);
+      if (!how) throw cancelled();
+      if (how === "tailscale-serve") {
+        const routeUrl = await exposeWithTailscaleServe(pending);
+        if (routeUrl) { pending.publicUrl = routeUrl; await writeListeners(config); }
+      } else if (how === "127.0.0.1") steps();
+      else if (how !== KEEP) {
+        // Same key and prefix, now bound on that network; links already handed out change host.
+        pending.host = how;
+        await writeListeners(config);
+        if (!(await waitForListener(pending))) console.error(`[rech] warning: listener "${pending.name}" is not answering on ${listenerAddress(pending)} yet; check the daemon with rech status.`);
+        uri = profileConnectionUri(profile, undefined, config.listeners, pending.name);
+      }
+    }
+  }
   const publicUrl = pending?.publicUrl;
   if (publicUrl && !opts.local) uri = rebaseConnectionUrl(publicUrl, uri);
   console.log(uri);
-  if (opts.save) console.error(`Saved RECHROME_URL to ${await saveProjectUrl(uri)}`);
+  if (opts.save) { const saved = await saveProjectUrl(uri); console.error(`Saved RECHROME_URL to ${saved}`); await warnSecretFile(saved); }
 }
 
 export function sandboxConnectionWarning(env: Record<string, string | undefined> = process.env): string | null {
@@ -1531,6 +1844,8 @@ export function sandboxConnectionWarning(env: Record<string, string | undefined>
  * profiles itself, and must never receive this machine's own extension tokens.
  */
 export async function isLocalDaemon(url: string): Promise<boolean> {
+  // A WebRTC bridge is on loopback but always leads to another machine.
+  if (bridgedUrls.has(url)) return false;
   const { key, host } = parseUrl(url);
   const config = await readListeners().catch(() => null);
   // Before listeners.json existed, a local install pointed at loopback and had its own registry;
@@ -1554,6 +1869,8 @@ async function callServe(
   overrideEnv?: Record<string, string>,
   precomputedIdentity?: { key: string; label: string; profile?: string },
   throwOnFailure = false,
+  upload?: UploadPayload,
+  secret?: string,
 ): Promise<{ status: number; stdout: string; stderr: string; files?: string[]; existingSession?: boolean }> {
   const { key, host, port, protocol, extensionId, extensionToken, profileDirectory, userDataDir, loadExtension } = parseUrl(url);
   // Reuse the caller's identity when provided — computing it shells out to `git` several times,
@@ -1572,7 +1889,8 @@ async function callServe(
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
     // dataDir is a client-local path; the daemon (possibly remote) only needs the session identity.
-    body: JSON.stringify({ args, identity: { key: identity.key, label: identity.label, profile: identity.profile }, env }),
+    // `secret` (fill-secret only) rides in its own field so it is never part of the logged args.
+    body: JSON.stringify({ args, identity: { key: identity.key, label: identity.label, profile: identity.profile }, env, ...(upload ? { upload } : {}), ...(secret ? { secret } : {}) }),
     signal: AbortSignal.timeout(70_000),
   }).catch(async (e) => {
     if (throwOnFailure) throw new Error("Cannot reach the rechrome daemon. Check that it is running.");
@@ -1609,10 +1927,29 @@ async function callServe(
     return JSON.parse(text);
   } catch {
     // Not the daemon answering, e.g. a reverse proxy's 404 because the URL's path prefix is wrong.
-    const detail = `HTTP ${res.status} from ${serviceUrl(url, "run")} is not a rechrome daemon response: ${text.slice(0, 200).trim()}`;
+    let detail = `HTTP ${res.status} from ${serviceUrl(url, "run")} is not a rechrome daemon response: ${text.slice(0, 200).trim()}`;
+    if (res.status === 502 || res.status === 503 || res.status === 504)
+      detail += `\n  The proxy is up but nothing answers behind it: this link's listener was likely removed or moved. Ask its owner for a fresh link (\`rech share\`), then \`rechrome connect <link>\`.`;
     if (throwOnFailure) throw new Error(detail);
     console.error(`[rech] rech-client -> ${serviceUrl(url, "run")}\n  -x: ${detail}`);
     process.exit(1);
+  }
+}
+
+/** Probe only the temporary setup session; always release it, including on transport errors. */
+export async function probeSetupBridge(
+  url: string,
+  session: string,
+  env: Record<string, string>,
+  identity: { key: string; label: string; profile?: string },
+  run: typeof callServe = callServe,
+): Promise<Awaited<ReturnType<typeof callServe>>> {
+  try {
+    // The bundled CLI has no --wait option. about:blank needs no page-load override.
+    return await run(url, [`-s=${session}`, "open", "about:blank"], env, identity, true);
+  } finally {
+    // Never claim or close an existing worktree session, or mask the probe error with cleanup errors.
+    await run(url, [`-s=${session}`, "close"], env, identity, true).catch(() => {});
   }
 }
 
@@ -1741,7 +2078,16 @@ export function unknownCommandHint(output: string, rechCommands: Iterable<string
   ].join("\n");
 }
 
-async function run(url: string, args: string[], overrideEnv?: Record<string, string>, opts: { verbatim?: boolean } = {}) {
+/**
+ * An `open` whose extension bridge never connected. Typical right after Chrome restarts: the
+ * relay's connect page reaches no live worker, yet a fresh bridge moments later connects at once
+ * (seen 2026-10-17: a timeout, then `rech setup`'s probe connected in 0.1s). Worth one retry.
+ */
+export function isBridgeTimeout(args: string[], result: { status: number; stderr?: string }): boolean {
+  return args.find(a => !a.startsWith("-")) === "open" && result.status !== 0 && /Extension connection timeout/i.test(result.stderr ?? "");
+}
+
+async function run(url: string, args: string[], overrideEnv?: Record<string, string>, opts: { verbatim?: boolean; bridgeRetried?: boolean } = {}) {
   // Match the underlying CLI's command names while accepting the short forms humans
   // naturally try. Keep this client-side so old and new serve daemons behave alike.
   args = normalizeCommandArgs(args);
@@ -1756,7 +2102,33 @@ async function run(url: string, args: string[], overrideEnv?: Record<string, str
 
   const resolvedEnv = await getClientEnv({ extensionId, extensionToken, profileDirectory: effectiveProfile, userDataDir, loadExtension });
   const effectiveEnv = { ...resolvedEnv, ...overrideEnv };
-  const { status, stdout, stderr, files, existingSession } = await callServe(url, args, overrideEnv, identity);
+  let secret: string | undefined;
+  let upload: UploadPayload | undefined;
+  const cmdIdx = args.findIndex(a => !a.startsWith("-s="));
+  if (args[cmdIdx] === "fill-secret") {
+    if (args.some(a => a === "--help" || a === "-h")) { console.log(FILL_SECRET_USAGE); process.exit(0); }
+    try {
+      ({ args, secret } = await prepareFillSecret(args));
+    } catch (err) {
+      console.error(`[rech] ${err instanceof Error ? err.message : String(err)}\n${FILL_SECRET_USAGE}`);
+      process.exit(2);
+    }
+  } else if (args.find(a => !/^-s=[a-zA-Z0-9_-]{1,64}$/.test(a)) === "upload") {
+    if (process.stdin.isTTY) throw new Error("upload reads stdin; redirect a PNG/SVG file with < icon.png");
+    ({ args, upload } = await prepareStdinUpload(args, process.stdin));
+  }
+  const served = await callServe(url, args, overrideEnv, identity, false, upload, secret);
+  // The daemon already masks the value; this is a second line of defence for an older daemon.
+  const scrub = (s: string) => secret && s ? s.replaceAll(secret, SECRET_MASK) : s;
+  const { files, existingSession } = served;
+  const status = served.status, stdout = scrub(served.stdout), stderr = scrub(served.stderr);
+  if (!opts.bridgeRetried && isBridgeTimeout(args, { status, stderr })) {
+    // Close the failed session so the retry gets a fresh cliDaemon and relay. callServe re-reads
+    // the extension's live token from the profile, so a re-minted token heals here too.
+    console.error(`[rech] the Chrome extension bridge did not answer (common right after Chrome restarts); retrying once with a fresh connection…`);
+    await callServe(url, [...args.filter(a => /^-s=/.test(a)), "close"], overrideEnv, identity).catch(() => {});
+    return run(url, args, overrideEnv, { ...opts, bridgeRetried: true });
+  }
 
   const isOpenWithUrl = args[0] === "open" && args.length > 1;
   if (existingSession && isOpenWithUrl) {
@@ -1776,9 +2148,12 @@ async function run(url: string, args: string[], overrideEnv?: Record<string, str
       // The daemon resolves registered profiles' bridge tokens itself and then asks for a reload;
       // only blame a missing install when neither side had credentials.
       const hasToken = !!effectiveEnv["PLAYWRIGHT_MCP_EXTENSION_TOKEN"] || /reload the .*extension/i.test(stderr);
+      const profileArg = displayProfile ? ` --profile ${JSON.stringify(displayProfile)}` : "";
       const last = hasToken
-        ? `  -x: extension did not connect (reload it at chrome://extensions; then verify its token) -> extension[degraded]`
-        : `  -> extension[not installed]  (run: rech setup)`;
+        ? `  -x: extension did not connect${opts.bridgeRetried ? " (also after an automatic retry)" : ""} -> extension[degraded]\n` +
+          `[rech] reload "Playwright MCP Bridge" at chrome://extensions${displayProfile ? ` in ${displayProfile}'s window` : ""}, then retry; ` +
+          `or run \`rech setup${profileArg}\`, which re-detects the extension and token and verifies the connection.`
+        : `  -> extension[not installed]  (run: rech setup${profileArg})`;
       console.error(`[rech] rech-client -> rech-server[ok] -> playwright[ok]\n${last}`);
     }
     if (stderr.includes("Browser '") && stderr.includes("is not open")) {
@@ -1811,6 +2186,42 @@ async function run(url: string, args: string[], overrideEnv?: Record<string, str
   }
 
   process.exit(status);
+}
+
+/** Swap the client-side fill-secret args for the wire form and read the value (or TOTP code). */
+async function prepareFillSecret(args: string[]): Promise<{ args: string[]; secret: string }> {
+  const sessionArgs = args.filter(a => a.startsWith("-s="));
+  const req = parseFillSecretArgs(args.filter(a => !a.startsWith("-s=")).slice(1));
+  const raw = await readSecretSource(req.source);
+  let secret = raw;
+  if (req.totp) {
+    const wait = totpWaitMs();
+    if (wait) { console.error(`[rech] TOTP code expires in under 5s; waiting ${Math.ceil(wait / 1000)}s for the next one`); await Bun.sleep(wait); }
+    secret = totpCode(raw); // only the code leaves this machine, never the seed
+  }
+  if (!req.allowDomains.length) console.error("[rech] fill-secret: no --allow-domain given; the value will be typed into whatever page is active");
+  const wire = fillSecretWireArgs(req);
+  return { args: [...wire, ...sessionArgs], secret };
+}
+
+/** The daemon's Playwright CLI predates `open --wait` (rechrome <= 1.35.1 bundled one). */
+export function cliRejectsWaitOption(output: string): boolean {
+  return /Unknown options?:?[^\n]*?['"`]?--wait\b/i.test(output);
+}
+
+/**
+ * setup's bridge probe: open about:blank without waiting for a load. The daemon owns the CLI and
+ * may be older than this client, so feature-check by behavior: if the CLI rejects `--wait`, probe
+ * again without it rather than reporting a broken bridge.
+ */
+export async function probeBridgeOpen<T extends { status: number; stdout: string; stderr: string }>(
+  call: (args: string[]) => Promise<T>,
+  note: (message: string) => void = () => {},
+): Promise<T> {
+  const probe = await call(["open", "about:blank", "--wait", "none"]);
+  if (probe.status === 0 || !cliRejectsWaitOption(`${probe.stderr}\n${probe.stdout}`)) return probe;
+  note("The daemon's Playwright CLI does not support `open --wait`; probing without it (update rechrome on the daemon host).");
+  return call(["open", "about:blank"]);
 }
 
 export type SetupPhase = "extension" | "token" | "bridge" | "error" | "save" | "ready";
@@ -2273,6 +2684,7 @@ export async function daemonInstall(serveUrl: string): Promise<void> {
     [ENV_KEY]: serveUrl,
     PWMCP_TEST_CONNECTION_TIMEOUT: process.env.PWMCP_TEST_CONNECTION_TIMEOUT || "30000",
     PLAYWRIGHT_CLI: resolvedPlaywrightCli,
+    RECH_SERVE_MANAGED: "1", // the manager restarts it; never idle-self-exit (see serve.ts)
   };
   if (process.env.RECH_HOST) daemonEnv.RECH_HOST = process.env.RECH_HOST;
   if (isReadable(process.env.RECH_TLS_CERT)) daemonEnv.RECH_TLS_CERT = process.env.RECH_TLS_CERT!;
@@ -2504,45 +2916,90 @@ function findChromiumForTesting(): string | null {
 // Minimal Chrome DevTools Protocol client over a WebSocket — just enough to create a
 // target, attach to it, and evaluate JS. Used to seed the auth token into a managed
 // profile's extension localStorage without pulling in the full Playwright dependency.
-class CDPClient {
+export class CDPClient {
   private ws: WebSocket;
   private nextId = 0;
-  private pending = new Map<number, { resolve: (v: any) => void; reject: (e: any) => void }>();
+  private pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>();
   private opened: Promise<void>;
-  constructor(url: string) {
+  constructor(url: string, private timeoutMs = 30_000) {
     this.ws = new WebSocket(url);
     this.opened = new Promise<void>((resolve, reject) => {
-      this.ws.addEventListener("open", () => resolve(), { once: true });
-      this.ws.addEventListener("error", () => reject(new Error("CDP WebSocket error")), { once: true });
+      const timer = setTimeout(() => { reject(new Error("CDP WebSocket connection timed out")); this.close(); }, timeoutMs);
+      this.ws.addEventListener("open", () => { clearTimeout(timer); resolve(); }, { once: true });
+      const fail = () => {
+        clearTimeout(timer);
+        const error = new Error("CDP WebSocket closed or failed");
+        reject(error);
+        for (const p of this.pending.values()) p.reject(error);
+        this.pending.clear();
+      };
+      this.ws.addEventListener("error", fail);
+      this.ws.addEventListener("close", fail);
     });
     this.ws.addEventListener("message", (ev: MessageEvent) => {
       let msg: any;
       try { msg = JSON.parse(typeof ev.data === "string" ? ev.data : ""); } catch { return; }
       const p = msg.id != null ? this.pending.get(msg.id) : undefined;
       if (!p) return;
-      this.pending.delete(msg.id);
       if (msg.error) p.reject(new Error(msg.error.message || JSON.stringify(msg.error)));
       else p.resolve(msg.result);
     });
   }
   async open(): Promise<void> { await this.opened; }
   send(method: string, params: Record<string, any> = {}, sessionId?: string): Promise<any> {
+    if (this.ws.readyState !== WebSocket.OPEN) return Promise.reject(new Error("CDP WebSocket is not open"));
     const id = ++this.nextId;
-    const payload: any = { id, method, params };
-    if (sessionId) payload.sessionId = sessionId;
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      this.ws.send(JSON.stringify(payload));
-      setTimeout(() => { if (this.pending.delete(id)) reject(new Error(`CDP ${method} timed out`)); }, 15_000);
+      const finish = (callback: (value: any) => void, value: any) => {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        callback(value);
+      };
+      const timer = setTimeout(() => finish(reject, new Error(`CDP ${method} timed out`)), this.timeoutMs);
+      this.pending.set(id, { resolve: v => finish(resolve, v), reject: e => finish(reject, e) });
+      try { this.ws.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) })); }
+      catch (error) { finish(reject, error); }
     });
   }
-  close(): void { try { this.ws.close(); } catch {} }
+  close(): void {
+    for (const p of this.pending.values()) p.reject(new Error("CDP client closed"));
+    this.pending.clear();
+    try { this.ws.close(); } catch {}
+  }
+}
+
+async function waitForExit(exited: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout>;
+  try {
+    return await Promise.race([exited.then(() => true), new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), timeoutMs); })]);
+  } finally { clearTimeout(timer!); }
+}
+
+export async function seedExtensionToken(cdp: Pick<CDPClient, "send">, token: string): Promise<void> {
+  const { targetId } = await cdp.send("Target.createTarget", { url: `chrome-extension://${EXTENSION_ID}/status.html` });
+  const { sessionId } = await cdp.send("Target.attachToTarget", { targetId, flatten: true });
+  // The extension page may still be loading; retry the write until localStorage reflects it.
+  let ok = false;
+  const expr = `(()=>{try{if(location.origin!==${JSON.stringify(`chrome-extension://${EXTENSION_ID}`)})return 'ERR:Extension page not loaded';localStorage.setItem('auth-token',${JSON.stringify(token)});return localStorage.getItem('auth-token');}catch(e){return 'ERR:'+e.message}})()`;
+  let lastError = "Extension page is not ready";
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    const r = await cdp.send("Runtime.evaluate", { expression: expr, returnByValue: true }, sessionId);
+    lastError = r?.exceptionDetails?.text || String(r?.result?.value ?? "No evaluation result");
+    if (r?.result?.value === token) { ok = true; break; }
+    // A target opened before the extension finishes loading can remain on Chrome's
+    // error document forever. Evaluating it again cannot finish the navigation.
+    const navigation = await cdp.send("Page.navigate", { url: `chrome-extension://${EXTENSION_ID}/status.html` }, sessionId);
+    if (navigation.errorText) lastError = navigation.errorText;
+    await Bun.sleep(1_000);
+  }
+  if (!ok) throw new Error(`Could not seed auth token into chrome-extension://${EXTENSION_ID}/: ${lastError}`);
 }
 
 // Launch a throwaway Chrome against a dedicated user-data-dir with the unpacked extension
 // loaded, then seed `token` into the extension's localStorage (the value `connect.html` checks
 // for token-bypass). Headless by default; never touches the user's real Chrome/profiles.
-async function provisionExtensionToken(opts: {
+export async function provisionExtensionToken(opts: {
   userDataDir: string; profileDir: string; dist: string; token: string; headed?: boolean;
 }): Promise<void> {
   // Branded Google Chrome 149+ rejects --load-extension ("not allowed in Google Chrome"), so a
@@ -2558,46 +3015,86 @@ async function provisionExtensionToken(opts: {
     `--profile-directory=${profileDir}`,
     `--load-extension=${dist}`,
     `--disable-extensions-except=${dist}`,
+    // Chromium 137+ ignores --load-extension unless this feature is off (Chrome for Testing
+    // too): the extension silently never loads and status.html is an error page.
+    "--disable-features=DisableLoadExtensionCommandLineSwitch",
     "--remote-debugging-port=0",
     "--no-first-run",
     "--no-default-browser-check",
     "--disable-background-timer-throttling",
+    "--disable-background-networking",
+    "--disable-component-update",
+    "--disable-search-engine-choice-screen",
+    // Match Playwright's unattended macOS launch: no interactive keychain prompt.
+    "--password-store=basic",
+    "--use-mock-keychain",
   ];
   if (!opts.headed) args.push("--headless=new");
   if (process.platform === "linux") args.push("--no-sandbox");
   args.push("about:blank");
-  const proc = Bun.spawn([chromeBin, ...args], { stdout: "ignore", stderr: "ignore", windowsHide: true });
+  // Own a separate process group so escalation cannot touch the user's Chrome.
+  const proc = cpSpawn(chromeBin, args, { detached: process.platform !== "win32", stdio: ["ignore", "ignore", "pipe"], windowsHide: true });
+  let stderr = "";
+  proc.stderr?.on("data", data => { stderr = (stderr + data.toString()).slice(-8_192); });
+  let launchError: Error | undefined;
+  const exited = new Promise<void>(resolve => {
+    proc.once("exit", () => resolve());
+    proc.once("error", error => { launchError = error; resolve(); });
+  });
+  const signal = (value: NodeJS.Signals) => {
+    if (!proc.pid) return;
+    try {
+      if (process.platform === "win32") proc.kill(value);
+      else process.kill(-proc.pid, value);
+    } catch {}
+  };
+  const interrupted = (value: NodeJS.Signals) => {
+    signal("SIGKILL");
+    console.error(`Profile provisioning interrupted (${value})`);
+    process.exit(value === "SIGINT" ? 130 : 143);
+  };
+  const onInt = () => interrupted("SIGINT");
+  const onTerm = () => interrupted("SIGTERM");
+  process.once("SIGINT", onInt);
+  process.once("SIGTERM", onTerm);
   let cdp: CDPClient | null = null;
+  let phase = "Chrome startup";
   try {
     // Chrome writes the chosen port to DevToolsActivePort once the debug server is up.
     let port: number | null = null;
-    for (let i = 0; i < 100; i++) {
+    for (let i = 0; i < 600; i++) {
       await Bun.sleep(100);
       const line = (await file(portFile).text().catch(() => "")).split("\n")[0]?.trim();
       if (line && /^\d+$/.test(line)) { port = parseInt(line); break; }
-      if (proc.exitCode !== null) throw new Error("Chrome exited before opening the DevTools port");
+      if (launchError) throw launchError;
+      if (proc.exitCode !== null || proc.signalCode !== null) throw new Error(`Chrome exited before opening the DevTools port (${proc.exitCode ?? proc.signalCode})`);
     }
     if (!port) throw new Error("Chrome DevTools port not found (extension may have failed to load)");
-    const ver = await (await fetch(`http://127.0.0.1:${port}/json/version`)).json();
+    phase = "Chrome DevTools discovery";
+    const ver = await (await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(30_000) })).json();
+    phase = "Chrome DevTools connection";
     cdp = new CDPClient(ver.webSocketDebuggerUrl as string);
     await cdp.open();
-    const { targetId } = await cdp.send("Target.createTarget", { url: `chrome-extension://${EXTENSION_ID}/status.html` });
-    const { sessionId } = await cdp.send("Target.attachToTarget", { targetId, flatten: true });
-    // The extension page may still be loading; retry the write until localStorage reflects it.
-    let ok = false;
-    const expr = `(()=>{try{localStorage.setItem('auth-token',${JSON.stringify(token)});return localStorage.getItem('auth-token');}catch(e){return 'ERR:'+e.message}})()`;
-    for (let i = 0; i < 50; i++) {
-      const r = await cdp.send("Runtime.evaluate", { expression: expr, returnByValue: true }, sessionId).catch(() => null);
-      if (r?.result?.value === token) { ok = true; break; }
-      await Bun.sleep(100);
-    }
-    if (!ok) throw new Error(`Could not seed auth token into chrome-extension://${EXTENSION_ID}/ (is the extension loading?)`);
+    phase = "Extension token seeding";
+    await seedExtensionToken(cdp, token);
     // Graceful close flushes localStorage to the profile's leveldb before we kill Chrome.
+    phase = "Chrome shutdown";
     await cdp.send("Browser.close").catch(() => {});
+    if (!await waitForExit(exited, 30_000)) throw new Error("Chrome did not exit after flushing the auth token");
+    if (readExtensionTokenFromProfile(userDataDir, profileDir, EXTENSION_ID) !== token)
+      throw new Error("Chrome exited without persisting the extension auth token");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`${phase}: ${message}${stderr.trim() ? `\nChrome stderr:\n${stderr.trim()}` : ""}`.replaceAll(token, "[redacted]"));
   } finally {
     cdp?.close();
-    try { proc.kill(); } catch {}
-    await proc.exited.catch(() => {});
+    signal("SIGTERM");
+    if (!await waitForExit(exited, 2_000)) signal("SIGKILL");
+    // Also reap helpers that survived the browser parent exiting.
+    signal("SIGKILL");
+    await waitForExit(exited, 2_000);
+    process.removeListener("SIGINT", onInt);
+    process.removeListener("SIGTERM", onTerm);
   }
 }
 
@@ -2617,7 +3114,7 @@ async function provisionProfile(name: string, opts: { headed?: boolean } = {}): 
   console.log(`      extension:     ${dist}`);
   console.log(`      Launching ${opts.headed ? "headed" : "headless"} Chrome to seed the auth token...`);
   await provisionExtensionToken({ userDataDir, profileDir: name, dist, token, headed: opts.headed });
-  console.log(`      Token seeded (${token.slice(0, 6)}…)`);
+  console.log("      Token seeded");
 
   // [2/3] Daemon URL — reuse the running daemon's key; warn (don't fail) if it isn't up yet.
   console.log(`\n[2/3] Building RECHROME_URL`);
@@ -2699,6 +3196,7 @@ async function removeListener(name: string): Promise<void> {
   config.listeners = config.listeners.filter(l => l !== listener);
   await writeListeners(config);
   console.log("Listener removed from configuration; daemon reloads automatically.");
+  await removeTailscaleServeRoutes(listener);
 }
 
 async function resolveProfileKeys(selectors: string[]): Promise<string[]> {
@@ -2791,7 +3289,41 @@ async function urlList(): Promise<void> {
   printTable(rows);
   const wide = config.listeners.filter(l => l.profiles !== "*" && l.profiles.length > 1);
   if (wide.length) console.log(`\nOne key covers several profiles on: ${wide.map(l => `${l.name} (${(l.profiles as string[]).length})`).join(", ")}. Anyone with such a link can use each of them.`);
+  const tailscale = formatTailscaleHealth(await inspectTailscaleServe(config.listeners));
+  if (tailscale.length) console.log(`\n${tailscale.join("\n")}`);
   console.log(`\nPrint a full URL (contains the secret key): rech share <profile>, or rech share --all`);
+}
+
+/**
+ * Ways an env file holding a connection secret could leak: tracked or committed in git, not
+ * git-ignored (one `git add .` away), or readable by other users. Warnings only — rech keeps
+ * working; the caller prints them. Empty when the file looks safe or doesn't exist.
+ */
+export async function secretFileWarnings(path: string, platform = process.platform): Promise<string[]> {
+  const warnings: string[] = [];
+  const st = await stat(path).catch(() => null);
+  if (!st?.isFile()) return warnings;
+  const dir = dirname(path), name = basename(path);
+  if (await gitOutput(["rev-parse", "--is-inside-work-tree"], dir) === "true") {
+    const untrack = `git rm --cached ${JSON.stringify(name)} (in ${dir}) and add it to .gitignore`;
+    // Only a currently tracked file counts: an old commit of a since-untracked file held an older key.
+    if (await gitOutput(["ls-files", "--", name], dir)) {
+      if (await gitOutput(["log", "-1", "--format=%h", "--", name], dir))
+        warnings.push(`${path} is committed to git, so its key is in the repo history. Ask the host for a fresh link (they rotate the key), then ${untrack}.`);
+      else warnings.push(`${path} is staged in git; committing it would publish its key. Run ${untrack}.`);
+    }
+    else if (!(await gitOutput(["check-ignore", "--", name], dir)))
+      warnings.push(`${path} is not git-ignored; a \`git add .\` would commit its key. Add it to .gitignore.`);
+  }
+  if (platform !== "win32" && (st.mode & 0o077))
+    warnings.push(`${path} is readable by other users (mode ${(st.mode & 0o777).toString(8)}). Run: chmod 600 ${JSON.stringify(path)}`);
+  return warnings;
+}
+
+/** Print secretFileWarnings for a file that holds RECHROME_URL. Never throws. */
+async function warnSecretFile(path: string | undefined): Promise<void> {
+  if (!path || path === "environment") return;
+  for (const w of await secretFileWarnings(path).catch(() => [])) console.error(`[rech] ⚠ ${w}`);
 }
 
 /** Write RECHROME_URL to this project's .rechrome/.env.local (the folder git-ignores itself). */
@@ -2800,14 +3332,49 @@ async function saveProjectUrl(url: string): Promise<string> {
   mkdirSync(dataDir, { recursive: true });
   const gitignore = join(dataDir, ".gitignore");
   if (!existsSync(gitignore)) await Bun.write(gitignore, "*\n");
-  const envPath = join(dataDir, ".env.local");
+  return writeEnvUrl(join(dataDir, ".env.local"), url);
+}
+
+/** Write RECHROME_URL to ~/.rechrome/.env.local: the default for every project without its own. */
+async function saveGlobalUrl(url: string): Promise<string> {
+  mkdirSync(dirname(GLOBAL_ENV_FILE), { recursive: true });
+  return writeEnvUrl(GLOBAL_ENV_FILE, url);
+}
+
+/** Replace RECHROME_URL in an env file, keeping its other lines; owner-only, since the URL holds a key. */
+async function writeEnvUrl(envPath: string, url: string): Promise<string> {
   const lines = (await file(envPath).text().catch(() => "")).split("\n").filter(l => l.trim() && !l.startsWith(`${ENV_KEY}=`));
   await writeFile(envPath, [...lines, envAssignment(ENV_KEY, url), ""].join("\n"), { mode: 0o600 });
   await chmod(envPath, 0o600);
   return envPath;
 }
 
-async function connect(url: string): Promise<void> {
+/**
+ * What would shadow the machine-wide RECHROME_URL from `cwd`: the shell's own RECHROME_URL, or the
+ * nearest project env file that sets one (searched the way loadNearestEnv walks). Null when none does.
+ */
+export function nearerUrlSource(cwd: string, inherited: boolean, globalFile = GLOBAL_ENV_FILE): string | null {
+  if (inherited) return "your shell's RECHROME_URL";
+  const globalReal = (() => { try { return realpathSync(globalFile); } catch { return globalFile; } })();
+  for (let dir = cwd; ; dir = dirname(dir)) {
+    for (const path of [join(dir, ".rechrome", ".env.local"), join(dir, ".env.local")]) {
+      if (path === globalFile || path === globalReal) return null;
+      const text = (() => { try { return readFileSync(path, "utf8"); } catch { return ""; } })();
+      if (text.split("\n").some(line => line.trimStart().startsWith(`${ENV_KEY}=`))) return path;
+    }
+    if (dirname(dir) === dir) return null;
+  }
+}
+
+type ConnectedShare = { share?: string; device?: { id: string; name: string; approved: boolean }; profiles: string[]; webrtc: boolean };
+
+async function connect(url: string, opts: { global?: boolean; project?: boolean } = {}, shared?: ConnectedShare): Promise<void> {
+  if (opts.global && opts.project) throw new Error("Pass --global or --project, not both.");
+  // A bare rech1_ token means the default signal server.
+  if (looksLikeToken(url)) url = `${DEFAULT_SIGNAL}#${url.trim()}`;
+  const share = shareLinkParts(url);
+  if (share && !shared) return connectShare(url, share, opts);
+  if (share && shared) return saveConnection(url, opts, shared);
   const parsed = parseUrl(url);
   if (!parsed.key) throw new Error("That URL has no key (#key=…). Ask the host for the full URL from: rech share <profile>");
   const response = await fetch(serviceUrl(url, "ping"), { headers: { Authorization: `Bearer ${parsed.key}` }, signal: AbortSignal.timeout(5000) })
@@ -2817,10 +3384,56 @@ async function connect(url: string): Promise<void> {
   const body = await response.json().catch(() => ({})) as { listener?: string; profiles?: string[] | "*" };
   if (parsed.profileDirectory && Array.isArray(body.profiles) && !body.profiles.includes(parsed.profileDirectory))
     throw new Error(`Connected, but listener "${body.listener}" does not allow profile "${parsed.profileDirectory}".`);
-  const saved = await saveProjectUrl(url);
-  console.log(`Connected to ${serviceUrl(url)}${body.listener ? ` (listener ${body.listener})` : ""}. Saved RECHROME_URL to ${saved}`);
-  if (Array.isArray(body.profiles) && body.profiles.length > 1 && !parsed.profileDirectory)
-    console.log(`This link shares ${body.profiles.length} profiles: ${body.profiles.join(", ")}.\nPick one per command: rech --profile <name> open https://example.com   (see them again with rech profile)`);
+  // Where to save: the flag, else ask in a terminal (this project by default), else this project.
+  let global = !!opts.global;
+  if (!opts.global && !opts.project && isInteractive()) {
+    const { dataDir } = await getClientIdentity();
+    const choice = await promptChoice("Use this link for:", [
+      { label: `This project only  (${join(dataDir, ".env.local")})`, value: "project" },
+      { label: `Every project on this machine without its own link  (${GLOBAL_ENV_FILE})`, value: "global" },
+    ], 0);
+    if (!choice) throw new Error("Cancelled; nothing saved.");
+    global = choice === "global";
+  }
+  // A machine running its own daemon would stop reaching its own Chrome from every project without a link.
+  if (global && !(await isLocalDaemon(url)) && (await readListeners().catch(() => null))?.listeners.length)
+    console.error(`[rech] warning: this machine runs its own rech daemon. Projects without their own RECHROME_URL will now use ${serviceUrl(url)}, not this machine's Chrome. Undo: remove ${ENV_KEY} from ${GLOBAL_ENV_FILE}`);
+  const saved = global ? await saveGlobalUrl(url) : await saveProjectUrl(url);
+  console.log(`Connected to ${serviceUrl(url)}${body.listener ? ` (listener ${body.listener})` : ""}. Saved RECHROME_URL ${global ? "for every project on this machine" : "for this project"}: ${saved}`);
+  await warnSecretFile(saved);
+  const shadow = global ? nearerUrlSource(process.cwd(), inheritedEnvKeys.has(ENV_KEY)) : null;
+  if (shadow) console.log(`Note: here, ${shadow} takes precedence over it. Remove that, or run rech connect --project to update it.`);
+  if (Array.isArray(body.profiles) && body.profiles.length > 1) {
+    console.log(`This link shares ${body.profiles.length} profiles:`);
+    for (const p of body.profiles) console.log(`  ${p}${p === parsed.profileDirectory ? "  (default)" : ""}`);
+    console.log(`${parsed.profileDirectory ? "Use another" : "Pick one"} per command: rech --profile <name> open https://example.com   (see them again with rech profile)`);
+  }
+}
+
+/** Save a share device's link (after connectShare redeemed or checked it) and say what it gives. */
+async function saveConnection(url: string, opts: { global?: boolean; project?: boolean }, shared: ConnectedShare): Promise<void> {
+  let global = !!opts.global;
+  if (!opts.global && !opts.project && isInteractive()) {
+    const { dataDir } = await getClientIdentity();
+    const choice = await promptChoice("Use this link for:", [
+      { label: `This project only  (${join(dataDir, ".env.local")})`, value: "project" },
+      { label: `Every project on this machine without its own link  (${GLOBAL_ENV_FILE})`, value: "global" },
+    ], 0);
+    if (!choice) throw new Error("Cancelled; nothing saved.");
+    global = choice === "global";
+  }
+  const saved = global ? await saveGlobalUrl(url) : await saveProjectUrl(url);
+  await warnSecretFile(saved);
+  const via = shared.webrtc ? `WebRTC via ${new URL(url).host}` : serviceUrl(url);
+  console.log(`Connected to share "${shared.share ?? "?"}" (${via}) as device ${shared.device?.name ?? "?"} (${shared.device?.id ?? "?"}).`);
+  console.log(`Saved this device's own link ${global ? "for every project on this machine" : "for this project"}: ${saved}`);
+  console.log(`The invite you used no longer works for anyone else.`);
+  if (shared.device && !shared.device.approved) console.log(`\nThe host must approve this device before it can drive the browser: rech share approve ${shared.share} ${shared.device.id}`);
+  if (shared.profiles.length > 1) {
+    console.log(`\nThis share has ${shared.profiles.length} profiles:`);
+    for (const p of shared.profiles) console.log(`  ${p}`);
+    console.log(`Pick one per command: rech --profile <name> open https://example.com   (see them again with rech profile)`);
+  } else if (shared.profiles.length === 1) console.log(`Profile: ${shared.profiles[0]}. Try: rech open https://example.com`);
 }
 
 export function detectSetupAgent(env: Record<string, string | undefined> = process.env): "Codex" | "Claude Code" | null {
@@ -2948,7 +3561,7 @@ async function setup(opts: SetupOptions = {}): Promise<void> {
   console.log(`✓ [1/5] Local management daemon verified; requested profile access: ${desiredBind}`);
 
   const cache = await readChromeProfileCache();
-  if (!cache) { console.error("      Chrome profiles not found"); rl?.close(); process.exit(1); }
+  if (!cache) { console.error(`      Chrome profiles not found: ${profileCacheProblem ?? "Local State not read"}`); rl?.close(); process.exit(1); }
   const userDataDir = await findChromeUserDataDir();
 
   async function pickProfile(exclude: Set<string>): Promise<[string, ChromeProfileInfo] | null> {
@@ -3074,13 +3687,7 @@ async function setup(opts: SetupOptions = {}): Promise<void> {
     guide?.takeRetry();
     guide?.update("bridge", "Extension and token detected. Testing the browser connection…");
     try {
-      const probe = await callServe(
-        rechUrl.toString(),
-        [`-s=${probeSession}`, "open", "about:blank", "--wait", "none"],
-        probeEnv,
-        probeIdentity,
-        true,
-      );
+      const probe = await probeSetupBridge(rechUrl.toString(), probeSession, probeEnv, probeIdentity);
       bridgeVerified = probe.status === 0;
       if (bridgeVerified) {
         console.log("✓ [4/5] Extension bridge connected successfully");
@@ -3092,9 +3699,6 @@ async function setup(opts: SetupOptions = {}): Promise<void> {
     } catch (error) {
       bridgeError = error instanceof Error ? error.message : String(error);
       console.error(`      Extension bridge verification failed: ${bridgeError}`);
-    } finally {
-      // The isolated probe must never claim or close an existing worktree session.
-      await callServe(rechUrl.toString(), [`-s=${probeSession}`, "close"], probeEnv, probeIdentity, true).catch(() => {});
     }
 
     if (bridgeVerified) break;
@@ -3221,12 +3825,303 @@ async function setup(opts: SetupOptions = {}): Promise<void> {
     console.error(`\nSetup was saved, but the selected profile did not pass the bridge check. Reload the extension at chrome://extensions and run \`rech setup --profile ${profileEmail}\` again.`);
 }
 
+// ---- shares: invite links, devices, transports (see shares.ts) ----------------------------
+
+const fmtDate = (ms?: number) => ms ? new Date(ms).toISOString().slice(0, 16).replace("T", " ") : "-";
+const fmtDay = (ms?: number) => ms ? new Date(ms).toISOString().slice(0, 10) : "never";
+
+/** A listener to carry a share over lan/tailscale/<IP>/<listener name>; created when missing. */
+async function shareTransportListener(selector: string, profiles: string[], label: string): Promise<string> {
+  const config = await requireListeners();
+  const named = config.listeners.find(l => l.name === selector);
+  if (named) {
+    if (named.profiles === "*") throw new Error(`"${selector}" is the local management listener; share over lan, tailscale or webrtc instead.`);
+    return named.name;
+  }
+  const address = chooseListenAddress(await detectListenChoices(), selector);
+  const existing = config.listeners.find(l => l.host === address && l.profiles !== "*" && normalizePrefix(l.prefix) === "/");
+  if (existing) return existing.name;
+  const listener: Listener = { name: `share-${label}`.slice(0, 40), host: address, port: freeListenerPort(config.listeners), key: randomBytes(24).toString("base64url"), profiles };
+  config.listeners.push(listener);
+  await writeListeners(config);
+  if (!(await waitForListener(listener))) console.error(`[rech] warning: the daemon has not opened ${listenerAddress(listener)} yet; is it running? (rech status)`);
+  return listener.name;
+}
+
+/** Where a share's invite can be used, as full links (each holds the secret). */
+async function shareLinks(share: Share): Promise<{ via: string; link: string }[]> {
+  const listeners = (await readListeners().catch(() => null))?.listeners ?? [];
+  return share.via.map(via => {
+    if (via === WEBRTC) return { via: "webrtc", link: inviteLink(share, share.signal ?? DEFAULT_SIGNAL) };
+    const l = listeners.find(x => x.name === via);
+    if (!l) return { via, link: "(listener removed)" };
+    return { via: l.name, link: inviteLink(share, l.publicUrl ?? `http://${listenerAddress(l)}${normalizePrefix(l.prefix)}`) };
+  });
+}
+
+function printInvite(share: Share, links: { via: string; link: string }[]): void {
+  const expiry = share.inviteExpiresAt ? `unused, it expires ${fmtDate(share.inviteExpiresAt)}` : "it never expires unused";
+  console.log(`Share "${share.label}": ${share.profiles.join(", ")}`);
+  console.log(`Invite for ${share.maxDevices === 1 ? "one device" : `${share.maxDevices} devices`} (${expiry}; secret: send it privately):\n`);
+  for (const { via, link } of links) console.log(`  ${links.length > 1 ? `${via.padEnd(10)} ` : ""}${link}`);
+  const rtc = links.find(l => l.via === "webrtc");
+  if (rtc && share.signal === DEFAULT_SIGNAL) console.log(`\n  or in a terminal:  rech connect ${share.invite}`);
+  console.log(`\nThe other machine runs: rech connect '<link>'`);
+  if (share.approve) console.log(`Each new device waits for you: rech share approve ${share.label}`);
+  console.log(`Share expires: ${fmtDay(share.expiresAt)}${share.expiresAt ? ` (renew: rech share renew ${share.label})` : ""}`);
+}
+
+export type ShareNewOptions = { name?: string; via?: string[]; signal?: string; expires?: string; inviteTtl?: string; devices?: number; approve?: boolean };
+
+async function shareNew(selectors: string[], opts: ShareNewOptions): Promise<void> {
+  if (!selectors.length) throw new Error("Which profiles? rech share new <profile..>   (see rech profile)");
+  const profiles = await resolveProfileKeys(selectors);
+  // An explicit --name must be free; a derived one gets -2, -3… so a second share just works.
+  const taken = new Set((await readShares()).shares.map(s => s.label));
+  const base = profileSlug(profiles[0]).slice(0, 36);
+  let label = (opts.name ?? base).toLowerCase();
+  for (let i = 2; !opts.name && taken.has(label); i++) label = `${base}-${i}`;
+  // Fail on the name before binding any listener for it.
+  if (taken.has(label)) throw new Error(`A share named "${label}" already exists. Pick another --name, or: rech share rotate ${label}`);
+  if (!/^[a-z0-9][a-z0-9_-]{0,39}$/.test(label)) throw new Error(`Share names use a-z, 0-9, "-" and "_" (up to 40), e.g. alice or ci-bot; got "${label}"`);
+  const wanted = (opts.via?.length ? opts.via : [WEBRTC]).flatMap(v => v.split(",")).map(v => v.trim()).filter(Boolean);
+  const via: string[] = [];
+  for (const v of wanted) via.push(v === WEBRTC ? WEBRTC : await shareTransportListener(v, profiles, label));
+  const expires = opts.expires ?? (via.includes(WEBRTC) ? "30d" : "never");
+  const expiresMs = parseDuration(expires);
+  const share = await updateShares(config => createShare(config, {
+    label, profiles, via, signal: opts.signal ?? process.env.RECH_SIGNAL,
+    expiresAt: expiresMs ? Date.now() + expiresMs : undefined,
+    inviteTtlMs: parseDuration(opts.inviteTtl ?? "24h"),
+    maxDevices: opts.devices ?? 1, approve: opts.approve,
+  }));
+  // The daemon answers WebRTC peers with node-datachannel: install it now, not on the first peer.
+  if (via.includes(WEBRTC)) await loadRTC().catch(error => console.error(`[rech] warning: ${error instanceof Error ? error.message : error}`));
+  printInvite(share, await shareLinks(share));
+}
+
+async function shareList(): Promise<void> {
+  const { shares } = await readShares();
+  if (shares.length) {
+    const now = Date.now();
+    const rows = [["SHARE", "PROFILES", "VIA", "DEVICES", "EXPIRES", "STATUS"]];
+    for (const s of shares) {
+      const pending = s.devices.filter(d => !d.approved).length;
+      const status = s.revokedAt ? "revoked" : s.expiresAt && now >= s.expiresAt ? "expired"
+        : inviteProblem(s, now) ? (pending ? `${pending} waiting for approval` : "active") : `invite open${pending ? `, ${pending} waiting` : ""}`;
+      rows.push([s.label, s.profiles.join(", "), s.via.join(", "), `${s.devices.length}/${s.maxDevices}`, fmtDay(s.expiresAt), status]);
+    }
+    printTable(rows);
+    console.log(`\nDevices: rech share devices <share> · invite link again: rech share rotate <share> · stop: rech share revoke <share>\n`);
+  }
+  const listeners = await readListeners().catch(() => null);
+  if (listeners) {
+    if (shares.length) console.log("Listener links (legacy #key=…):");
+    await urlList();
+  } else if (!shares.length) console.log("Nothing shared yet. Share a profile: rech share new <profile>");
+}
+
+async function shareDevices(name: string, remove?: string): Promise<void> {
+  if (remove) {
+    const device = await updateShares(config => {
+      const share = findShare(config, name);
+      const d = findDevice(share, remove);
+      share.devices = share.devices.filter(x => x !== d);
+      return d;
+    });
+    console.log(`Removed ${device.name} (${device.id}) from "${name}"; its sessions close and its link stops working.`);
+    return;
+  }
+  const share = findShare(await readShares(), name);
+  if (!share.devices.length) { console.log(`No device has used "${share.label}" yet.${inviteProblem(share) ? "" : " Its invite is still open."}`); return; }
+  const rows = [["DEVICE", "NAME", "APPROVED", "ADDED", "LAST USED"]];
+  for (const d of share.devices) rows.push([d.id, d.name, d.approved ? "yes" : "waiting", fmtDate(d.addedAt), fmtDate(d.lastSeen)]);
+  printTable(rows);
+}
+
+async function shareEdit(action: string, name: string, args: string[], opts: { expires?: string } = {}): Promise<void> {
+  if (action === "allow" || action === "deny") {
+    if (!args.length) throw new Error(`Which profiles? rech share ${action} ${name} <profile..>`);
+    const keys = await resolveProfileKeys(args);
+    const share = await updateShares(config => {
+      const s = findShare(config, name);
+      const next = action === "allow" ? [...new Set([...s.profiles, ...keys])] : s.profiles.filter(p => !keys.includes(p));
+      if (!next.length) throw new Error(`That would leave "${s.label}" with no profiles; revoke it instead: rech share revoke ${s.label}`);
+      s.profiles = next;
+      return s;
+    });
+    console.log(`"${share.label}" now shares: ${share.profiles.join(", ")} (connected devices see it on their next command; the link is unchanged).`);
+  } else if (action === "rotate") {
+    const share = await updateShares(config => {
+      const s = findShare(config, name);
+      s.invite = newToken();
+      s.inviteExpiresAt = s.inviteTtlMs ? Date.now() + s.inviteTtlMs : undefined;
+      if (s.devices.length >= s.maxDevices) s.maxDevices = s.devices.length + 1;
+      return s;
+    });
+    console.log("New invite; the previous invite link no longer works (devices already connected keep working).\n");
+    printInvite(share, await shareLinks(share));
+  } else if (action === "revoke") {
+    await updateShares(config => { findShare(config, name).revokedAt = Date.now(); });
+    console.log(`Revoked "${name}": its links and devices stop working, and its sessions close. Remove it entirely: rech share rm ${name}`);
+  } else if (action === "rm") {
+    await updateShares(config => { const s = findShare(config, name); config.shares = config.shares.filter(x => x !== s); });
+    console.log(`Removed "${name}".`);
+  } else if (action === "renew") {
+    const ms = parseDuration(opts.expires ?? args[0] ?? "30d");
+    const share = await updateShares(config => {
+      const s = findShare(config, name);
+      if (s.revokedAt) throw new Error(`"${s.label}" was revoked; create a new share instead: rech share new ${s.profiles.join(" ")}`);
+      s.expiresAt = ms ? Date.now() + ms : undefined;
+      return s;
+    });
+    console.log(`"${share.label}" now expires: ${fmtDay(share.expiresAt)}`);
+  } else if (action === "approve") {
+    const approved = await updateShares(config => {
+      const s = findShare(config, name);
+      const targets = args.length ? args.map(a => findDevice(s, a)) : s.devices.filter(d => !d.approved);
+      for (const d of targets) d.approved = true;
+      return targets;
+    });
+    console.log(approved.length ? `Approved: ${approved.map(d => `${d.name} (${d.id})`).join(", ")}` : `No device of "${name}" is waiting for approval.`);
+  }
+}
+
+// ---- client side of a rech1_ link -----------------------------------------------------------
+
+/** A rech1_ link's parts: the token, the origin it points at, and the transport once known. */
+export function shareLinkParts(url: string): { token: string; origin: string; webrtc: boolean; profile?: string } | null {
+  let u: URL;
+  try { u = new URL(url); } catch { return null; }
+  const [token, ...rest] = u.hash.slice(1).split("&");
+  if (!looksLikeToken(token)) return null;
+  const params = new URLSearchParams(rest.join("&"));
+  return { token, origin: `${u.protocol}//${u.host}${normalizePrefix(u.pathname)}`, webrtc: params.get("via") === WEBRTC, profile: u.searchParams.get("profile") ?? undefined };
+}
+
+/** Call a share's HTTP API over whichever transport its link uses (one-shot, for connect). */
+async function shareRequest(origin: string, token: string, webrtc: boolean, method: string, path: string, body?: unknown): Promise<Response> {
+  if (!webrtc) return fetch(serviceUrl(origin, path), {
+    method, headers: { Authorization: `Bearer ${bearerOf(token)}`, ...(body ? { "Content-Type": "application/json" } : {}) },
+    body: body ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(10_000),
+  });
+  const client = new WebrtcClient(token, origin, m => console.error(m));
+  await client.connect();
+  try {
+    const res = await client.request(method, `/${path}`, body ? JSON.stringify(body) : undefined, body ? "application/json" : undefined);
+    return new Response(await res.arrayBuffer(), { status: res.status, headers: res.headers });
+  } finally { client.close(); }
+}
+
+/** `rech connect` for a rech1_ link: find the transport, redeem the invite, save this device's link. */
+async function connectShare(url: string, parts: { token: string; origin: string }, opts: { global?: boolean; project?: boolean }): Promise<void> {
+  const parsed = parseToken(parts.token);
+  if (!parsed.ok) throw new Error(parsed.reason === "checksum"
+    ? "This rech1_ link is damaged (checksum mismatch): it was copied incompletely or mistyped. Ask for it again."
+    : "That is not a complete rech1_ link.");
+  // One unauthenticated probe tells a signal server (WebRTC) from a rech daemon (direct HTTP).
+  // The bearer is a working HTTP credential, so it never goes to a signal server.
+  const get = (auth: boolean) => fetch(serviceUrl(parts.origin, "ping"), { headers: auth ? { Authorization: `Bearer ${bearerOf(parts.token)}` } : {}, signal: AbortSignal.timeout(8000) })
+    .catch(error => { throw new Error(`Could not reach ${parts.origin}: ${error instanceof Error ? error.message : error}`); });
+  const read = async (r: Response) => { const text = await r.text().catch(() => ""); try { return { text, body: JSON.parse(text) }; } catch { return { text, body: null as any }; } };
+  let probe = await get(false);
+  let { text: probeText, body: probeBody } = await read(probe);
+  if (probe.status === 503 && !probeBody && probeText.trim()) throw new Error(probeText.trim());
+  const webrtc = !!probeBody?.["rech-signal"];
+  if (!webrtc && probe.status === 401) ({ text: probeText, body: probeBody } = await read(probe = await get(true)));
+  if (!webrtc && probe.status === 401) throw new Error("The host rejected this link. Ask for a fresh one (rech share rotate <share> on the host).");
+  if (!webrtc && !probe.ok) throw new Error(probeBody?.error ?? `${serviceUrl(parts.origin, "ping")} answered ${probe.status}; is this a rech link?`);
+  if (webrtc) console.error(`[rech] connecting to the host over WebRTC via ${new URL(parts.origin).host}…`);
+  const ping = webrtc ? await (await shareRequest(parts.origin, parts.token, true, "GET", "ping")).json() as any : probeBody;
+  if (ping?.error) throw new Error(ping.error);
+  let token = parts.token, device = ping?.device, profiles: string[] = Array.isArray(ping?.profiles) ? ping.profiles : [];
+  const share = ping?.share;
+  if (ping?.kind === "invite") {
+    const res = await shareRequest(parts.origin, parts.token, webrtc, "POST", "redeem", { name: hostname().replace(/\.local$/, "") });
+    const body = await res.json().catch(() => ({})) as any;
+    if (!res.ok || !body.token) throw new Error(body.error ?? `The host refused this invite (HTTP ${res.status}).`);
+    token = body.token; device = body.device; profiles = body.profiles ?? profiles;
+  }
+  const saved = new URL(parts.origin);
+  if (profiles.length === 1) saved.searchParams.set("profile", profiles[0]);
+  saved.hash = `${token}${webrtc ? `&via=${WEBRTC}` : ""}`;
+  await connect(saved.toString(), opts, { share, device, profiles, webrtc });
+}
+
+// ---- WebRTC client bridge -------------------------------------------------------------------
+
+/** The command that runs this rech (for spawning `rech bridge`). */
+const selfCommand = () => [process.execPath, Bun.main];
+
+/**
+ * For a WebRTC link, the loopback URL of a running bridge to it (started when missing); any other
+ * URL comes back unchanged. Everything downstream then speaks plain HTTP.
+ */
+const bridgedUrls = new Set<string>();
+
+export async function transportUrl(url: string): Promise<string> {
+  const parts = shareLinkParts(url);
+  if (!parts?.webrtc) return url;
+  const info = await spawnBridge(parts.token, parts.origin, selfCommand());
+  const bridged = new URL(`http://127.0.0.1:${info.port}/`);
+  new URL(url).searchParams.forEach((v, k) => bridged.searchParams.set(k, v));
+  bridged.hash = `key=${info.key}`;
+  bridgedUrls.add(bridged.toString());
+  return bridged.toString();
+}
+
+async function bridgeCommand(): Promise<void> {
+  const token = process.env.RECH_BRIDGE_TOKEN, signal = process.env.RECH_BRIDGE_SIGNAL;
+  if (!token || !signal) throw new Error("rech bridge is started by rech itself for WebRTC links.");
+  delete process.env.RECH_BRIDGE_TOKEN;
+  await runBridge(token, signal, { log: m => console.error(m), onStop: () => process.exit(0) });
+}
+
+// ---- sessions (client view) -----------------------------------------------------------------
+
+async function sessionCommand(action: string, name?: string): Promise<void> {
+  const raw = process.env[ENV_KEY];
+  if (!raw) throw new Error(notConnectedMessage());
+  const url = await transportUrl(raw);
+  if (action === "close") {
+    if (!name) throw new Error("Which session? rech session close <name>   (see rech session ls)");
+    return run(url, ["close", `-s=${name}`]);
+  }
+  const res = await fetch(serviceUrl(url, "sessions"), { headers: { Authorization: `Bearer ${parseUrl(url).key}` }, signal: AbortSignal.timeout(10_000) });
+  const body = await res.json().catch(() => null) as { sessions?: { session: string; profile?: string; client?: string; owner?: string; lastUsed: number; live: boolean }[]; stderr?: string } | null;
+  if (!res.ok || !body?.sessions) throw new Error(body?.stderr?.trim() || `The host does not list sessions (HTTP ${res.status}); it may run an older rech.`);
+  if (!body.sessions.length) { console.log("No sessions yet (since the host's daemon started)."); return; }
+  const rows = [["SESSION", "PROFILE", "CLIENT", "LAST USED", "STATE"]];
+  for (const s of body.sessions) rows.push([s.session, s.profile ?? "-", s.client ?? "-", fmtDate(s.lastUsed), s.live ? "open" : "closed"]);
+  printTable(rows);
+  console.log(`\nUse one: rech -s=<session> open https://example.com · close it: rech session close <session>`);
+}
+
+async function signalServe(opts: { host?: string; port?: number }): Promise<void> {
+  const server = startSignalRelay({ host: opts.host ?? "127.0.0.1", port: opts.port ?? 8787, log });
+  console.log(`rech signal server (rech-signal-1) on http://${server.hostname}:${server.port}/`);
+  console.log(`Put HTTPS in front of it, then share through it: rech share new <profile> --signal https://<your-host>/`);
+}
+
 async function status(): Promise<void> {
-  const url = process.env[ENV_KEY];
-  if (!url) {
+  const rawUrl = process.env[ENV_KEY];
+  if (!rawUrl) {
     console.log(`serve:    not configured`);
     console.log(notConnectedMessage().split("\n").slice(1).join("\n"));
     return;
+  }
+  // A WebRTC share link is checked through its local bridge, like every command.
+  const link = shareLinkParts(rawUrl);
+  let url = rawUrl;
+  if (link?.webrtc) {
+    try {
+      url = await transportUrl(rawUrl);
+      console.log(`via:      WebRTC through ${new URL(link.origin).host} (local bridge ${serviceUrl(url)})`);
+    } catch (error) {
+      console.log(`via:      ✗ WebRTC through ${new URL(link.origin).host}: ${error instanceof Error ? error.message : error}`);
+      if (rechromeUrlSource && rechromeUrlSource !== "environment") console.log(`config:   ${rechromeUrlSource}`);
+      return;
+    }
   }
   const parsed = parseUrl(url);
   const ping = await fetch(serviceUrl(url), { signal: AbortSignal.timeout(2000) }).catch(() => null);
@@ -3234,12 +4129,22 @@ async function status(): Promise<void> {
   const pingResponse = ping
     ? await fetch(serviceUrl(url, "ping"), { headers: { Authorization: `Bearer ${parsed.key}` }, signal: AbortSignal.timeout(2000) }).catch(() => null)
     : null;
-  const pingBody = pingResponse?.ok
-    ? await pingResponse.json().catch(() => null) as { bind?: string; listener?: string; profiles?: string[] | "*"; degraded?: boolean; consecutiveTimeouts?: number } | null
+  const pingBody = pingResponse?.ok || pingResponse?.status === 403
+    ? await pingResponse.json().catch(() => null) as { bind?: string; listener?: string; profiles?: string[] | "*"; degraded?: boolean; consecutiveTimeouts?: number; chromeAccessProblem?: string; share?: string; kind?: string; device?: { id: string; name: string; approved: boolean }; expiresAt?: number; error?: string } | null
     : null;
   // Show the URL this client connects to; through a proxy, the daemon's bind is on another port.
   const details = [pingBody?.listener && `listener ${pingBody.listener}`, pingBody?.bind && `bind ${pingBody.bind}`].filter(Boolean).join(", ");
-  console.log(`serve:    ${ping ? `running  ${serviceUrl(url)}${details ? `  (${details})` : ""}` : `not reachable at ${serviceUrl(url)}`}`);
+  // Any HTTP answer is not the daemon: a proxy's 404/502 means the link's listener is gone or moved.
+  const answered = pingResponse?.ok || pingResponse?.status === 401 || (pingResponse?.status === 403 && !!pingBody?.error);
+  console.log(`serve:    ${!ping ? `not reachable at ${serviceUrl(url)}`
+    : answered ? `running  ${serviceUrl(url)}${details ? `  (${details})` : ""}`
+    : `✗ ${serviceUrl(url)} answers HTTP ${pingResponse?.status ?? ping.status}, not a rechrome daemon — this link's listener was likely removed or moved; ask its host for a fresh link (\`rech share <profile>\`), then \`rech connect '<url>'\``}`);
+  if (rechromeUrlSource) console.log(`config:   ${rechromeUrlSource === "environment" ? "RECHROME_URL from the environment" : rechromeUrlSource}${rechromeUrlSource === GLOBAL_ENV_FILE ? "  (machine-wide)" : ""}`);
+  if (rechromeUrlSource && rechromeUrlSource !== "environment")
+    for (const w of await secretFileWarnings(rechromeUrlSource).catch(() => [])) console.log(`secret:   ⚠ ${w}`);
+  if (pingBody?.share)
+    console.log(`share:    ${pingBody.share}${pingBody.device ? `, device ${pingBody.device.name} (${pingBody.device.id})${pingBody.device.approved ? "" : " — ⚠ waiting for the host's approval"}` : pingBody.kind === "invite" ? " — an unused invite: run rech connect '<link>' to register this device" : ""}${pingBody.expiresAt ? `, expires ${fmtDay(pingBody.expiresAt)}` : ""}`);
+  if (pingResponse?.status === 403 && pingBody?.error) console.log(`auth:     ✗ ${pingBody.error}`);
   if (pingResponse?.status === 401)
     console.log(`auth:     ✗ key rejected — ask the host for a fresh URL (\`rech share <profile>\`), then \`rech connect '<url>'\``);
   // daemonManager().id — there is no PM_BIN constant. Referencing one threw a
@@ -3251,6 +4156,8 @@ async function status(): Promise<void> {
   // No oxmgr/pm2 on PATH must not take down `rech status`: report it instead of throwing.
   let mgr: DaemonManager | undefined;
   if (isHost) try { mgr = daemonManager(); } catch { /* reported below */ }
+  if (pingBody?.chromeAccessProblem)
+    console.log(`chrome:   ⚠ daemon ${pingBody.chromeAccessProblem}`);
   if (pingBody?.degraded)
     console.log(`relay:    ⚠ degraded (${pingBody.consecutiveTimeouts} consecutive command timeouts) — if it persists, the daemon self-restarts; ${isHost ? `force it now with \`${mgr?.id ?? "oxmgr"} restart ${PM_PROCESS_NAME}\`` : "the daemon host can restart it"}`);
   if (isHost) {
@@ -3262,7 +4169,11 @@ async function status(): Promise<void> {
   const current = effective ? await resolveProfileEmail(effective).catch(() => effective) : undefined;
   const allowed = pingBody?.profiles === "*" ? "all registered profiles" : pingBody?.profiles?.join(", ");
   console.log(`profile:  ${current ?? "(none selected; add ?profile= to the URL or pass --profile)"}${allowed ? `  — this listener serves: ${allowed}` : ""}`);
-  if (isHost) console.log(`\nMore: rech profile (profiles) · rech share ls (who can connect, and where)`);
+  if (isHost) {
+    const listeners = (await readListeners().catch(() => null))?.listeners ?? [];
+    for (const line of formatTailscaleHealth(await inspectTailscaleServe(listeners))) console.log(line);
+    console.log(`\nMore: rech profile (profiles) · rech share ls (who can connect, and where)`);
+  }
 }
 
 
@@ -3278,7 +4189,7 @@ export type RechHandlers = {
   printProfileUri(selector?: string, listener?: string, opts?: { local?: boolean; save?: boolean; all?: boolean }): Promise<void>;
   urlList(): Promise<void>;
   shareProfiles(selectors: string[], opts: { listener?: string; local?: boolean; save?: boolean }): Promise<void>;
-  connect(url: string): Promise<void>;
+  connect(url: string, opts?: { global?: boolean; project?: boolean }): Promise<void>;
   listenerPort(name?: string): Promise<void>;
   allowListener(name: string, profiles: string[]): Promise<void>;
   denyListener(name: string, profiles: string[]): Promise<void>;
@@ -3288,10 +4199,19 @@ export type RechHandlers = {
   tray(action?: string): Promise<void>;
   provisionProfile(name: string, opts: { headed: boolean; experimental: boolean }): Promise<void>;
   uninstall(): Promise<void>;
+  shareNew(profiles: string[], opts: ShareNewOptions): Promise<void>;
+  shareList(): Promise<void>;
+  shareDevices(name: string, remove?: string): Promise<void>;
+  shareEdit(action: string, name: string, args: string[], opts?: { expires?: string }): Promise<void>;
+  session(action: string, name?: string): Promise<void>;
+  signalServe(opts: { host?: string; port?: number }): Promise<void>;
+  bridge(): Promise<void>;
 };
 
+const SHARE_ACTIONS = new Set(["new", "allow", "deny", "rotate", "revoke", "rm", "renew", "approve", "devices"]);
+
 /** Commands rech handles itself; anything else is forwarded verbatim to playwright-cli. */
-export const RECH_COMMANDS = new Set(["serve", "status", "listener", "listeners", "profile", "profiles", "share", "connect", "setup", "tray", "provision-profile", "uninstall"]);
+export const RECH_COMMANDS = new Set(["serve", "status", "listener", "listeners", "profile", "profiles", "share", "connect", "session", "sessions", "signal", "bridge", "setup", "tray", "provision-profile", "uninstall"]);
 
 const portOption = { type: "number", requiresArg: true, describe: "Listener port (1-65535)" } as const;
 
@@ -3305,11 +4225,14 @@ const HELP_EPILOGUE = `Browser commands (sent to this project's Chrome session):
       open, goto, click, fill, screenshot, eval, tab-list…  (\`rech pw --help\` lists all)
       --profile <p>  as another registered profile (email, name or folder); put it first
       --isolate      in a throwaway session, e.g. for a login flow
+  rech fill-secret <ref> --from-env VAR | --totp-from-env VAR [--env-file f] [--allow-domain '*.example.com']
+                     type a password / TOTP code without it reaching argv, logs or output
   rech pw <args>     forward verbatim to playwright-cli, e.g. \`rech pw --version\`
   rech --version     rechrome's version
 
 Environment:
   ${ENV_KEY}      connection URL; read from the nearest .rechrome/.env.local or .env.local
+  RECHROME_PROFILE  default browser profile selector; --profile overrides it
   RECH_IDENTITY     session key: worktree (default) | branch | cwd
   RECH_TOKEN        extension token for \`rech setup\` (same as --token)
   RECH_SETUP_AGENT  setup hints: codex | claude | none (auto-detected)
@@ -3318,8 +4241,9 @@ Examples:
   rech setup --profile you@example.com         set up Chrome on this machine
   rech open https://example.com                open a page in this project's session
   rech screenshot                              saved to <project>/.rechrome/output/
-  rech share you@example.com                   URL to give another machine (secret)
-  rech connect '<url>'                         use that URL in this project
+  rech share new you@example.com               invite link for another machine (WebRTC, no open port)
+  rech connect '<link>'                        use that link in this project
+  rech share ls                                shares, devices, expiry
 
 Run \`rech <command> --help\` for a command's options. Tutorial: https://github.com/snomiao/rechrome#tutorial`;
 
@@ -3358,25 +4282,45 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
         throw new Error(`To share "${a.name}" with another machine: rech share ${JSON.stringify(a.name)}. To list profiles: rech profile`);
       })
     // Share with and connect from other machines
-    .command("share [profiles..]", "Print a URL another machine can connect with (secret); `share ls` lists all", y => y
-      .positional("profiles", { type: "string", array: true, describe: "Profile(s): email, name, folder, or a unique part of one. Several = one link for all of them. ls/list lists everything shared" })
+    .command("share [profiles..]", "Share profiles: `share new <profile..>` makes an invite link (WebRTC by default); `share ls` lists all", y => y
+      .positional("profiles", { type: "string", array: true, describe: "new <profile..> | ls | devices|approve|allow|deny|rotate|renew|revoke|rm <share> […]; or a profile for its legacy listener link" })
+      .option("name", { type: "string", requiresArg: true, describe: "With new: the share's name (default: from the first profile)" })
+      .option("via", { type: "string", array: true, requiresArg: true, describe: "With new: webrtc (default) | lan | tailscale | <IP> | <listener>; repeat or comma-separate for several" })
+      .option("signal", { type: "string", requiresArg: true, describe: `With new: signal server for webrtc (default ${DEFAULT_SIGNAL}, or RECH_SIGNAL)` })
+      .option("expires", { type: "string", requiresArg: true, describe: "With new/renew: 30d, 2w, 24h, never (new default: 30d over webrtc, else never)" })
+      .option("invite-ttl", { type: "string", requiresArg: true, describe: "With new: an unused invite stops working after this (default 24h)" })
+      .option("devices", { type: "number", requiresArg: true, describe: "With new: how many devices may redeem the invite (default 1)" })
+      .option("approve", { type: "boolean", describe: "With new: each new device waits for `rech share approve`" })
+      .option("rm", { type: "string", requiresArg: true, describe: "With devices: remove this device" })
       .option("listener", { type: "string", requiresArg: true, describe: "Listener to share through (default: the one that allows the profile)" })
       .option("local", { type: "boolean", describe: "Print the direct listener address even when a public URL is set" })
       .option("save", { type: "boolean", describe: "Also save it as RECHROME_URL in this project's .rechrome/.env.local" })
       .option("all", { type: "boolean", describe: "One link for every registered profile (a snapshot, on its own listener); the other machine picks with --profile" }),
       a => {
         const profiles = (a.profiles ?? []) as string[];
-        if (profiles.length === 1 && ["ls", "list"].includes(profiles[0]) && !a.listener && !a.save && !a.all) return handlers.urlList();
+        const [action, target, ...rest] = profiles;
+        if (action === "new") return handlers.shareNew(profiles.slice(1), { name: a.name, via: a.via as string[] | undefined, signal: a.signal, expires: a.expires, inviteTtl: a.inviteTtl, devices: a.devices, approve: a.approve });
+        if (action && SHARE_ACTIONS.has(action)) {
+          if (!target) throw new Error(`Which share? rech share ${action} <share>   (see rech share ls)`);
+          if (action === "devices") return handlers.shareDevices(target, a.rm);
+          return handlers.shareEdit(action, target, rest, { expires: a.expires });
+        }
+        if (profiles.length === 1 && ["ls", "list"].includes(profiles[0]) && !a.listener && !a.save && !a.all) return handlers.shareList();
         if (profiles.length > 1) {
           if (a.all) throw new Error("Pass profiles or --all, not both.");
           return handlers.shareProfiles(profiles, { listener: a.listener, local: a.local, save: a.save });
         }
         return handlers.printProfileUri(profiles[0], a.listener, a.all ? { local: a.local, save: a.save, all: true } : { local: a.local, save: a.save });
       })
-    .command("connect <url>", "Use a URL from another machine in this project (checks it first)", y => y
-      .positional("url", { type: "string", demandOption: true, describe: "The URL printed by `rech share <profile>` on the machine with Chrome. Quote it: it contains #" })
-      .example("rech connect 'https://host.example.ts.net/rechrome/?profile=you%40example.com#key=…'", ""),
-      a => handlers.connect(a.url))
+    .command("connect <url>", "Use a URL from another machine (checks it first; asks: this project or every project)", y => y
+      .positional("url", { type: "string", demandOption: true, describe: "The link from `rech share` on the machine with Chrome (or a bare rech1_ token). Quote it: it contains #" })
+      .option("project", { type: "boolean", describe: "Save it for this project only (.rechrome/.env.local); the default without a terminal" })
+      .option("global", { type: "boolean", describe: "Save it for every project on this machine without its own link (~/.rechrome/.env.local)" })
+      .conflicts("project", "global")
+      .example("rech connect 'https://host.example.ts.net/rechrome/?profile=you%40example.com#key=…'", "")
+      .example("rech connect 'https://rechrome.pages.dev/#rech1_…'", "An invite: registers this device, then saves its own link")
+      .example("rech connect --global '<url>'", "An agent machine: one link for every folder, /tmp included"),
+      a => a.global || a.project ? handlers.connect(a.url, { global: a.global, project: a.project }) : handlers.connect(a.url))
     .command(["listener", "listeners"], "Control who can connect: listeners, allowed profiles, keys, public URLs", y => y
       .command(["ls", "list", "$0"], "List listeners (keys hidden)", {}, () => handlers.listListeners())
       .command("add <name>", "Expose registered profiles on an address (local for a proxy, lan, tailscale, IP)", y => y
@@ -3405,6 +4349,16 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
       .command("remove <name>", "Remove a listener", y => y.positional("name", { type: "string", demandOption: true }),
         a => handlers.removeListener(a.name))
       .demandCommand(1).strict())
+    .command(["session [action] [name]", "sessions [action] [name]"], "This link's browser sessions on the host: ls (default) | close <name>", y => y
+      .positional("action", { type: "string", choices: ["ls", "list", "close"], default: "ls" })
+      .positional("name", { type: "string", describe: "With close: the session (as `rech session ls` shows it)" }),
+      a => handlers.session(a.action === "list" ? "ls" : a.action!, a.name))
+    .command("signal [action]", "Run a WebRTC signal server for your own shares (see docs/signal-selfhost.md)", y => y
+      .positional("action", { type: "string", choices: ["serve"], default: "serve" })
+      .option("host", { type: "string", requiresArg: true, describe: "Address to bind (default 127.0.0.1; put HTTPS in front)" })
+      .option("port", { ...portOption, describe: "Port (default 8787)" }),
+      a => handlers.signalServe({ host: a.host, port: a.port }))
+    .command("bridge", false, {}, () => handlers.bridge())
     // Daemon and extras
     .command("tray [action]", "Menu-bar icon for the daemon (starts after setup)", y => y
       .positional("action", { type: "string", choices: ["show", "start", "hide", "stop", "quit"] }),
@@ -3440,7 +4394,8 @@ if (import.meta.main) {
     status,
     listListeners, addListener, removeListener, printProfileUri,
     listProfiles: async () => {
-      const url = process.env[ENV_KEY];
+      const raw = process.env[ENV_KEY];
+      const url = raw ? await transportUrl(raw) : raw;
       return url && !(await isLocalDaemon(url)) ? listRemoteProfiles(url) : listProfiles();
     },
     urlList, shareProfiles, removeProfile, connect, listenerPort, allowListener, denyListener, rotateKey, setListener,
@@ -3463,6 +4418,10 @@ if (import.meta.main) {
       await provisionProfile(name, { headed });
     },
     uninstall: daemonUninstall,
+    shareNew, shareList, shareDevices, shareEdit,
+    session: sessionCommand,
+    signalServe: async opts => { await signalServe(opts); await new Promise(() => {}); },
+    bridge: async () => { await bridgeCommand(); await new Promise(() => {}); },
   };
 
   if (cmd && RECH_COMMANDS.has(cmd)) {
@@ -3472,7 +4431,7 @@ if (import.meta.main) {
       console.error(error instanceof Error ? error.message : String(error));
       process.exitCode = 1;
     } finally {
-      if (cmd !== "serve") envWatcher?.close();
+      if (!["serve", "signal", "bridge"].includes(cmd)) envWatcher?.close();
     }
   } else if (cmd === "--version") {
     console.log(rechromeVersion()); // playwright-cli's own: rech pw --version
@@ -3481,11 +4440,16 @@ if (import.meta.main) {
     try { await rechCli(["--help"], handlers).parseAsync(); }
     finally { envWatcher?.close(); }
   } else {
-    const url = process.env[ENV_KEY];
-    if (!url) {
+    const rawUrl = process.env[ENV_KEY];
+    if (!rawUrl) {
       console.error(notConnectedMessage());
       process.exit(1);
     }
+    // A WebRTC share link goes through a local bridge; from here on it is plain HTTP.
+    const url = await transportUrl(rawUrl).catch(error => {
+      console.error(`[rech] ${error instanceof Error ? error.message : error}`);
+      process.exit(1);
+    });
     // --profile: target a registered Chrome profile globally (see extractGlobalProfileArg for
     // the leading-flags-only rule that protects the forwarded CLI's own --profile).
     let profileSelector: string | undefined;
@@ -3496,7 +4460,7 @@ if (import.meta.main) {
     if (separator !== -1) args = args.slice(0, separator);
     try {
       const extracted = extractGlobalProfileArg(args);
-      profileSelector = extracted.selector;
+      profileSelector = extracted.selector ?? (process.env.RECHROME_PROFILE?.trim() || undefined);
       args = extracted.args;
     } catch (err) {
       console.error(err instanceof Error ? err.message : String(err));

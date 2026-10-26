@@ -1,8 +1,13 @@
+import { receiveUpload, readRequestJson } from "./scoped-upload.ts";
 import { readListeners, listenerAddress, authorizeProfileRequest, canReadProfileFile, profileOutputPrefix, normalizePrefix, resolveAllowedProfile, type Listener } from "./listeners.ts";
+import { WEBRTC, authorizeCredential, credentialForBearer, readShares, redeemInvite, shareProblem, updateShares, webrtcCredentials, type Credential, type ShareConfig } from "./shares.ts";
+import { bearerOf, safeEqual } from "./secret.ts";
+import { WebrtcHost } from "./webrtc.ts";
 import { file } from "bun";
-import { createHash, X509Certificate } from "crypto";
-import { mkdirSync, unlinkSync, accessSync, readdirSync, realpathSync, constants as fsConstants } from "fs";
-import { join, resolve, relative, isAbsolute } from "path";
+import { createHash, randomBytes, X509Certificate } from "crypto";
+import { mkdirSync, lstatSync, statSync, chmodSync, unlinkSync, accessSync, readdirSync, realpathSync, existsSync, readFileSync, constants as fsConstants } from "fs";
+import { join, resolve, relative, isAbsolute, sep } from "path";
+import { tmpdir } from "os";
 import {
   log,
   parseUrl,
@@ -16,7 +21,10 @@ import {
   resolvePlaywrightCli,
   readTokenRegistry,
   readChromeProfileCache,
+  checkTailscaleServe,
+  chromeDataAccessHint,
 } from "./rechrome.ts";
+import { SecretMasker, parseFillSecretWire, fillSecretOnSession, passwordValuesOnSession, hasSnapshot, maskPasswordLines, withholdSnapshots } from "./fill-secret.ts";
 
 const TAILSCALE_BIN = process.env.TAILSCALE_BIN || "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
 const CERT_RENEW_THRESHOLD_DAYS = 7;
@@ -80,6 +88,18 @@ const sessionTimeouts = new Map<string, number>(); // per-session consecutive-ti
 // Most-recently-used non-iso sessions, so the deep health probe can target something real
 // instead of spawning a fresh session (which could open a browser window).
 const recentSessions = new Map<string, number>();
+// Values typed by `fill-secret`, masked in every output, log line and served text file for a
+// while afterwards: snapshots echo input values (passwords included). See fill-secret.ts.
+const secretMasker = new SecretMasker();
+const TEXT_OUTPUT = /\.(?:ya?ml|json|md|txt|log)$/i;
+// /run commands in flight, with the (real) output dir each writes to once known. A snapshot file
+// exists on disk before its command has checked it for password values, so a text download waits
+// until no command writing to its directory is in flight.
+const runsInFlight = new Map<Promise<void>, string | undefined>();
+// Only the CLI's own artifacts are ever scrubbed or deleted, never a file a page merely names.
+const CLI_TEXT_ARTIFACT = /(^|\/)\.playwright-cli(-multi-tab)?\/[^/]+\.(?:ya?ml|json|md|txt|log)$/;
+// Artifacts that could not be checked AND could not be deleted: never served.
+const deniedFiles = new Set<string>();
 function noteSession(sess: string, now: number): void {
   recentSessions.set(sess, now);
   if (recentSessions.size > 64) {
@@ -119,6 +139,16 @@ export function provesRelayAlive(o: { stdout: string; stderr: string }): boolean
   return true;
 }
 
+/**
+ * The relay checks Chrome's data folder for the installed extension before connecting. Under
+ * macOS TCC that read fails and it reports "Playwright Extension not found" although the
+ * extension is installed — name the real cause instead of sending the user to reinstall.
+ */
+export function explainExtensionNotFound(output: string, accessProblem: string | undefined): string | undefined {
+  if (!accessProblem || !/Playwright Extension not found in/i.test(output)) return undefined;
+  return `[rech] the extension is probably installed; this daemon ${accessProblem}\n`;
+}
+
 export function inferSilentExtensionFailure(options: {
   status: number;
   stdout: string;
@@ -136,8 +166,42 @@ export function inferSilentExtensionFailure(options: {
   return `Extension connection timeout after ${handshakeTimeoutMs}ms. Automatic recovery retry failed; reload the Playwright MCP Bridge extension at chrome://extensions and retry.\n`;
 }
 
-function tmpSocketRoot(): string {
-  return `${(process.env.TMPDIR || "/tmp").replace(/\/$/, "")}/playwright-cli`;
+// Every CLI child must agree on its socket namespace, including probes and reapers.
+export function playwrightCliEnv(
+  overrides: Record<string, string | undefined> = {},
+  runtime = { env: process.env, platform: process.platform, uid: process.getuid?.() },
+): Record<string, string | undefined> {
+  const source = runtime.env;
+  const env: Record<string, string | undefined> = {
+    PATH: source.PATH,
+    HOME: source.HOME || HOME,
+    USERPROFILE: source.USERPROFILE,
+    TMPDIR: source.TMPDIR,
+    DISPLAY: source.DISPLAY,
+    XDG_RUNTIME_DIR: source.XDG_RUNTIME_DIR,
+    DEBUG: source.DEBUG,
+    PWDEBUG: source.PWDEBUG,
+    ...overrides,
+    PLAYWRIGHT_SOCKETS_DIR: source.PLAYWRIGHT_SOCKETS_DIR,
+  };
+  if (runtime.platform === "darwin") {
+    if (runtime.uid === undefined) throw new Error("Cannot determine socket directory owner");
+    const dir = source.PLAYWRIGHT_SOCKETS_DIR || `/tmp/pw-${runtime.uid}`;
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const stat = lstatSync(dir);
+    if (!stat.isDirectory() || stat.uid !== runtime.uid)
+      throw new Error(`Refusing unsafe Playwright socket directory: ${dir}`);
+    chmodSync(dir, 0o700);
+    env.PLAYWRIGHT_SOCKETS_DIR = dir;
+  }
+  return env;
+}
+
+export function tmpSocketRoot(env = playwrightCliEnv()): string {
+  // Match the shipped coreBundle makeSocketPath('cli', session). CLI children do
+  // not inherit USER/USERNAME, so the vendor's fallback username is "default".
+  const userHash = createHash("sha1").update(env.USERNAME || env.USER || "default").digest("hex").slice(0, 8);
+  return join(env.PLAYWRIGHT_SOCKETS_DIR || join(env.TMPDIR || tmpdir(), `pw-${userHash}`), "cli");
 }
 
 // On startup, adopt any iso-* sessions a previous daemon left behind so they still get reaped
@@ -146,15 +210,11 @@ function tmpSocketRoot(): string {
 function adoptOrphanedIsoSessions(): void {
   try {
     const root = tmpSocketRoot();
-    for (const sub of readdirSync(root)) {
-      let entries: string[];
-      try { entries = readdirSync(`${root}/${sub}`); } catch { continue; }
-      for (const f of entries) {
-        const m = f.match(/^([0-9a-f]+-iso-[0-9a-f]+)/) || f.match(/^(iso-[0-9a-f]+)/);
-        if (m && !isoLastUsed.has(m[1])) {
-          isoLastUsed.set(m[1], Date.now());
-          log(`adopted orphaned isolated session for reaping: ${m[1]}`);
-        }
+    for (const f of readdirSync(root)) {
+      const sess = f.endsWith(".sock") ? f.slice(0, -5) : "";
+      if (isIsoSession(sess) && !isoLastUsed.has(sess)) {
+        isoLastUsed.set(sess, Date.now());
+        log(`adopted orphaned isolated session for reaping: ${sess}`);
       }
     }
   } catch {
@@ -174,7 +234,7 @@ function reapIdleIsoSessions(bin: string, binArgs: string[], workDir: string): v
         stdout: "ignore",
         stderr: "ignore",
         windowsHide: true, // hide the CLI child's console; the user's Chrome (a GUI grandchild) stays visible
-        env: { PATH: process.env.PATH, HOME: HOME, USERPROFILE: process.env.USERPROFILE },
+        env: playwrightCliEnv(),
       });
       log(`reaped idle isolated session (idle ${Math.round((now - last) / 1000)}s): ${sess}`);
     } catch (e) {
@@ -223,24 +283,63 @@ export function splitCommand(cmd: string): string[] {
     t.startsWith('"') && t.endsWith('"') ? t.slice(1, -1) : t);
 }
 
-async function resolveProfileDirectory(nameOrEmail: string): Promise<string> {
+/** Why this daemon cannot read Chrome's data folder; reported by /ping so `rech status` shows it. */
+let chromeAccessProblem: string | undefined;
+/** Log (once) why Chrome's data folder is unreadable — under launchd/oxmgr on macOS this is TCC. */
+export function warnChromeDataAccess(path: string, error: unknown): void {
+  if (chromeAccessProblem) return;
+  const message = error instanceof Error ? error.message : String(error);
+  chromeAccessProblem = `cannot read ${path} (${message}). ${chromeDataAccessHint(error) ?? "Profile names and emails cannot be resolved here."}`;
+  log(chromeAccessProblem);
+}
+
+/** A profile name or email could not be mapped to its Chrome folder because Local State is unreadable. */
+export class ProfileResolutionError extends Error {
+  constructor(readonly profile: string, statePath: string, cause: unknown) {
+    const message = cause instanceof Error ? cause.message : String(cause);
+    const hint = chromeDataAccessHint(cause);
+    super(`[rech] cannot find the Chrome folder for profile "${profile}": ${statePath} is unreadable (${message}). Refusing, so Chrome does not create a new empty profile named "${profile}".\n`
+      + `  Register it once (records its folder in ~/.rechrome): rech setup --profile ${JSON.stringify(profile)}\n`
+      + `  Or select the folder directly, e.g. rech --profile "Profile 1" …\n`
+      + (hint ? `  ${hint}\n` : ""));
+    this.name = "ProfileResolutionError";
+  }
+}
+
+export async function resolveProfileDirectory(
+  nameOrEmail: string,
+  registry?: Record<string, { profileDir?: string }>,
+  statePaths: string[] = [
+    join(HOME || "~", "Library/Application Support/Google/Chrome/Local State"),
+    join(HOME || "~", ".config/google-chrome/Local State"),
+    join(HOME || "~", "AppData/Local/Google/Chrome/User Data/Local State"),
+  ],
+): Promise<string> {
   if (/^(Default|Profile \d+)$/i.test(nameOrEmail)) return nameOrEmail;
-  const home = HOME || "~";
-  const candidates = [
-    join(home, "Library/Application Support/Google/Chrome/Local State"),
-    join(home, ".config/google-chrome/Local State"),
-    join(home, "AppData/Local/Google/Chrome/User Data/Local State"),
-  ];
-  for (const statePath of candidates) {
-    const f = file(statePath);
-    if (!(await f.exists())) continue;
-    const data = JSON.parse(await f.text());
-    const cache: Record<string, any> = data?.profile?.info_cache ?? {};
-    for (const [dir, info] of Object.entries(cache)) {
-      if ([info.name, info.user_name, info.gaia_name].includes(nameOrEmail))
-        return dir;
+  // setup recorded each registered profile's folder in ~/.rechrome, which macOS privacy (TCC)
+  // never guards, so a launchd/oxmgr daemon resolves it without touching Chrome's data folder.
+  const entry = (registry ?? await readTokenRegistry().catch(() => ({})) as Record<string, { profileDir?: string }>)[nameOrEmail];
+  if (entry?.profileDir) return entry.profileDir;
+  let unreadable: { path: string; error: unknown } | undefined;
+  for (const statePath of statePaths) {
+    try {
+      // Read without an exists() probe: under TCC the stat fails too, and exists() would report
+      // "missing" and hide the denial.
+      const data = JSON.parse(await file(statePath).text());
+      const cache: Record<string, any> = data?.profile?.info_cache ?? {};
+      for (const [dir, info] of Object.entries(cache)) {
+        if ([info.name, info.user_name, info.gaia_name].includes(nameOrEmail))
+          return dir;
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code === "ENOENT") continue;
+      warnChromeDataAccess(statePath, error);
+      unreadable ??= { path: statePath, error };
     }
   }
+  // Passing an email or display name through would make Chrome create a NEW empty profile folder
+  // literally named after it (--profile-directory=me@example.com) instead of opening the real one.
+  if (unreadable) throw new ProfileResolutionError(nameOrEmail, unreadable.path, unreadable.error);
   return nameOrEmail;
 }
 
@@ -364,15 +463,34 @@ async function freeStalePort(port: number, host: string): Promise<void> {
 // the leak self-heals. /ping is deliberately NOT activity (the tray polls it every 2s
 // and would otherwise keep an orphan alive forever).
 const ORPHAN_POLL_INTERVAL_MS = 15_000;
-const ORPHAN_IDLE_EXIT_MS = Number(process.env.RECH_SERVE_IDLE_TIMEOUT_MS) || 5 * 60_000;
+const ORPHAN_IDLE_EXIT_MS = parseIdleTimeout(process.env.RECH_SERVE_IDLE_TIMEOUT_MS);
+
+// `RECH_SERVE_IDLE_TIMEOUT_MS=0` must disable self-exit; `Number(v) || default` turned 0 back into 5 min.
+export function parseIdleTimeout(raw: string | undefined, fallback = 5 * 60_000): number {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : fallback;
+}
+
+// A supervisor owns this serve's lifetime, so it is never a leaked foreground serve:
+// RECH_SERVE_MANAGED=1 (set by `rech setup`'s oxmgr/pm2 install), or a LaunchAgent — launchd
+// starts it with ppid 1 and its job label in XPC_SERVICE_NAME. ppid 1 alone is not enough:
+// `setsid rech serve` or `(rech serve &)` also starts with ppid 1 and must still self-exit.
+// Terminal apps set XPC_SERVICE_NAME to "0" or "application.<bundle id>…".
+export function isManagedServe(startPpid: number, env: Record<string, string | undefined> = process.env): boolean {
+  if (env.RECH_SERVE_MANAGED === "1") return true;
+  const label = env.XPC_SERVICE_NAME;
+  return startPpid === 1 && !!label && label !== "0" && !label.startsWith("application.");
+}
 
 // Pure decision predicate (testable). idleTimeoutMs <= 0 disables orphan self-exit.
 export function shouldExitOrphanedServe(opts: {
   orphaned: boolean;
   idleMs: number;
   idleTimeoutMs: number;
+  managed?: boolean;
 }): boolean {
-  return opts.idleTimeoutMs > 0 && opts.orphaned && opts.idleMs >= opts.idleTimeoutMs;
+  return !opts.managed && opts.idleTimeoutMs > 0 && opts.orphaned && opts.idleMs >= opts.idleTimeoutMs;
 }
 
 export const LANDING_HEADERS = {
@@ -380,12 +498,12 @@ export const LANDING_HEADERS = {
   "Cache-Control": "no-store",
   "Referrer-Policy": "no-referrer",
   "X-Content-Type-Options": "nosniff",
-  "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+  "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
 };
 
 /**
- * The page a shared connection URL shows in a browser: install-and-connect commands to copy,
- * one per shell. It is static; the script reads the full URL (with its #key) from the address
+ * The page a shared connection URL shows in a browser: two install-and-connect lines to copy,
+ * identical for every shell. It is static; the script reads the full URL (with its #key) from the address
  * bar, shows it with the key masked, and copies it whole.
  */
 export function landingPage(): string {
@@ -401,56 +519,83 @@ main { max-width: 760px; margin: 0 auto; padding: 40px 16px 56px; }
 h1 { font-size: 1.6rem; margin: 0 0 8px; }
 p { margin: 0 0 16px; color: var(--muted); }
 .row { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; margin: 0 0 12px; }
-.label { font-size: .8rem; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin-bottom: 6px; }
 .cmd { display: flex; gap: 10px; align-items: flex-start; }
 code { flex: 1; font: 13px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace; word-break: break-all; white-space: pre-wrap; }
 button { flex: none; font: inherit; font-size: .9rem; padding: 4px 12px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); cursor: pointer; }
 button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .warn { color: var(--warn); font-weight: 600; }
 .small { font-size: .85rem; }
+#plist { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 16px; }
+#plist button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); font-weight: 600; }
 a { color: var(--accent); }
 </style></head>
 <body><main>
 <h1>Connect to a shared Chrome</h1>
 <p>Someone shared a Chrome profile with you through <a href="https://github.com/snomiao/rechrome">rechrome</a>.
-On your computer, inside the project folder that should use it, run:</p>
-<p id="nokey" class="warn" hidden>This link is missing its key (the part after #key=). Ask for the full link from <code>rech share</code>.</p>
+On your computer, inside the project folder that should use it, run these two lines
+(the same in macOS/Linux terminals, PowerShell and cmd):</p>
+<p id="nokey" class="warn" hidden>This link is missing its key (the part after # — #key=… or #rech1_…). Ask for the full link from <code>rech share</code>.</p>
 <div id="cmds"></div>
+<div id="profiles" hidden><p>Profiles this link can use (pick one to make it the default in the command above):</p><div id="plist"></div></div>
 <p class="small">Needs <a href="https://bun.sh">Bun</a>. Then try <code>rechrome open https://example.com</code>.
 This link contains a secret key: anyone with it can use this browser profile, so share it privately.</p>
 </main>
 <script>
 (() => {
-  const url = location.href;
-  if (!/[#&?]key=/.test(location.hash)) document.getElementById("nokey").hidden = false;
-  const posix = s => "'" + s.replace(/'/g, "'\\\\''") + "'";
-  const pwsh = s => '"' + s.replace(/[\`"$]/g, c => "\`" + c) + '"';
-  const cmd = s => '"' + s.replace(/"/g, "%22") + '"';
-  const shells = [
-    ["macOS / Linux", "bun i -g rechrome && rechrome connect " + posix(url)],
-    ["Windows PowerShell", "bun i -g rechrome; rechrome connect " + pwsh(url)],
-    ["Windows cmd", "bun i -g rechrome && rechrome connect " + cmd(url)],
-  ];
-  const mask = s => s.replace(/(key=)[^&"'\`]+/, "$1…");
+  let url = location.href;
+  const key = (location.hash.match(/[#&]key=([^&]*)/) || [])[1];
+  const invite = /^#rech1_[1-9A-HJ-NP-Za-km-z]{28}$/.test(location.hash);
+  if (!/[#&?]key=/.test(location.hash) && !invite) document.getElementById("nokey").hidden = false;
+  // One command for every shell: two lines (no && vs ; split), one double-quoted URL. Characters a
+  // shell expands inside double quotes ($ \` " \\ !) are percent-encoded, which the URL reads the same;
+  // %40 goes back to a readable @ (valid in a query, and one less % for cmd to try to expand).
+  const quote = s => '"' + s.replace(/%40/g, "@").replace(/[$\`"\\\\!]/g, c => "%" + c.charCodeAt(0).toString(16).toUpperCase()) + '"';
+  const build = u => "bun i -g rechrome\\nrechrome connect " + quote(u);
+  const mask = s => s.replace(/(key=)[^&"\\n]+/, "$1…").replace(/(#rech1_[1-9A-HJ-NP-Za-km-z]{4})[1-9A-HJ-NP-Za-km-z]+/, "$1…");
   const root = document.getElementById("cmds");
-  for (const [label, text] of shells) {
-    const row = document.createElement("div"); row.className = "row";
-    const name = document.createElement("div"); name.className = "label"; name.textContent = label;
-    const line = document.createElement("div"); line.className = "cmd";
-    const code = document.createElement("code"); code.textContent = mask(text);
-    const button = document.createElement("button"); button.type = "button"; button.textContent = "Copy";
-    button.setAttribute("aria-label", "Copy the " + label + " command");
-    button.addEventListener("click", async () => {
-      try { await navigator.clipboard.writeText(text); }
-      catch {
-        // Plain-HTTP pages (e.g. a LAN address) have no clipboard API: copy via a hidden textarea.
-        const area = document.createElement("textarea"); area.value = text; document.body.append(area);
-        area.select(); document.execCommand("copy"); area.remove();
+  const row = document.createElement("div"); row.className = "row";
+  const line = document.createElement("div"); line.className = "cmd";
+  const code = document.createElement("code");
+  const entry = { text: "", update() { this.text = build(url); code.textContent = mask(this.text); } };
+  entry.update();
+  const button = document.createElement("button"); button.type = "button"; button.textContent = "Copy";
+  button.setAttribute("aria-label", "Copy the commands");
+  button.addEventListener("click", async () => {
+    const text = entry.text;
+    try { await navigator.clipboard.writeText(text); }
+    catch {
+      // Plain-HTTP pages (e.g. a LAN address) have no clipboard API: copy via a hidden textarea.
+      const area = document.createElement("textarea"); area.value = text; document.body.append(area);
+      area.select(); document.execCommand("copy"); area.remove();
+    }
+    button.textContent = "Copied"; setTimeout(() => { button.textContent = "Copy"; }, 1500);
+  });
+  line.append(code, button); row.append(line); root.append(row);
+  // The key never leaves the browser except to this listener's own /ping, which lists what it
+  // allows. Picking a profile only rewrites ?profile= in the command (the key works for all).
+  if (!key || typeof fetch !== "function") return;
+  const path = location.href.split("#")[0].split("?")[0], base = path.endsWith("/") ? path : path + "/";
+  fetch(base + "ping", { headers: { Authorization: "Bearer " + decodeURIComponent(key) } })
+    .then(r => r.ok ? r.json() : null)
+    .then(body => {
+      const profiles = body && Array.isArray(body.profiles) ? body.profiles : [];
+      if (!profiles.length) return;
+      const list = document.getElementById("plist"), buttons = [];
+      const select = p => {
+        const u = new URL(url); u.searchParams.set("profile", p); url = u.href;
+        for (const b of buttons) b.setAttribute("aria-pressed", String(b.textContent === p));
+        entry.update();
+      };
+      const current = new URL(url).searchParams.get("profile");
+      for (const p of profiles) {
+        const b = document.createElement("button"); b.type = "button"; b.textContent = p;
+        b.setAttribute("aria-pressed", String(p === current));
+        b.addEventListener("click", async () => select(p));
+        buttons.push(b); list.append(b);
       }
-      button.textContent = "Copied"; setTimeout(() => { button.textContent = "Copy"; }, 1500);
-    });
-    line.append(code, button); row.append(name, line); root.append(row);
-  }
+      document.getElementById("profiles").hidden = false;
+    })
+    .catch(() => {});
 })();
 </script>
 </body></html>
@@ -474,13 +619,23 @@ export async function serve() {
   let orphaned = false;
   let idleSince = Date.now();
   const markActivity = () => { idleSince = Date.now(); };
+  const managed = isManagedServe(process.ppid);
+  if (managed) log("serve is supervised (launchd, a process manager, or RECH_SERVE_MANAGED=1) — idle self-exit disabled");
   setInterval(() => {
     if (process.ppid === 1) orphaned = true;
-    if (shouldExitOrphanedServe({ orphaned, idleMs: Date.now() - idleSince, idleTimeoutMs: ORPHAN_IDLE_EXIT_MS })) {
+    if (shouldExitOrphanedServe({ orphaned, managed, idleMs: Date.now() - idleSince, idleTimeoutMs: ORPHAN_IDLE_EXIT_MS })) {
       log(`orphaned foreground serve idle ${Math.round((Date.now() - idleSince) / 1000)}s — exiting (spawning agent is gone)`);
       process.exit(0);
     }
   }, ORPHAN_POLL_INTERVAL_MS);
+
+  // Say at startup, not on the first failed open, when macOS privacy blocks Chrome's data folder.
+  if (process.platform === "darwin") {
+    const chromeDir = join(HOME, "Library/Application Support/Google/Chrome");
+    try { readdirSync(chromeDir); } catch (error) {
+      if ((error as { code?: string }).code !== "ENOENT") warnChromeDataAccess(chromeDir, error);
+    }
+  }
 
   // Reap idle --isolate sessions so single-shot OAuth/login drives don't leak browser contexts.
   adoptOrphanedIsoSessions();
@@ -505,24 +660,23 @@ export async function serve() {
   const legacy: Listener = { name: "legacy", host: listenHost, port, key, profiles: "*" };
   const policies = new Map<string, Listener>();
   const servers = new Map<string, ReturnType<typeof Bun.serve>>();
-  const startServer = (initial: Listener, reusePort = false) => Bun.serve({
-    hostname: initial.host,
-    port: initial.port,
-    // reusePort is used only as a last-resort fallback (see bindAtStartup below): if an orphaned
-    // holder can't be killed, binding with SO_REUSEADDR keeps serve up (degraded, port-shared)
-    // instead of crash-looping on EADDRINUSE. The normal path binds a clean, exclusive socket.
-    reusePort,
-    tls,
-    error(err) {
-      log(`unhandled error: ${err.message}`);
-      return Response.json({ status: 1, stdout: "", stderr: err.message }, { status: 500 });
-    },
-    async fetch(req, server) {
-      const listener = policies.get(listenerAddress(initial));
-      if (!listener) return new Response("Listener removed", { status: 403 });
-      const key = listener.key;
-      const listenHost = listener.host;
-      const scoped = listener.profiles !== "*";
+  // Shares (shares.json) are reloaded with the listeners below. sessionOwners remembers which
+  // credential drove each session, for `rech session ls` and for closing a revoked share's sessions.
+  let shares: ShareConfig = { version: 1, shares: [] };
+  const sessionOwners = new Map<string, { owner: string; label: string; profile?: string; name: string; lastUsed: number }>();
+  const deviceSeen = new Map<string, number>();
+  const noteDeviceUse = (cred: Credential & { kind: "device" }) => {
+    const now = Date.now();
+    if (now - (deviceSeen.get(cred.device.id) ?? cred.device.lastSeen ?? 0) < 10 * 60_000) return;
+    deviceSeen.set(cred.device.id, now);
+    void updateShares(config => {
+      const device = config.shares.find(s => s.id === cred.share.id)?.devices.find(d => d.id === cred.device.id);
+      if (device) device.lastSeen = now;
+    }).catch(error => log(`could not record device use: ${error}`));
+  };
+
+  const handle = async (req: Request, initialListener: Listener, remoteAddr: () => string): Promise<Response> => {
+      let listener = initialListener;
       const reqUrl = new URL(req.url);
       const prefix = normalizePrefix(listener.prefix);
       // Accept the path with or without the prefix, so a proxy works whether it keeps the
@@ -533,18 +687,79 @@ export async function serve() {
         else if (reqUrl.pathname.startsWith(prefix)) reqUrl.pathname = "/" + reqUrl.pathname.slice(prefix.length);
       }
 
+      // Who is asking: the listener's own key (legacy links, the local management key), or a
+      // share credential (an invite or a device, see shares.ts) offered on this transport. A
+      // share narrows the listener to the share's own profiles.
+      const presented = req.headers.get("authorization")?.replace(/^Bearer /, "") ?? "";
+      const cred = presented && !safeEqual(presented, listener.key) ? credentialForBearer(shares, presented) : null;
+      if (cred) {
+        const route = reqUrl.pathname === "/ping" ? "ping" : reqUrl.pathname === "/redeem" ? "redeem" : "use";
+        const denial = authorizeCredential(cred, listener.name, route);
+        if (denial) return Response.json({ status: 1, stdout: "", stderr: `[rech] ${denial.message}\n`, error: denial.message, pending: denial.pending }, { status: denial.status });
+        if (cred.kind === "device") noteDeviceUse(cred);
+        listener = { ...listener, key: presented, profiles: cred.share.profiles };
+      }
+      const key = listener.key;
+      const listenHost = listener.host;
+      const scoped = listener.profiles !== "*";
+      const owner = cred?.kind === "device" ? `share:${cred.share.id}:${cred.device.id}` : `listener:${listener.name}`;
+
+      if (reqUrl.pathname === "/redeem" && req.method === "POST") {
+        if (cred?.kind !== "invite") return Response.json({ error: "Only an invite link can be redeemed." }, { status: 400 });
+        const { name } = await req.json().catch(() => ({})) as { name?: string };
+        try {
+          const device = await updateShares(config => redeemInvite(config, cred.share.id, String(name ?? "")));
+          shares = await readShares();
+          log(`share ${cred.share.label}: invite redeemed by device ${device.id} (${device.name})${device.approved ? "" : ", waiting for approval"}`);
+          return Response.json({ token: device.token, device: { id: device.id, name: device.name, approved: device.approved }, share: cred.share.label, profiles: cred.share.profiles });
+        } catch (error) { return Response.json({ error: error instanceof Error ? error.message : String(error) }, { status: 403 }); }
+      }
+
+      if (reqUrl.pathname === "/profiles") {
+        const denied = authCheck(req, key);
+        if (denied) return denied;
+        const registry = await readTokenRegistry().catch(() => ({} as Awaited<ReturnType<typeof readTokenRegistry>>));
+        const cache = await readChromeProfileCache().catch(() => null) ?? {};
+        const keys = listener.profiles === "*" ? Object.keys(registry) : listener.profiles;
+        return Response.json({ share: cred?.share.label, profiles: keys.map(k => ({ key: k, name: cache[registry[k]?.profileDir ?? ""]?.name ?? "", registered: !!registry[k] })) });
+      }
+
+      if (reqUrl.pathname === "/sessions") {
+        const denied = authCheck(req, key);
+        if (denied) return denied;
+        let live = new Set<string>();
+        try { live = new Set(readdirSync(tmpSocketRoot()).filter(f => f.endsWith(".sock")).map(f => f.slice(0, -5))); } catch {}
+        const all = listener.profiles === "*" && !cred;
+        const rows = [...sessionOwners.entries()]
+          .filter(([, o]) => all || o.owner === owner)
+          .map(([session, o]) => ({ session: o.name, profile: o.profile, client: o.label, owner: all ? o.owner : undefined, lastUsed: o.lastUsed, live: live.has(session) }))
+          .sort((a, b) => b.lastUsed - a.lastUsed);
+        return Response.json({ sessions: rows });
+      }
+
       // Serve files from output dir
       if (reqUrl.pathname.startsWith("/files/")) {
         const denied = authCheck(req, key);
         if (denied) return denied;
         const name = decodeURIComponent(reqUrl.pathname.slice(7));
         if (!isUnderDir(workDir, name)) return new Response("Forbidden", { status: 403 });
-        if (!canReadProfileFile(listener, name)) return new Response("Forbidden", { status: 403 });
+        const readable = (path: string) => canReadProfileFile(listener, path)
+          && (cred?.kind !== "device" || cred.share.profiles.some(p => path.startsWith(`${profileOutputPrefix(p)}d-${cred.device.id}/`)));
+        if (!readable(name)) return new Response("Forbidden", { status: 403 });
         const resolved = resolve(workDir, name);
         const f = file(resolved);
         if (!(await f.exists())) return new Response("Not found", { status: 404 });
         const real = realpathSync(resolved);
-        if (!isUnderDir(realpathSync(workDir), real) || !canReadProfileFile(listener, relative(realpathSync(workDir), real).replaceAll("\\", "/"))) return new Response("Forbidden", { status: 403 });
+        if (!isUnderDir(realpathSync(workDir), real) || !readable(relative(realpathSync(workDir), real).replaceAll("\\", "/"))) return new Response("Forbidden", { status: 403 });
+        if (deniedFiles.has(real)) return new Response("Forbidden", { status: 403 });
+        if (TEXT_OUTPUT.test(real)) {
+          const busy = () => [...runsInFlight].filter(([, dir]) => !dir || real.startsWith(dir + sep)).map(([p]) => p);
+          for (let pending = busy(); pending.length; pending = busy()) await Promise.all(pending); // re-check: new runs may start
+          // Synchronous from the last check on: no await, so no new run can start and write here.
+          if (deniedFiles.has(real)) return new Response("Forbidden", { status: 403 });
+          if (!existsSync(real)) return new Response("Not found", { status: 404 }); // withheld
+          return new Response(maskPasswordLines(secretMasker.mask(readFileSync(real, "utf8"))));
+        }
         return new Response(f);
       }
 
@@ -556,17 +771,20 @@ export async function serve() {
         // clients / `rech status` can see trouble without an active probe.
         const degraded = consecutiveTimeouts > 0;
         if (scoped || !reqUrl.searchParams.get("deep"))
-          return Response.json({ ok: true, bind: listenHost, listener: listener.name, profiles: listener.profiles, multiListener: true, consecutiveTimeouts, degraded });
+          return Response.json({
+            ok: true, bind: listenHost, listener: listener.name, profiles: listener.profiles, multiListener: true, consecutiveTimeouts, degraded, chromeAccessProblem,
+            ...(cred ? { share: cred.share.label, kind: cred.kind, ...(cred.kind === "device" ? { device: { id: cred.device.id, name: cred.device.name, approved: cred.device.approved } } : {}), expiresAt: cred.share.expiresAt } : {}),
+          });
         // Deep probe: exercise the relay read-only via `tab-list` (opens nothing) against the
         // most-recently-used session — never a fresh one, which could spawn a browser window.
         const target = [...recentSessions.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
         if (!target)
-          return Response.json({ ok: true, bind: listenHost, relay: "idle", consecutiveTimeouts, degraded });
+          return Response.json({ ok: true, bind: listenHost, relay: "idle", consecutiveTimeouts, degraded, chromeAccessProblem });
         const [pbin, ...pbinArgs] = splitCommand(resolvePlaywrightCli());
         const probe = Bun.spawn([pbin, ...pbinArgs, "tab-list", `-s=${target}`], {
           cwd: workDir, stdin: "ignore", stdout: "ignore", stderr: "ignore",
           windowsHide: true,
-          env: { PATH: process.env.PATH, HOME: HOME, USERPROFILE: process.env.USERPROFILE },
+          env: playwrightCliEnv(),
         });
         const probeStatus = await Promise.race([
           probe.exited,
@@ -575,7 +793,7 @@ export async function serve() {
         const healthy = probeStatus !== -1;
         return Response.json({
           ok: healthy, bind: listenHost, relay: healthy ? "healthy" : "degraded",
-          consecutiveTimeouts, degraded: degraded || !healthy,
+          consecutiveTimeouts, degraded: degraded || !healthy, chromeAccessProblem,
         });
       }
       // A browser opening a shared URL gets copyable connect instructions. The key stays in the
@@ -586,8 +804,14 @@ export async function serve() {
       const denied = authCheck(req, key);
       if (denied) return denied;
       markActivity(); // a real command: this serve is not idle
+      let runDone = () => {};
+      const running = new Promise<void>((r) => { runDone = r; });
+      runsInFlight.set(running, undefined); // dir not known yet: holds every text download
+      try { return await (async () => {
 
-      const body = await req.json();
+      let body: any;
+      try { body = await readRequestJson(req); }
+      catch { return Response.json({ status: 1, stdout: "", stderr: "Invalid JSON or request exceeds 3 MiB\n" }, { status: 400 }); }
       let scopedProfile: string | undefined;
       let profileEnv: Record<string, string> = {};
       if (scoped) {
@@ -614,20 +838,29 @@ export async function serve() {
             PLAYWRIGHT_MCP_USER_DATA_DIR: entry.userDataDir || "",
             PLAYWRIGHT_MCP_LOAD_EXTENSION: entry.loadExtension || "",
           };
-          body.identity.key = `scoped:${body.identity.key}`;
+          // A share's devices never share browser state with each other or with legacy links.
+          body.identity.key = cred?.kind === "device" ? `share:${cred.share.id}:${cred.device.id}:${body.identity.key}` : `scoped:${body.identity.key}`;
+          if (cred) body.identity.label = cred.share.label;
           body.env = {}; // Server-owned profile configuration wins over every client override.
-        } catch (error) { return Response.json({ status: 1, stdout: "", stderr: `${error instanceof Error ? error.message : String(error)}\n` }, { status: 403 }); }
+        } catch (error) {
+          if (Array.isArray(body?.args) && body.args.filter((a: unknown) => typeof a !== "string" || !/^-s=[a-zA-Z0-9_-]{1,64}$/.test(a))[0] === "upload")
+            log(`upload: ${JSON.stringify({ listener: listener.name, profile: scopedProfile ?? null, name: typeof body.upload?.name === "string" ? body.upload.name.slice(0, 128) : null, size: null, sha256: null, origin: null, result: "rejected" })}`);
+          return Response.json({ status: 1, stdout: "", stderr: `${error instanceof Error ? error.message : String(error)}\n` }, { status: 403 });
+        }
       }
-      const outputPrefix = scopedProfile ? profileOutputPrefix(scopedProfile) : "";
+      // A share device's files live under its own folder, so other devices and links on the same
+      // profile can't fetch them (see the /files check above).
+      const outputPrefix = scopedProfile ? profileOutputPrefix(scopedProfile) + (cred?.kind === "device" ? `d-${cred.device.id}/` : "") : "";
       const runWorkDir = scopedProfile ? join(workDir, outputPrefix) : workDir;
       mkdirSync(runWorkDir, { recursive: true });
+      runsInFlight.set(running, realpathSync(runWorkDir));
       let args: string[];
       let sessionId: string;
       let clientName = "";
       let clientEnv: Record<string, string> = {};
       if (Array.isArray(body)) {
         args = body;
-        const clientAddr = `${req.headers.get("x-forwarded-for") || server.requestIP(req)?.address || "unknown"}`;
+        const clientAddr = remoteAddr();
         sessionId = createHash("sha256").update(clientAddr).digest("hex").slice(0, 8);
         clientName = clientAddr;
         log(`session from client IP: ${clientAddr} -> ${sessionId}`);
@@ -648,7 +881,7 @@ export async function serve() {
           clientName = labelBase || keyBase;
           log(`session from identity: ${clientName}${id?.profile ? ` profile:${id.profile}` : ""} [${keyBase}] -> ${sessionId}`);
         } else {
-          const clientAddr = `${req.headers.get("x-forwarded-for") || server.requestIP(req)?.address || "unknown"}`;
+          const clientAddr = remoteAddr();
           sessionId = createHash("sha256").update(clientAddr).digest("hex").slice(0, 8);
           clientName = clientAddr;
           log(`session from client IP fallback: ${clientAddr} -> ${sessionId}`);
@@ -673,6 +906,8 @@ export async function serve() {
       const namespacedSession = clientSession ? `${sessionId}-${clientSession}` : sessionId;
       // Track --isolate sessions so the idle-TTL reaper can close them later.
       const nowMs = Date.now();
+      sessionOwners.set(namespacedSession, { owner, label: cred ? `${cred.share.label}/${(cred as any).device?.name ?? ""}` : clientName, profile: scopedProfile ?? (body as any)?.identity?.profile, name: clientSession || "default", lastUsed: nowMs });
+      if (sessionOwners.size > 512) sessionOwners.delete(sessionOwners.keys().next().value!);
       if (isIsoSession(namespacedSession)) isoLastUsed.set(namespacedSession, nowMs);
       else noteSession(namespacedSession, nowMs); // for the deep health probe to target
 
@@ -685,6 +920,27 @@ export async function serve() {
       }
 
       log(`run: rech ${filteredArgs.join(" ")} (session=${namespacedSession})`);
+
+      // fill-secret: the value arrives in body.secret, never in args; it is handed to the live
+      // session over its socket (no child argv) and never logged. See fill-secret.ts.
+      if (filteredArgs[0] === "fill-secret") {
+        const secret = !Array.isArray(body) && typeof body.secret === "string" ? body.secret : "";
+        try {
+          const { ref, allowDomains, submit, totp } = parseFillSecretWire(filteredArgs);
+          if (!secret) throw new Error("fill-secret: the request carried no secret (this client is older than the daemon?)");
+          secretMasker.add(secret, totp ? undefined : Infinity);
+          const reply = await fillSecretOnSession({ socketRoot: tmpSocketRoot(), session: namespacedSession, cwd: runWorkDir, ref, value: secret, allowDomains, submit });
+          // Drop the echoed run-code body (it embeds the value, masked or not, and is noise).
+          const text = secretMasker.mask(reply.text).replace(/### Ran Playwright code\n```js\n[\s\S]*?\n```\n?/, "").trim();
+          const status = reply.isError ? 1 : 0;
+          log(`exit: ${status} | fill-secret ${ref}`);
+          return Response.json(reply.isError ? { status, stdout: "", stderr: `${text}\n`, files: [] } : { status, stdout: `${text}\n`, stderr: "", files: [] });
+        } catch (error) {
+          const message = secretMasker.mask(secret ? (error instanceof Error ? error.message : String(error)).replaceAll(secret, "***") : (error instanceof Error ? error.message : String(error)));
+          log(`exit: 1 | fill-secret: ${message.split("\n")[0]}`);
+          return Response.json({ status: 1, stdout: "", stderr: `[rech] ${message}\n`, files: [] });
+        }
+      }
 
       // For open commands, default to about:blank to avoid leaving connect.html visible
       const isOpenCmd = filteredArgs[0] === "open";
@@ -700,7 +956,14 @@ export async function serve() {
 
       // Resolve profile name/email → directory name
       if (!scoped && passthroughEnv.PLAYWRIGHT_MCP_PROFILE_DIRECTORY) {
-        const resolved = await resolveProfileDirectory(passthroughEnv.PLAYWRIGHT_MCP_PROFILE_DIRECTORY);
+        let resolved: string;
+        try {
+          resolved = await resolveProfileDirectory(passthroughEnv.PLAYWRIGHT_MCP_PROFILE_DIRECTORY);
+        } catch (error) {
+          if (!(error instanceof ProfileResolutionError)) throw error;
+          log(`refused unresolvable profile "${error.profile}" (session=${namespacedSession})`);
+          return Response.json({ status: 1, stdout: "", stderr: error.message, files: [] });
+        }
         if (resolved !== passthroughEnv.PLAYWRIGHT_MCP_PROFILE_DIRECTORY)
           log(`profile resolved: "${passthroughEnv.PLAYWRIGHT_MCP_PROFILE_DIRECTORY}" → "${resolved}"`);
         passthroughEnv.PLAYWRIGHT_MCP_PROFILE_DIRECTORY = resolved;
@@ -735,7 +998,7 @@ export async function serve() {
             stdout: "pipe",
             stderr: "pipe",
             windowsHide: true, // hide the CLI child's console; the user's Chrome (a GUI grandchild) stays visible
-            env: { PATH: process.env.PATH, HOME: HOME, USERPROFILE: process.env.USERPROFILE },
+            env: playwrightCliEnv(),
           });
           const [listStatus, listOut] = await Promise.race([
             Promise.all([listProc.exited, new Response(listProc.stdout).text()]),
@@ -764,14 +1027,6 @@ export async function serve() {
       }
 
       const childEnv: Record<string, string | undefined> = {
-        PATH: process.env.PATH,
-        HOME: HOME,
-        USERPROFILE: process.env.USERPROFILE,
-        TMPDIR: process.env.TMPDIR,
-        DISPLAY: process.env.DISPLAY,
-        XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR,
-        DEBUG: process.env.DEBUG, // forward debug namespaces (e.g. pw:mcp:relay) for diagnostics
-        PWDEBUG: process.env.PWDEBUG,
         ...(clientName ? { PLAYWRIGHT_MCP_CLIENT_NAME: shortClientLabel(clientName) } : {}),
         ...passthroughEnv,
         // Enable extension bridge when credentials are present
@@ -779,19 +1034,36 @@ export async function serve() {
           ? { PLAYWRIGHT_MCP_EXTENSION: "1" }
           : {}),
       };
-      // For open commands: clean up stale sockets so a closed browser can be reopened
-      if (isOpenCmd) {
-        const tmpDir = (process.env.TMPDIR || "/tmp").replace(/\/$/, "");
-        const playwrightTmpDir = `${tmpDir}/playwright-cli`;
+      if (filteredArgs[0] === "upload") {
+        const result = await receiveUpload({
+          policy: listener.uploads, payload: body.upload, args: filteredArgs,
+          audit: event => log(`upload: ${JSON.stringify({ listener: listener.name, profile: scopedProfile ?? body.identity?.profile ?? null, ...event })}`),
+          run: async uploadArgs => {
+            const child = Bun.spawn([bin, ...binArgs, ...uploadArgs, `-s=${namespacedSession}`], {
+              cwd: runWorkDir, stdin: "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true, env: playwrightCliEnv(childEnv),
+            });
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            try {
+              const result = Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+              const [status, stdout, stderr] = await Promise.race([result, new Promise<never>((_, reject) => {
+                timer = setTimeout(() => { child.kill(); reject(new Error("Upload command timed out")); }, 30_000);
+              })]);
+              return { status, stdout, stderr };
+            } finally { clearTimeout(timer); }
+          },
+        });
+        return Response.json({ ...result, files: [] });
+      }
+
+      // Only a remaining open needs cleanup; a successful probe converted it to
+      // goto and its live daemon socket must remain reachable.
+      if (filteredArgs[0] === "open") {
+        const socketRoot = tmpSocketRoot();
         try {
-          const { readdirSync } = await import("fs");
-          for (const sub of readdirSync(playwrightTmpDir)) {
-            const subDir = `${playwrightTmpDir}/${sub}`;
-            for (const f of readdirSync(subDir)) {
-              if (f.startsWith(namespacedSession)) {
-                const sockPath = `${subDir}/${f}`;
-                try { unlinkSync(sockPath); log(`Removed stale socket: ${sockPath}`); } catch {}
-              }
+          for (const f of readdirSync(socketRoot)) {
+            if (f === `${namespacedSession}.sock`) {
+              const sockPath = join(socketRoot, f);
+              try { unlinkSync(sockPath); log(`Removed stale socket: ${sockPath}`); } catch {}
             }
           }
         } catch {}
@@ -804,7 +1076,7 @@ export async function serve() {
         stdout: "pipe",
         stderr: "pipe",
         windowsHide: true, // hide the CLI child's console; the user's Chrome (a GUI grandchild) stays visible
-        env: childEnv,
+        env: playwrightCliEnv(childEnv),
       });
 
       const TIMEOUT = 60_000;
@@ -817,7 +1089,7 @@ export async function serve() {
           reject(new Error("timeout"));
         }, TIMEOUT);
       });
-      const [status, stdout, rawStderr] = await Promise.race([
+      let [status, stdout, rawStderr] = await Promise.race([
         Promise.all([
           proc.exited,
           new Response(proc.stdout).text(),
@@ -833,7 +1105,8 @@ export async function serve() {
       const handshakeTimeoutMs = Number.isFinite(configuredHandshakeTimeout) && configuredHandshakeTimeout > 0
         ? configuredHandshakeTimeout
         : 30_000;
-      const stderr = inferSilentExtensionFailure({
+      const tccNote = explainExtensionNotFound(`${stdout}\n${rawStderr}`, chromeAccessProblem);
+      let stderr = (tccNote ?? "") + inferSilentExtensionFailure({
         status,
         stdout,
         stderr: rawStderr,
@@ -843,6 +1116,24 @@ export async function serve() {
         handshakeTimeoutMs,
       });
 
+      // Snapshots print every input's value, password fields included (e.g. ones Chrome
+      // autofilled). Read the live password values and mask them before anything is logged,
+      // returned or left on disk; the label-based pass catches what the scan misses.
+      // Fails closed: a snapshot that can't be fully checked is withheld, not passed through.
+      const rawOutput = `${stdout}\n${stderr}`; // artifact paths come from the unmasked text
+      const snapshotOut = hasSnapshot(rawOutput);
+      let withheld = "";
+      if (snapshotOut) {
+        try {
+          for (const v of await passwordValuesOnSession({ socketRoot: tmpSocketRoot(), session: namespacedSession, cwd: runWorkDir })) secretMasker.add(v, Infinity);
+        } catch (error) {
+          withheld = "could not check it for password values";
+          log(`snapshot withheld: ${secretMasker.mask(error instanceof Error ? error.message : String(error)).split("\n")[0]}`);
+        }
+      }
+      stdout = maskPasswordLines(secretMasker.mask(stdout));
+      stderr = maskPasswordLines(secretMasker.mask(stderr));
+      if (withheld) { stdout = withholdSnapshots(stdout, withheld); stderr = withholdSnapshots(stderr, withheld); }
       log(`exit: ${status}${stdout.trim() ? ` | ${stdout.trim().slice(0, 200)}` : ""}`);
 
       // Relay self-heal (see notes at SESSION_CLOSE_TIMEOUTS). A command that RETURNS usually
@@ -860,7 +1151,7 @@ export async function serve() {
             Bun.spawn([bin, ...binArgs, "close", `-s=${namespacedSession}`], {
               cwd: runWorkDir, stdin: "ignore", stdout: "ignore", stderr: "ignore",
               windowsHide: true,
-              env: { PATH: process.env.PATH, HOME: HOME, USERPROFILE: process.env.USERPROFILE },
+              env: playwrightCliEnv(),
             });
           } catch {}
           sessionTimeouts.delete(namespacedSession);
@@ -880,12 +1171,8 @@ export async function serve() {
       }
 
       // Detect files mentioned in output
-      const filePattern = /[\w./-]+\.(?:png|jpe?g|pdf|json|yml)\b/gi;
-      const mentionedFiles = [
-        ...new Set(
-          [...stdout.matchAll(filePattern), ...stderr.matchAll(filePattern)].map((m) => m[0]),
-        ),
-      ];
+      const filePattern = /[\w./-]+\.(?:png|jpe?g|pdf|json|ya?ml)\b/gi;
+      const mentionedFiles = [...new Set([...rawOutput.matchAll(filePattern)].map((m) => m[0]))];
       const outputFiles: string[] = [];
       for (const f of mentionedFiles) {
         if (!isUnderDir(runWorkDir, f)) continue;
@@ -905,6 +1192,35 @@ export async function serve() {
         }
       }
 
+      // A file the command was told to write (`snapshot --filename=x.yml`) is its own artifact too.
+      const ownFilenames = filteredArgs.flatMap((a, i) => a.startsWith("--filename=") ? [a.slice(11)] : a === "--filename" && filteredArgs[i + 1] ? [filteredArgs[i + 1]!] : []);
+      // Snapshot files echo input values: scrub them on disk too, not only on download. Only
+      // files this command wrote (a page can merely mention an existing file's name). One that
+      // can't be checked or scrubbed is deleted, or, failing that, never served.
+      // The command's own --filename targets count even when the output doesn't name them.
+      const ownTargets = ownFilenames.filter(n => isUnderDir(runWorkDir, n) && existsSync(join(runWorkDir, n)));
+      if (snapshotOut || secretMasker.active) for (const f of [...new Set([...outputFiles, ...ownTargets])]) {
+        const ownFile = ownFilenames.some(n => resolve(runWorkDir, n) === resolve(runWorkDir, f));
+        if (!ownFile && !CLI_TEXT_ARTIFACT.test(f.replaceAll("\\", "/"))) continue;
+        const path = join(runWorkDir, f);
+        let mtimeMs = 0;
+        try { mtimeMs = statSync(path).mtimeMs; } catch { continue; }
+        if (mtimeMs < commandStartedAt - 1000) continue;
+        try {
+          // Unchecked: withhold every snapshot file, and anything the command was told to write.
+          if (withheld && (ownFile || /\.ya?ml$/i.test(f))) throw new Error("withheld");
+          // Text vs binary by content, not name: `snapshot --filename=x.png` writes text.
+          const bytes = new Uint8Array(await file(path).arrayBuffer());
+          if (bytes.subarray(0, 8192).includes(0)) continue; // binary (e.g. a screenshot)
+          const text = new TextDecoder().decode(bytes);
+          const masked = maskPasswordLines(secretMasker.mask(text));
+          if (masked !== text) await Bun.write(path, masked);
+        } catch {
+          try { unlinkSync(path); } catch { try { deniedFiles.add(realpathSync(path)); } catch {} }
+          if (outputFiles.includes(f)) outputFiles.splice(outputFiles.indexOf(f), 1);
+        }
+      }
+
       const rebrand = (s: string) => s.replaceAll("npx playwright-cli", "rech");
       return Response.json({
         status,
@@ -914,6 +1230,34 @@ export async function serve() {
         // a cross-OS daemon↔client (e.g. Windows daemon serving a Linux container client).
         files: outputFiles.map((p) => (outputPrefix + p).replaceAll("\\", "/")),
       });
+      })(); } finally { runsInFlight.delete(running); runDone(); }
+  };
+
+  // WebRTC: the same handler, reached over an encrypted DataChannel. Each request carries the
+  // bearer of the credential whose room it came in on, so share checks apply unchanged.
+  const webrtcListener: Listener = { name: WEBRTC, host: "webrtc", port: 0, key: randomBytes(24).toString("base64url"), profiles: [] };
+  const webrtc = new WebrtcHost(async (req, token) => {
+    const headers = new Headers(req.headers);
+    headers.set("Authorization", `Bearer ${bearerOf(token)}`);
+    return handle(new Request(req, { headers }), webrtcListener, () => "webrtc");
+  }, log);
+
+  const startServer = (initial: Listener, reusePort = false) => Bun.serve({
+    hostname: initial.host,
+    port: initial.port,
+    // reusePort is used only as a last-resort fallback (see bindAtStartup below): if an orphaned
+    // holder can't be killed, binding with SO_REUSEADDR keeps serve up (degraded, port-shared)
+    // instead of crash-looping on EADDRINUSE. The normal path binds a clean, exclusive socket.
+    reusePort,
+    tls,
+    error(err) {
+      log(`unhandled error: ${err.message}`);
+      return Response.json({ status: 1, stdout: "", stderr: err.message }, { status: 500 });
+    },
+    async fetch(req, server) {
+      const listener = policies.get(listenerAddress(initial));
+      if (!listener) return new Response("Listener removed", { status: 403 });
+      return handle(req, listener, () => `${req.headers.get("x-forwarded-for") || server.requestIP(req)?.address || "unknown"}`);
     },
   });
 
@@ -982,12 +1326,42 @@ export async function serve() {
     configured ||= !!config;
     applied = fingerprint;
   };
+  // Shares change independently of listeners (redeem, approve, revoke); a bad shares.json keeps
+  // the previous one, like listeners.json.
+  let appliedShares = "";
+  const reloadShares = async () => {
+    const next = await readShares();
+    // Expiry is time-based: fold "what is live right now" into the fingerprint so an expiring
+    // share or invite closes its rooms and sessions without anyone touching the file.
+    const now = Date.now();
+    const fingerprint = JSON.stringify(next) + JSON.stringify(next.shares.map(s => [!!shareProblem(s, now), !!(s.inviteExpiresAt && now >= s.inviteExpiresAt)]));
+    if (fingerprint === appliedShares) return;
+    const allowed = new Set(next.shares.filter(s => !shareProblem(s, now)).flatMap(s => s.devices.map(d => `share:${s.id}:${d.id}`)));
+    const dropped = [...sessionOwners.entries()].filter(([, o]) => o.owner.startsWith("share:") && !allowed.has(o.owner));
+    shares = next;
+    appliedShares = fingerprint;
+    // A revoked share or a removed device loses its browser sessions too.
+    if (dropped.length) {
+      const [bin, ...binArgs] = splitCommand(resolvePlaywrightCli());
+      for (const [session, o] of dropped) {
+        sessionOwners.delete(session);
+        try { Bun.spawn([bin, ...binArgs, "close", `-s=${session}`], { cwd: workDir, stdin: "ignore", stdout: "ignore", stderr: "ignore", windowsHide: true, env: playwrightCliEnv() }); } catch {}
+        log(`closed session ${session} of ${o.label}: its share was revoked or its device removed`);
+      }
+    }
+    const creds = webrtcCredentials(next);
+    webrtc.sync(creds.map(c => ({ token: c.token, signal: c.share.signal!, label: c.kind === "device" ? `${c.share.label}/${c.device.name}` : `${c.share.label} (invite)` })));
+    if (creds.length || webrtc.size) log(`webrtc: listening for ${creds.length} share credential(s)`);
+  };
+  await reloadShares().catch(error => log(`shares.json rejected: ${error}`));
   await reload(true);
   let reloading = false;
   let lastError = "";
   setInterval(async () => {
     if (reloading) return;
     reloading = true;
+    // Independent: a broken listeners.json must not freeze revocations (and vice versa).
+    try { await reloadShares(); } catch (error) { log(`shares.json reload rejected; previous shares retained: ${error}`); }
     try { await reload(); lastError = ""; }
     catch (error) {
       const message = String(error);
@@ -996,4 +1370,19 @@ export async function serve() {
     } finally { reloading = false; }
   }, 1000);
   log("Connection credentials remain in local configuration; listener changes reload automatically");
+  // Keep Tailscale Serve routes on the listeners' current ports: right away, after every listener
+  // change, and every few minutes (routes can be edited by hand). Each finding is logged once.
+  let checkedFor = "", lastReport = "", lastCheck = 0, checking = false;
+  setInterval(async () => {
+    if (checking || (applied === checkedFor && Date.now() - lastCheck < 5 * 60_000)) return;
+    checking = true;
+    try {
+      const listeners = JSON.parse(applied || "[]") as Listener[];
+      const lines = await checkTailscaleServe(listeners);
+      const report = lines.join("\n");
+      if (report && report !== lastReport) for (const line of lines) log(line);
+      lastReport = report; checkedFor = applied; lastCheck = Date.now();
+    } catch (error) { log(`tailscale serve health check failed: ${error}`); }
+    finally { checking = false; }
+  }, 2000);
 }

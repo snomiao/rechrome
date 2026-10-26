@@ -10,7 +10,7 @@ test("share --all: one snapshot link, profiles picked on the host, never the man
   const reserve = () => { const s = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() }); const p = s.port!; s.stop(true); return p; };
   const mgmtPort = reserve(), onePort = reserve();
   await mkdir(join(root, ".rechrome"));
-  for (const name of ["rechrome.ts", "serve.ts", "listeners.ts", "extension-token.ts", "daemon-manager.ts"])
+  for (const name of ["rechrome.ts", "serve.ts", "listeners.ts", "extension-token.ts", "daemon-manager.ts", "fill-secret.ts", "scoped-upload.ts", "shares.ts", "secret.ts", "e2e.ts", "webrtc.ts", "signal-relay.ts"])
     await copyFile(join(import.meta.dir, name), join(root, name));
   await symlink(join(import.meta.dir, "node_modules"), join(root, "node_modules"), "junction");
   // Stand-in playwright-cli: report the profile the host chose and the session it was given.
@@ -53,7 +53,12 @@ test("share --all: one snapshot link, profiles picked on the host, never the man
     const ownListener = ownConfig.listeners.find((l: any) => l.name === "personal");
     expect(ownListener.host).toBe("127.0.0.1");
     expect(ownListener.key).not.toBe(one.key);
-    expect((await rech(["share", "personal"], hostEnv)).stdout.trim()).toBe(own.stdout.trim());   // now shared: same link
+    const reshared = await rech(["share", "personal"], hostEnv);
+    expect(reshared.stdout.trim()).toBe(own.stdout.trim());   // now shared: same link
+    // ...but still loopback-only with no proxy: say so and how to expose it, not a bare 127.0.0.1 URL.
+    expect(reshared.stderr).toContain("this link only works on this machine");
+    expect(reshared.stderr).toContain(`rech listener set ${ownListener.name} --public-url`);
+    expect((await rech(["share", "personal", "--local"], hostEnv)).stderr).not.toContain("only works on this machine");
     ownConfig.listeners = ownConfig.listeners.filter((l: any) => l !== ownListener && l.name !== ownListener.name);
     await writeFile(listenersPath, JSON.stringify(ownConfig));   // keep the rest of this test's setup unchanged
 
