@@ -64,6 +64,39 @@ verbatim: `rech --version` prints rechrome's version, `rech pw --version` playwr
 Commands from the same git worktree share one browser session, so tabs you open persist
 between calls; another worktree gets its own. `-s=<name>` opens a named sub-session.
 
+#### Passwords and 2FA codes: `fill-secret`
+
+`rech fill <ref> <password>` puts the password in the command line, the daemon log and the output.
+`fill-secret` keeps it out of all three:
+
+```bash
+rech fill-secret e7 --from-env SITE_PASSWORD --allow-domain '*.app.example.com'
+rech fill-secret e9 --totp-from-env SITE_TOTP_SEED --env-file ~/secrets/.env --allow-domain '*.app.example.com' --submit
+printf '%s\n' "$PW" | rech fill-secret e7 --from-stdin
+```
+
+The client reads the value (or computes the TOTP code from a base32 seed: SHA1, 6 digits, 30 s; the
+seed never leaves the client) and sends it outside the command's arguments. The daemon hands it to
+the browser over the session's local socket. `--allow-domain` is checked against the host of the
+field's own frame (an allowed page can't lend its host to a cross-origin iframe), and the fill goes
+to that exact element, so it fails rather than types into a page that navigated after the check.
+Snapshots echo input values, so the daemon shows `***` for the value in this and every later output,
+log line and saved snapshot file: passwords until the daemon restarts, TOTP codes for 15 minutes.
+Profile-scoped listeners accept `fill-secret` with its own flags.
+
+Every password field is masked in snapshots, whoever filled it (you, Chrome's autofill, or
+`fill-secret`): when an output carries a snapshot, the daemon reads the live values of all
+`input[type=password]` fields in every frame (plus fields marked as passwords by `autocomplete` or a
+name/id containing "pass", which covers a "show password" toggle) and masks them, and also blanks
+any textbox whose name reads like a password field (password, PIN, パスワード…). If that check can't
+be completed, the snapshot is withheld (inline and as a file) instead of passed through.
+
+Limits: the masking stops accidental echoes, not someone who can run `eval`/`run-code` on the
+session and deliberately reads the field back encoded. A snapshot file is scrubbed right after the
+browser writes it, not before (downloads wait for the scrub). The check reads the page right after
+the snapshot, so a page script that clears or replaces a neutrally-labelled password field in
+between can slip past; closing that needs redaction inside playwright's snapshot code. Not yet supported on a Windows daemon.
+
 ### 3. Where things are kept
 
 | Where | What |
@@ -77,9 +110,71 @@ directory outside git. rechrome reads `RECHROME_URL` from the nearest `.rechrome
 When editing a file by hand, quote the URL (`RECHROME_URL="…#key=…"`): unquoted, a `#` starts a
 comment for some .env loaders. rech quotes it when it saves one.
 
-### 4. Use it from another machine
+### 4. Share with another machine
 
-The daemon only listens on this machine until you expose a profile. The recommended way is a
+On the host (the machine with Chrome), make an invite:
+
+```bash
+rech share new you@example.com --name alice
+# Share "alice": you@example.com
+# Invite for one device (unused, it expires …; secret: send it privately):
+#   https://rechrome.pages.dev/#rech1_7fQxC9tZp2mVb8wLrN4hdK3kT9aQ
+#   or in a terminal:  rech connect rech1_7fQxC9tZp2mVb8wLrN4hdK3kT9aQ
+```
+
+On the other machine, inside the project that should use it:
+
+```bash
+rech connect 'https://rechrome.pages.dev/#rech1_…'
+rech open https://example.com
+```
+
+By default the two machines meet over **WebRTC**: neither needs an open port, a VPN or a
+domain. A small signal server introduces them, and then traffic flows peer to peer, end-to-end
+encrypted with keys the signal server never sees. The first `rech` command after connecting starts
+a small local bridge that keeps the connection open between commands.
+
+**The link is an invite, not a key.** `rech connect` redeems it once: this machine gets its own
+device credential (saved to `.rechrome/.env.local`) and the invite stops working, so a link that
+leaks after it was used is harmless, and if someone else used it first you'll know. Unused invites
+expire after 24 hours, and WebRTC shares after 30 days unless renewed.
+
+| On the host | |
+|---|---|
+| `rech share new <profile..> [--name n]` | Invite link (`--via webrtc` by default) |
+| `--via lan` · `--via tailscale` · `--via <IP or listener>` | Direct HTTP instead of (or as well as) WebRTC |
+| `--devices 3` · `--approve` | Let 3 devices redeem it · make each new device wait for `rech share approve` |
+| `--expires 7d` · `--invite-ttl 1h` · `--signal <url>` | Lifetimes · your [own signal server](docs/signal-selfhost.md) |
+| `rech share ls` · `rech share devices <share> [--rm <device>]` | Shares, devices, expiry · drop one device |
+| `rech share allow\|deny <share> <profile..>` | Change the profiles; the link and devices stay |
+| `rech share rotate <share>` | A fresh invite; the old one stops working |
+| `rech share renew <share> --expires 30d` · `revoke` · `rm` | Extend · cut it off (closes its sessions) · delete |
+
+| On the other machine | |
+|---|---|
+| `rech profile` | The profiles this share gives you |
+| `rech --profile <name> open <url>` | Pick one when the share has several |
+| `rech -s=<name> open <url>` · `rech session ls` · `rech session close <name>` | Separate browser sessions; list and close them |
+| `rech status` | Transport, share, device, expiry |
+
+Each device gets its own browser sessions, apart from every other device and link. A share allows
+navigation, tabs, snapshots, screenshots and basic interactions, but not `eval`/`run-code` or
+filesystem commands (see [Remote access](#remote-access)).
+
+**WebRTC needs** `node-datachannel`, installed on first use into `~/.rechrome/webrtc`. When a
+direct path can't be found (some corporate networks, symmetric NAT), give the host TURN: set
+`CF_TURN_KEY_ID` and `CF_TURN_API_TOKEN` (a [Cloudflare TURN](https://developers.cloudflare.com/realtime/turn/)
+key; its free tier is 1,000 GB/month) in the daemon's environment, or share `--via tailscale`.
+
+**Keep links out of git.** `rech status`, `rech connect` and `rech share --save` warn when the file
+holding `RECHROME_URL` is committed, staged, not git-ignored, or readable by other users. Links
+use a `rech1_` prefix and a checksum, so secret scanners can match them:
+`\brech1_[1-9A-HJ-NP-Za-km-z]{28}\b`.
+
+#### Listener links (reverse proxies)
+
+Before invites, a profile was shared as a listener's link carrying its key (`#key=…`); these
+keep working. The daemon only listens on this machine until you expose a profile. One way is a
 **scoped listener behind a reverse proxy** — shown with Tailscale Serve, but any proxy that
 forwards to `127.0.0.1:<port>` works. The commands are identical in bash, PowerShell and
 `cmd.exe`.
@@ -130,8 +225,10 @@ profile to your LAN address directly (plain HTTP); share the result of `rech sha
 
 ### 5. Manage access
 
+Invite shares are managed with `rech share` (above). Listener links:
+
 ```bash
-rech share ls                                 # everything shared: listener × profile, local and public URLs (keys hidden)
+rech share ls                                 # shares, then listener × profile, local and public URLs (keys hidden)
 rech share you@example.com                    # print one URL again (add --save to use it in this project)
 rech listener allow share teammate@example.com
 rech listener deny share teammate@example.com
@@ -163,6 +260,11 @@ If no supported daemon manager is available, setup asks before installing `oxmgr
 (default: No). It uses `bun i -g oxmgr` when launched with bunx and `npm i -g oxmgr`
 when launched with npx. Pass `--yes` to approve this without prompting,
 for example `bunx rechrome setup --profile Default --yes`.
+
+On macOS, a daemon started by launchd or oxmgr cannot read Chrome's profile folder
+until its bun binary has Full Disk Access. `rech status` and the serve log report
+this and name the binary. See [Keeping rech serve running on macOS](docs/macos-daemon.md)
+for the grant, a LaunchAgent, and the terminal keep-alive alternative.
 
 Agents setting up Chrome on macOS can use the [rechrome setup skill](skills/rechrome-setup/SKILL.md),
 which covers native extension installation with Computer Use and CLI connection verification.
@@ -245,6 +347,7 @@ cp .env.example .env.local
 | `PLAYWRIGHT_MCP_EXTENSION_ID`       | Chrome extension ID (client overrides server)                                                                                       | —                |
 | `PLAYWRIGHT_MCP_EXTENSION_TOKEN`    | Chrome extension token — profile-specific, get it from the extension's status page (client overrides server)                        | —                |
 | `PLAYWRIGHT_MCP_USER_DATA_DIR`      | Chrome user data directory — use to pin connections to a specific Chrome install (client overrides server)                          | —                |
+| `RECHROME_PROFILE` | Default profile selector for browser commands, equivalent to `--profile`. An explicit flag wins; blank values are ignored. Remote listeners still enforce their allowlist. | — |
 | `PLAYWRIGHT_MCP_PROFILE_DIRECTORY`  | Chrome profile — accepts directory name (`Profile 2`), display name (`Snowstar`), or **email** (`you@example.com`) (client overrides server) | —         |
 
 > **Multi-profile tip:** Each project's `.env.local` can specify a different Chrome profile via the `?profile=` query param in `RECHROME_URL`. The server resolves display names and email addresses to the actual Chrome profile directory automatically (reads `~/Library/Application Support/Google/Chrome/Local State`).
@@ -255,6 +358,57 @@ cp .env.example .env.local
 > ```
 >
 > Shell-set `PLAYWRIGHT_MCP_*` variables take priority over `.env.local`, so you can always override per-command without editing files.
+
+### Small icon uploads from stdin
+
+Uploads are disabled by default on every listener. The host owner can add an
+`uploads` object to the intended listener entry in `~/.rechrome/listeners.json`:
+
+```json
+"uploads": {
+  "maxBytes": 2097152,
+  "contentTypes": ["image/png", "image/svg+xml"]
+}
+```
+
+The object enables uploads; omitting it disables them. `uploads: {}` uses the
+same defaults shown above. The owner can lower the byte limit or narrow the type
+list, but cannot exceed the hard **2 MiB** limit or enable other types. Do not
+replace the listener's other fields or share its key. Install the updated daemon
+code before enabling this policy; configuration changes then use the usual
+listener reload mechanism.
+
+On the **client machine**, open the website's file chooser with `rech click`, then
+send the icon through stdin in the same profile/session:
+
+```bash
+rech --profile work -s=slack upload --name app-icon.png < ./app-icon.png
+cat ./app-icon.svg | rech --profile work -s=slack upload --name app-icon.svg
+```
+
+`--content-type image/png` or `--content-type image/svg+xml` may be specified;
+otherwise the type is inferred from `--name`. This command is stdin-only: there
+is no positional file path. The shell reads the local file; only its bytes and
+metadata are sent to the listener. Client and server both enforce the byte cap.
+The server checks PNG signatures or UTF-8 SVG markup (rejecting DTD/entities),
+and checks the type against the listener policy. These checks identify the file
+format; they do not sanitize SVG or scan for malware. The host never renders the
+file or resolves anything referenced inside it.
+
+The receiver writes a random `.png`/`.svg` filename with mode 0600 inside a private
+0700 temporary directory, outside the downloadable output tree. It passes only
+that generated path to the existing file-chooser command and removes the directory
+on success, error, or timeout. Neither filenames nor payload fields can select a
+host file. A crash or forced process kill can interrupt cleanup; the files remain
+private OS temporary files. Permission modes apply on POSIX hosts.
+
+Each upload produces one `upload:` JSON audit record with listener, profile,
+original name, byte size, SHA-256, page origin observed immediately before upload,
+and result. It contains no file contents, credentials, page path, query, or fragment.
+Requests rejected before inspection have null values for unavailable fields.
+An HTTP(S) origin must be determined before an upload is attempted. As with other
+browser commands, avoid concurrent tab navigation in the same session. Scoped
+`eval`, `run-code`, host paths, and CLI option overrides remain unavailable.
 
 ### Remote access
 
@@ -311,6 +465,8 @@ roll up to their parent), or the current directory outside git. So two worktrees
 get separate sessions, and `git checkout` keeps you in the same one. `RECH_IDENTITY=branch`
 restores the older `<remote>/tree/<branch>` keying and `RECH_IDENTITY=cwd` keys on the exact
 directory. Pass `-s=<name>` for a named sub-session, or `--isolate` for a throwaway one.
+A share device's sessions are additionally keyed by its share and device, so they never meet
+another device's or a listener link's; `rech session ls` lists the ones this link drove.
 
 ## Development
 
@@ -347,3 +503,25 @@ PRs upstream are welcome. Once these features land in the official packages we w
 ## License
 
 MIT
+
+### Bridge connection diagnostics and recovery
+
+Each connection attempt records fixed phase names (launch, retry, WebSocket
+accepted, initialized, timeout/close) in its own private `.bridge.jsonl` file under
+`~/.cache/ms-playwright/bridge`, or `PLAYWRIGHT_MCP_BRIDGE_LOG_DIR` when configured
+for the Playwright process. Records contain an attempt ID, PID and timing only;
+no URLs, tokens, page text or raw error messages. CLI startup stderr is retained
+separately in a unique `.err` file for each launch and is not the sanitized log.
+
+A failed automated connection page retires itself at its deadline only if it
+still shows the original connection URL. The profile's worker can remove an older
+page for the same attempt and relay; it excludes other attempts, attached tabs,
+and tabs that navigated away. Automatic recovery no longer reloads the extension,
+which could disconnect other working lanes. A genuinely unresponsive worker can
+still require an explicit operator-approved extension reload.
+
+This source change requires rebuilding the vendored Playwright bundle and
+reloading the updated extension before use. It does not modify a running daemon
+or extension. The draft PR records isolated-browser validation and negative
+controls; passing recovery tests does not establish the original intermittent
+timeout's root cause.

@@ -1,5 +1,9 @@
 import { describe, test, expect } from "bun:test";
-import { inferSilentExtensionFailure, isUnderDir, provesRelayAlive, shouldExitOrphanedServe } from "./serve.ts";
+import { chmodSync, mkdtempSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
+import { explainExtensionNotFound, inferSilentExtensionFailure, isManagedServe, isUnderDir, parseIdleTimeout, ProfileResolutionError, provesRelayAlive, resolveProfileDirectory, shouldExitOrphanedServe } from "./serve.ts";
+import { chromeDataAccessHint } from "./rechrome.ts";
 
 describe("isUnderDir", () => {
   test("allows simple relative file", () => {
@@ -156,5 +160,96 @@ describe("shouldExitOrphanedServe", () => {
 
   test("a non-positive timeout disables orphan self-exit entirely", () => {
     expect(shouldExitOrphanedServe({ orphaned: true, idleMs: 1_000_000, idleTimeoutMs: 0 })).toBe(false);
+  });
+
+  // A LaunchAgent's serve has ppid 1 from birth; it must not self-exit after 5 idle minutes.
+  test("never exits a supervised serve, even with ppid 1 and idle", () => {
+    expect(shouldExitOrphanedServe({ orphaned: true, managed: true, idleMs: 1_000_000, idleTimeoutMs: 300_000 })).toBe(false);
+  });
+});
+
+describe("isManagedServe", () => {
+  test("a LaunchAgent serve (ppid 1 + launchd job label) is supervised", () => {
+    expect(isManagedServe(1, { XPC_SERVICE_NAME: "dev.rechrome.serve" })).toBe(true);
+  });
+  test("a detached foreground serve (setsid / double fork) is not, despite ppid 1", () => {
+    expect(isManagedServe(1, {})).toBe(false);
+    expect(isManagedServe(1, { XPC_SERVICE_NAME: "0" })).toBe(false);
+    expect(isManagedServe(1, { XPC_SERVICE_NAME: "application.com.apple.Terminal.1234" })).toBe(false);
+  });
+  test("a serve started by a shell or agent is not, unless RECH_SERVE_MANAGED=1", () => {
+    expect(isManagedServe(4242, {})).toBe(false);
+    expect(isManagedServe(4242, { RECH_SERVE_MANAGED: "1" })).toBe(true);
+  });
+});
+
+describe("parseIdleTimeout", () => {
+  test("0 disables (it used to fall back to 5 minutes)", () => {
+    expect(parseIdleTimeout("0")).toBe(0);
+  });
+  test("unset, blank or garbage keeps the default", () => {
+    expect(parseIdleTimeout(undefined)).toBe(300_000);
+    expect(parseIdleTimeout("")).toBe(300_000);
+    expect(parseIdleTimeout("soon")).toBe(300_000);
+  });
+  test("a number is used as-is", () => {
+    expect(parseIdleTimeout("60000")).toBe(60_000);
+  });
+});
+
+// Under launchd/oxmgr on macOS, TCC denies Chrome's data folder (EPERM on Local State).
+describe("resolveProfileDirectory", () => {
+  test("resolves a registered email from the registry without reading Local State", async () => {
+    expect(await resolveProfileDirectory("me@example.com", { "me@example.com": { profileDir: "Profile 2" } }, ["/nonexistent/Local State"])).toBe("Profile 2");
+  });
+  test("falls back to Local State for unregistered names", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "rech-ls-"));
+    writeFileSync(join(dir, "Local State"), JSON.stringify({ profile: { info_cache: { "Profile 7": { user_name: "other@example.com" } } } }));
+    expect(await resolveProfileDirectory("other@example.com", {}, [join(dir, "Local State")])).toBe("Profile 7");
+  });
+  test("an unreadable Local State refuses instead of passing the email through as a folder", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "rech-ls-"));
+    writeFileSync(join(dir, "Local State"), "{}");
+    chmodSync(join(dir, "Local State"), 0o000); // exists, but open() fails — as under TCC
+    // Passing it through made Chrome create a new empty profile folder named "who@example.com".
+    await expect(resolveProfileDirectory("who@example.com", {}, [join(dir, "Local State")])).rejects.toBeInstanceOf(ProfileResolutionError);
+  });
+  test("an unreadable Local State still resolves registered profiles and folder names", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "rech-ls-"));
+    writeFileSync(join(dir, "Local State"), "{}");
+    chmodSync(join(dir, "Local State"), 0o000);
+    const states = [join(dir, "Local State")];
+    expect(await resolveProfileDirectory("me@example.com", { "me@example.com": { profileDir: "Default" } }, states)).toBe("Default");
+    expect(await resolveProfileDirectory("Profile 4", {}, states)).toBe("Profile 4");
+  });
+  test("a missing Local State (no Chrome installed there) is not an error", async () => {
+    expect(await resolveProfileDirectory("custom-name", {}, ["/nonexistent/Local State"])).toBe("custom-name");
+  });
+  test("folder names pass through untouched", async () => {
+    expect(await resolveProfileDirectory("Profile 3", {}, [])).toBe("Profile 3");
+  });
+});
+
+describe("chromeDataAccessHint", () => {
+  const eperm = Object.assign(new Error("EPERM: operation not permitted, open 'Local State'"), { code: "EPERM" });
+  test("names Full Disk Access and the exact binary on macOS", () => {
+    const hint = chromeDataAccessHint(eperm, "/Users/me/.bun/bin/bun", "darwin")!;
+    expect(hint).toContain("Full Disk Access");
+    expect(hint).toContain("/Users/me/.bun/bin/bun");
+  });
+  test("is silent for other errors and other platforms", () => {
+    expect(chromeDataAccessHint(Object.assign(new Error("ENOENT"), { code: "ENOENT" }), "/b", "darwin")).toBeUndefined();
+    expect(chromeDataAccessHint(eperm, "/b", "linux")).toBeUndefined();
+  });
+});
+
+describe("explainExtensionNotFound", () => {
+  const out = 'Daemon pid=1: Playwright Extension not found in "/Users/me/Library/Application Support/Google/Chrome". Install it from https://x';
+  test("blames macOS privacy, not a missing install, when the daemon cannot read Chrome's folder", () => {
+    expect(explainExtensionNotFound(out, "cannot read X (EPERM). Grant Full Disk Access")).toContain("Full Disk Access");
+  });
+  test("stays silent when the folder is readable (the extension really is missing)", () => {
+    expect(explainExtensionNotFound(out, undefined)).toBeUndefined();
+    expect(explainExtensionNotFound("ok", "cannot read X")).toBeUndefined();
   });
 });

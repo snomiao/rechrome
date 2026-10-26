@@ -8,6 +8,7 @@ rechrome.js
 daemon-manager.js
 extension-token.js
 listeners.js
+fill-secret.js
 serve.js
 .playwright-cli/
 
@@ -16,3 +17,8 @@ vendor/
 
 # Windows: `> nul` / `--outfile nul` from bash/bun creates a literal file
 nul
+secret.js
+shares.js
+e2e.js
+webrtc.js
+signal-relay.js
