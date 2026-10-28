@@ -2,7 +2,7 @@ import { describe, test, expect } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { rechCli, listenerNextSteps, unknownCommandHint, notConnectedMessage, chooseShareListener, matchProfileLoosely, promptChoice, type RechHandlers } from "./rechrome.ts";
+import { rechCli, listenerNextSteps, unknownCommandHint, notConnectedMessage, chooseShareListener, matchProfileLoosely, preferManagementListener, promptChoice, type RechHandlers } from "./rechrome.ts";
 
 async function run(argv: string[]) {
   const calls: [string, ...unknown[]][] = [];
@@ -444,4 +444,19 @@ test("RECHROME_PROFILE selects remote profile; flag wins and blank preserves URL
     }
     expect(bodies.at(-1).args).toEqual(["--profile", "forwarded"]);
   } finally { server.stop(true); rmSync(home, { recursive: true, force: true }); }
+});
+
+test("a URL for this machine's own scoped listener goes through the loopback management listener", () => {
+  const config = { listeners: [
+    { name: "local", host: "127.0.0.1", port: 13775, key: "management-key-0123", profiles: "*" as const },
+    { name: "tail", host: "100.64.0.7", port: 13775, key: "scoped-key-0123456", profiles: ["you@x.com"] },
+  ] };
+  expect(preferManagementListener("http://scoped-key-0123456@100.64.0.7:13775/?profile=you%40x.com", config))
+    .toBe("http://127.0.0.1:13775/?profile=you%40x.com#key=management-key-0123");
+  expect(preferManagementListener("http://100.64.0.7:13775/#key=scoped-key-0123456&token=t", config))
+    .toBe("http://127.0.0.1:13775/#key=management-key-0123&token=t");
+  // Another machine's listener, a reverse proxy, HTTPS, or no listeners.json: untouched.
+  for (const url of ["http://other-key-0123456@100.64.0.9:13775/", "http://scoped-key-0123456@tak.ts.net/", "https://scoped-key-0123456@100.64.0.7:13775/"])
+    expect(preferManagementListener(url, config)).toBe(url);
+  expect(preferManagementListener("http://scoped-key-0123456@100.64.0.7:13775/", null)).toBe("http://scoped-key-0123456@100.64.0.7:13775/");
 });
