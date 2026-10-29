@@ -80,7 +80,7 @@ export async function writeListeners(config: ListenerConfig): Promise<void> {
 
 // Restricted listeners deliberately exclude arbitrary code, host filesystem access,
 // attachment/config overrides, and commands that manage all browser sessions.
-const SCOPED_COMMANDS = new Set(["open", "goto", "tab-new", "tab-list", "tab-select", "tab-close", "snapshot", "screenshot", "click", "dblclick", "fill", "type", "press", "hover", "select", "check", "uncheck", "go-back", "go-forward", "reload", "resize", "close", "fill-secret", "console"]);
+const SCOPED_COMMANDS = new Set(["open", "goto", "tab-new", "tab-list", "tab-select", "tab-close", "snapshot", "screenshot", "click", "dblclick", "fill", "type", "press", "hover", "select", "check", "uncheck", "go-back", "go-forward", "reload", "resize", "close", "fill-secret", "console", "dialog-accept", "dialog-dismiss"]);
 export function authorizeProfileRequest(listener: Listener, body: any): string {
   if (!body || Array.isArray(body) || !body.identity || typeof body.identity.key !== "string" || !body.identity.key || !Array.isArray(body.args) || body.args.some((a: unknown) => typeof a !== "string")) throw new Error("Scoped requests require identity.key, identity.profile and string args");
   const profile = body.identity.profile;

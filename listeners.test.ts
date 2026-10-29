@@ -37,6 +37,12 @@ test("reading or clearing the page's console is as page-scoped as a snapshot", (
   expect(() => authorizeProfileRequest(listener, request(["console", "--filename=../x.log"]))).toThrow(/option overrides/);
 });
 
+test("a dialog (alert, prompt, beforeunload) can be answered, or it blocks the tab", () => {
+  expect(authorizeProfileRequest(listener, request(["dialog-accept"]))).toBe("qa");
+  expect(authorizeProfileRequest(listener, request(["dialog-accept", "my answer"]))).toBe("qa");
+  expect(authorizeProfileRequest(listener, request(["dialog-dismiss"]))).toBe("qa");
+});
+
 test("file paths must belong to a permitted profile", () => {
   expect(canReadProfileFile(listener, profileOutputPrefix("qa") + "screenshot.png")).toBe(true);
   expect(canReadProfileFile(listener, profileOutputPrefix("personal") + "screenshot.png")).toBe(false);
