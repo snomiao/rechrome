@@ -20,9 +20,12 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
 
+      # vendor-src/ must be built from the pinned lib/ commits; refresh-vendor.yml fixes a mismatch.
+      - run: bash scripts/check-vendor-src.sh
+
       - run: bun install
 
-      - run: bun test
+      - run: bun run test
 
       - uses: actions/setup-node@v4
         with:
