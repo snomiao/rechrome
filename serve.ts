@@ -1038,7 +1038,8 @@ export async function serve() {
       };
       if (filteredArgs[0] === "upload") {
         const result = await receiveUpload({
-          policy: listener.uploads, payload: body.upload, args: filteredArgs,
+          // The management key can already run any code, so uploads need no extra opt-in there.
+          policy: listener.uploads ?? (listener.profiles === "*" ? {} : undefined), payload: body.upload, args: filteredArgs,
           audit: event => log(`upload: ${JSON.stringify({ listener: listener.name, profile: scopedProfile ?? body.identity?.profile ?? null, ...event })}`),
           run: async uploadArgs => {
             const child = Bun.spawn([bin, ...binArgs, ...uploadArgs, `-s=${namespacedSession}`], {
@@ -1048,7 +1049,7 @@ export async function serve() {
             try {
               const result = Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
               const [status, stdout, stderr] = await Promise.race([result, new Promise<never>((_, reject) => {
-                timer = setTimeout(() => { child.kill(); reject(new Error("Upload command timed out")); }, 30_000);
+                timer = setTimeout(() => { child.kill(); reject(new Error("Upload command timed out")); }, 60_000);
               })]);
               return { status, stdout, stderr };
             } finally { clearTimeout(timer); }

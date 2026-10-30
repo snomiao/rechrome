@@ -169,7 +169,9 @@ For an agent that just wants to *use* rech to open/verify a URL in the user's Ch
 - **`bun rechrome.ts status` first.** "bearer key rejected" = the `<KEY>@host` userinfo rotated (it does so
   every Mac serve restart) → ask the user for a fresh `RECHROME_URL`; can't SSH into the Mac.
 - **Commands:** `open <url>` · `screenshot [--full-page] [--filename x.png]` · `resize <w> <h>` ·
-  `eval "() => …"`. Screenshots download to `<project root>/.rechrome/output/` (the worktree root; the folder git-ignores itself).
+  `eval "() => …"` · `upload <file> [--into <ref> | --drop <ref> | --paste [<ref>]]` (an image into a
+  picker/file input/drop zone/editor; `--into <button ref>` clicks the "add image" button and fills
+  its chooser. On a shared listener the host must first run `rech listener set <name> --uploads`). Screenshots download to `<project root>/.rechrome/output/` (the worktree root; the folder git-ignores itself).
 - **Each call is a SEPARATE session.** An `eval` that scrolls does NOT persist into the next
   `screenshot` (it re-opens at top) — but **`resize` DOES** persist (it's a window property). To shoot
   below the fold on a page that scrolls an inner container (where `--full-page` only captures the

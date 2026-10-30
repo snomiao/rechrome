@@ -104,6 +104,8 @@ test("listener port, allow, deny, rotate-key and set", async () => {
   expect(await run(["listener", "set", "share", "--public-url", "https://h.ts.net/rechrome/"])).toEqual([["setListener", "share", { publicUrl: "https://h.ts.net/rechrome/", clearPublicUrl: undefined }]]);
   expect(await run(["listener", "set", "share", "--clear-public-url"])).toEqual([["setListener", "share", { publicUrl: undefined, clearPublicUrl: true }]]);
   await expect(run(["listener", "set", "share"])).rejects.toThrow(/public-url/);
+  expect(await run(["listener", "set", "share", "--uploads"])).toEqual([["setListener", "share", { publicUrl: undefined, clearPublicUrl: undefined, uploads: true }]]);
+  expect(await run(["listener", "set", "share", "--no-uploads"])).toEqual([["setListener", "share", { publicUrl: undefined, clearPublicUrl: undefined, uploads: false }]]);
 });
 
 test("next steps are plain text with the port filled in, so any shell (cmd too) can paste them", () => {
