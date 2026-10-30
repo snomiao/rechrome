@@ -1493,6 +1493,43 @@ export function chooseShareListener(profile: string, listeners: Listener[]): str
   ].filter(Boolean).join("\n"), "none", scoped);
 }
 
+/**
+ * Why a saved link to one of this machine's listeners stopped working, with the command that
+ * replaces it; null when it still matches its listener or points at another machine.
+ * A removed listener's port goes to the next one created (`freeListenerPort`), so a stale
+ * link can reach a different listener: its path is not served there and its key is unknown.
+ */
+export function staleLinkHint(url: string, listeners: Listener[], source?: string): string | null {
+  let parsed: ReturnType<typeof parseUrl>;
+  try { parsed = parseUrl(url); } catch { return null; }
+  const loopback = (host: string) => isLoopback(host) || host === "localhost";
+  const urlHost = parsed.host.replace(/^\[|\]$/g, "");
+  const at = listeners.find(l => l.port === parsed.port && (l.host === urlHost || l.host === "0.0.0.0" || loopback(l.host) && loopback(urlHost)));
+  const owner = listeners.find(l => l.key === parsed.key);
+  if (!at && !owner && !loopback(urlHost)) return null; // another machine's daemon: only its owner knows
+  if (owner && owner === at && normalizePrefix(owner.prefix) === parsed.prefix) return null;
+  const profile = parsed.profileDirectory;
+  let fix = profile ? `rech share ${JSON.stringify(profile)} --save` : "rech share --save";
+  if (profile) {
+    try {
+      const name = owner && owner.profiles !== "*" ? owner.name : chooseShareListener(profile, listeners);
+      fix = `rech share ${JSON.stringify(profile)} --listener ${name}${owner?.publicUrl || listeners.find(l => l.name === name)?.publicUrl ? "" : " --local"} --save`;
+    } catch { /* no single listener shares it: the default creates a fresh link */ }
+  }
+  const lines = [owner
+    ? `this link's listener "${owner.name}" moved: it now serves ${listenerAddress(owner)}${normalizePrefix(owner.prefix)}, not ${parsed.host}:${parsed.port}${parsed.prefix}.`
+    : `this link's key matches no listener on this machine: its listener was removed or its key rotated.${at ? ` ${listenerAddress(at)} belongs to listener "${at.name}" (${normalizePrefix(at.prefix)}), which this link is not for.` : ""}`];
+  if (source && source !== "environment") lines.push(`The stale RECHROME_URL is saved in ${source}.`);
+  lines.push(`Replace it with a current link:  ${fix}`);
+  return lines.join("\n  ");
+}
+
+/** staleLinkHint against this machine's listeners.json; null when it can't be read. */
+async function localStaleLinkHint(url: string): Promise<string | null> {
+  const config = await readListeners().catch(() => null);
+  return config ? staleLinkHint(url, config.listeners, url === process.env[ENV_KEY] ? rechromeUrlSource : undefined) : null;
+}
+
 /** A loopback port no listener uses and nothing else is bound to, from the management port + 2. */
 function freeListenerPort(listeners: Listener[]): number {
   const used = new Set(listeners.map(l => l.port));
@@ -1918,8 +1955,9 @@ async function callServe(
     process.exit(1);
   });
   if (res.status === 401) {
-    if (throwOnFailure) throw new Error("The daemon rejected its connection key. Run setup again to refresh it.");
-    console.error(`[rech] rech-client -> rech-server[ok]\n  -x: bearer key rejected (used: ${key.slice(0, 4)}...) -> playwright[unknown]`);
+    const stale = await localStaleLinkHint(url);
+    if (throwOnFailure) throw new Error(stale ? `The daemon rejected this link's key: ${stale}` : "The daemon rejected its connection key. Run setup again to refresh it.");
+    console.error(`[rech] rech-client -> rech-server[ok]\n  -x: bearer key rejected (used: ${key.slice(0, 4)}...) -> playwright[unknown]${stale ? `\n  ${stale}` : ""}`);
     process.exit(1);
   }
   const text = await res.text();
@@ -1930,6 +1968,8 @@ async function callServe(
     let detail = `HTTP ${res.status} from ${serviceUrl(url, "run")} is not a rechrome daemon response: ${text.slice(0, 200).trim()}`;
     if (res.status === 502 || res.status === 503 || res.status === 504)
       detail += `\n  The proxy is up but nothing answers behind it: this link's listener was likely removed or moved. Ask its owner for a fresh link (\`rech share\`), then \`rechrome connect <link>\`.`;
+    const stale = await localStaleLinkHint(url);
+    if (stale) detail += `\n  ${stale}`;
     if (throwOnFailure) throw new Error(detail);
     console.error(`[rech] rech-client -> ${serviceUrl(url, "run")}\n  -x: ${detail}`);
     process.exit(1);
@@ -4135,7 +4175,8 @@ async function status(): Promise<void> {
   // Show the URL this client connects to; through a proxy, the daemon's bind is on another port.
   const details = [pingBody?.listener && `listener ${pingBody.listener}`, pingBody?.bind && `bind ${pingBody.bind}`].filter(Boolean).join(", ");
   // Any HTTP answer is not the daemon: a proxy's 404/502 means the link's listener is gone or moved.
-  const answered = pingResponse?.ok || pingResponse?.status === 401 || (pingResponse?.status === 403 && !!pingBody?.error);
+  // A 200 that isn't the /ping JSON is another listener's catch-all: its port was reused.
+  const answered = (pingResponse?.ok && !!pingBody) || pingResponse?.status === 401 || (pingResponse?.status === 403 && !!pingBody?.error);
   console.log(`serve:    ${!ping ? `not reachable at ${serviceUrl(url)}`
     : answered ? `running  ${serviceUrl(url)}${details ? `  (${details})` : ""}`
     : `✗ ${serviceUrl(url)} answers HTTP ${pingResponse?.status ?? ping.status}, not a rechrome daemon — this link's listener was likely removed or moved; ask its host for a fresh link (\`rech share <profile>\`), then \`rech connect '<url>'\``}`);
@@ -4147,6 +4188,8 @@ async function status(): Promise<void> {
   if (pingResponse?.status === 403 && pingBody?.error) console.log(`auth:     ✗ ${pingBody.error}`);
   if (pingResponse?.status === 401)
     console.log(`auth:     ✗ key rejected — ask the host for a fresh URL (\`rech share <profile>\`), then \`rech connect '<url>'\``);
+  const stale = ping && !pingBody ? await localStaleLinkHint(url) : null;
+  if (stale) console.log(`stale:    ✗ ${stale}`);
   // daemonManager().id — there is no PM_BIN constant. Referencing one threw a
   // ReferenceError that took down the whole of `rech status`, so the one command
   // that reports "the relay is wedged" died exactly when the relay was wedged,
