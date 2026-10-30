@@ -359,56 +359,59 @@ cp .env.example .env.local
 >
 > Shell-set `PLAYWRIGHT_MCP_*` variables take priority over `.env.local`, so you can always override per-command without editing files.
 
-### Small icon uploads from stdin
+### Uploading files
 
-Uploads are disabled by default on every listener. The host owner can add an
-`uploads` object to the intended listener entry in `~/.rechrome/listeners.json`:
-
-```json
-"uploads": {
-  "maxBytes": 2097152,
-  "contentTypes": ["image/png", "image/svg+xml"]
-}
-```
-
-The object enables uploads; omitting it disables them. `uploads: {}` uses the
-same defaults shown above. The owner can lower the byte limit or narrow the type
-list, but cannot exceed the hard **2 MiB** limit or enable other types. Do not
-replace the listener's other fields or share its key. Install the updated daemon
-code before enabling this policy; configuration changes then use the usual
-listener reload mechanism.
-
-On the **client machine**, open the website's file chooser with `rech click`, then
-send the icon through stdin in the same profile/session:
+`rech upload <file>` puts a local image into the page: a file picker, an
+`<input type=file>` (hidden ones too), a drag-and-drop zone, or an editor that
+takes pasted images. The file is read on **your** machine and only its bytes are
+sent, so it works the same against a remote host.
 
 ```bash
-rech --profile work -s=slack upload --name app-icon.png < ./app-icon.png
-cat ./app-icon.svg | rech --profile work -s=slack upload --name app-icon.svg
+rech upload ./shot.png                     # the chooser a click opened, else the page's only file input
+rech upload ./shot.png --into e42          # a file input, or the button that opens the picker (clicks it)
+rech upload ./shot.png --into 'input#avatar'
+rech upload ./shot.png --drop e17          # a drag-and-drop zone
+rech upload ./shot.png --paste e9          # an editor that takes pasted images (default: the focused element)
+rech upload --name shot.png < ./shot.png   # bytes from stdin instead of a path
 ```
 
-`--content-type image/png` or `--content-type image/svg+xml` may be specified;
-otherwise the type is inferred from `--name`. This command is stdin-only: there
-is no positional file path. The shell reads the local file; only its bytes and
-metadata are sent to the listener. Client and server both enforce the byte cap.
-The server checks PNG signatures or UTF-8 SVG markup (rejecting DTD/entities),
-and checks the type against the listener policy. These checks identify the file
-format; they do not sanitize SVG or scan for malware. The host never renders the
-file or resolves anything referenced inside it.
+Targets are snapshot refs (`rech snapshot`) or selectors, the same as `rech click`.
+The usual flow for a site's "add image" button is `rech snapshot`, then
+`rech upload ./shot.png --into <the button's ref>`: rech clicks it and fills the file
+chooser that opens. Run the steps in one session (`-s=<name>`) when they span
+several commands.
 
-The receiver writes a random `.png`/`.svg` filename with mode 0600 inside a private
-0700 temporary directory, outside the downloadable output tree. It passes only
-that generated path to the existing file-chooser command and removes the directory
-on success, error, or timeout. Neither filenames nor payload fields can select a
-host file. A crash or forced process kill can interrupt cleanup; the files remain
-private OS temporary files. Permission modes apply on POSIX hosts.
+**Types and size:** PNG, JPEG, GIF, WebP and SVG, up to **10 MiB**. Both the client
+and the host check the size, and check the bytes against the type (PNG/JPEG/GIF/WebP
+signatures; UTF-8 SVG without DTD/entities). These checks identify the format; they
+don't sanitize SVG or scan for malware. The host never renders the file.
 
-Each upload produces one `upload:` JSON audit record with listener, profile,
-original name, byte size, SHA-256, page origin observed immediately before upload,
-and result. It contains no file contents, credentials, page path, query, or fragment.
-Requests rejected before inspection have null values for unavailable fields.
-An HTTP(S) origin must be determined before an upload is attempted. As with other
-browser commands, avoid concurrent tab navigation in the same session. Scoped
-`eval`, `run-code`, host paths, and CLI option overrides remain unavailable.
+**Turning uploads on:** they are always on through the local management listener.
+On a shared (scoped) listener they are **off** until the host turns them on:
+
+```bash
+rech listener set <listener> --uploads      # --no-uploads turns them off again
+```
+
+That writes an `uploads` object to the listener's entry in `~/.rechrome/listeners.json`.
+The host can tune it by hand, lowering the byte limit or narrowing the types, but not
+going above the 10 MiB cap or adding other types:
+
+```json
+"uploads": { "maxBytes": 2097152, "contentTypes": ["image/png", "image/jpeg"] }
+```
+
+**On the host:** the bytes are written under their original file name inside a fresh
+private temporary directory (0700, file 0600), outside the downloadable output tree,
+and the directory is removed afterwards (on success, error or timeout). Neither the
+name, the target nor any other payload field can select a host file or inject code:
+the drop/paste/input steps run as a server-built script that embeds them as JSON
+data. Each upload writes one `upload:` JSON audit record: listener, profile,
+original name, size, SHA-256, delivery mode, the page origin just before the
+upload, and the result. It never contains file contents, credentials, or the page's
+path, query or fragment. An HTTP(S) origin must be known before an upload is
+attempted. Scoped `eval`, `run-code`, host paths and CLI option overrides stay
+unavailable; enabling uploads doesn't change that.
 
 ### Remote access
 

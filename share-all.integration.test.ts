@@ -17,6 +17,8 @@ test("share --all: one snapshot link, profiles picked on the host, never the man
   await writeFile(join(root, "fake-cli.ts"), `
     const session = process.argv.find(a => a.startsWith('-s='))?.slice(3);
     console.log('Profile: ' + process.env.PLAYWRIGHT_MCP_PROFILE_DIRECTORY + ' Session: ' + session);
+    if (process.argv.includes('tab-list')) console.log('- 0: (current) [Page](https://example.com/form)');
+    if (process.argv.includes('upload')) console.log('Uploaded ' + require('path').basename(process.argv[process.argv.indexOf('upload') + 1]));
   `);
   const entry = (profileDir: string) => ({ profileDir, extensionId: "a".repeat(32), token: `token-${profileDir}` });
   const registryPath = join(root, ".rechrome", "profiles.json");
@@ -140,14 +142,34 @@ test("share --all: one snapshot link, profiles picked on the host, never the man
     config = JSON.parse(await readFile(listenersPath, "utf8"));
     expect([...config.listeners.find((l: any) => l.name === "one").profiles].sort()).toEqual(["personal", "qa", "team-a@x.com"]);
 
+    // Uploads: off on a scoped listener until the host turns them on, and the refusal says how.
+    // The client reads the file; the host stages its bytes under the original name.
+    const shot = join(client, "shot.png");
+    await writeFile(shot, Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jI1sAAAAASUVORK5CYII=", "base64"));
+    const off = await rech(["--profile", "qa", "upload", shot], clientEnv, client);
+    expect(off.code).not.toBe(0);
+    expect(off.stdout + off.stderr).toContain(`Uploads are off on listener "share-all". The host can turn them on: rech listener set share-all --uploads`);
+    expect((await rech(["listener", "set", "share-all", "--uploads"], hostEnv)).stdout).toContain("share-all: uploads on");
+    await Bun.sleep(1500); // the daemon reloads listeners.json about every second
+    const on = await rech(["--profile", "qa", "upload", shot], clientEnv, client);
+    expect(on.stdout).toContain("Uploaded shot.png");
+    expect(on.stdout + on.stderr).not.toContain("rech-upload-");
+    const bad = await rech(["--profile", "qa", "upload", join(client, "missing.png")], clientEnv, client);
+    expect(bad.code).toBe(2);
+    expect(bad.stderr).toContain("no such file");
+    expect(bad.stderr).toContain("Usage: rech upload <file>");
+    expect((await rech(["listener", "set", "share-all", "--no-uploads"], hostEnv)).stdout).toContain("uploads off");
+
     // A link saved with --save is remembered: removing its listener warns with the file and the fix,
     // and the next listener rech creates does not take the freed port (no other listener's answer).
     const saver = join(root, "saver"); await mkdir(saver);
     const saved = await rech(["share", "team-b@x.com", "--save"], hostEnv, saver);
     expect(saved.code).toBe(0);
     const savedPort = Number(new URL(saved.stdout.trim()).port);
-    const teamB = JSON.parse(await readFile(listenersPath, "utf8")).listeners.find((l: any) => l.port === savedPort).name;
-    const removed = await rech(["listener", "remove", teamB], hostEnv);
+    // team-b is already on share-all (share --all above), so the saved link is share-all's.
+    const savedOn = JSON.parse(await readFile(listenersPath, "utf8")).listeners.find((l: any) => l.port === savedPort).name;
+    expect(savedOn).toBe("share-all");
+    const removed = await rech(["listener", "remove", savedOn], hostEnv);
     expect(removed.code).toBe(0);
     expect(removed.stderr).toContain("a saved link stops working");
     expect(removed.stderr).toContain(join(saver, ".rechrome", ".env.local"));

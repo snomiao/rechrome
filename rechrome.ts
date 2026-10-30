@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { prepareStdinUpload, type UploadPayload } from "./scoped-upload.ts";
+import { prepareUpload, UPLOAD_USAGE, MAX_UPLOAD_BYTES, type UploadPayload } from "./scoped-upload.ts";
 import { readListeners, writeListeners as writeListenersFile, listenerAddress, isLoopback, normalizePrefix, serviceUrl, allowProfiles, denyProfiles, rotateListenerKey, setPublicUrl, canonicalProfileKeys, planProfileRemoval, type Listener, type ListenerConfig } from "./listeners.ts";
 
 import { file } from "bun";
@@ -2177,8 +2177,14 @@ async function run(url: string, args: string[], overrideEnv?: Record<string, str
       process.exit(2);
     }
   } else if (args.find(a => !/^-s=[a-zA-Z0-9_-]{1,64}$/.test(a)) === "upload") {
-    if (process.stdin.isTTY) throw new Error("upload reads stdin; redirect a PNG/SVG file with < icon.png");
-    ({ args, upload } = await prepareStdinUpload(args, process.stdin));
+    if (args.some(a => a === "--help" || a === "-h")) { console.log(UPLOAD_USAGE); process.exit(0); }
+    try {
+      // A path argument is read here; without one the bytes come from stdin (never a terminal).
+      ({ args, upload } = await prepareUpload(args, process.stdin.isTTY ? null : process.stdin));
+    } catch (err) {
+      console.error(`[rech] ${err instanceof Error ? err.message : String(err)}\n${UPLOAD_USAGE}`);
+      process.exit(2);
+    }
   }
   const served = await callServe(url, args, overrideEnv, identity, false, upload, secret);
   // The daemon already masks the value; this is a second line of defence for an older daemon.
@@ -3333,11 +3339,19 @@ async function rotateKey(name: string): Promise<void> {
   console.log(`New key for ${name}; URLs carrying the old key stop working now. Print new ones with: rech share <profile> --listener ${name}`);
 }
 
-async function setListener(name: string, opts: { publicUrl?: string; clearPublicUrl?: boolean }): Promise<void> {
+async function setListener(name: string, opts: { publicUrl?: string; clearPublicUrl?: boolean; uploads?: boolean }): Promise<void> {
   const config = await requireListeners();
-  const listener = setPublicUrl(config, name, opts.clearPublicUrl ? null : opts.publicUrl ?? null);
+  let listener = config.listeners.find(l => l.name === name);
+  if (!listener) throw new Error(`Unknown listener "${name}". See rech listener ls.`);
+  if (opts.publicUrl !== undefined || opts.clearPublicUrl) listener = setPublicUrl(config, name, opts.clearPublicUrl ? null : opts.publicUrl ?? null);
+  if (opts.uploads !== undefined) {
+    if (listener.profiles === "*") throw new Error(`"${name}" is the local management listener: uploads are always on there.`);
+    // {} = the defaults (every supported image type, the full size cap); hand-tuned limits stay.
+    if (opts.uploads) listener.uploads ??= {}; else delete listener.uploads;
+  }
   await writeListeners(config);
-  console.log(listener.publicUrl ? `${name} is reachable at ${listener.publicUrl}` : `${name}: public URL cleared`);
+  if (opts.publicUrl !== undefined || opts.clearPublicUrl) console.log(listener.publicUrl ? `${name} is reachable at ${listener.publicUrl}` : `${name}: public URL cleared`);
+  if (opts.uploads !== undefined) console.log(opts.uploads ? `${name}: uploads on (rech upload <file>; images up to ${(listener.uploads?.maxBytes ?? MAX_UPLOAD_BYTES) / 1024 / 1024} MiB)` : `${name}: uploads off`);
 }
 
 const hideKey = (url: string) => url.replace(/([#&?]key=)[^&]*/, "$1…");
@@ -4325,7 +4339,7 @@ export type RechHandlers = {
   allowListener(name: string, profiles: string[]): Promise<void>;
   denyListener(name: string, profiles: string[]): Promise<void>;
   rotateKey(name: string): Promise<void>;
-  setListener(name: string, opts: { publicUrl?: string; clearPublicUrl?: boolean }): Promise<void>;
+  setListener(name: string, opts: { publicUrl?: string; clearPublicUrl?: boolean; uploads?: boolean }): Promise<void>;
   setup(opts: SetupOptions): Promise<void>;
   tray(action?: string): Promise<void>;
   provisionProfile(name: string, opts: { headed: boolean; experimental: boolean }): Promise<void>;
@@ -4467,12 +4481,13 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
       .command("deny <name> <profiles..>", "Remove profiles from a listener", y => y
         .positional("name", { type: "string", demandOption: true }).positional("profiles", { type: "string", array: true, demandOption: true }),
         a => handlers.denyListener(a.name, a.profiles))
-      .command("set <name>", "Record where a reverse proxy exposes a listener", y => y
+      .command("set <name>", "Record where a reverse proxy exposes a listener, or turn uploads on/off", y => y
         .positional("name", { type: "string", demandOption: true })
         .option("public-url", { type: "string", requiresArg: true, describe: "e.g. https://host.example.ts.net/rechrome/" })
         .option("clear-public-url", { type: "boolean", conflicts: "public-url" })
-        .check(a => a.publicUrl !== undefined || a.clearPublicUrl ? true : "Pass --public-url <url> or --clear-public-url"),
-        a => handlers.setListener(a.name, { publicUrl: a.publicUrl, clearPublicUrl: a.clearPublicUrl }))
+        .option("uploads", { type: "boolean", describe: "Let this listener's links upload images (rech upload); --no-uploads turns it off" })
+        .check(a => a.publicUrl !== undefined || a.clearPublicUrl || a.uploads !== undefined ? true : "Pass --public-url <url>, --clear-public-url, or --uploads/--no-uploads"),
+        a => handlers.setListener(a.name, { publicUrl: a.publicUrl, clearPublicUrl: a.clearPublicUrl, ...(a.uploads !== undefined ? { uploads: a.uploads } : {}) }))
       .command("port [name]", "Print a listener's port (for a proxy command)", y => y.positional("name", { type: "string" }),
         a => handlers.listenerPort(a.name))
       .command("rotate-key <name>", "Give a listener a new key (old URLs stop working)", y => y.positional("name", { type: "string", demandOption: true }),
