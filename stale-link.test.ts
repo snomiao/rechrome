@@ -3,17 +3,17 @@ import { staleLinkHint } from "./rechrome.ts";
 import type { Listener } from "./listeners.ts";
 
 const local: Listener = { name: "local", host: "127.0.0.1", port: 13775, key: "m".repeat(24), profiles: "*", prefix: "/" };
-const shareAll: Listener = { name: "share-all", host: "127.0.0.1", port: 13777, key: "a".repeat(24), profiles: ["snomiao@gmail.com", "work@x"], prefix: "/rechrome-all/" };
+const shareAll: Listener = { name: "share-all", host: "127.0.0.1", port: 13777, key: "a".repeat(24), profiles: ["me@example.com", "work@x"], prefix: "/rechrome-all/" };
 
 test("a link whose listener was removed and whose port share --all reused names the exact fix", () => {
-  // The Lianki case: `rech share snomiao --save` wrote /rechrome/snomiao/ on 13777; that listener
+  // The reported case: `rech share me --save` wrote /rechrome/me/ on 13777; that listener
   // was removed and `rech share --all` took the free port with its own prefix and key.
-  const stale = `http://127.0.0.1:13777/rechrome/snomiao/?profile=snomiao%40gmail.com#key=${"s".repeat(24)}`;
+  const stale = `http://127.0.0.1:13777/rechrome/me/?profile=me%40example.com#key=${"s".repeat(24)}`;
   const hint = staleLinkHint(stale, [local, shareAll], "/repo/.rechrome/.env.local")!;
   expect(hint).toContain("matches no listener on this machine");
   expect(hint).toContain(`127.0.0.1:13777 belongs to listener "share-all" (/rechrome-all/)`);
   expect(hint).toContain("/repo/.rechrome/.env.local");
-  expect(hint).toContain(`rech share "snomiao@gmail.com" --listener share-all --local --save`);
+  expect(hint).toContain(`rech share "me@example.com" --listener share-all --local --save`);
 });
 
 test("a link whose listener moved points at its listener", () => {
