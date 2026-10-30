@@ -28,6 +28,15 @@ if [[ ! -f "$WRAPPER_SRC" || ! -f "$CORE_SRC/lib/tools/cli-client/program.js" ]]
   exit 1
 fi
 
+# The wrapper must load the playwright-core packed next to it: vendor/ ships no `playwright` package.
+# A fork sync once replaced it with upstream's `require('playwright/lib/cli/client/program')`, and
+# rechrome@1.39.0 shipped a CLI that could not start ("Cannot find module 'playwright/...'").
+if ! grep -q "require('playwright-core/lib/tools/cli-client/program')" "$WRAPPER_SRC"; then
+  echo "refresh-vendor-src: $WRAPPER_SRC does not load playwright-core/lib/tools/cli-client/program;" >&2
+  echo "  the fork lost rechrome's wrapper (re-apply it in snomiao/playwright-cli). Not refreshing." >&2
+  exit 1
+fi
+
 rm -rf "$SRC"
 mkdir -p "$SRC"
 cp "$WRAPPER_SRC" "$SRC/playwright-cli.js"
