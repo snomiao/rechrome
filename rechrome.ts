@@ -4166,9 +4166,30 @@ const selfCommand = () => [process.execPath, Bun.main];
  */
 const bridgedUrls = new Set<string>();
 
+/**
+ * RECHROME_URL may address one of this machine's own scoped listeners directly (e.g. its tailnet
+ * IP), which refuses management-only commands. Same user, same daemon: go through the loopback
+ * management listener instead. The session is unchanged, since it is keyed by identity, not by
+ * listener. HTTPS is left alone: the daemon's certificate doesn't name 127.0.0.1.
+ */
+export function preferManagementListener(url: string, config: { listeners: Listener[] } | null): string {
+  const { key, host, port, protocol } = parseUrl(url);
+  const own = config?.listeners.find(l => l.key === key);
+  const management = config?.listeners.find(l => l.profiles === "*" && isLoopback(l.host));
+  if (!key || !own || own.profiles === "*" || !management || protocol !== "http") return url;
+  if (own.host !== host.replace(/^\[|\]$/g, "") || own.port !== port) return url;
+  const source = new URL(url);
+  const next = new URL(`http://${listenerAddress(management)}${normalizePrefix(management.prefix)}`);
+  next.search = source.search;
+  const fragment = new URLSearchParams(source.hash.slice(1).replace(/^\?/, ""));
+  fragment.set("key", management.key);
+  next.hash = fragment.toString();
+  return next.toString();
+}
+
 export async function transportUrl(url: string): Promise<string> {
   const parts = shareLinkParts(url);
-  if (!parts?.webrtc) return url;
+  if (!parts?.webrtc) return preferManagementListener(url, await readListeners().catch(() => null));
   const info = await spawnBridge(parts.token, parts.origin, selfCommand());
   const bridged = new URL(`http://127.0.0.1:${info.port}/`);
   new URL(url).searchParams.forEach((v, k) => bridged.searchParams.set(k, v));
