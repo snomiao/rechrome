@@ -133,6 +133,31 @@ test("share --all: one snapshot link, profiles picked on the host, never the man
     expect(onto.stderr).toContain("now reach exactly these profiles");
     config = JSON.parse(await readFile(listenersPath, "utf8"));
     expect([...config.listeners.find((l: any) => l.name === "one").profiles].sort()).toEqual(["personal", "qa"]);
+    // ...and only ever adds: a later list without qa keeps qa, so links already given out for it still work.
+    const more = await rech(["share", "personal", "team-a@x.com", "--listener", "one"], hostEnv);
+    expect(more.stderr).toContain("added team-a@x.com");
+    expect(more.stderr).not.toContain("removed");
+    config = JSON.parse(await readFile(listenersPath, "utf8"));
+    expect([...config.listeners.find((l: any) => l.name === "one").profiles].sort()).toEqual(["personal", "qa", "team-a@x.com"]);
+
+    // A link saved with --save is remembered: removing its listener warns with the file and the fix,
+    // and the next listener rech creates does not take the freed port (no other listener's answer).
+    const saver = join(root, "saver"); await mkdir(saver);
+    const saved = await rech(["share", "team-b@x.com", "--save"], hostEnv, saver);
+    expect(saved.code).toBe(0);
+    const savedPort = Number(new URL(saved.stdout.trim()).port);
+    const teamB = JSON.parse(await readFile(listenersPath, "utf8")).listeners.find((l: any) => l.port === savedPort).name;
+    const removed = await rech(["listener", "remove", teamB], hostEnv);
+    expect(removed.code).toBe(0);
+    expect(removed.stderr).toContain("a saved link stops working");
+    expect(removed.stderr).toContain(join(saver, ".rechrome", ".env.local"));
+    expect(removed.stderr).toContain(`rech share "team-b@x.com"`);
+    expect(JSON.parse(await readFile(listenersPath, "utf8")).retiredPorts).toContain(savedPort);
+    const next = await rech(["share", "team-b@x.com"], hostEnv);
+    expect(Number(new URL(next.stdout.trim()).port)).not.toBe(savedPort);
+    // An already-stale saved link stays quiet on later, unrelated changes.
+    const nextName = JSON.parse(await readFile(listenersPath, "utf8")).listeners.find((l: any) => l.port === Number(new URL(next.stdout.trim()).port)).name;
+    expect((await rech(["listener", "remove", nextName], hostEnv)).stderr).not.toContain("a saved link stops working");
   } finally {
     daemon.kill();
     await daemon.exited;

@@ -800,7 +800,9 @@ export async function serve() {
       // #fragment, which browsers never send, so the page is static and the key never reaches here.
       if (reqUrl.pathname === "/" && req.method === "GET" && (req.headers.get("accept") ?? "").includes("text/html"))
         return new Response(landingPage(), { headers: LANDING_HEADERS });
-      if (reqUrl.pathname !== "/run") return new Response("rech server\n");
+      // Unknown paths are a 404, not the banner: a stale link (its listener removed, the port
+      // reused by another with a different prefix) must fail loudly, not look like a live daemon.
+      if (reqUrl.pathname !== "/run") return reqUrl.pathname === "/" ? new Response("rech server\n") : new Response("rech server: nothing at this path\n", { status: 404 });
       const denied = authCheck(req, key);
       if (denied) return denied;
       markActivity(); // a real command: this serve is not idle

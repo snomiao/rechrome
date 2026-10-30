@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { prepareStdinUpload, type UploadPayload } from "./scoped-upload.ts";
-import { readListeners, writeListeners, listenerAddress, isLoopback, normalizePrefix, serviceUrl, allowProfiles, denyProfiles, rotateListenerKey, setPublicUrl, canonicalProfileKeys, planProfileRemoval, type Listener } from "./listeners.ts";
+import { readListeners, writeListeners as writeListenersFile, listenerAddress, isLoopback, normalizePrefix, serviceUrl, allowProfiles, denyProfiles, rotateListenerKey, setPublicUrl, canonicalProfileKeys, planProfileRemoval, type Listener, type ListenerConfig } from "./listeners.ts";
 
 import { file } from "bun";
 import yargs from "yargs";
@@ -1504,21 +1504,34 @@ export function staleLinkHint(url: string, listeners: Listener[], source?: strin
   try { parsed = parseUrl(url); } catch { return null; }
   const loopback = (host: string) => isLoopback(host) || host === "localhost";
   const urlHost = parsed.host.replace(/^\[|\]$/g, "");
-  const at = listeners.find(l => l.port === parsed.port && (l.host === urlHost || l.host === "0.0.0.0" || loopback(l.host) && loopback(urlHost)));
+  // Direct: the link names a listener's own address. Proxied: it names a recorded public URL.
+  const at = listeners.find(l => l.port === parsed.port && (l.host === urlHost || loopback(l.host) && loopback(urlHost)));
+  const direct = !!at || loopback(urlHost);
+  const viaProxy = (l: Listener) => {
+    if (!l.publicUrl) return false;
+    const pub = parseUrl(l.publicUrl);
+    return pub.host === parsed.host && pub.port === parsed.port && pub.prefix === parsed.prefix;
+  };
+  const proxied = listeners.find(viaProxy);
   const owner = listeners.find(l => l.key === parsed.key);
-  if (!at && !owner && !loopback(urlHost)) return null; // another machine's daemon: only its owner knows
-  if (owner && owner === at && normalizePrefix(owner.prefix) === parsed.prefix) return null;
+  if (!direct && !proxied && !owner) return null; // another machine's daemon: only its owner knows
   const profile = parsed.profileDirectory;
+  const allows = (l: Listener) => l.profiles === "*" || !profile || l.profiles.includes(profile);
+  // Through a proxy rech knows nothing about, only the key and the allowlist can be checked.
+  const reachesOwner = owner && (direct ? owner === at && normalizePrefix(owner.prefix) === parsed.prefix : !proxied || owner === proxied);
+  if (owner && reachesOwner && allows(owner)) return null;
   let fix = profile ? `rech share ${JSON.stringify(profile)} --save` : "rech share --save";
   if (profile) {
     try {
-      const name = owner && owner.profiles !== "*" ? owner.name : chooseShareListener(profile, listeners);
-      fix = `rech share ${JSON.stringify(profile)} --listener ${name}${owner?.publicUrl || listeners.find(l => l.name === name)?.publicUrl ? "" : " --local"} --save`;
+      const name = owner && owner.profiles !== "*" && allows(owner) ? owner.name : chooseShareListener(profile, listeners);
+      fix = `rech share ${JSON.stringify(profile)} --listener ${name}${direct ? " --local" : ""} --save`;
     } catch { /* no single listener shares it: the default creates a fresh link */ }
   }
-  const lines = [owner
-    ? `this link's listener "${owner.name}" moved: it now serves ${listenerAddress(owner)}${normalizePrefix(owner.prefix)}, not ${parsed.host}:${parsed.port}${parsed.prefix}.`
-    : `this link's key matches no listener on this machine: its listener was removed or its key rotated.${at ? ` ${listenerAddress(at)} belongs to listener "${at.name}" (${normalizePrefix(at.prefix)}), which this link is not for.` : ""}`];
+  const lines = [!owner
+    ? `this link's key matches no listener on this machine: its listener was removed or its key rotated.${at ? ` ${listenerAddress(at)} belongs to listener "${at.name}" (${normalizePrefix(at.prefix)}), which this link is not for.` : ""}`
+    : !reachesOwner
+      ? `this link's listener "${owner.name}" moved: it now serves ${owner.publicUrl && !direct ? owner.publicUrl : `${listenerAddress(owner)}${normalizePrefix(owner.prefix)}`}, not ${parsed.host}:${parsed.port}${parsed.prefix}.`
+      : `this link's listener "${owner.name}" no longer allows "${profile}" (it serves: ${(owner.profiles as string[]).join(", ")}).`];
   if (source && source !== "environment") lines.push(`The stale RECHROME_URL is saved in ${source}.`);
   lines.push(`Replace it with a current link:  ${fix}`);
   return lines.join("\n  ");
@@ -1530,13 +1543,19 @@ async function localStaleLinkHint(url: string): Promise<string | null> {
   return config ? staleLinkHint(url, config.listeners, url === process.env[ENV_KEY] ? rechromeUrlSource : undefined) : null;
 }
 
-/** A loopback port no listener uses and nothing else is bound to, from the management port + 2. */
-function freeListenerPort(listeners: Listener[]): number {
-  const used = new Set(listeners.map(l => l.port));
-  for (let port = DEFAULT_PORT + 2; port < 65536; port++) {
-    if (used.has(port)) continue;
-    try { Bun.serve({ hostname: "127.0.0.1", port, fetch: () => new Response() }).stop(true); return port; } catch { /* taken */ }
-  }
+const loopbackPortIsFree = (port: number) => {
+  try { Bun.serve({ hostname: "127.0.0.1", port, fetch: () => new Response() }).stop(true); return true; } catch { return false; }
+};
+
+/**
+ * A loopback port no listener uses and nothing else is bound to, from the management port + 2.
+ * A removed listener's port is skipped: reusing it would route that listener's saved links to
+ * this one, a confusing wrong answer instead of a plain "connection refused".
+ */
+export function freeListenerPort(config: Pick<ListenerConfig, "listeners" | "retiredPorts">, isFree = loopbackPortIsFree): number {
+  const used = new Set(config.listeners.map(l => l.port)), retired = new Set(config.retiredPorts ?? []);
+  for (let port = DEFAULT_PORT + 2; port < 65536; port++) if (!used.has(port) && !retired.has(port) && isFree(port)) return port;
+  for (const port of config.retiredPorts ?? []) if (!used.has(port) && isFree(port)) return port; // oldest first, as a last resort
   throw new Error("No free port for the share-all listener; pass one with rech listener add");
 }
 
@@ -1558,9 +1577,10 @@ function canonicalKeyFor(registry: Record<string, TokenEntry>, key: string): str
 }
 
 /**
- * `rech share a b c`: one link for exactly these profiles, on one listener. With --listener it
- * sets that listener's profiles to the list (e.g. one that already has a proxy route); otherwise
- * it reuses a listener with exactly this set, or creates one with its own key.
+ * `rech share a b c`: one link for these profiles, on one listener. With --listener it adds
+ * them to that listener (e.g. one that already has a proxy route) and never removes any:
+ * that is rech listener deny. Otherwise it reuses a listener with exactly this set, or
+ * creates one with its own key.
  */
 async function shareProfiles(selectors: string[], opts: { listener?: string; local?: boolean; save?: boolean }): Promise<void> {
   const registry = await readTokenRegistry(), cache = await readChromeProfileCache();
@@ -1573,11 +1593,11 @@ async function shareProfiles(selectors: string[], opts: { listener?: string; loc
   const config = await requireListeners();
   const same = config.listeners.find(l => l.profiles !== "*" && l.profiles.length === keys.length && keys.every(k => (l.profiles as string[]).includes(k)));
   const id = createHash("sha256").update([...keys].sort().join("\0")).digest("hex").slice(0, 6);
-  return shareSet(keys, { ...opts, listener: opts.listener ?? same?.name, defaultName: `share-${id}`, prefix: `/rechrome-${id}/`, again: `rech share ${selectors.map(s => JSON.stringify(s)).join(" ")}` });
+  return shareSet(keys, { ...opts, merge: !!opts.listener, listener: opts.listener ?? same?.name, defaultName: `share-${id}`, prefix: `/rechrome-${id}/`, again: `rech share ${selectors.map(s => JSON.stringify(s)).join(" ")}` });
 }
 
 /** Put exactly `snapshot` on one scoped listener (created if missing) and print its link. */
-async function shareSet(snapshot: string[], opts: { listener?: string; local?: boolean; save?: boolean; defaultName: string; prefix: string; again: string; host?: string; tailscaleServe?: boolean }): Promise<void> {
+async function shareSet(snapshot: string[], opts: { listener?: string; local?: boolean; save?: boolean; defaultName: string; prefix: string; again: string; host?: string; tailscaleServe?: boolean; merge?: boolean }): Promise<void> {
   const config = await requireListeners();
   const name = opts.listener ?? opts.defaultName;
   let listener = config.listeners.find(l => l.name === name);
@@ -1586,11 +1606,14 @@ async function shareSet(snapshot: string[], opts: { listener?: string; local?: b
   let changes = "";
   if (!listener) {
     if (opts.listener) throw new Error(`Unknown listener "${name}". See rech listener ls.`);
-    listener = { name, host: opts.host ?? "127.0.0.1", port: freeListenerPort(config.listeners), prefix: opts.prefix, key: randomBytes(24).toString("base64url"), profiles: snapshot };
+    listener = { name, host: opts.host ?? "127.0.0.1", port: freeListenerPort(config), prefix: opts.prefix, key: randomBytes(24).toString("base64url"), profiles: snapshot };
     config.listeners.push(listener);
     changes = `created listener "${name}" on ${listenerAddress(listener)}${listener.prefix}`;
   } else {
     const before = listener.profiles as string[];
+    // Merging (a listener named with --listener) only adds: profiles shared there for someone
+    // else stay. Removing one is explicit: rech listener deny.
+    if (opts.merge) snapshot = [...before, ...snapshot.filter(p => !before.includes(p))];
     const added = snapshot.filter(p => !before.includes(p)), removed = before.filter(p => !snapshot.includes(p));
     listener.profiles = snapshot;
     changes = added.length || removed.length ? [added.length && `added ${added.join(", ")}`, removed.length && `removed ${removed.join(", ")}`].filter(Boolean).join("; ") : "no changes";
@@ -3386,7 +3409,51 @@ async function writeEnvUrl(envPath: string, url: string): Promise<string> {
   const lines = (await file(envPath).text().catch(() => "")).split("\n").filter(l => l.trim() && !l.startsWith(`${ENV_KEY}=`));
   await writeFile(envPath, [...lines, envAssignment(ENV_KEY, url), ""].join("\n"), { mode: 0o600 });
   await chmod(envPath, 0o600);
+  await recordSavedLink(envPath).catch(() => {}); // only bookkeeping for later warnings
   return envPath;
+}
+
+/** Env files rech saved a RECHROME_URL into: paths only, never the URLs (they hold keys). */
+export const SAVED_LINKS_FILE = join(RECH_DIR, "saved-links.json");
+
+async function readSavedLinks(): Promise<string[]> {
+  const value = await file(SAVED_LINKS_FILE).json().catch(() => []);
+  return Array.isArray(value) ? value.filter((p): p is string => typeof p === "string") : [];
+}
+
+async function recordSavedLink(envPath: string): Promise<void> {
+  const path = resolve(envPath), known = await readSavedLinks();
+  if (known.includes(path)) return;
+  mkdirSync(dirname(SAVED_LINKS_FILE), { recursive: true });
+  await writeFile(SAVED_LINKS_FILE, JSON.stringify([...known, path], null, 2) + "\n", { mode: 0o600 });
+}
+
+/** The RECHROME_URL an env file sets, or null. */
+function savedUrlIn(envPath: string): string | null {
+  try { return parseBunEnvFile(readFileSync(envPath, "utf8"))[ENV_KEY] || null; } catch { return null; }
+}
+
+/**
+ * One warning per saved link that worked with `before`'s listeners and is stale with `after`'s:
+ * a listener change (rm, rotate-key, deny, setup moving a profile) that breaks a link rech
+ * saved says so, with the fix, instead of the link failing later in some other project.
+ * Links that were already stale stay quiet: this change didn't break them.
+ */
+export function savedLinksBrokenBy(before: Listener[], after: Listener[], saved: { path: string; url: string }[]): string[] {
+  return saved.flatMap(({ path, url }) => {
+    if (staleLinkHint(url, before)) return [];
+    const hint = staleLinkHint(url, after, path);
+    return hint ? [`[rech] warning: a saved link stops working: ${hint}`] : [];
+  });
+}
+
+/** writeListeners, then warn about saved links the write broke (see savedLinksBrokenBy). */
+async function writeListeners(config: ListenerConfig): Promise<void> {
+  const before = await readListeners().catch(() => null);
+  await writeListenersFile(config);
+  if (!before) return;
+  const saved = (await readSavedLinks()).flatMap(path => { const url = savedUrlIn(path); return url ? [{ path, url }] : []; });
+  for (const line of savedLinksBrokenBy(before.listeners, config.listeners, saved)) console.error(line);
 }
 
 /**
@@ -3881,7 +3948,7 @@ async function shareTransportListener(selector: string, profiles: string[], labe
   const address = chooseListenAddress(await detectListenChoices(), selector);
   const existing = config.listeners.find(l => l.host === address && l.profiles !== "*" && normalizePrefix(l.prefix) === "/");
   if (existing) return existing.name;
-  const listener: Listener = { name: `share-${label}`.slice(0, 40), host: address, port: freeListenerPort(config.listeners), key: randomBytes(24).toString("base64url"), profiles };
+  const listener: Listener = { name: `share-${label}`.slice(0, 40), host: address, port: freeListenerPort(config), key: randomBytes(24).toString("base64url"), profiles };
   config.listeners.push(listener);
   await writeListeners(config);
   if (!(await waitForListener(listener))) console.error(`[rech] warning: the daemon has not opened ${listenerAddress(listener)} yet; is it running? (rech status)`);

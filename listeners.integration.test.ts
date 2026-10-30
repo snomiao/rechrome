@@ -64,8 +64,10 @@ test("multiple sockets enforce profile/file policies and reload without browser 
     expect(page.headers.get("cache-control")).toBe("no-store");
     expect(await page.text()).toContain("rechrome connect");
     expect(await (await fetch(`http://127.0.0.1:${portA}/rechrome/`)).text()).toBe("rech server\n");
-    // A look-alike prefix is not stripped, so it misses /ping and gets only the unauthenticated banner.
-    expect(await (await direct("/rechrome-other/ping")).text()).toBe("rech server\n");
+    // A look-alike prefix is not stripped, so it misses /ping: a 404, never a 200 that looks like a live daemon.
+    const other = await direct("/rechrome-other/ping");
+    expect(other.status).toBe(404);
+    expect(await other.text()).toBe("rech server: nothing at this path\n");
     expect((await get({ ...qa, key: personal.key })).status).toBe(401);
     expect((await run(qa, "personal", ["tab-list"])).status).toBe(403);
     expect((await run(qa, "qa", ["run-code", "async page => {}"])).status).toBe(403);
