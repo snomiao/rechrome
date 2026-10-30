@@ -69,3 +69,15 @@ if (missing.size) {
 }
 console.log(`check-pack: ok — ${entries.length} shipped module(s) scanned; every relative import is in the tarball.`);
 '
+
+# The vendored CLI must start: vendor/ is excluded from the import scan above, and rechrome@1.39.0
+# shipped a wrapper requiring a `playwright` package it doesn't contain, so every command failed.
+if [ -f vendor/playwright-cli/playwright-cli.js ]; then
+  if ! version="$(node vendor/playwright-cli/playwright-cli.js --version 2>&1)"; then
+    echo "check-pack: the vendored playwright-cli does not start:" >&2
+    echo "$version" | sed "s/^/  /" >&2
+    echo "Restore vendor-src/playwright-cli.js (it must require playwright-core/lib/tools/cli-client/program)." >&2
+    exit 1
+  fi
+  echo "check-pack: ok — vendored playwright-cli starts ($version)."
+fi
