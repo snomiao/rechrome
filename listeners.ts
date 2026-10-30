@@ -7,7 +7,10 @@ import { mkdir, readFile, rename, writeFile } from "fs/promises";
 
 // publicUrl: where a reverse proxy (Tailscale Serve, Caddy, nginx, ...) exposes this listener.
 export type Listener = { name: string; host: string; port: number; key: string; profiles: string[] | "*"; prefix?: string; publicUrl?: string; uploads?: UploadPolicy };
-export type ListenerConfig = { version: 1; listeners: Listener[] };
+// retiredPorts: ports of removed listeners, newest last. New listeners skip them so a link
+// saved for a removed listener gets "connection refused", not some other listener's answer.
+export type ListenerConfig = { version: 1; listeners: Listener[]; retiredPorts?: number[] };
+const MAX_RETIRED_PORTS = 32;
 export const LISTENERS_FILE = join(homedir(), ".rechrome", "listeners.json");
 export const isLoopback = (host: string) => host === "::1" || /^127\./.test(host);
 export const listenerAddress = (l: Listener) => `${l.host.includes(":") ? `[${l.host}]` : l.host}:${l.port}`;
@@ -60,6 +63,8 @@ export function validateListeners(value: unknown): ListenerConfig {
     if (names.has(l.name) || addresses.has(address) || keys.has(l.key)) throw new Error("Listener names, addresses, and credentials must be unique");
     names.add(l.name); addresses.add(address); keys.add(l.key);
   }
+  if (config.retiredPorts !== undefined && (!Array.isArray(config.retiredPorts) || config.retiredPorts.some(p => !Number.isInteger(p) || p < 1 || p > 65535)))
+    throw new Error("listeners.json retiredPorts must be a list of ports");
   return config;
 }
 
@@ -70,8 +75,19 @@ export async function readListeners(): Promise<ListenerConfig | null> {
   return validateListeners(JSON.parse(raw));
 }
 
+/** `previous`'s retired ports plus the ports its listeners used that `next` no longer does. */
+export function retirePorts(previous: ListenerConfig | null, next: ListenerConfig): number[] {
+  const inUse = new Set(next.listeners.map(l => l.port));
+  const freed = (previous?.listeners ?? []).map(l => l.port).filter(p => !inUse.has(p));
+  const merged = [...(previous?.retiredPorts ?? []), ...(next.retiredPorts ?? []), ...freed].filter(p => !inUse.has(p));
+  return [...new Set(merged.reverse())].reverse().slice(-MAX_RETIRED_PORTS);
+}
+
 export async function writeListeners(config: ListenerConfig): Promise<void> {
   validateListeners(config);
+  const previous = await readListeners().catch(() => null);
+  const retired = retirePorts(previous, config);
+  if (retired.length) config.retiredPorts = retired; else delete config.retiredPorts;
   await mkdir(join(homedir(), ".rechrome"), { recursive: true });
   const temp = `${LISTENERS_FILE}.${randomBytes(6).toString("hex")}.tmp`;
   await writeFile(temp, JSON.stringify(config, null, 2) + "\n", { mode: 0o600 });
