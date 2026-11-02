@@ -163,12 +163,35 @@ test('host-path uploads: off unless the listener lists the directory; never outs
   await symlink(join(root, 'secret.png'), join(allowed, 'link.png'));
   expect(await readHostFile(join(allowed, 'a.png'), [allowed], MAX_UPLOAD_BYTES)).toEqual(png);
   await expect(readHostFile(join(allowed, 'a.png'), undefined, MAX_UPLOAD_BYTES)).rejects.toThrow(/off on this listener/);
-  await expect(readHostFile(join(root, 'secret.png'), [allowed], MAX_UPLOAD_BYTES)).rejects.toThrow(/outside/);
-  await expect(readHostFile(join(allowed, '..', 'secret.png'), [allowed], MAX_UPLOAD_BYTES)).rejects.toThrow(/outside/);
-  await expect(readHostFile(join(allowed, 'link.png'), [allowed], MAX_UPLOAD_BYTES)).rejects.toThrow(/outside/);
+  await expect(readHostFile(join(root, 'secret.png'), [allowed], MAX_UPLOAD_BYTES)).rejects.toThrow(/not an existing file in the listener's allowed directories/);
+  await expect(readHostFile(join(allowed, '..', 'secret.png'), [allowed], MAX_UPLOAD_BYTES)).rejects.toThrow(/not an existing file in the listener's allowed directories/);
+  await expect(readHostFile(join(allowed, 'link.png'), [allowed], MAX_UPLOAD_BYTES)).rejects.toThrow(/not an existing file in the listener's allowed directories/);
   await expect(readHostFile(join(allowed, 'a.png'), [allowed], 10)).rejects.toThrow(/maxBytes/);
+  // A missing path gets the same answer as one outside, so the link can't probe what exists.
+  const missing = await readHostFile(join(root, 'nope.png'), [allowed], MAX_UPLOAD_BYTES).catch(e => e.message);
+  const outside = await readHostFile(join(root, 'secret.png'), [allowed], MAX_UPLOAD_BYTES).catch(e => e.message);
+  expect(missing).toBe(outside);
   expect(() => validateUploadPolicy({ hostDirs: ['/'] })).toThrow();
   expect(() => validateUploadPolicy({ hostDirs: ['relative'] })).toThrow();
+});
+
+test('--host with --drop/--paste puts the bytes read on the host into the page script', async () => {
+  const { mkdtemp, writeFile, readFile } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const allowed = await mkdtemp(join(tmpdir(), 'rech-host-drop-'));
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jI1sAAAAASUVORK5CYII=', 'base64');
+  await writeFile(join(allowed, 'a.png'), png);
+  const tabs = { status: 0, stdout: '- 0: (current) [Page](https://example.com/)', stderr: '' };
+  for (const mode of ['drop', 'paste'] as const) {
+    let script = '';
+    const result = await receiveUpload({
+      policy: { hostDirs: [allowed] }, payload: { name: 'a.png', contentType: 'image/png', hostPath: join(allowed, 'a.png'), mode, target: '#zone' }, args: ['upload'], audit: () => {},
+      run: async args => { if (args[0] === 'tab-list') return tabs; script = await readFile(args[2], 'utf8'); return { status: 0, stdout: 'ok', stderr: '' }; },
+    });
+    expect(result.status).toBe(0);
+    expect(script).toContain(JSON.stringify(png.toString('base64')));
+    expect(script).not.toContain('data: undefined');
+  }
 });
 
 test('the client sends only the host path for --host, never bytes', async () => {
