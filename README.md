@@ -126,7 +126,8 @@ browser into an auth tool:
 rech read-cookie d acme.slack.com --allow-domain acme.slack.com | slack auth cookie
 ```
 
-- Reads via Playwright's `context.cookies()`, so `HttpOnly` cookies are included.
+- Reads via Playwright's `context.cookies()`, so `HttpOnly` cookies are included. It works over the
+  extension bridge too: the relay answers the browser-level cookie query through an attached tab.
 - `--allow-domain` is required, and the cookie's own domain must match it.
 - Same pipe-only, never-logged, masked-afterwards rules as `read-secret`.
 - On a shared (scoped) listener it is off until the host runs
