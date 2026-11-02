@@ -109,6 +109,12 @@ test.skipIf(!hasBrowser)("fill-secret fills the page and leaks the value nowhere
     expect(readOk.status).toBe(0);
     expect(readOk.stdout).toBe(CANARY);
     expect(readOk.stderr).not.toContain(CANARY);
+    // Redirected to a file: refused, nothing written.
+    const outFile = join(root, "secret.out");
+    const toFile = Bun.spawn([process.execPath, join(import.meta.dir, "rechrome.ts"), "read-secret", "e3", "--allow-domain", "127.0.0.1"], { cwd: work, env, stdin: "ignore", stdout: Bun.file(outFile), stderr: "pipe" });
+    expect(await toFile.exited).toBe(2);
+    expect(await new Response(toFile.stderr).text()).toContain("must be a pipe");
+    expect(await readFile(outFile, "utf8").catch(() => "")).toBe("");
 
     // TOTP from an env file: the code lands; the seed never leaves the client.
     const envFile = join(root, "secrets.env");
