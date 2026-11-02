@@ -245,11 +245,15 @@ export class WebrtcHost {
       (code, reason) => {
         if (room.stopped) return;
         if (code === 1000 && /replaced/.test(reason)) { this.log(`webrtc ${room.cred.label}: another host took this room over; not reconnecting`); return; }
-        room.retry = setTimeout(() => void this.connect(room), room.backoff);
+        // Only a connection that stayed up resets the back-off: a server that accepts and then
+        // drops us must not be hit every second.
+        if (room.openedAt && Date.now() - room.openedAt >= STABLE_MS) room.backoff = 1000;
+        room.openedAt = undefined;
+        room.retry = setTimeout(() => void this.connect(room), reconnectDelay(room.backoff));
         room.backoff = Math.min(room.backoff * 2, 30_000);
       });
     room.signal = sock;
-    try { await sock.open(); room.backoff = 1000; }
+    try { await sock.open(); room.openedAt = Date.now(); }
     catch (error) { this.log(`webrtc ${room.cred.label}: ${error instanceof Error ? error.message : error}`); }
   }
 
@@ -532,4 +536,12 @@ export async function spawnBridge(token: string, signal: string, entry: string[]
   }
   const tail = existsSync(logPath) ? readFileSync(logPath, "utf8").trim().split("\n").slice(-3).join("\n") : "";
   throw new Error(`the local WebRTC bridge did not start${tail ? `:\n${tail}` : ""}`);
+}
+
+/** How long a signal connection must stay up before the reconnect back-off starts over. */
+export const STABLE_MS = 60_000;
+/** The back-off with ±25% jitter, so hosts dropped together (a signal server restart) don't
+ *  all reconnect in the same instant. */
+export function reconnectDelay(backoff: number, random = Math.random): number {
+  return Math.round(backoff * (0.75 + random() * 0.5));
 }
