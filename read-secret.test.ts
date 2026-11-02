@@ -22,7 +22,7 @@ test("the read code checks the host before reading, and never embeds a value", (
   expect(code).toContain("app\\\\.slack\\\\.com");
 });
 
-const listener = { name: "dede", host: "127.0.0.1", port: 1, key: "k", profiles: ["qa"] };
+const listener = { name: "team", host: "127.0.0.1", port: 1, key: "k", profiles: ["qa"] };
 const body = (args: string[]) => ({ args, identity: { key: "k", profile: "qa" } });
 
 test("read-secret is off on a scoped listener until the host turns it on", () => {
