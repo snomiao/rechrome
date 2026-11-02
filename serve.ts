@@ -24,7 +24,7 @@ import {
   checkTailscaleServe,
   chromeDataAccessHint,
 } from "./rechrome.ts";
-import { SecretMasker, parseReadSecretWire, readSecretOnSession, parseFillSecretWire, fillSecretOnSession, passwordValuesOnSession, hasSnapshot, maskPasswordLines, withholdSnapshots } from "./fill-secret.ts";
+import { SecretMasker, parseReadCookieWire, readCookieOnSession, parseReadSecretWire, readSecretOnSession, parseFillSecretWire, fillSecretOnSession, passwordValuesOnSession, hasSnapshot, maskPasswordLines, withholdSnapshots } from "./fill-secret.ts";
 
 const TAILSCALE_BIN = process.env.TAILSCALE_BIN || "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
 const CERT_RENEW_THRESHOLD_DAYS = 7;
@@ -977,6 +977,22 @@ export async function serve() {
         } catch (error) {
           const message = secretMasker.mask(error instanceof Error ? error.message : String(error));
           log(`exit: 1 | read-secret: ${message.split("\n")[0]}`);
+          return Response.json({ status: 1, stdout: "", stderr: `[rech] ${message}\n`, files: [] });
+        }
+      }
+
+      // read-cookie: like read-secret, the value goes back only in secretOut. See fill-secret.ts.
+      if (filteredArgs[0] === "read-cookie") {
+        try {
+          const { name, domain, allowDomains } = parseReadCookieWire(filteredArgs);
+          const { domain: dom, value } = await readCookieOnSession({ socketRoot: tmpSocketRoot(), session: namespacedSession, cwd: runWorkDir, name, domain, allowDomains });
+          if (!value) throw new Error(`read-cookie: ${name} for ${dom} is empty`);
+          secretMasker.add(value, Infinity);
+          log(`exit: 0 | read-cookie ${name} for ${dom} (${value.length} chars, value not logged)`);
+          return Response.json({ status: 0, stdout: "", stderr: "", files: [], secretOut: value });
+        } catch (error) {
+          const message = secretMasker.mask(error instanceof Error ? error.message : String(error));
+          log(`exit: 1 | read-cookie: ${message.split("\n")[0]}`);
           return Response.json({ status: 1, stdout: "", stderr: `[rech] ${message}\n`, files: [] });
         }
       }

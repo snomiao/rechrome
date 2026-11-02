@@ -437,6 +437,96 @@ export async function readSecretOnSession(opts: { socketRoot: string; session: s
   return out;
 }
 
+// ---------- read-cookie: a cookie value (incl. HttpOnly) to a pipe ----------
+//
+// Same contract as read-secret: the value travels only in the response's `secretOut`, is never
+// logged, is masked in later outputs, and the client writes it raw to a pipe only. For moving a
+// session cookie (Slack's HttpOnly `d`/xoxd) from the user's own browser into an auth tool.
+// Reads via Playwright's context.cookies(), which returns HttpOnly cookies (document.cookie can't).
+
+export const READ_COOKIE_USAGE = `Usage: rech read-cookie <name> <domain> --allow-domain <domain> | <command>
+  Writes the cookie's value, raw and without a newline, to stdout, which must be a pipe into the
+  program that stores it (never a terminal or a file). Never logged; masked in later outputs.
+  <name>                the cookie name, e.g. d
+  <domain>              the cookie's domain, e.g. symphoneed.slack.com
+  --allow-domain GLOB   required: the cookie's domain must match, e.g. symphoneed.slack.com`;
+
+function validCookieName(n: string): boolean {
+  // RFC6265 token; no control/separator chars. Keeps the name out of regex/URL trouble.
+  return /^[!#$%&'*+\-.^_`|~0-9A-Za-z]{1,256}$/.test(n);
+}
+
+export function parseReadCookieArgs(args: string[]): { name: string; domain: string; allowDomains: string[] } {
+  const [cmd, ...rest] = args;
+  if (cmd !== "read-cookie") throw new Error("Expected read-cookie");
+  const pos: string[] = [];
+  const allowDomains: string[] = [];
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i]!;
+    if (a === "--allow-domain" || a.startsWith("--allow-domain=")) {
+      const v = a === "--allow-domain" ? rest[++i] : a.slice("--allow-domain=".length);
+      if (!v) throw new Error("--allow-domain got an empty host");
+      for (const d of v.split(",")) { domainGlobToRegExp(d.trim()); allowDomains.push(d.trim()); }
+    } else if (a.startsWith("-")) throw new Error(`read-cookie: unknown option ${a}`);
+    else pos.push(a);
+  }
+  if (pos.length !== 2) throw new Error("read-cookie needs <name> <domain>, e.g. rech read-cookie d symphoneed.slack.com");
+  const [name, domain] = pos;
+  if (!validCookieName(name!)) throw new Error("read-cookie: that cookie name is not a valid token");
+  if (!/^[a-z0-9.-]+$/i.test(domain!)) throw new Error("read-cookie: <domain> must be a plain host like symphoneed.slack.com");
+  if (!allowDomains.length) throw new Error("read-cookie needs --allow-domain: name the domain the cookie must belong to");
+  return { name: name!, domain: domain!, allowDomains };
+}
+
+export function readCookieWireArgs(req: { name: string; domain: string; allowDomains: string[] }): string[] {
+  return ["read-cookie", req.name, req.domain, ...req.allowDomains.map(d => `--allow-domain=${d}`)];
+}
+
+export function parseReadCookieWire(args: string[]): { name: string; domain: string; allowDomains: string[] } {
+  const [cmd, name, domain, ...rest] = args;
+  if (cmd !== "read-cookie" || !name || !domain || name.startsWith("-") || domain.startsWith("-")) throw new Error("read-cookie needs <name> <domain>");
+  if (!validCookieName(name)) throw new Error("read-cookie: invalid cookie name");
+  if (!/^[a-z0-9.-]+$/i.test(domain)) throw new Error("read-cookie: invalid domain");
+  const allowDomains: string[] = [];
+  for (const a of rest) {
+    if (!a.startsWith("--allow-domain=")) throw new Error(`read-cookie: unexpected argument ${a.startsWith("-") ? a : "(positional)"}`);
+    const d = a.slice("--allow-domain=".length);
+    domainGlobToRegExp(d);
+    allowDomains.push(d);
+  }
+  if (!allowDomains.length) throw new Error("read-cookie needs --allow-domain");
+  return { name, domain, allowDomains };
+}
+
+/** run-code that reads one cookie via context.cookies(); returns {domain, value} JSON, or throws. */
+export function buildReadCookieCode(name: string, domain: string, allowDomains: string[]): string {
+  const patterns = allowDomains.map(d => domainGlobToRegExp(d).source);
+  return `async page => {
+  const allowed = ${JSON.stringify(patterns)};
+  const dom = ${JSON.stringify(domain.toLowerCase())}.replace(/^\\./, "");
+  if (!allowed.some(p => new RegExp(p, "i").test(dom)))
+    throw new Error("read-cookie refused: domain " + JSON.stringify(dom) + " is not allowed by --allow-domain");
+  const url = "https://" + dom + "/";
+  const cookies = await page.context().cookies([url]);
+  const match = cookies.filter(c => c.name === ${JSON.stringify(name)} && dom === String(c.domain).replace(/^\\./, "").toLowerCase());
+  if (!match.length) throw new Error("read-cookie: no cookie " + JSON.stringify(${JSON.stringify(name)}) + " for " + dom + " (is this profile signed in?)");
+  let value;
+  try { value = String(match[0].value); } catch { throw new Error("read-cookie: could not read the cookie"); }
+  return JSON.stringify({ domain: dom, value });
+}`;
+}
+
+export async function readCookieOnSession(opts: { socketRoot: string; session: string; cwd: string; name: string; domain: string; allowDomains: string[] }): Promise<{ domain: string; value: string }> {
+  const { isError, text } = await runCodeOnSession({ ...opts, code: buildReadCookieCode(opts.name, opts.domain, opts.allowDomains), json: true });
+  if (isError) throw new Error(text.match(/read-cookie(?: refused)?: [^\n]*/)?.[0] ?? (/no browser is open|could not reach/.test(text) ? text.trim().split("\n")[0]! : "read-cookie: could not read the cookie"));
+  let raw: unknown;
+  try { raw = JSON.parse(text).result; } catch { raw = text.match(/### Result\n([^\n]*)/)?.[1]; }
+  let out: any = raw;
+  for (let i = 0; i < 2 && typeof out === "string"; i++) { try { out = JSON.parse(out); } catch { out = undefined; } }
+  if (!out || typeof out.domain !== "string" || typeof out.value !== "string") throw new Error("read-cookie: the browser returned no value");
+  return out;
+}
+
 // ---------- password fields in snapshots ----------
 //
 // Snapshots print every input's value, and that includes password fields Chrome autofilled
