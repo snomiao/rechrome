@@ -6,7 +6,7 @@ import { join } from "path";
 import { mkdir, readFile, rename, writeFile } from "fs/promises";
 
 // publicUrl: where a reverse proxy (Tailscale Serve, Caddy, nginx, ...) exposes this listener.
-export type Listener = { name: string; host: string; port: number; key: string; profiles: string[] | "*"; prefix?: string; publicUrl?: string; uploads?: UploadPolicy | false; keepDownloads?: boolean };
+export type Listener = { name: string; host: string; port: number; key: string; profiles: string[] | "*"; prefix?: string; publicUrl?: string; uploads?: UploadPolicy | false; keepDownloads?: boolean; readSecrets?: boolean };
 // retiredPorts: ports of removed listeners, newest last. New listeners skip them so a link
 // saved for a removed listener gets "connection refused", not some other listener's answer.
 export type ListenerConfig = { version: 1; listeners: Listener[]; retiredPorts?: number[] };
@@ -62,6 +62,7 @@ export function validateListeners(value: unknown): ListenerConfig {
     // host never reads a path for them.
     if (l.uploads !== undefined && l.uploads !== false) validateUploadPolicy(l.uploads);
     if (l.keepDownloads !== undefined && typeof l.keepDownloads !== "boolean") throw new Error("keepDownloads must be true or false");
+    if (l.readSecrets !== undefined && typeof l.readSecrets !== "boolean") throw new Error("readSecrets must be true or false");
     const address = listenerAddress(l);
     if (names.has(l.name) || addresses.has(address) || keys.has(l.key)) throw new Error("Listener names, addresses, and credentials must be unique");
     names.add(l.name); addresses.add(address); keys.add(l.key);
@@ -108,8 +109,10 @@ export function authorizeProfileRequest(listener: Listener, body: any): string {
   const args = body.args.filter((a: string) => /^-s=[a-zA-Z0-9_-]{1,64}$/.test(a) === false);
   if (args[0] === "upload" && listener.uploads === false)
     throw new Error(`Uploads are off on listener "${listener.name}". The host can turn them on: rech listener set ${listener.name} --uploads`);
-  if (args[0] !== "upload" && !SCOPED_COMMANDS.has(args[0])) throw new Error("Command is unavailable on profile-scoped listeners; use the local management listener for arbitrary code or host access");
-  if (body.args.filter((a: string) => a.startsWith("-s=")).length > 1 || args.slice(1).some((a: string) => a.startsWith("-") && !(args[0] === "screenshot" && a === "--full-page") && !(args[0] === "console" && a === "--clear") && !(args[0] === "fill-secret" && (a === "--submit" || a === "--totp" || a.startsWith("--allow-domain="))))) throw new Error("CLI option overrides are unavailable on profile-scoped listeners");
+  if (args[0] === "read-secret" && listener.readSecrets !== true)
+    throw new Error(`read-secret is off on listener "${listener.name}". The host can turn it on: rech listener set ${listener.name} --read-secrets`);
+  if (args[0] !== "upload" && args[0] !== "read-secret" && !SCOPED_COMMANDS.has(args[0])) throw new Error("Command is unavailable on profile-scoped listeners; use the local management listener for arbitrary code or host access");
+  if (body.args.filter((a: string) => a.startsWith("-s=")).length > 1 || args.slice(1).some((a: string) => a.startsWith("-") && !(args[0] === "screenshot" && a === "--full-page") && !(args[0] === "console" && a === "--clear") && !(args[0] === "fill-secret" && (a === "--submit" || a === "--totp" || a.startsWith("--allow-domain="))) && !(args[0] === "read-secret" && a.startsWith("--allow-domain=")))) throw new Error("CLI option overrides are unavailable on profile-scoped listeners");
   if (["open", "goto", "tab-new"].includes(args[0]) && args[1] && !/^https?:\/\//i.test(args[1]) && args[1] !== "about:blank") throw new Error("Scoped navigation accepts only HTTP(S) or about:blank");
   // Upload is handled by the byte-only receiver; the caller cannot supply host paths.
   if (args[0] === "upload" && (args.length !== 1 || !body.upload)) throw new Error("Upload requires stdin bytes; host paths are unavailable");
