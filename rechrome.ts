@@ -16,7 +16,7 @@ import { createRequire } from "node:module";
 import { spawn as cpSpawn } from "child_process";
 import { readFile, writeFile, rename, chmod, mkdir, stat } from "node:fs/promises";
 import { isDeprecatedPm2Fallback, listsProcess, oxmgrInstallCommand, pickDaemonManager, PM2_DEPRECATION, type DaemonManager } from "./daemon-manager.ts";
-import { DEFAULT_SIGNAL, WEBRTC, createShare, findDevice, findShare, inviteLink, inviteProblem, parseDuration, readShares, updateShares, type Share } from "./shares.ts";
+import { DEFAULT_SIGNAL, WEBRTC, createShare, normalizeSignal, findDevice, findShare, inviteLink, inviteProblem, parseDuration, readShares, updateShares, type Share } from "./shares.ts";
 import { bearerOf, looksLikeToken, newToken, parseToken, redactSecrets } from "./secret.ts";
 import { WebrtcClient, loadRTC, runBridge, spawnBridge } from "./webrtc.ts";
 import { startSignalRelay } from "./signal-relay.ts";
@@ -3644,18 +3644,10 @@ async function setup(opts: SetupOptions = {}): Promise<void> {
   const scheme = previous.protocol;
   let url = `${scheme}://${management.key}@${listenerAddress(management)}${normalizePrefix(management.prefix)}`;
   const { host, port, protocol, key: serveKey } = parseUrl(url);
+  // Connect the profile locally first; who else may reach it is asked at the end (setupShareStep),
+  // once the bridge works. --listen still picks the exposure up front, for scripts.
   let desiredBind = management.host;
   if (opts.listen) desiredBind = chooseListenAddress(listenChoices, opts.listen);
-  else if (isTTY) {
-    console.log("\n      Where should this profile be accessible? (Other profiles keep their listeners.)");
-    listenChoices.forEach((choice, index) => console.log(`        ${index + 1}. ${choice.label} — ${choice.address}`));
-    while (true) {
-      const answer = (await ask("      Choice [1]: ", "1")).trim();
-      const choice = /^\d+$/.test(answer) ? listenChoices[Number(answer) - 1] : undefined;
-      if (choice) { desiredBind = choice.address; break; }
-      console.log("      Enter one of the numbers shown above.");
-    }
-  }
   const pingManagement = () => fetch(serviceUrl(url, "ping"), {
     headers: { Authorization: `Bearer ${serveKey}` }, signal: AbortSignal.timeout(2000),
   }).then(async r => r.ok && (await r.json()).multiListener === true).catch(() => false);
@@ -3938,12 +3930,77 @@ async function setup(opts: SetupOptions = {}): Promise<void> {
     guide?.close();
     console.log(`      Saved token for ${extraDisplay}`);
   }
+  if (bridgeVerified && isTTY && !opts.listen) await setupShareStep(ask, profileEmail);
   rl?.close();
   envWatcher?.close();
   if (bridgeVerified)
     console.log(`\nDone! Test with:\n  rech open github.com/snomiao`);
   else
     console.error(`\nSetup was saved, but the selected profile did not pass the bridge check. Reload the extension at chrome://extensions and run \`rech setup --profile ${profileEmail}\` again.`);
+}
+
+const SIGNAL_SELFHOST_DOC = "https://github.com/snomiao/rechrome/blob/main/docs/signal-selfhost.md";
+
+/** The menu of setupShareStep: existing listeners first, then the new kinds. */
+export function shareMenu(listeners: Listener[], choices: ListenChoice[]): { key: string; label: string; listener?: string; kind?: "lan" | "tailscale" | "webrtc" | "webrtc-own" }[] {
+  const menu: ReturnType<typeof shareMenu> = [{ key: "1", label: "Don't add sharing (local access is always on; existing shares stay: rech share ls)" }];
+  for (const l of listeners.filter(l => l.profiles !== "*"))
+    menu.push({ key: String(menu.length + 1), label: `Existing listener "${l.name}" (${listenerAddress(l)}${l.publicUrl ? `, ${l.publicUrl}` : ""})`, listener: l.name });
+  const has = (k: string) => choices.some(c => c.kind === k);
+  if (has("lan")) menu.push({ key: String(menu.length + 1), label: "New: LAN (machines on this network)", kind: "lan" });
+  if (has("tailscale")) menu.push({ key: String(menu.length + 1), label: "New: Tailscale only (your tailnet)", kind: "tailscale" });
+  menu.push({ key: String(menu.length + 1), label: "New: WebRTC via rechrome.pages.dev (works across networks, nothing to run)", kind: "webrtc" });
+  menu.push({ key: String(menu.length + 1), label: "New: WebRTC via your own signal server (and TURN)", kind: "webrtc-own" });
+  return menu;
+}
+
+/** setup's last step: once the profile works here, offer to share it with other machines. */
+async function setupShareStep(ask: (q: string, def?: string) => Promise<string>, profile: string): Promise<void> {
+  const listeners = (await readListeners().catch(() => null))?.listeners ?? [];
+  const choices = await detectListenChoices();
+  const menu = shareMenu(listeners, choices);
+  console.log(`\n○ Share ${profile} with other machines?`);
+  for (const m of menu) console.log(`        ${m.key}. ${m.label}`);
+  let pick: (typeof menu)[number] | undefined;
+  while (!pick) {
+    const answer = (await ask("      Choice [1]: ", "1")).trim();
+    pick = menu.find(m => m.key === answer);
+    if (!pick) console.log("      Enter one of the numbers shown above.");
+  }
+  try {
+    if (pick.key === "1") { console.log("✓ Not shared. Later: rech share new " + JSON.stringify(profile)); return; }
+    if (pick.listener) {
+      const config = await requireListeners();
+      allowProfiles(config, pick.listener, [profile]);
+      await writeListeners(config);
+      await printProfileUri(profile, pick.listener);
+      return;
+    }
+    if (pick.kind === "tailscale") {
+      const dns = (JSON.parse(await runTailscale(["status", "--json"]) ?? "null")?.Self?.DNSName as string | undefined)?.replace(/\.$/, "");
+      if (!dns?.endsWith(".ts.net")) console.log(`      ! Tailscale's hostname is ${dns ? `"${dns}", not under ts.net` : "unknown (is tailscale up?)"}; the link uses the tailnet IP.`);
+      else console.log(`      Tailscale hostname: ${dns}`);
+    }
+    let signal: string | undefined;
+    if (pick.kind === "webrtc-own") {
+      console.log(`\n      Run a signal server, then paste its URL here:`);
+      console.log(`        1. Read ${SIGNAL_SELFHOST_DOC}`);
+      console.log(`           (A: Cloudflare Workers is the easiest; C: Tailscale Funnel needs no domain).`);
+      console.log(`        2. Deploy it and open its URL in a browser to check that it answers.`);
+      console.log(`        3. For TURN (strict NATs), set CF_TURN_KEY_ID and CF_TURN_API_TOKEN in the daemon's env (see "TURN" in that doc).`);
+      while (!signal) {
+        const raw = (await ask("      Signal server URL (empty: cancel): ")).trim();
+        if (!raw) { console.log("      Not shared. Later: rech share new <profile> --signal <url>"); return; }
+        try { signal = normalizeSignal(raw); } catch (error) { console.log(`      ${error instanceof Error ? error.message : error}`); continue; }
+        const ok = await fetch(signal, { signal: AbortSignal.timeout(5000) }).then(() => true).catch(() => false);
+        if (!ok) console.log(`      ! ${signal} did not answer; the share is made anyway, check the server before sending the link.`);
+      }
+    }
+    const via = pick.kind === "webrtc" || pick.kind === "webrtc-own" ? WEBRTC : pick.kind!;
+    await shareNew([profile], { via: [via], ...(signal ? { signal } : {}) });
+  } catch (error) {
+    console.error(`      Sharing failed: ${error instanceof Error ? error.message : error}. Setup itself is saved; retry with rech share new ${JSON.stringify(profile)}.`);
+  }
 }
 
 // ---- shares: invite links, devices, transports (see shares.ts) ----------------------------
