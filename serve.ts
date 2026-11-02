@@ -24,7 +24,7 @@ import {
   checkTailscaleServe,
   chromeDataAccessHint,
 } from "./rechrome.ts";
-import { SecretMasker, maskable, parseFillSecretWire, fillSecretOnSession, passwordValuesOnSession, hasSnapshot, maskPasswordLines, withholdSnapshots } from "./fill-secret.ts";
+import { SecretMasker, parseFillSecretWire, fillSecretOnSession, passwordValuesOnSession, hasSnapshot, maskPasswordLines, withholdSnapshots } from "./fill-secret.ts";
 
 const TAILSCALE_BIN = process.env.TAILSCALE_BIN || "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
 const CERT_RENEW_THRESHOLD_DAYS = 7;
@@ -938,7 +938,7 @@ export async function serve() {
           log(`exit: ${status} | fill-secret ${ref}`);
           return Response.json(reply.isError ? { status, stdout: "", stderr: `${text}\n`, files: [] } : { status, stdout: `${text}\n`, stderr: "", files: [] });
         } catch (error) {
-          const message = secretMasker.mask(maskable(secret) ? (error instanceof Error ? error.message : String(error)).replaceAll(secret, "***") : (error instanceof Error ? error.message : String(error)));
+          const message = secretMasker.mask(secret ? (error instanceof Error ? error.message : String(error)).replaceAll(secret, "***") : (error instanceof Error ? error.message : String(error)));
           log(`exit: 1 | fill-secret: ${message.split("\n")[0]}`);
           return Response.json({ status: 1, stdout: "", stderr: `[rech] ${message}\n`, files: [] });
         }

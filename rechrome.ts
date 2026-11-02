@@ -5,7 +5,7 @@ import { readListeners, writeListeners as writeListenersFile, listenerAddress, i
 import { file } from "bun";
 import yargs from "yargs";
 import { readExtensionTokenFromProfile } from "./extension-token.ts";
-import { FILL_SECRET_USAGE, SECRET_MASK, maskable, parseFillSecretArgs, fillSecretWireArgs, readSecretSource, totpCode, totpWaitMs } from "./fill-secret.ts";
+import { FILL_SECRET_USAGE, SECRET_MASK, parseFillSecretArgs, fillSecretWireArgs, readSecretSource, totpCode, totpWaitMs } from "./fill-secret.ts";
 import { createHash, randomBytes } from "crypto";
 import { mkdirSync, appendFileSync, existsSync, realpathSync, accessSync, cpSync, unlinkSync, readFileSync, readdirSync, renameSync, rmdirSync, constants as fsConstants } from "fs";
 import { hostname, homedir, networkInterfaces } from "os";
@@ -2188,7 +2188,7 @@ async function run(url: string, args: string[], overrideEnv?: Record<string, str
   }
   const served = await callServe(url, args, overrideEnv, identity, false, upload, secret);
   // The daemon already masks the value; this is a second line of defence for an older daemon.
-  const scrub = (s: string) => maskable(secret) && s ? s.replaceAll(secret, SECRET_MASK) : s;
+  const scrub = (s: string) => secret && s ? s.replaceAll(secret, SECRET_MASK) : s;
   const { files, existingSession } = served;
   const status = served.status, stdout = scrub(served.stdout), stderr = scrub(served.stderr);
   if (!opts.bridgeRetried && isBridgeTimeout(args, { status, stderr })) {
