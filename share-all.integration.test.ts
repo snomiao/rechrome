@@ -20,6 +20,11 @@ test("share --all: one snapshot link, profiles picked on the host, never the man
     console.log('Profile: ' + process.env.PLAYWRIGHT_MCP_PROFILE_DIRECTORY + ' Session: ' + session);
     if (process.argv.includes('tab-list')) console.log('- 0: (current) [Page](https://example.com/form)');
     if (process.argv.includes('upload')) console.log('Uploaded ' + require('path').basename(process.argv[process.argv.indexOf('upload') + 1]));
+    if (process.argv.includes('download-me')) {
+      require('fs').mkdirSync('.playwright-cli', { recursive: true });
+      require('fs').writeFileSync('.playwright-cli/download-report.csv', 'a,b\\n1,2\\n');
+      console.log('- Downloaded file report.csv to ".playwright-cli/download-report.csv"');
+    }
   `);
   const entry = (profileDir: string) => ({ profileDir, extensionId: "a".repeat(32), token: `token-${profileDir}` });
   const registryPath = join(root, ".rechrome", "profiles.json");
@@ -160,6 +165,15 @@ test("share --all: one snapshot link, profiles picked on the host, never the man
     expect(bad.code).toBe(2);
     expect(bad.stderr).toContain("no such file");
     expect(bad.stderr).toContain("Usage: rech upload <file>");
+
+    // A browser download (any type) goes to the client, then is deleted on the host.
+    const dl = await rech(["--profile", "qa", "click", "download-me"], clientEnv, client);
+    expect(dl.code).toBe(0);
+    const savedDl = (await Array.fromAsync(new Bun.Glob("**/download-report.csv").scan({ cwd: client, dot: true })));
+    expect(savedDl.length).toBe(1);
+    expect(await readFile(join(client, savedDl[0]!), "utf8")).toBe("a,b\n1,2\n");
+    const hostDl = await Array.fromAsync(new Bun.Glob("**/download-report.csv").scan({ cwd: join(root, ".rechrome"), dot: true }));
+    expect(hostDl).toEqual([]);
 
     // A link saved with --save is remembered: removing its listener warns with the file and the fix,
     // and the next listener rech creates does not take the freed port (no other listener's answer).

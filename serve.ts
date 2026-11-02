@@ -100,6 +100,13 @@ const runsInFlight = new Map<Promise<void>, string | undefined>();
 const CLI_TEXT_ARTIFACT = /(^|\/)\.playwright-cli(-multi-tab)?\/[^/]+\.(?:ya?ml|json|md|txt|log)$/;
 // Artifacts that could not be checked AND could not be deleted: never served.
 const deniedFiles = new Set<string>();
+// Browser downloads go to the client: a download waits here (real path → cleanup timer) until the
+// client fetches it once, then the host copy is deleted. A listener with keepDownloads: true
+// keeps them on the host instead (opt-in).
+const pendingDownloads = new Map<string, ReturnType<typeof setTimeout>>();
+const DOWNLOAD_PICKUP_MS = 10 * 60_000;
+// playwright-cli's line for a finished download (tools/backend/response.ts).
+const DOWNLOADED_LINE = /^- Downloaded file (.+?) to "(.+)"$/gm;
 function noteSession(sess: string, now: number): void {
   recentSessions.set(sess, now);
   if (recentSessions.size > 64) {
@@ -752,6 +759,15 @@ export async function serve() {
         const real = realpathSync(resolved);
         if (!isUnderDir(realpathSync(workDir), real) || !readable(relative(realpathSync(workDir), real).replaceAll("\\", "/"))) return new Response("Forbidden", { status: 403 });
         if (deniedFiles.has(real)) return new Response("Forbidden", { status: 403 });
+        const pickup = pendingDownloads.get(real);
+        if (pickup) {
+          // Handed over once, then gone from the host.
+          clearTimeout(pickup);
+          pendingDownloads.delete(real);
+          const bytes = readFileSync(real);
+          try { unlinkSync(real); } catch (e) { log(`download: could not delete ${relative(realpathSync(workDir), real)} after pickup: ${e}`); }
+          return new Response(bytes);
+        }
         if (TEXT_OUTPUT.test(real)) {
           const busy = () => [...runsInFlight].filter(([, dir]) => !dir || real.startsWith(dir + sep)).map(([p]) => p);
           for (let pending = busy(); pending.length; pending = busy()) await Promise.all(pending); // re-check: new runs may start
@@ -1226,6 +1242,23 @@ export async function serve() {
             }
           }
         }
+      }
+
+      // Browser downloads, whatever their type: forwarded to the client and logged.
+      for (const [, name, rel] of rawOutput.matchAll(DOWNLOADED_LINE)) {
+        if (!isUnderDir(runWorkDir, rel)) continue;
+        const path = resolve(runWorkDir, rel);
+        if (!existsSync(path)) continue;
+        const f = relative(runWorkDir, path).replaceAll("\\", "/");
+        if (!outputFiles.includes(f)) outputFiles.push(f);
+        const bytes = readFileSync(path);
+        const keep = listener.keepDownloads === true;
+        log(`download: ${JSON.stringify({ listener: listener.name, name: name.slice(0, 256), size: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"), kept: keep })}`);
+        if (keep) continue;
+        const real = realpathSync(path);
+        clearTimeout(pendingDownloads.get(real));
+        // Never fetched (the client went away): delete it anyway.
+        pendingDownloads.set(real, setTimeout(() => { pendingDownloads.delete(real); try { unlinkSync(real); } catch {} }, DOWNLOAD_PICKUP_MS));
       }
 
       // A file the command was told to write (`snapshot --filename=x.yml`) is its own artifact too.

@@ -6,7 +6,7 @@ import { join } from "path";
 import { mkdir, readFile, rename, writeFile } from "fs/promises";
 
 // publicUrl: where a reverse proxy (Tailscale Serve, Caddy, nginx, ...) exposes this listener.
-export type Listener = { name: string; host: string; port: number; key: string; profiles: string[] | "*"; prefix?: string; publicUrl?: string; uploads?: UploadPolicy | false; readSecrets?: boolean; readCookies?: boolean };
+export type Listener = { name: string; host: string; port: number; key: string; profiles: string[] | "*"; prefix?: string; publicUrl?: string; uploads?: UploadPolicy | false; readSecrets?: boolean; readCookies?: boolean; keepDownloads?: boolean };
 // retiredPorts: ports of removed listeners, newest last. New listeners skip them so a link
 // saved for a removed listener gets "connection refused", not some other listener's answer.
 export type ListenerConfig = { version: 1; listeners: Listener[]; retiredPorts?: number[] };
@@ -63,6 +63,7 @@ export function validateListeners(value: unknown): ListenerConfig {
     if (l.uploads !== undefined && l.uploads !== false) validateUploadPolicy(l.uploads);
     if (l.readSecrets !== undefined && typeof l.readSecrets !== "boolean") throw new Error("readSecrets must be true or false");
     if (l.readCookies !== undefined && typeof l.readCookies !== "boolean") throw new Error("readCookies must be true or false");
+    if (l.keepDownloads !== undefined && typeof l.keepDownloads !== "boolean") throw new Error("keepDownloads must be true or false");
     const address = listenerAddress(l);
     if (names.has(l.name) || addresses.has(address) || keys.has(l.key)) throw new Error("Listener names, addresses, and credentials must be unique");
     names.add(l.name); addresses.add(address); keys.add(l.key);
