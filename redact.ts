@@ -20,6 +20,8 @@ export type SecretRule = {
   /** Which capture group is the secret (gitleaks' `secretGroup`). */
   group?: number;
   allow: RegExp[];
+  /** Allowlist regexes gitleaks runs against the whole match (`regexTarget = "match"`). */
+  allowMatch?: RegExp[];
   stop: string[];
 };
 
@@ -76,16 +78,17 @@ export function loadGitleaksRules(toml: string): SecretRule[] {
   for (const r of c.rules) {
     if (!r.regex) continue;
     const allow = [...gAllow];
+    const allowMatch: RegExp[] = [];
     const stop = [...gStop];
     for (const a of [...(r.allowlists ?? []), ...(r.allowlist ? [r.allowlist] : [])]) {
       if (a.regexTarget && a.regexTarget !== "secret" && a.regexTarget !== "match") continue;
-      for (const x of a.regexes ?? []) allow.push(compile(x));
+      for (const x of a.regexes ?? []) (a.regexTarget === "match" ? allowMatch : allow).push(compile(x));
       for (const s of a.stopwords ?? []) stop.push(String(s).toLowerCase());
     }
     const j = goToJs(r.regex);
     rules.push({
       id: r.id, re: new RegExp(j.source, j.flags + "g"), keywords: (r.keywords ?? []).map((k) => k.toLowerCase()),
-      ...(r.entropy ? { entropy: r.entropy } : {}), ...(r.secretGroup ? { group: r.secretGroup } : {}), allow, stop,
+      ...(r.entropy ? { entropy: r.entropy } : {}), ...(r.secretGroup ? { group: r.secretGroup } : {}), allow, ...(allowMatch.length ? { allowMatch } : {}), stop,
     });
   }
   return rules;
@@ -94,12 +97,12 @@ export function loadGitleaksRules(toml: string): SecretRule[] {
 /** Ours, for what gitleaks' set leaves out. */
 export const OWN_RULES: SecretRule[] = [
   // ?token=… / &sig=… in a URL; `<your token>` and xxx-style placeholders are not secrets.
-  { id: "url-secret-param", re: /[?&](?:access_token|token|key|api_key|apikey|secret|client_secret|password|passwd|pwd|sig|signature)=([^&\s#<>"'|]{6,})/gi, keywords: ["="], allow: [/^(?:x+|\*+|\.\.\.|your[-_]?\w*|xxx\w*)$/i], stop: [] },
+  { id: "url-secret-param", re: /[?&](?:access_token|token|key|api_key|apikey|secret|client_secret|password|passwd|pwd|sig|signature)=([^&\s#<>"'|]{6,})/gi, group: 1, keywords: ["="], allow: [/^(?:x+|\*+|\.\.\.|your[-_]?\w*|xxx\w*)$/i], stop: [] },
   // OpenAI / Anthropic / OpenRouter style keys, whatever their exact layout.
   { id: "sk-key", re: /\b(sk-(?:proj-|ant-|or-v1-|svcacct-)?[A-Za-z0-9_-]{20,})/g, keywords: ["sk-"], entropy: 3.5, allow: [], stop: [] },
   // A 6-digit code only right after a word that says it is one: a bare
   // 6-digit number is far more often an amount, an order or a build.
-  { id: "otp-code", re: /(?:code|コード|otp|pin|passcode|認証|確認番号|ワンタイム)[^\d\n]{0,20}(?<![\d.])(\d{6})(?![\d.])/gi, keywords: [], allow: [], stop: [] },
+  { id: "otp-code", re: /(?:code|コード|otp|pin|passcode|認証|確認番号|ワンタイム)[^\d\n]{0,20}(?<![\d.])(\d{6})(?![\d.])/gi, group: 1, keywords: [], allow: [], stop: [] },
 ];
 
 let cached: SecretRule[] | undefined;
@@ -134,10 +137,13 @@ export function findSecrets(text: string, rules = secretRules()): SecretHit[] {
       if (!secret) continue;
       if (r.entropy && shannon(secret) < r.entropy) continue;
       if (r.allow.some((a) => a.test(secret))) continue;
+      if (r.allowMatch?.some((a) => a.test(m[0]))) continue;
       const sl = secret.toLowerCase();
       if (r.stop.some((s) => sl.includes(s))) continue;
-      const start = gi > 0 && m.indices?.[gi] ? m.indices[gi]![0] : m.index;
-      out.push({ id: r.id, start, end: start + secret.length });
+      // Without an explicit secretGroup the first capture may be a harmless fragment (a
+      // webhook's UUID, a JWT's fixed header), so mask the whole match then.
+      const span = r.group && m.indices?.[r.group] ? m.indices[r.group]! : [m.index, m.index + m[0].length];
+      out.push({ id: r.id, start: span[0], end: span[1] });
     }
   }
   return out;
