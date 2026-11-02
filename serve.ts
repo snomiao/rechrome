@@ -764,9 +764,13 @@ export async function serve() {
           // Handed over once, then gone from the host.
           clearTimeout(pickup);
           pendingDownloads.delete(real);
-          const bytes = readFileSync(real);
-          try { unlinkSync(real); } catch (e) { log(`download: could not delete ${relative(realpathSync(workDir), real)} after pickup: ${e}`); }
-          return new Response(bytes);
+          // Streamed, then deleted once fully sent (or when the client hangs up).
+          const done = () => { try { unlinkSync(real); } catch { /* already gone */ } };
+          const reader = file(real).stream().getReader();
+          return new Response(new ReadableStream({
+            async pull(c) { const { done: end, value } = await reader.read(); if (end) { c.close(); done(); } else c.enqueue(value); },
+            cancel() { void reader.cancel(); done(); },
+          }));
         }
         if (TEXT_OUTPUT.test(real)) {
           const busy = () => [...runsInFlight].filter(([, dir]) => !dir || real.startsWith(dir + sep)).map(([p]) => p);
@@ -1216,13 +1220,17 @@ export async function serve() {
         if (!isUnderDir(runWorkDir, rel)) continue;
         const path = resolve(runWorkDir, rel);
         if (!existsSync(path)) continue;
+        // Only a regular file really inside the work dir: never follow a link to delete elsewhere.
+        const real = realpathSync(path);
+        if (!isUnderDir(realpathSync(runWorkDir), real) || !lstatSync(real).isFile()) continue;
         const f = relative(runWorkDir, path).replaceAll("\\", "/");
         if (!outputFiles.includes(f)) outputFiles.push(f);
-        const bytes = readFileSync(path);
+        const hash = createHash("sha256");
+        let size = 0;
+        for await (const chunk of file(real).stream()) { hash.update(chunk); size += chunk.byteLength; }
         const keep = listener.keepDownloads === true;
-        log(`download: ${JSON.stringify({ listener: listener.name, name: name.slice(0, 256), size: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"), kept: keep })}`);
+        log(`download: ${JSON.stringify({ listener: listener.name, name: name.slice(0, 256), size, sha256: hash.digest("hex"), kept: keep })}`);
         if (keep) continue;
-        const real = realpathSync(path);
         clearTimeout(pendingDownloads.get(real));
         // Never fetched (the client went away): delete it anyway.
         pendingDownloads.set(real, setTimeout(() => { pendingDownloads.delete(real); try { unlinkSync(real); } catch {} }, DOWNLOAD_PICKUP_MS));
