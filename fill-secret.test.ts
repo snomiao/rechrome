@@ -134,11 +134,11 @@ describe("SecretMasker", () => {
     let now = 0;
     const m = new SecretMasker(1000, () => now);
     expect(m.active).toBe(false);
-    m.add('pa"ss');
-    expect(m.mask(`fill("pa\\"ss") and pa"ss`)).toBe(`fill("***") and ***`);
+    m.add('pa"ssw');
+    expect(m.mask(`fill("pa\\"ssw") and pa"ssw`)).toBe(`fill("***") and ***`);
     now = 1001;
     expect(m.active).toBe(false);
-    expect(m.mask('pa"ss')).toBe('pa"ss');
+    expect(m.mask('pa"ssw')).toBe('pa"ssw');
     m.add("pw-forever", Infinity);
     now = 10 ** 12;
     expect(m.mask("x pw-forever")).toBe("x ***");
@@ -193,4 +193,14 @@ describe("password fields in snapshots", () => {
     expect(hasSnapshot("- [Snapshot](.playwright-cli/page-1.yml)")).toBe(true);
     expect(hasSnapshot("### Result\n42")).toBe(false);
   });
+});
+
+test("values shorter than MIN_MASK_LENGTH are never masked (a '1' would corrupt every output)", () => {
+  const m = new SecretMasker();
+  m.add("1", Infinity);
+  m.add("12345", Infinity);
+  expect(m.active).toBe(false);
+  expect(m.mask("team T011 ref e137")).toBe("team T011 ref e137");
+  m.add("123456");
+  expect(m.mask("code 123456")).toBe("code ***");
 });
