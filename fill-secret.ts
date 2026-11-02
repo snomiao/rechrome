@@ -19,6 +19,10 @@ import { join } from "path";
 
 export const SECRET_MASK = "***";
 export const SECRET_MASK_TTL_MS = 15 * 60_000;
+/** Shorter values are never masked: masking "1" everywhere would turn every 1 in every output
+ *  into ***, corrupting ids and refs for the daemon's lifetime. A TOTP code (6 digits) still is. */
+export const MIN_MASK_LENGTH = 6;
+export const maskable = (value: string | undefined | null): value is string => !!value && value.length >= MIN_MASK_LENGTH;
 
 // ---------- client side ----------
 
@@ -233,7 +237,7 @@ export function buildFillCode(ref: string, value: string, allowDomains: string[]
 export class SecretMasker {
   private values = new Map<string, number>();
   constructor(private ttlMs = SECRET_MASK_TTL_MS, private now = () => Date.now()) {}
-  add(value: string, ttlMs = this.ttlMs) { if (value) this.values.set(value, this.now() + ttlMs); }
+  add(value: string, ttlMs = this.ttlMs) { if (maskable(value)) this.values.set(value, this.now() + ttlMs); }
   get active(): boolean { this.prune(); return this.values.size > 0; }
   mask(text: string): string {
     if (!text) return text;
