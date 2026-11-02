@@ -21,7 +21,8 @@ export const SECRET_MASK = "***";
 export const SECRET_MASK_TTL_MS = 15 * 60_000;
 /** Shorter values are never masked: masking "1" everywhere would turn every 1 in every output
  *  into ***, corrupting ids and refs for the daemon's lifetime. A TOTP code (6 digits) still is.
- *  The fill-secret command's own output is still scrubbed of its value, whatever the length. */
+ *  A short value is kept out of fill-secret's own reply by dropping the echoed code that holds it,
+ *  and out of its error message by an exact replace; anything the page itself shows is not masked. */
 export const MIN_MASK_LENGTH = 6;
 export const maskable = (value: string | undefined | null): value is string => !!value && value.length >= MIN_MASK_LENGTH;
 

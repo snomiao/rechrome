@@ -643,7 +643,7 @@ export async function getOrCreateUrl(persist = true): Promise<string> {
     const envRaw = await file(globalEnvFile).text().catch(() => "");
     const lines = envRaw.trimEnd().split("\n").filter(l => !l.startsWith(`${ENV_KEY}=`));
     const content = [...lines, newLine, ""].join("\n");
-    await Bun.write(globalEnvFile, content);
+    await writeAtomic(globalEnvFile, content, 0o600); // holds the management key
   }
   process.env[ENV_KEY] = url;
   return url;
@@ -1780,7 +1780,7 @@ async function printProfileUri(selector?: string, listener?: string, opts: { loc
     if (!picked.startsWith(SETUP)) return picked;
     const dir = picked.slice(SETUP.length);
     console.error(`[rech] ${dir} isn't set up yet; running rech setup --profile ${JSON.stringify(dir)} first.`);
-    await setup({ profile: dir });
+    await setup({ profile: dir, skipShare: true });
     const after = await readTokenRegistry();
     const key = unregisteredChromeProfiles(after, { [dir]: {} }).length ? undefined : canonicalProfileKeys(after).find(k => after[k].profileDir === dir);
     if (process.exitCode || !key) throw new Error(`Setup didn't register ${dir}; nothing shared. Retry with: rech setup --profile ${JSON.stringify(dir)}`);
@@ -2737,7 +2737,7 @@ export async function daemonInstall(serveUrl: string): Promise<void> {
   const envRaw = await file(globalEnvFile).text().catch(() => "");
   const lines = envRaw.trimEnd().split("\n");
   const filtered = lines.filter(l => !l.startsWith(`${ENV_KEY}=`));
-  await Bun.write(globalEnvFile, [...filtered, envAssignment(ENV_KEY, keepProfileParam(serveUrl, lines.find(l => l.startsWith(`${ENV_KEY}=`))?.slice(ENV_KEY.length + 1))), ""].join("\n"));
+  await writeAtomic(globalEnvFile, [...filtered, envAssignment(ENV_KEY, keepProfileParam(serveUrl, lines.find(l => l.startsWith(`${ENV_KEY}=`))?.slice(ENV_KEY.length + 1))), ""].join("\n"), 0o600);
 
   const home = HOME;
   const bunBin = Bun.which("bun") ?? process.execPath;
@@ -3434,7 +3434,6 @@ async function saveGlobalUrl(url: string): Promise<string> {
   return writeEnvUrl(GLOBAL_ENV_FILE, url);
 }
 
-/** Replace RECHROME_URL in an env file, keeping its other lines; owner-only, since the URL holds a key. */
 /** Write a file whole or not at all: a temp file beside it, then rename (atomic on one filesystem). */
 export async function writeAtomic(path: string, data: string, mode?: number): Promise<void> {
   // A symlinked .env.local stays a link: write the file it points to.
@@ -3471,6 +3470,7 @@ export async function ensureProjectDir(dir: string): Promise<void> {
   if (!existsSync(readme)) await writeAtomic(readme, PROJECT_DIR_README);
 }
 
+/** Replace RECHROME_URL in an env file, keeping its other lines; owner-only, since the URL holds a key. */
 async function writeEnvUrl(envPath: string, url: string): Promise<string> {
   const lines = (await file(envPath).text().catch(() => "")).split("\n").filter(l => l.trim() && !l.startsWith(`${ENV_KEY}=`));
   await writeAtomic(envPath, [...lines, envAssignment(ENV_KEY, url), ""].join("\n"), 0o600);
@@ -3981,7 +3981,7 @@ async function setup(opts: SetupOptions = {}): Promise<void> {
     guide?.close();
     console.log(`      Saved token for ${extraDisplay}`);
   }
-  if (bridgeVerified && isTTY && !opts.listen) await setupShareStep(ask, profileEmail);
+  if (bridgeVerified && isTTY && !opts.listen && !opts.skipShare) await setupShareStep(ask, profileEmail);
   rl?.close();
   envWatcher?.close();
   if (bridgeVerified)
@@ -4430,7 +4430,7 @@ async function status(): Promise<void> {
 }
 
 
-export type SetupOptions = { profile?: string; token?: string; listen?: string; prefix?: string; port?: number; yes?: boolean };
+export type SetupOptions = { profile?: string; token?: string; listen?: string; prefix?: string; port?: number; yes?: boolean; /** Called from `rech share`, which shares the profile itself. */ skipShare?: boolean };
 export type RechHandlers = {
   serve(): Promise<void> | void;
   status(): Promise<void>;

@@ -151,8 +151,27 @@ function findKnown(text: string, known: readonly string[]): SecretHit[] {
 
 export type RedactOptions = { rules?: SecretRule[]; known?: readonly string[] };
 
+/** Unbroken runs of base64/hex characters this long are image data or blobs, not secrets (the
+ *  longest gitleaks secret is a few hundred characters). Scanning them costs seconds per MB, as
+ *  short keywords such as `api` or `okta` turn up in random base64 by chance. */
+const OPAQUE_RUN = /[A-Za-z0-9+/=_-]{4096,}/g;
+
 /** Every secret span in `text`. */
 export function findSecrets(text: string, opts: RedactOptions = {}): SecretHit[] {
+  if (text.length >= 4096 && OPAQUE_RUN.test(text)) {
+    OPAQUE_RUN.lastIndex = 0;
+    // Scan the text between the runs only, keeping the original offsets; known values are still
+    // found everywhere, since an exact match is cheap.
+    const out: SecretHit[] = opts.known?.length ? findKnown(text, opts.known) : [];
+    let at = 0;
+    for (const m of [...text.matchAll(OPAQUE_RUN), { index: text.length, 0: '' } as unknown as RegExpExecArray]) {
+      const piece = text.slice(at, m.index);
+      if (piece) for (const h of findSecrets(piece, { ...opts, known: [] })) out.push({ ...h, start: h.start + at, end: h.end + at });
+      at = m.index + m[0].length;
+    }
+    return out;
+  }
+  OPAQUE_RUN.lastIndex = 0;
   const rules = opts.rules ?? secretRules();
   const lower = text.toLowerCase();
   const out: SecretHit[] = opts.known?.length ? findKnown(text, opts.known) : [];

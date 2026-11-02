@@ -224,8 +224,10 @@ export async function readHostFile(path: string, hostDirs: string[] | undefined,
   const inside = (real: string) => roots.some(root => real.startsWith(root.endsWith(sep) ? root : root + sep));
   const resolveInside = async () => {
     let real: string;
-    try { real = await realpath(path); } catch { throw new Error('Host upload file not found'); }
-    if (!inside(real)) throw new Error('Host upload path is outside the listener\'s allowed directories');
+    // One answer for "missing" and "outside", so a link holder can't probe which host paths exist.
+    const refused = () => new Error('Host upload path is not an existing file in the listener\'s allowed directories');
+    try { real = await realpath(path); } catch { throw refused(); }
+    if (!inside(real)) throw refused();
     return real;
   };
   // Open once, then prove the opened file is the one an allowed path names now (same device and
@@ -293,7 +295,8 @@ export async function receiveUpload(options: {
     const failed = (r: UploadResult) => r.status !== 0 || /^### Error\b/m.test(r.stdout);
     const script = async (mode: Exclude<UploadMode, 'chooser'>) => {
       const file = join(dir!, randomBytes(8).toString('hex') + '.js');
-      await writeFile(file, uploadScript(mode, p.target, path, p), { mode: 0o600, flag: 'wx' });
+      // drop/paste embed the bytes in the page script; a --host upload sent none, so use what was read.
+      await writeFile(file, uploadScript(mode, p.target, path, { ...p, data: bytes.toString('base64') }), { mode: 0o600, flag: 'wx' });
       return options.run(['run-code', '--filename', file]);
     };
     const mode = p.mode ?? 'auto';

@@ -26,3 +26,13 @@ test("a mid-pattern (?i) keeps alternatives apart", () => {
   const key = "Zq8vR2mXw7LpT4nKc9YbH3sJd6GfA1eU";
   expect(redact(`curl -H 'Authorization: Bearer ${key}' https://example.com`).text).not.toContain(key);
 });
+
+test("long base64 runs (image data) are skipped, fast; secrets beside them are still caught", () => {
+  const blob = Buffer.from(crypto.getRandomValues(new Uint8Array(3_750_000))).toString("base64"); // 5 MB
+  const text = `"data:image/png;base64,${blob}" token ghp_1234567890abcdefghijABCDEFGHIJ123456\n`;
+  const t0 = performance.now();
+  const r = redact(text);
+  expect(performance.now() - t0).toBeLessThan(500);
+  expect(r.kinds).toEqual(["github-pat"]);
+  expect(r.text).toContain(blob);
+});
