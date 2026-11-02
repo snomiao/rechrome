@@ -24,7 +24,7 @@ import {
   checkTailscaleServe,
   chromeDataAccessHint,
 } from "./rechrome.ts";
-import { SecretMasker, parseFillSecretWire, fillSecretOnSession, passwordValuesOnSession, hasSnapshot, maskPasswordLines, withholdSnapshots } from "./fill-secret.ts";
+import { SecretMasker, parseReadSecretWire, readSecretOnSession, parseFillSecretWire, fillSecretOnSession, passwordValuesOnSession, hasSnapshot, maskPasswordLines, withholdSnapshots } from "./fill-secret.ts";
 
 const TAILSCALE_BIN = process.env.TAILSCALE_BIN || "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
 const CERT_RENEW_THRESHOLD_DAYS = 7;
@@ -940,6 +940,23 @@ export async function serve() {
         } catch (error) {
           const message = secretMasker.mask(secret ? (error instanceof Error ? error.message : String(error)).replaceAll(secret, "***") : (error instanceof Error ? error.message : String(error)));
           log(`exit: 1 | fill-secret: ${message.split("\n")[0]}`);
+          return Response.json({ status: 1, stdout: "", stderr: `[rech] ${message}\n`, files: [] });
+        }
+      }
+
+      // read-secret: the value goes back only in `secretOut`, never into stdout, a log line or a
+      // file, and is masked in every later output. See fill-secret.ts.
+      if (filteredArgs[0] === "read-secret") {
+        try {
+          const { ref, allowDomains } = parseReadSecretWire(filteredArgs);
+          const { host, value } = await readSecretOnSession({ socketRoot: tmpSocketRoot(), session: namespacedSession, cwd: runWorkDir, ref, allowDomains });
+          if (!value) throw new Error(`read-secret: ${ref} on ${host} is empty`);
+          secretMasker.add(value, Infinity);
+          log(`exit: 0 | read-secret ${ref} on ${host} (${value.length} chars, value not logged)`);
+          return Response.json({ status: 0, stdout: "", stderr: "", files: [], secretOut: value });
+        } catch (error) {
+          const message = secretMasker.mask(error instanceof Error ? error.message : String(error));
+          log(`exit: 1 | read-secret: ${message.split("\n")[0]}`);
           return Response.json({ status: 1, stdout: "", stderr: `[rech] ${message}\n`, files: [] });
         }
       }

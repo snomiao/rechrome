@@ -95,6 +95,21 @@ test.skipIf(!hasBrowser)("fill-secret fills the page and leaks the value nowhere
     expect(filled.out).toContain("filled e3 on 127.0.0.1");
     expect((await rech(fieldHash("#pw"))).out).toContain(`H${hash(CANARY)}`);
 
+    // read-secret: the value comes back raw on a piped stdout, and only there.
+    const readRaw = async (args: string[]) => {
+      const p = Bun.spawn([process.execPath, join(import.meta.dir, "rechrome.ts"), ...args], { cwd: work, env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+      const [status, stdout, stderr] = await Promise.all([p.exited, new Response(p.stdout).text(), new Response(p.stderr).text()]);
+      return { status, stdout, stderr };
+    };
+    const readBad = await readRaw(["read-secret", "e3", "--allow-domain", "*.example.com"]);
+    expect(readBad.status).not.toBe(0);
+    expect(readBad.stdout).toBe("");
+    expect(readBad.stderr).toContain("read-secret refused");
+    const readOk = await readRaw(["read-secret", "e3", "--allow-domain", "127.0.0.1"]);
+    expect(readOk.status).toBe(0);
+    expect(readOk.stdout).toBe(CANARY);
+    expect(readOk.stderr).not.toContain(CANARY);
+
     // TOTP from an env file: the code lands; the seed never leaves the client.
     const envFile = join(root, "secrets.env");
     await writeFile(envFile, `SEED=${SEED}\n`);
@@ -128,6 +143,7 @@ test.skipIf(!hasBrowser)("fill-secret fills the page and leaks the value nowhere
     }
     const log = await readFile(serveLog, "utf8") + await readFile(join(root, "serve.err"), "utf8");
     expect(log).toContain("run: rech fill-secret e3");
+    expect(log).toContain("read-secret e3 on 127.0.0.1");
     expect(log).not.toContain(CANARY);
     expect(log).not.toContain(SEED);
     expect(log).not.toContain(AUTOFILL);

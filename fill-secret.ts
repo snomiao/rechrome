@@ -348,6 +348,96 @@ export function fillSecretOnSession(opts: { socketRoot: string; session: string;
   return runCodeOnSession({ ...opts, code: buildFillCode(opts.ref, opts.value, opts.allowDomains, opts.submit) });
 }
 
+// ---------- read-secret: a field's value to a pipe ----------
+//
+// The reverse of fill-secret, for moving a secret a page shows (an API signing secret in a
+// password-type field) into a vault without it appearing anywhere. The page host must match a
+// required --allow-domain; the value travels only in the response's `secretOut` field, is never
+// logged, is masked in every later output, and the client writes it raw to a pipe only, never
+// to a terminal. On a profile-scoped listener it is refused unless the host turned it on.
+
+export const READ_SECRET_USAGE = `Usage: rech read-secret <ref|selector> --allow-domain <glob> [--allow-domain <glob>]... | <vault command>
+  Writes the field's current value, raw and without a newline, to stdout, which must be a pipe
+  or a file (never a terminal). The value is never logged and is masked in later outputs.
+  --allow-domain GLOB   required: refuse unless the field's page host matches, e.g. app.slack.com`;
+
+/** Client args → the wire args (same shape); --allow-domain is required. */
+export function parseReadSecretArgs(args: string[]): { ref: string; allowDomains: string[] } {
+  const [cmd, ...rest] = args;
+  if (cmd !== "read-secret") throw new Error("Expected read-secret");
+  let ref: string | undefined;
+  const allowDomains: string[] = [];
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i]!;
+    if (a === "--allow-domain" || a.startsWith("--allow-domain=")) {
+      const v = a === "--allow-domain" ? rest[++i] : a.slice("--allow-domain=".length);
+      if (!v) throw new Error("--allow-domain got an empty host");
+      for (const d of v.split(",")) { domainGlobToRegExp(d.trim()); allowDomains.push(d.trim()); }
+    } else if (a.startsWith("-")) throw new Error(`read-secret: unknown option ${a}`);
+    else if (ref === undefined) ref = a;
+    else throw new Error("read-secret takes one target");
+  }
+  if (!ref) throw new Error("read-secret needs a target ref (from rech snapshot) or a selector");
+  if (!allowDomains.length) throw new Error("read-secret needs --allow-domain: name the site the secret must come from");
+  return { ref, allowDomains };
+}
+
+export function readSecretWireArgs(req: { ref: string; allowDomains: string[] }): string[] {
+  return ["read-secret", req.ref, ...req.allowDomains.map(d => `--allow-domain=${d}`)];
+}
+
+/** Parse what the daemon received; exactly the shape readSecretWireArgs sends. */
+export function parseReadSecretWire(args: string[]): { ref: string; allowDomains: string[] } {
+  const [cmd, ref, ...rest] = args;
+  if (cmd !== "read-secret" || !ref || ref.startsWith("-")) throw new Error("read-secret needs a target ref");
+  const allowDomains: string[] = [];
+  for (const a of rest) {
+    if (!a.startsWith("--allow-domain=")) throw new Error(`read-secret: unexpected argument ${a.startsWith("-") ? a : "(positional)"}`);
+    const d = a.slice("--allow-domain=".length);
+    domainGlobToRegExp(d);
+    allowDomains.push(d);
+  }
+  if (!allowDomains.length) throw new Error("read-secret needs --allow-domain");
+  return { ref, allowDomains };
+}
+
+/** run-code that checks the field's own document host, then returns {host, value} as JSON. */
+export function buildReadCode(ref: string, allowDomains: string[]): string {
+  const patterns = allowDomains.map(d => domainGlobToRegExp(d).source);
+  const locator = /^(f\d+)?e\d+$/.test(ref) ? `page.locator(${JSON.stringify(`aria-ref=${ref}`)})` : `page.locator(${JSON.stringify(ref)})`;
+  return `async page => {
+  const el = await ${locator}.elementHandle({ timeout: 10000 });
+  try {
+    const host = String(await el.evaluate(e => e.ownerDocument.location.hostname)).toLowerCase();
+    const allowed = ${JSON.stringify(patterns)};
+    if (!allowed.some(p => new RegExp(p, "i").test(host)))
+      throw new Error("read-secret refused: the field's page host " + JSON.stringify(host) + " is not allowed by --allow-domain");
+    // Like fill: a label ref means its control. A field reads as its value; anything else (a
+    // secret shown as text after "Show") as its text.
+    const value = await el.evaluate(e => {
+      const t = e.tagName === "LABEL" && e.control ? e.control : e;
+      return t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" ? String(t.value) : String(t.textContent ?? "").trim();
+    });
+    return JSON.stringify({ host, value });
+  } finally {
+    await el.dispose().catch(() => {});
+  }
+}`;
+}
+
+/** Read the field on the session's live browser. The returned value must never be logged. */
+export async function readSecretOnSession(opts: { socketRoot: string; session: string; cwd: string; ref: string; allowDomains: string[] }): Promise<{ host: string; value: string }> {
+  const { isError, text } = await runCodeOnSession({ ...opts, code: buildReadCode(opts.ref, opts.allowDomains), json: true });
+  // An error text can't hold the value: the code throws before reading it, or fails reading it.
+  if (isError) throw new Error(text.replace(/### Ran Playwright code\n```js\n[\s\S]*?\n```\n?/, "").trim() || "read-secret failed");
+  let raw: unknown;
+  try { raw = JSON.parse(text).result; } catch { raw = text.match(/### Result\n([^\n]*)/)?.[1]; }
+  let out: any = raw;
+  for (let i = 0; i < 2 && typeof out === "string"; i++) { try { out = JSON.parse(out); } catch { out = undefined; } }
+  if (!out || typeof out.host !== "string" || typeof out.value !== "string") throw new Error("read-secret: the page returned no value");
+  return out;
+}
+
 // ---------- password fields in snapshots ----------
 //
 // Snapshots print every input's value, and that includes password fields Chrome autofilled
