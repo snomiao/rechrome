@@ -22,3 +22,7 @@ shares.js
 e2e.js
 webrtc.js
 signal-relay.js
+
+# A symlinked node_modules or vendor (from a worktree) must not be committed either.
+/node_modules
+/vendor
