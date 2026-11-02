@@ -512,13 +512,15 @@ export function buildReadCookieCode(name: string, domain: string, allowDomains: 
   const dom = ${JSON.stringify(domain.toLowerCase())}.replace(/^\\./, "");
   if (!allowed.some(p => new RegExp(p, "i").test(dom)))
     throw new Error("read-cookie refused: domain " + JSON.stringify(dom) + " is not allowed by --allow-domain");
-  const url = "https://" + dom + "/";
-  const cookies = await page.context().cookies([url]);
-  const match = cookies.filter(c => c.name === ${JSON.stringify(name)} && dom === String(c.domain).replace(/^\\./, "").toLowerCase());
+  // All cookies, any path (a URL filter would drop /app-scoped ones). Domain-match per RFC6265:
+  // the cookie's own domain is dom, or a parent of dom (a ".slack.com" cookie serves a subdomain).
+  const cookies = await page.context().cookies();
+  const domainMatches = cd => { cd = String(cd).replace(/^\\./, "").toLowerCase(); return dom === cd || dom.endsWith("." + cd); };
+  const match = cookies.filter(c => c.name === ${JSON.stringify(name)} && domainMatches(c.domain));
   if (!match.length) throw new Error("read-cookie: no cookie " + JSON.stringify(${JSON.stringify(name)}) + " for " + dom + " (is this profile signed in?)");
-  let value;
-  try { value = String(match[0].value); } catch { throw new Error("read-cookie: could not read the cookie"); }
-  return JSON.stringify({ domain: dom, value });
+  const values = [...new Set(match.map(c => { try { return String(c.value); } catch { return null; } }))];
+  if (values.length !== 1 || values[0] == null) throw new Error("read-cookie: " + match.length + " cookies named " + JSON.stringify(${JSON.stringify(name)}) + " for " + dom + " disagree; narrow the domain");
+  return JSON.stringify({ domain: dom, value: values[0] });
 }`;
 }
 
