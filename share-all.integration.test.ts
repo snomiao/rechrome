@@ -25,6 +25,11 @@ test("share --all: one snapshot link, profiles picked on the host, never the man
       require('fs').writeFileSync('.playwright-cli/download-report.csv', 'a,b\\n1,2\\n');
       console.log('- Downloaded file report.csv to ".playwright-cli/download-report.csv"');
     }
+    if (process.argv.includes('download-link')) {
+      require('fs').mkdirSync('.playwright-cli', { recursive: true });
+      try { require('fs').symlinkSync(process.env.OUTSIDE_FILE, '.playwright-cli/download-evil.csv'); } catch {}
+      console.log('- Downloaded file evil.csv to ".playwright-cli/download-evil.csv"');
+    }
   `);
   const entry = (profileDir: string) => ({ profileDir, extensionId: "a".repeat(32), token: `token-${profileDir}` });
   const registryPath = join(root, ".rechrome", "profiles.json");
@@ -34,7 +39,9 @@ test("share --all: one snapshot link, profiles picked on the host, never the man
   const one = { name: "one", host: "127.0.0.1", port: onePort, key: "o".repeat(24), profiles: ["qa"], prefix: "/" };
   const listenersPath = join(root, ".rechrome", "listeners.json");
   await writeFile(listenersPath, JSON.stringify({ version: 1, listeners: [mgmt, one] }));
-  const hostEnv = { ...Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith("PLAYWRIGHT_MCP_"))), HOME: root, USERPROFILE: root, RECHROME_URL: `http://127.0.0.1:${mgmtPort}/#key=${mgmt.key}`, PLAYWRIGHT_CLI: `${process.execPath} ${join(root, "fake-cli.ts")}` };
+  const outsideFile = join(root, "outside.txt");
+  await writeFile(outsideFile, "keep me");
+  const hostEnv = { OUTSIDE_FILE: outsideFile, ...Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith("PLAYWRIGHT_MCP_"))), HOME: root, USERPROFILE: root, RECHROME_URL: `http://127.0.0.1:${mgmtPort}/#key=${mgmt.key}`, PLAYWRIGHT_CLI: `${process.execPath} ${join(root, "fake-cli.ts")}` };
   const daemon = Bun.spawn([process.execPath, join(root, "rechrome.ts"), "serve"], { cwd: root, env: hostEnv, stdin: "ignore", stdout: "ignore", stderr: "ignore" });
   // Other test files load the developer's .env.local into process.env; keep its profile/URL out.
   const baseEnv = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith("PLAYWRIGHT_MCP_") && k !== "RECHROME_URL"));
@@ -174,6 +181,10 @@ test("share --all: one snapshot link, profiles picked on the host, never the man
     expect(await readFile(join(client, savedDl[0]!), "utf8")).toBe("a,b\n1,2\n");
     const hostDl = await Array.fromAsync(new Bun.Glob("**/download-report.csv").scan({ cwd: join(root, ".rechrome"), dot: true }));
     expect(hostDl).toEqual([]);
+    // A "download" that is a link out of the work dir is neither forwarded nor deleted.
+    await rech(["--profile", "qa", "click", "download-link"], clientEnv, client);
+    await Bun.sleep(300);
+    expect(await readFile(outsideFile, "utf8")).toBe("keep me");
 
     // A link saved with --save is remembered: removing its listener warns with the file and the fix,
     // and the next listener rech creates does not take the freed port (no other listener's answer).
