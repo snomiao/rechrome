@@ -6,9 +6,9 @@ import { file } from "bun";
 import yargs from "yargs";
 import { readExtensionTokenFromProfile } from "./extension-token.ts";
 import { redact } from "./redact.ts";
-import { FILL_SECRET_USAGE, SECRET_MASK, parseFillSecretArgs, fillSecretWireArgs, readSecretSource, totpCode, totpWaitMs } from "./fill-secret.ts";
+import { READ_SECRET_USAGE, parseReadSecretArgs, readSecretWireArgs, FILL_SECRET_USAGE, SECRET_MASK, parseFillSecretArgs, fillSecretWireArgs, readSecretSource, totpCode, totpWaitMs } from "./fill-secret.ts";
 import { createHash, randomBytes } from "crypto";
-import { mkdirSync, appendFileSync, existsSync, realpathSync, accessSync, cpSync, unlinkSync, readFileSync, readdirSync, renameSync, readlinkSync, rmdirSync, constants as fsConstants } from "fs";
+import { mkdirSync, fstatSync, appendFileSync, existsSync, realpathSync, accessSync, cpSync, unlinkSync, readFileSync, readdirSync, renameSync, readlinkSync, rmdirSync, constants as fsConstants } from "fs";
 import { hostname, homedir, networkInterfaces } from "os";
 import { isIPv4 } from "net";
 import { join, basename, dirname, resolve } from "path";
@@ -1932,7 +1932,7 @@ async function callServe(
   throwOnFailure = false,
   upload?: UploadPayload,
   secret?: string,
-): Promise<{ status: number; stdout: string; stderr: string; files?: string[]; existingSession?: boolean }> {
+): Promise<{ status: number; stdout: string; stderr: string; files?: string[]; existingSession?: boolean; secretOut?: string }> {
   const { key, host, port, protocol, extensionId, extensionToken, profileDirectory, userDataDir, loadExtension } = parseUrl(url);
   // Reuse the caller's identity when provided — computing it shells out to `git` several times,
   // and run() has already done so for its log line. Recomputing here would double those git
@@ -2169,6 +2169,29 @@ async function run(url: string, args: string[], overrideEnv?: Record<string, str
   let secret: string | undefined;
   let upload: UploadPayload | undefined;
   const cmdIdx = args.findIndex(a => !a.startsWith("-s="));
+  if (args[cmdIdx] === "read-secret") {
+    if (args.some(a => a === "--help" || a === "-h")) { console.log(READ_SECRET_USAGE); process.exit(0); }
+    let wire: string[];
+    try {
+      // Only a pipe: a terminal would show the secret, and a file would keep it. Checked before
+      // asking the host for it.
+      const out = fstatSync(1);
+      if (!out.isFIFO() && !out.isSocket()) throw new Error("read-secret writes the secret to stdout, which must be a pipe into the program that stores it (not a terminal or a file)");
+      wire = readSecretWireArgs(parseReadSecretArgs(args.slice(cmdIdx)));
+    } catch (err) {
+      console.error(`[rech] ${err instanceof Error ? err.message : String(err)}\n${READ_SECRET_USAGE}`);
+      process.exit(2);
+    }
+    const res = await callServe(url, [...args.filter(a => a.startsWith("-s=")), ...wire], overrideEnv, identity);
+    if (res.status !== 0 || typeof res.secretOut !== "string") {
+      process.stderr.write(res.stderr || (res.status === 0 ? "[rech] read-secret: this daemon is older than the client (no value returned)\n" : ""));
+      process.exit(res.status || 1);
+    }
+    // Wait until the pipe has taken all of it before exiting.
+    await new Promise<void>((done, fail) => process.stdout.write(res.secretOut!, e => e ? fail(e) : done()));
+    console.error(`[rech] read-secret: wrote ${res.secretOut.length} characters to stdout`);
+    process.exit(0);
+  }
   if (args[cmdIdx] === "fill-secret") {
     if (args.some(a => a === "--help" || a === "-h")) { console.log(FILL_SECRET_USAGE); process.exit(0); }
     try {
@@ -3345,7 +3368,7 @@ async function rotateKey(name: string): Promise<void> {
   console.log(`New key for ${name}; URLs carrying the old key stop working now. Print new ones with: rech share <profile> --listener ${name}`);
 }
 
-async function setListener(name: string, opts: { publicUrl?: string; clearPublicUrl?: boolean; uploads?: boolean; hostUploadDirs?: string[]; noHostUploads?: boolean }): Promise<void> {
+async function setListener(name: string, opts: { publicUrl?: string; clearPublicUrl?: boolean; uploads?: boolean; hostUploadDirs?: string[]; noHostUploads?: boolean; readSecrets?: boolean }): Promise<void> {
   const config = await requireListeners();
   let listener = config.listeners.find(l => l.name === name);
   if (!listener) throw new Error(`Unknown listener "${name}". See rech listener ls.`);
@@ -3363,7 +3386,12 @@ async function setListener(name: string, opts: { publicUrl?: string; clearPublic
     else policy.hostDirs = [...new Set([...(policy.hostDirs ?? []), ...opts.hostUploadDirs!.map(d => realpathSync(resolve(d)))])];
     listener.uploads = policy;
   }
+  if (opts.readSecrets !== undefined) {
+    if (listener.profiles === "*") throw new Error(`"${name}" is the local management listener: read-secret is always available there.`);
+    if (opts.readSecrets) listener.readSecrets = true; else delete listener.readSecrets;
+  }
   await writeListeners(config);
+  if (opts.readSecrets !== undefined) console.log(opts.readSecrets ? `${name}: read-secret on. Anyone with this link can copy the value of any field (saved passwords included) on any site its profiles have open; --allow-domain only checks the site the caller names. Each read is logged without the value` : `${name}: read-secret off`);
   if (opts.publicUrl !== undefined || opts.clearPublicUrl) console.log(listener.publicUrl ? `${name} is reachable at ${listener.publicUrl}` : `${name}: public URL cleared`);
   if (opts.hostUploadDirs?.length || opts.noHostUploads) {
     const dirs = (listener.uploads || {}).hostDirs;
@@ -4447,7 +4475,7 @@ export type RechHandlers = {
   allowListener(name: string, profiles: string[]): Promise<void>;
   denyListener(name: string, profiles: string[]): Promise<void>;
   rotateKey(name: string): Promise<void>;
-  setListener(name: string, opts: { publicUrl?: string; clearPublicUrl?: boolean; uploads?: boolean; hostUploadDirs?: string[]; noHostUploads?: boolean }): Promise<void>;
+  setListener(name: string, opts: { publicUrl?: string; clearPublicUrl?: boolean; uploads?: boolean; hostUploadDirs?: string[]; noHostUploads?: boolean; readSecrets?: boolean }): Promise<void>;
   setup(opts: SetupOptions): Promise<void>;
   tray(action?: string): Promise<void>;
   provisionProfile(name: string, opts: { headed: boolean; experimental: boolean }): Promise<void>;
@@ -4480,6 +4508,8 @@ const HELP_EPILOGUE = `Browser commands (sent to this project's Chrome session):
       --isolate      in a throwaway session, e.g. for a login flow
   rech fill-secret <ref> --from-env VAR | --totp-from-env VAR [--env-file f] [--allow-domain '*.example.com']
                      type a password / TOTP code without it reaching argv, logs or output
+  rech read-secret <ref> --allow-domain <host> | <vault command>
+                     copy a field's value (e.g. an API secret) into a pipe, never shown or logged
   rech pw <args>     forward verbatim to playwright-cli, e.g. \`rech pw --version\`
   rech --version     rechrome's version
 
@@ -4595,9 +4625,10 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
         .option("clear-public-url", { type: "boolean", conflicts: "public-url" })
         .option("uploads", { type: "boolean", describe: "Uploads of images the link holder sends (rech upload) are on by default; --no-uploads turns them off" })
         .option("host-upload-dir", { type: "string", array: true, requiresArg: true, describe: "Off by default. Also let links upload files already on this host, from inside this directory (rech upload --host <path>); repeatable" })
+        .option("read-secrets", { type: "boolean", describe: "Off by default. Let this listener's links copy any field's value (saved passwords too) into a pipe (rech read-secret): only for links you trust with those accounts. --no-read-secrets turns it off" })
         .option("host-uploads", { type: "boolean", describe: "--no-host-uploads turns host-path uploads off again" })
-        .check(a => a.publicUrl !== undefined || a.clearPublicUrl || a.uploads !== undefined || a.hostUploadDir?.length || a.hostUploads === false ? true : "Pass --public-url <url>, --clear-public-url, --uploads/--no-uploads, or --host-upload-dir/--no-host-uploads"),
-        a => handlers.setListener(a.name, { publicUrl: a.publicUrl, clearPublicUrl: a.clearPublicUrl, ...(a.uploads !== undefined ? { uploads: a.uploads } : {}), ...(a.hostUploadDir?.length ? { hostUploadDirs: a.hostUploadDir as string[] } : {}), ...(a.hostUploads === false ? { noHostUploads: true } : {}) }))
+        .check(a => a.publicUrl !== undefined || a.clearPublicUrl || a.uploads !== undefined || a.hostUploadDir?.length || a.hostUploads === false || a.readSecrets !== undefined ? true : "Pass --public-url <url>, --clear-public-url, --uploads/--no-uploads, or --host-upload-dir/--no-host-uploads"),
+        a => handlers.setListener(a.name, { publicUrl: a.publicUrl, clearPublicUrl: a.clearPublicUrl, ...(a.uploads !== undefined ? { uploads: a.uploads } : {}), ...(a.hostUploadDir?.length ? { hostUploadDirs: a.hostUploadDir as string[] } : {}), ...(a.hostUploads === false ? { noHostUploads: true } : {}), ...(a.readSecrets !== undefined ? { readSecrets: a.readSecrets } : {}) }))
       .command("port [name]", "Print a listener's port (for a proxy command)", y => y.positional("name", { type: "string" }),
         a => handlers.listenerPort(a.name))
       .command("rotate-key <name>", "Give a listener a new key (old URLs stop working)", y => y.positional("name", { type: "string", demandOption: true }),
