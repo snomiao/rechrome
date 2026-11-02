@@ -97,6 +97,23 @@ browser writes it, not before (downloads wait for the scrub). The check reads th
 the snapshot, so a page script that clears or replaces a neutrally-labelled password field in
 between can slip past; closing that needs redaction inside playwright's snapshot code. Not yet supported on a Windows daemon.
 
+#### Copying a secret out of a page: `read-secret`
+
+The reverse of `fill-secret`, for moving a secret that a page shows (an app's signing
+secret, an API key) into a vault without it appearing anywhere:
+
+```bash
+rech read-secret e12 --allow-domain api.example.com | vault-put my-app/signing-secret
+```
+
+- `--allow-domain` is required. The field's own page host must match it.
+- The value goes back in its own response field. It is never in a log line, a file or
+  another command's output, and is masked in every later output.
+- stdout must be a pipe: a terminal or a file redirect is refused before the host is asked.
+- A label ref means its input, as with `fill`. A non-field element gives its text.
+- On a shared (scoped) listener it is off until the host runs
+  `rech listener set <listener> --read-secrets`. Each read is logged without the value.
+
 ### 3. Where things are kept
 
 | Where | What |
