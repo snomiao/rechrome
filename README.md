@@ -113,6 +113,8 @@ rech read-secret e12 --allow-domain api.example.com | vault-put my-app/signing-s
 - A label ref means its input, as with `fill`. A non-field element gives its text.
 - On a shared (scoped) listener it is off until the host runs
   `rech listener set <listener> --read-secrets`. Each read is logged without the value.
+  Turn it on only for links you trust with every account in their profiles: the caller picks
+  `--allow-domain`, so the link can read any field it can reach, saved passwords included.
 
 ### 3. Where things are kept
 

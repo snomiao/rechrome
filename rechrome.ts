@@ -3391,7 +3391,7 @@ async function setListener(name: string, opts: { publicUrl?: string; clearPublic
     if (opts.readSecrets) listener.readSecrets = true; else delete listener.readSecrets;
   }
   await writeListeners(config);
-  if (opts.readSecrets !== undefined) console.log(opts.readSecrets ? `${name}: read-secret on (links can copy a field's value, from --allow-domain sites only, into a pipe; each read is logged without the value)` : `${name}: read-secret off`);
+  if (opts.readSecrets !== undefined) console.log(opts.readSecrets ? `${name}: read-secret on. Anyone with this link can copy the value of any field (saved passwords included) on any site its profiles have open; --allow-domain only checks the site the caller names. Each read is logged without the value` : `${name}: read-secret off`);
   if (opts.publicUrl !== undefined || opts.clearPublicUrl) console.log(listener.publicUrl ? `${name} is reachable at ${listener.publicUrl}` : `${name}: public URL cleared`);
   if (opts.hostUploadDirs?.length || opts.noHostUploads) {
     const dirs = (listener.uploads || {}).hostDirs;
@@ -4625,7 +4625,7 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
         .option("clear-public-url", { type: "boolean", conflicts: "public-url" })
         .option("uploads", { type: "boolean", describe: "Uploads of images the link holder sends (rech upload) are on by default; --no-uploads turns them off" })
         .option("host-upload-dir", { type: "string", array: true, requiresArg: true, describe: "Off by default. Also let links upload files already on this host, from inside this directory (rech upload --host <path>); repeatable" })
-        .option("read-secrets", { type: "boolean", describe: "Off by default. Let this listener's links copy a field's value into a pipe (rech read-secret); --no-read-secrets turns it off" })
+        .option("read-secrets", { type: "boolean", describe: "Off by default. Let this listener's links copy any field's value (saved passwords too) into a pipe (rech read-secret): only for links you trust with those accounts. --no-read-secrets turns it off" })
         .option("host-uploads", { type: "boolean", describe: "--no-host-uploads turns host-path uploads off again" })
         .check(a => a.publicUrl !== undefined || a.clearPublicUrl || a.uploads !== undefined || a.hostUploadDir?.length || a.hostUploads === false || a.readSecrets !== undefined ? true : "Pass --public-url <url>, --clear-public-url, --uploads/--no-uploads, or --host-upload-dir/--no-host-uploads"),
         a => handlers.setListener(a.name, { publicUrl: a.publicUrl, clearPublicUrl: a.clearPublicUrl, ...(a.uploads !== undefined ? { uploads: a.uploads } : {}), ...(a.hostUploadDir?.length ? { hostUploadDirs: a.hostUploadDir as string[] } : {}), ...(a.hostUploads === false ? { noHostUploads: true } : {}), ...(a.readSecrets !== undefined ? { readSecrets: a.readSecrets } : {}) }))
