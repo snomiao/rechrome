@@ -10,3 +10,7 @@ test("leaves ordinary page text alone", () => {
   const t = "Welcome back — 3 new messages at https://example.com/inbox";
   expect(redact(t).text).toBe(t);
 });
+test("masks the captured value, not an earlier copy of it", () => {
+  const hits = [{ id: "t", re: /token=(\w+)/g, keywords: [], allow: [], stop: [] }];
+  expect(redact("token=token", hits).text).toBe("token=[redacted:t]");
+});

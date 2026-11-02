@@ -2033,7 +2033,8 @@ async function run(url: string, args: string[], overrideEnv?: Record<string, str
   const scrub = (s: string) => {
     if (!s) return s;
     if (secret) s = s.replaceAll(secret, SECRET_MASK);
-    return process.env.RECH_REDACT === "0" ? s : redact(s).text;
+    if (process.env.RECH_REDACT === "0") return s;
+    try { return redact(s).text; } catch { return s; } // missing rules must not swallow output
   };
   const { files, existingSession } = served;
   const status = served.status, stdout = scrub(served.stdout), stderr = scrub(served.stderr);

@@ -125,14 +125,18 @@ export function findSecrets(text: string, rules = secretRules()): SecretHit[] {
   const out: SecretHit[] = [];
   for (const r of rules) {
     if (r.keywords.length && !r.keywords.some((k) => lower.includes(k))) continue;
-    for (const m of text.matchAll(r.re)) {
-      const secret = (r.group ? m[r.group] : m.slice(1).find((g) => g)) ?? m[0];
+    // The `d` flag gives each group's own offsets; indexOf on the match could find an
+    // earlier copy (`access_token=access_token`) and leave the real value showing.
+    const re = r.re.hasIndices ? r.re : new RegExp(r.re.source, r.re.flags.includes("g") ? r.re.flags + "d" : r.re.flags + "gd");
+    for (const m of text.matchAll(re)) {
+      const gi = r.group ?? m.slice(1).findIndex((g) => g) + 1;
+      const secret = (gi > 0 ? m[gi] : undefined) ?? m[0];
       if (!secret) continue;
       if (r.entropy && shannon(secret) < r.entropy) continue;
       if (r.allow.some((a) => a.test(secret))) continue;
       const sl = secret.toLowerCase();
       if (r.stop.some((s) => sl.includes(s))) continue;
-      const start = m.index + m[0].indexOf(secret);
+      const start = gi > 0 && m.indices?.[gi] ? m.indices[gi]![0] : m.index;
       out.push({ id: r.id, start, end: start + secret.length });
     }
   }
