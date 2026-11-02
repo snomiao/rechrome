@@ -24,7 +24,7 @@ import {
   checkTailscaleServe,
   chromeDataAccessHint,
 } from "./rechrome.ts";
-import { SecretMasker, parseReadCookieWire, readCookieOnSession, parseReadSecretWire, readSecretOnSession, parseFillSecretWire, fillSecretOnSession, passwordValuesOnSession, hasSnapshot, maskPasswordLines, withholdSnapshots } from "./fill-secret.ts";
+import { SecretMasker, parseReadCookieWire, readCookieOnSession, parseReadStorageWire, readStorageOnSession, parseReadSecretWire, readSecretOnSession, parseFillSecretWire, fillSecretOnSession, passwordValuesOnSession, hasSnapshot, maskPasswordLines, withholdSnapshots } from "./fill-secret.ts";
 
 const TAILSCALE_BIN = process.env.TAILSCALE_BIN || "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
 const CERT_RENEW_THRESHOLD_DAYS = 7;
@@ -957,6 +957,22 @@ export async function serve() {
         } catch (error) {
           const message = secretMasker.mask(error instanceof Error ? error.message : String(error));
           log(`exit: 1 | read-secret: ${message.split("\n")[0]}`);
+          return Response.json({ status: 1, stdout: "", stderr: `[rech] ${message}\n`, files: [] });
+        }
+      }
+
+      // read-storage: a localStorage/sessionStorage value, page-level; secretOut only.
+      if (filteredArgs[0] === "read-storage") {
+        try {
+          const { area, key, path, allowDomains } = parseReadStorageWire(filteredArgs);
+          const { host, value } = await readStorageOnSession({ socketRoot: tmpSocketRoot(), session: namespacedSession, cwd: runWorkDir, area, key, path, allowDomains });
+          if (!value) throw new Error(`read-storage: ${area} ${key} on ${host} is empty`);
+          secretMasker.add(value, Infinity);
+          log(`exit: 0 | read-storage ${area} ${key}${path.length ? " " + path.join(".") : ""} on ${host} (${value.length} chars, value not logged)`);
+          return Response.json({ status: 0, stdout: "", stderr: "", files: [], secretOut: value });
+        } catch (error) {
+          const message = secretMasker.mask(error instanceof Error ? error.message : String(error));
+          log(`exit: 1 | read-storage: ${message.split("\n")[0]}`);
           return Response.json({ status: 1, stdout: "", stderr: `[rech] ${message}\n`, files: [] });
         }
       }
