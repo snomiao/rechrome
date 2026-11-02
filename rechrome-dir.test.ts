@@ -27,3 +27,11 @@ test("writeAtomic keeps a symlink a symlink and leaves no temp file", async () =
   expect(await readFile(join(dir, "real.env"), "utf8")).toBe("new");
   expect((await readdir(dir)).filter(f => f.endsWith(".tmp"))).toEqual([]);
 });
+
+test("writeAtomic creates a dangling symlink's target instead of replacing the link", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "rech-dir-"));
+  await symlink(join(dir, "later.env"), join(dir, ".env.local"));
+  await writeAtomic(join(dir, ".env.local"), "x");
+  expect((await lstat(join(dir, ".env.local"))).isSymbolicLink()).toBe(true);
+  expect(await readFile(join(dir, "later.env"), "utf8")).toBe("x");
+});

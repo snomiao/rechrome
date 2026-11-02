@@ -7,7 +7,7 @@ import yargs from "yargs";
 import { readExtensionTokenFromProfile } from "./extension-token.ts";
 import { FILL_SECRET_USAGE, SECRET_MASK, parseFillSecretArgs, fillSecretWireArgs, readSecretSource, totpCode, totpWaitMs } from "./fill-secret.ts";
 import { createHash, randomBytes } from "crypto";
-import { mkdirSync, appendFileSync, existsSync, realpathSync, accessSync, cpSync, unlinkSync, readFileSync, readdirSync, renameSync, rmdirSync, constants as fsConstants } from "fs";
+import { mkdirSync, appendFileSync, existsSync, realpathSync, accessSync, cpSync, unlinkSync, readFileSync, readdirSync, renameSync, readlinkSync, rmdirSync, constants as fsConstants } from "fs";
 import { hostname, homedir, networkInterfaces } from "os";
 import { isIPv4 } from "net";
 import { join, basename, dirname, resolve } from "path";
@@ -3419,7 +3419,12 @@ async function saveGlobalUrl(url: string): Promise<string> {
 /** Write a file whole or not at all: a temp file beside it, then rename (atomic on one filesystem). */
 export async function writeAtomic(path: string, data: string, mode?: number): Promise<void> {
   // A symlinked .env.local stays a link: write the file it points to.
-  try { path = realpathSync(path); } catch { /* not there yet */ }
+  // Follow links by hand: realpath fails on a dangling one, whose target we still create.
+  for (let hops = 0; hops < 8; hops++) {
+    let target: string;
+    try { target = readlinkSync(path); } catch { break; } // not a link, or not there yet
+    path = resolve(dirname(path), target);
+  }
   const tmp = `${path}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
   try {
     await writeFile(tmp, data, mode === undefined ? {} : { mode });
