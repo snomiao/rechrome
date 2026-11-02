@@ -4,6 +4,7 @@ import { readListeners, writeListeners, listenerAddress, isLoopback, normalizePr
 import { file } from "bun";
 import yargs from "yargs";
 import { readExtensionTokenFromProfile } from "./extension-token.ts";
+import { redact } from "./redact.ts";
 import { FILL_SECRET_USAGE, SECRET_MASK, parseFillSecretArgs, fillSecretWireArgs, readSecretSource, totpCode, totpWaitMs } from "./fill-secret.ts";
 import { createHash, randomBytes } from "crypto";
 import { mkdirSync, appendFileSync, existsSync, realpathSync, accessSync, cpSync, unlinkSync, readFileSync, readdirSync, renameSync, rmdirSync, constants as fsConstants } from "fs";
@@ -2028,7 +2029,12 @@ async function run(url: string, args: string[], overrideEnv?: Record<string, str
   }
   const served = await callServe(url, args, overrideEnv, identity, false, secret);
   // The daemon already masks the value; this is a second line of defence for an older daemon.
-  const scrub = (s: string) => secret && s ? s.replaceAll(secret, SECRET_MASK) : s;
+  // Then any secret-shaped string (API keys, tokens) in page text, unless RECH_REDACT=0.
+  const scrub = (s: string) => {
+    if (!s) return s;
+    if (secret) s = s.replaceAll(secret, SECRET_MASK);
+    return process.env.RECH_REDACT === "0" ? s : redact(s).text;
+  };
   const { files, existingSession } = served;
   const status = served.status, stdout = scrub(served.stdout), stderr = scrub(served.stderr);
 
