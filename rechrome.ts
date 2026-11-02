@@ -4559,7 +4559,7 @@ const HELP_EPILOGUE = `Browser commands (sent to this project's Chrome session):
                      copy a field's value (e.g. an API secret) into a pipe, never shown or logged
   rech read-cookie <name> <domain> --allow-domain <domain> | <command>
                      copy a cookie (incl. HttpOnly) into a pipe, never shown or logged
-  rech read-storage <local|session> <key> [json-path] --allow-domain <host> | <command>
+  rech read-storage <local|session> <key> [json-path] --allow-domain <host> [--goto <url>] | <command>
                      copy a localStorage/sessionStorage value into a pipe, never shown or logged
   rech pw <args>     forward verbatim to playwright-cli, e.g. \`rech pw --version\`
   rech --version     rechrome's version
