@@ -8,7 +8,7 @@ import { readExtensionTokenFromProfile } from "./extension-token.ts";
 import { redact } from "./redact.ts";
 import { READ_SECRET_USAGE, parseReadSecretArgs, readSecretWireArgs, FILL_SECRET_USAGE, SECRET_MASK, parseFillSecretArgs, fillSecretWireArgs, readSecretSource, totpCode, totpWaitMs } from "./fill-secret.ts";
 import { createHash, randomBytes } from "crypto";
-import { mkdirSync, appendFileSync, existsSync, realpathSync, accessSync, cpSync, unlinkSync, readFileSync, readdirSync, renameSync, readlinkSync, rmdirSync, constants as fsConstants } from "fs";
+import { mkdirSync, fstatSync, appendFileSync, existsSync, realpathSync, accessSync, cpSync, unlinkSync, readFileSync, readdirSync, renameSync, readlinkSync, rmdirSync, constants as fsConstants } from "fs";
 import { hostname, homedir, networkInterfaces } from "os";
 import { isIPv4 } from "net";
 import { join, basename, dirname, resolve } from "path";
@@ -2173,8 +2173,10 @@ async function run(url: string, args: string[], overrideEnv?: Record<string, str
     if (args.some(a => a === "--help" || a === "-h")) { console.log(READ_SECRET_USAGE); process.exit(0); }
     let wire: string[];
     try {
-      // A terminal would show the secret: refuse before asking the host for it.
-      if (process.stdout.isTTY) throw new Error("read-secret writes the secret to stdout, which is a terminal here. Pipe it into the program that stores it, or redirect to a file");
+      // Only a pipe: a terminal would show the secret, and a file would keep it. Checked before
+      // asking the host for it.
+      const out = fstatSync(1);
+      if (!out.isFIFO() && !out.isSocket()) throw new Error("read-secret writes the secret to stdout, which must be a pipe into the program that stores it (not a terminal or a file)");
       wire = readSecretWireArgs(parseReadSecretArgs(args.slice(cmdIdx)));
     } catch (err) {
       console.error(`[rech] ${err instanceof Error ? err.message : String(err)}\n${READ_SECRET_USAGE}`);
@@ -2185,7 +2187,8 @@ async function run(url: string, args: string[], overrideEnv?: Record<string, str
       process.stderr.write(res.stderr || (res.status === 0 ? "[rech] read-secret: this daemon is older than the client (no value returned)\n" : ""));
       process.exit(res.status || 1);
     }
-    process.stdout.write(res.secretOut);
+    // Wait until the pipe has taken all of it before exiting.
+    await new Promise<void>((done, fail) => process.stdout.write(res.secretOut!, e => e ? fail(e) : done()));
     console.error(`[rech] read-secret: wrote ${res.secretOut.length} characters to stdout`);
     process.exit(0);
   }

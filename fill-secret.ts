@@ -358,7 +358,8 @@ export function fillSecretOnSession(opts: { socketRoot: string; session: string;
 
 export const READ_SECRET_USAGE = `Usage: rech read-secret <ref|selector> --allow-domain <glob> [--allow-domain <glob>]... | <vault command>
   Writes the field's current value, raw and without a newline, to stdout, which must be a pipe
-  or a file (never a terminal). The value is never logged and is masked in later outputs.
+  into the program that stores it (never a terminal or a file). The value is never logged and
+  is masked in later outputs.
   --allow-domain GLOB   required: refuse unless the field's page host matches, e.g. app.slack.com`;
 
 /** Client args → the wire args (same shape); --allow-domain is required. */
@@ -414,10 +415,14 @@ export function buildReadCode(ref: string, allowDomains: string[]): string {
       throw new Error("read-secret refused: the field's page host " + JSON.stringify(host) + " is not allowed by --allow-domain");
     // Like fill: a label ref means its control. A field reads as its value; anything else (a
     // secret shown as text after "Show") as its text.
-    const value = await el.evaluate(e => {
-      const t = e.tagName === "LABEL" && e.control ? e.control : e;
-      return t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" ? String(t.value) : String(t.textContent ?? "").trim();
-    });
+    // A page getter can throw an error that quotes the value: report a fixed message instead.
+    let value;
+    try {
+      value = await el.evaluate(e => {
+        const t = e.tagName === "LABEL" && e.control ? e.control : e;
+        return t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" ? String(t.value) : String(t.textContent ?? "").trim();
+      });
+    } catch { throw new Error("read-secret: could not read the field"); }
     return JSON.stringify({ host, value });
   } finally {
     await el.dispose().catch(() => {});
@@ -428,8 +433,8 @@ export function buildReadCode(ref: string, allowDomains: string[]): string {
 /** Read the field on the session's live browser. The returned value must never be logged. */
 export async function readSecretOnSession(opts: { socketRoot: string; session: string; cwd: string; ref: string; allowDomains: string[] }): Promise<{ host: string; value: string }> {
   const { isError, text } = await runCodeOnSession({ ...opts, code: buildReadCode(opts.ref, opts.allowDomains), json: true });
-  // An error text can't hold the value: the code throws before reading it, or fails reading it.
-  if (isError) throw new Error(text.replace(/### Ran Playwright code\n```js\n[\s\S]*?\n```\n?/, "").trim() || "read-secret failed");
+  // Pass on only the messages this code writes itself (they hold the host, never the value).
+  if (isError) throw new Error(text.match(/read-secret refused: [^\n]*/)?.[0] ?? (/no browser is open|could not reach/.test(text) ? text.trim().split("\n")[0]! : "read-secret: could not read the field (is the ref from a fresh rech snapshot?)"));
   let raw: unknown;
   try { raw = JSON.parse(text).result; } catch { raw = text.match(/### Result\n([^\n]*)/)?.[1]; }
   let out: any = raw;
