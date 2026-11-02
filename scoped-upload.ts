@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { mkdtemp, writeFile, rm, realpath, stat, readFile } from 'node:fs/promises';
+import { mkdtemp, writeFile, rm, realpath, stat, open } from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
 import { basename, join, isAbsolute, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -219,15 +220,30 @@ function cleanOutput(text: string, path: string, dir: string, name: string): str
 export async function readHostFile(path: string, hostDirs: string[] | undefined, limit: number): Promise<Buffer> {
   if (!hostDirs?.length) throw new Error('Host-path uploads are off on this listener (the host can allow a directory: rech listener set <name> --host-upload-dir <dir>)');
   if (!isAbsolute(path) || path.includes('\0')) throw new Error('Host upload path must be absolute');
-  let real: string;
-  try { real = await realpath(path); } catch { throw new Error('Host upload file not found'); }
-  const roots = await Promise.all(hostDirs.map(d => realpath(d).catch(() => null)));
-  if (!roots.some(root => root && real.startsWith(root.endsWith(sep) ? root : root + sep)))
-    throw new Error('Host upload path is outside the listener\'s allowed directories');
-  const info = await stat(real);
-  if (!info.isFile()) throw new Error('Host upload path is not a regular file');
-  if (info.size > limit) throw new Error('Upload is empty or exceeds maxBytes');
-  return readFile(real);
+  const roots = (await Promise.all(hostDirs.map(d => realpath(d).catch(() => null)))).filter((r): r is string => !!r);
+  const inside = (real: string) => roots.some(root => real.startsWith(root.endsWith(sep) ? root : root + sep));
+  const resolveInside = async () => {
+    let real: string;
+    try { real = await realpath(path); } catch { throw new Error('Host upload file not found'); }
+    if (!inside(real)) throw new Error('Host upload path is outside the listener\'s allowed directories');
+    return real;
+  };
+  // Open once, then prove the opened file is the one an allowed path names now (same device and
+  // inode), so swapping in a symlink between the check and the open can't reach outside. Read from
+  // that descriptor only, at most limit + 1 bytes, so a file growing after the check can't either.
+  const handle = await open(await resolveInside(), fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+  try {
+    const info = await handle.stat();
+    if (!info.isFile()) throw new Error('Host upload path is not a regular file');
+    const now = await stat(await resolveInside());
+    if (now.dev !== info.dev || now.ino !== info.ino) throw new Error('Host upload file changed while it was being opened');
+    if (info.size > limit) throw new Error("Upload is empty or exceeds maxBytes");
+    const buf = Buffer.alloc(limit + 1);
+    let n = 0;
+    for (let r; n < buf.length && (r = await handle.read(buf, n, buf.length - n, n)).bytesRead > 0;) n += r.bytesRead;
+    if (n > limit) throw new Error('Upload is empty or exceeds maxBytes');
+    return buf.subarray(0, n);
+  } finally { await handle.close(); }
 }
 
 export async function receiveUpload(options: {
