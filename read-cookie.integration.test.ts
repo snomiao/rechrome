@@ -48,10 +48,12 @@ test.skipIf(!hasBrowser)("read-cookie reads an HttpOnly cookie to a pipe and lea
     expect((await rech(["open", `http://127.0.0.1:${page.port}/`])).status).toBe(0);
     // document.cookie cannot see an HttpOnly cookie.
     expect((await rech(["eval", "() => document.cookie"])).stdout).not.toContain(CANARY);
-    // Wrong domain: refused, nothing on stdout.
-    const bad = await rech(["read-cookie", "tc", "example.com", "--allow-domain", "example.com"]);
+    // The cookie exists for 127.0.0.1, but --allow-domain names a different domain: refused.
+    // (This is what --allow-domain guards; without the check the real cookie would be returned.)
+    const bad = await rech(["read-cookie", "tc", "127.0.0.1", "--allow-domain", "example.com"]);
     expect(bad.status).not.toBe(0);
     expect(bad.stdout).toBe("");
+    expect(bad.stderr).toContain("read-cookie refused");
     // Right domain: the exact value on the piped stdout, and only there.
     const ok = await rech(["read-cookie", "tc", "127.0.0.1", "--allow-domain", "127.0.0.1"]);
     expect(ok.status).toBe(0);
