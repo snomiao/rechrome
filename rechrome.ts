@@ -3943,7 +3943,7 @@ const SIGNAL_SELFHOST_DOC = "https://github.com/snomiao/rechrome/blob/main/docs/
 
 /** The menu of setupShareStep: existing listeners first, then the new kinds. */
 export function shareMenu(listeners: Listener[], choices: ListenChoice[]): { key: string; label: string; listener?: string; kind?: "lan" | "tailscale" | "webrtc" | "webrtc-own" }[] {
-  const menu: ReturnType<typeof shareMenu> = [{ key: "1", label: "No, local only (this computer; always on)" }];
+  const menu: ReturnType<typeof shareMenu> = [{ key: "1", label: "Don't add sharing (local access is always on; existing shares stay: rech share ls)" }];
   for (const l of listeners.filter(l => l.profiles !== "*"))
     menu.push({ key: String(menu.length + 1), label: `Existing listener "${l.name}" (${listenerAddress(l)}${l.publicUrl ? `, ${l.publicUrl}` : ""})`, listener: l.name });
   const has = (k: string) => choices.some(c => c.kind === k);
