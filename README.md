@@ -116,6 +116,25 @@ rech read-secret e12 --allow-domain api.example.com | vault-put my-app/signing-s
   Turn it on only for links you trust with every account in their profiles: the caller picks
   `--allow-domain`, so the link can read any field it can reach, saved passwords included.
 
+#### Copying a cookie out of the browser: `read-cookie`
+
+Like `read-secret`, but for a cookie, including an `HttpOnly` one that `document.cookie`
+and `eval` cannot see. For moving a session cookie (e.g. Slack's `d` / xoxd) from the
+browser into an auth tool:
+
+```bash
+rech read-cookie d acme.slack.com --allow-domain acme.slack.com | slack auth cookie
+```
+
+- Reads via Playwright's `context.cookies()`, so `HttpOnly` cookies are included.
+- `--allow-domain` is required, and the cookie's own domain must match it.
+- Same pipe-only, never-logged, masked-afterwards rules as `read-secret`.
+- On a shared (scoped) listener it is off until the host runs
+  `rech listener set <listener> --read-cookies` (a gate separate from `--read-secrets`).
+  A session cookie is a login: turn it on only for links you trust with every account their
+  profiles are signed in to (the caller picks `--allow-domain`).
+
+
 ### 3. Where things are kept
 
 | Where | What |
