@@ -100,6 +100,32 @@ const runsInFlight = new Map<Promise<void>, string | undefined>();
 const CLI_TEXT_ARTIFACT = /(^|\/)\.playwright-cli(-multi-tab)?\/[^/]+\.(?:ya?ml|json|md|txt|log)$/;
 // Artifacts that could not be checked AND could not be deleted: never served.
 const deniedFiles = new Set<string>();
+// Browser downloads go to the client: a download waits here (real path → cleanup timer) until the
+// client fetches it once, then the host copy is deleted. A listener with keepDownloads: true
+// keeps them on the host instead (opt-in).
+const pendingDownloads = new Map<string, ReturnType<typeof setTimeout>>();
+const DOWNLOAD_PICKUP_MS = 10 * 60_000;
+// playwright-cli's line for a finished download (tools/backend/response.ts).
+const DOWNLOADED_LINE = /^- Downloaded file (.+?) to "(.+)"$/gm;
+// Where the CLI saves downloads: its output dir under the session's cwd (context.ts outputDir).
+const CLI_OUTPUT_DIRS = new Set([".playwright-cli", ".playwright-mcp"]);
+
+/**
+ * The downloads the CLI itself reported: `- Downloaded file …` lines inside its own `### Events`
+ * section only, with paths in its output dir. The rest of the output carries page-controlled text
+ * (snapshots, console messages, eval results), and a page that prints a look-alike line must not
+ * be able to make the host forward and delete a file of its choosing.
+ */
+export function reportedDownloads(output: string): { name: string; rel: string }[] {
+  const out: { name: string; rel: string }[] = [];
+  for (const m of output.matchAll(/^### Events\n([\s\S]*?)(?=^### |(?![\s\S]))/gm)) {
+    for (const [, name, rel] of m[1]!.matchAll(DOWNLOADED_LINE)) {
+      const first = rel!.replaceAll("\\", "/").split("/")[0]!;
+      if (CLI_OUTPUT_DIRS.has(first)) out.push({ name: name!, rel: rel! });
+    }
+  }
+  return out;
+}
 function noteSession(sess: string, now: number): void {
   recentSessions.set(sess, now);
   if (recentSessions.size > 64) {
@@ -752,6 +778,19 @@ export async function serve() {
         const real = realpathSync(resolved);
         if (!isUnderDir(realpathSync(workDir), real) || !readable(relative(realpathSync(workDir), real).replaceAll("\\", "/"))) return new Response("Forbidden", { status: 403 });
         if (deniedFiles.has(real)) return new Response("Forbidden", { status: 403 });
+        const pickup = pendingDownloads.get(real);
+        if (pickup) {
+          // Handed over once, then gone from the host.
+          clearTimeout(pickup);
+          pendingDownloads.delete(real);
+          // Streamed, then deleted once fully sent (or when the client hangs up).
+          const done = () => { try { unlinkSync(real); } catch { /* already gone */ } };
+          const reader = file(real).stream().getReader();
+          return new Response(new ReadableStream({
+            async pull(c) { const { done: end, value } = await reader.read(); if (end) { c.close(); done(); } else c.enqueue(value); },
+            cancel() { void reader.cancel(); done(); },
+          }));
+        }
         if (TEXT_OUTPUT.test(real)) {
           const busy = () => [...runsInFlight].filter(([, dir]) => !dir || real.startsWith(dir + sep)).map(([p]) => p);
           for (let pending = busy(); pending.length; pending = busy()) await Promise.all(pending); // re-check: new runs may start
@@ -1122,6 +1161,7 @@ export async function serve() {
       }
 
       const commandStartedAt = Date.now();
+      const runStartedAt = Date.now(); // downloads must be newer than this
       const proc = Bun.spawn([bin, ...binArgs, ...filteredArgs, `-s=${namespacedSession}`], {
         cwd: runWorkDir,
         stdin: "ignore",
@@ -1242,6 +1282,29 @@ export async function serve() {
             }
           }
         }
+      }
+
+      // Browser downloads, whatever their type: forwarded to the client and logged.
+      for (const { name, rel } of reportedDownloads(rawOutput)) {
+        if (!isUnderDir(runWorkDir, rel)) continue;
+        const path = resolve(runWorkDir, rel);
+        if (!existsSync(path)) continue;
+        // Only a regular file really inside the work dir: never follow a link to delete elsewhere.
+        const real = realpathSync(path);
+        if (!isUnderDir(realpathSync(runWorkDir), real) || !lstatSync(real).isFile()) continue;
+        // Written during this command: an older file named by a replayed line is left alone.
+        if (statSync(real).mtimeMs < runStartedAt - 2000) continue;
+        const f = relative(runWorkDir, path).replaceAll("\\", "/");
+        if (!outputFiles.includes(f)) outputFiles.push(f);
+        const hash = createHash("sha256");
+        let size = 0;
+        for await (const chunk of file(real).stream()) { hash.update(chunk); size += chunk.byteLength; }
+        const keep = listener.keepDownloads === true;
+        log(`download: ${JSON.stringify({ listener: listener.name, name: name.slice(0, 256), size, sha256: hash.digest("hex"), kept: keep })}`);
+        if (keep) continue;
+        clearTimeout(pendingDownloads.get(real));
+        // Never fetched (the client went away): delete it anyway.
+        pendingDownloads.set(real, setTimeout(() => { pendingDownloads.delete(real); try { unlinkSync(real); } catch {} }, DOWNLOAD_PICKUP_MS));
       }
 
       // A file the command was told to write (`snapshot --filename=x.yml`) is its own artifact too.

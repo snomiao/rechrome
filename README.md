@@ -398,6 +398,23 @@ cp .env.example .env.local
 >
 > Shell-set `PLAYWRIGHT_MCP_*` variables take priority over `.env.local`, so you can always override per-command without editing files.
 
+### Downloading files
+
+A file the page downloads (a link, an export button) goes to **your** machine. Any type
+works. It lands in `<project>/.rechrome/output/` with the command's other files. The host
+saves it in a private folder, hands it to the client once, and then deletes it. A download
+that is never fetched is deleted after 10 minutes. Each download is logged on the host
+with its name, size and sha256.
+
+Keeping a copy on the host is opt-in, per listener:
+
+```bash
+rech listener set <listener> --keep-downloads    # --no-keep-downloads: back to client-only
+```
+
+A download that finishes after its command has returned is reported, and handed over,
+by the next command on that tab.
+
 ### Uploading files
 
 `rech upload <file>` puts a local image into the page: a file picker, an
