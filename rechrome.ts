@@ -6,7 +6,7 @@ import { file } from "bun";
 import yargs from "yargs";
 import { readExtensionTokenFromProfile } from "./extension-token.ts";
 import { redact } from "./redact.ts";
-import { READ_COOKIE_USAGE, parseReadCookieArgs, readCookieWireArgs, READ_SECRET_USAGE, parseReadSecretArgs, readSecretWireArgs, FILL_SECRET_USAGE, SECRET_MASK, parseFillSecretArgs, fillSecretWireArgs, readSecretSource, totpCode, totpWaitMs } from "./fill-secret.ts";
+import { READ_COOKIE_USAGE, parseReadCookieArgs, readCookieWireArgs, READ_STORAGE_USAGE, parseReadStorageArgs, readStorageWireArgs, READ_SECRET_USAGE, parseReadSecretArgs, readSecretWireArgs, FILL_SECRET_USAGE, SECRET_MASK, parseFillSecretArgs, fillSecretWireArgs, readSecretSource, totpCode, totpWaitMs } from "./fill-secret.ts";
 import { createHash, randomBytes } from "crypto";
 import { mkdirSync, fstatSync, appendFileSync, existsSync, realpathSync, accessSync, cpSync, unlinkSync, readFileSync, readdirSync, renameSync, readlinkSync, rmdirSync, constants as fsConstants } from "fs";
 import { hostname, homedir, networkInterfaces } from "os";
@@ -2187,6 +2187,26 @@ async function run(url: string, args: string[], overrideEnv?: Record<string, str
     }
     await new Promise<void>((done, fail) => process.stdout.write(res.secretOut!, e => e ? fail(e) : done()));
     console.error(`[rech] read-cookie: wrote ${res.secretOut.length} characters to stdout`);
+    process.exit(0);
+  }
+  if (args[cmdIdx] === "read-storage") {
+    if (args.some(a => a === "--help" || a === "-h")) { console.log(READ_STORAGE_USAGE); process.exit(0); }
+    let swire: string[];
+    try {
+      const out = fstatSync(1);
+      if (!out.isFIFO() && !out.isSocket()) throw new Error("read-storage writes the value to stdout, which must be a pipe into the program that stores it (not a terminal or a file)");
+      swire = readStorageWireArgs(parseReadStorageArgs(args.slice(cmdIdx)));
+    } catch (err) {
+      console.error(`[rech] ${err instanceof Error ? err.message : String(err)}\n${READ_STORAGE_USAGE}`);
+      process.exit(2);
+    }
+    const res = await callServe(url, [...args.filter(a => a.startsWith("-s=")), ...swire], overrideEnv, identity);
+    if (res.status !== 0 || typeof res.secretOut !== "string") {
+      process.stderr.write(res.stderr || (res.status === 0 ? "[rech] read-storage: this daemon is older than the client (no value returned)\n" : ""));
+      process.exit(res.status || 1);
+    }
+    await new Promise<void>((done, fail) => process.stdout.write(res.secretOut!, e => e ? fail(e) : done()));
+    console.error(`[rech] read-storage: wrote ${res.secretOut.length} characters to stdout`);
     process.exit(0);
   }
   if (args[cmdIdx] === "read-secret") {
@@ -4537,6 +4557,8 @@ const HELP_EPILOGUE = `Browser commands (sent to this project's Chrome session):
                      copy a field's value (e.g. an API secret) into a pipe, never shown or logged
   rech read-cookie <name> <domain> --allow-domain <domain> | <command>
                      copy a cookie (incl. HttpOnly) into a pipe, never shown or logged
+  rech read-storage <local|session> <key> [json-path] --allow-domain <host> | <command>
+                     copy a localStorage/sessionStorage value into a pipe, never shown or logged
   rech pw <args>     forward verbatim to playwright-cli, e.g. \`rech pw --version\`
   rech --version     rechrome's version
 
@@ -4652,7 +4674,7 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
         .option("clear-public-url", { type: "boolean", conflicts: "public-url" })
         .option("uploads", { type: "boolean", describe: "Uploads of images the link holder sends (rech upload) are on by default; --no-uploads turns them off" })
         .option("host-upload-dir", { type: "string", array: true, requiresArg: true, describe: "Off by default. Also let links upload files already on this host, from inside this directory (rech upload --host <path>); repeatable" })
-        .option("read-secrets", { type: "boolean", describe: "Off by default. Let this listener's links copy any field's value (saved passwords too) into a pipe (rech read-secret): only for links you trust with those accounts. --no-read-secrets turns it off" })
+        .option("read-secrets", { type: "boolean", describe: "Off by default. Let this listener's links copy any field's value (saved passwords too) or localStorage/sessionStorage value (app tokens) into a pipe (rech read-secret, read-storage): only for links you trust with those accounts. --no-read-secrets turns it off" })
         .option("read-cookies", { type: "boolean", describe: "Off by default. Let this listener's links copy any cookie, HttpOnly session cookies too (rech read-cookie): enough to take over the profiles' signed-in sessions, so only for links you trust with those accounts. --no-read-cookies turns it off" })
         .option("host-uploads", { type: "boolean", describe: "--no-host-uploads turns host-path uploads off again" })
         .check(a => a.publicUrl !== undefined || a.clearPublicUrl || a.uploads !== undefined || a.hostUploadDir?.length || a.hostUploads === false || a.readSecrets !== undefined || a.readCookies !== undefined ? true : "Pass --public-url <url>, --clear-public-url, --uploads/--no-uploads, or --host-upload-dir/--no-host-uploads"),
