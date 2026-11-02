@@ -13,7 +13,7 @@ const signal = `http://127.0.0.1:${relay.port}/`;
 const cleanups: Array<() => void | Promise<void>> = [() => relay.stop(true)];
 afterAll(async () => { for (const c of cleanups.reverse()) await c(); });
 
-const MODULES = ["rechrome.ts", "serve.ts", "listeners.ts", "extension-token.ts", "daemon-manager.ts", "fill-secret.ts", "scoped-upload.ts", "shares.ts", "secret.ts", "e2e.ts", "webrtc.ts", "signal-relay.ts"];
+const MODULES = ["rechrome.ts", "serve.ts", "listeners.ts", "extension-token.ts", "daemon-manager.ts", "fill-secret.ts", "scoped-upload.ts", "shares.ts", "secret.ts", "e2e.ts", "webrtc.ts", "signal-relay.ts", "redact.ts", "secret-rules/gitleaks.toml"];
 const reserve = () => { const s = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() }); const p = s.port!; s.stop(true); return p; };
 
 test("share new → connect → drive → session ls → reuse refused → approve → revoke, over WebRTC and LAN", async () => {
@@ -23,6 +23,7 @@ test("share new → connect → drive → session ls → reuse refused → appro
   const client3 = await mkdtemp(join(tmpdir(), "rech-rtc-client3-"));
   const mgmtPort = reserve(), lanPort = reserve();
   await mkdir(join(root, ".rechrome"));
+  await mkdir(join(root, "secret-rules"));
   for (const name of MODULES) await copyFile(join(import.meta.dir, name), join(root, name));
   await symlink(join(import.meta.dir, "node_modules"), join(root, "node_modules"), "junction");
   await writeFile(join(root, "fake-cli.ts"), `
