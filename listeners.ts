@@ -6,7 +6,7 @@ import { join } from "path";
 import { mkdir, readFile, rename, writeFile } from "fs/promises";
 
 // publicUrl: where a reverse proxy (Tailscale Serve, Caddy, nginx, ...) exposes this listener.
-export type Listener = { name: string; host: string; port: number; key: string; profiles: string[] | "*"; prefix?: string; publicUrl?: string; uploads?: UploadPolicy };
+export type Listener = { name: string; host: string; port: number; key: string; profiles: string[] | "*"; prefix?: string; publicUrl?: string; uploads?: UploadPolicy | false };
 // retiredPorts: ports of removed listeners, newest last. New listeners skip them so a link
 // saved for a removed listener gets "connection refused", not some other listener's answer.
 export type ListenerConfig = { version: 1; listeners: Listener[]; retiredPorts?: number[] };
@@ -58,7 +58,9 @@ export function validateListeners(value: unknown): ListenerConfig {
     } else if (!Array.isArray(l.profiles) || !l.profiles.length || l.profiles.some(p => typeof p !== "string" || !p.trim() || p.includes("\0") || p === "*")) {
       throw new Error("Listener profiles must be a nonempty list of registered profile keys");
     }
-    if (l.uploads !== undefined) validateUploadPolicy(l.uploads);
+    // Uploads are on unless set to false: the client sends file bytes it already has, and the
+    // host never reads a path for them.
+    if (l.uploads !== undefined && l.uploads !== false) validateUploadPolicy(l.uploads);
     const address = listenerAddress(l);
     if (names.has(l.name) || addresses.has(address) || keys.has(l.key)) throw new Error("Listener names, addresses, and credentials must be unique");
     names.add(l.name); addresses.add(address); keys.add(l.key);
@@ -103,7 +105,7 @@ export function authorizeProfileRequest(listener: Listener, body: any): string {
   if (typeof profile !== "string" || listener.profiles === "*" || !listener.profiles.includes(profile)) throw new Error("Profile is not allowed on this listener");
   if (body.env?.PLAYWRIGHT_MCP_PROFILE_DIRECTORY && body.env.PLAYWRIGHT_MCP_PROFILE_DIRECTORY !== profile) throw new Error("Profile override does not match request identity");
   const args = body.args.filter((a: string) => /^-s=[a-zA-Z0-9_-]{1,64}$/.test(a) === false);
-  if (args[0] === "upload" && listener.uploads === undefined)
+  if (args[0] === "upload" && listener.uploads === false)
     throw new Error(`Uploads are off on listener "${listener.name}". The host can turn them on: rech listener set ${listener.name} --uploads`);
   if (args[0] !== "upload" && !SCOPED_COMMANDS.has(args[0])) throw new Error("Command is unavailable on profile-scoped listeners; use the local management listener for arbitrary code or host access");
   if (body.args.filter((a: string) => a.startsWith("-s=")).length > 1 || args.slice(1).some((a: string) => a.startsWith("-") && !(args[0] === "screenshot" && a === "--full-page") && !(args[0] === "console" && a === "--clear") && !(args[0] === "fill-secret" && (a === "--submit" || a === "--totp" || a.startsWith("--allow-domain="))))) throw new Error("CLI option overrides are unavailable on profile-scoped listeners");
