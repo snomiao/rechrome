@@ -33,3 +33,13 @@ test("read-cookie is off on a scoped listener until --read-cookies, separate fro
   expect(authorizeProfileRequest(on as any, body(["read-cookie", "d", "slack.com", "--allow-domain=slack.com"]))).toBe("qa");
   expect(() => authorizeProfileRequest(on as any, body(["read-cookie", "d", "slack.com", "--filename=/x"]))).toThrow();
 });
+
+test("the cookie code matches a parent-domain cookie and rejects disagreeing matches", async () => {
+  const fn = eval("(" + buildReadCookieCode("d", "symphoneed.slack.com", ["symphoneed.slack.com"]) + ")");
+  const page = (cookies: any[]) => ({ context: () => ({ cookies: async () => cookies }) });
+  const read = async (cookies: any[]) => { try { return JSON.parse(await fn(page(cookies))).value; } catch (e: any) { return "ERR:" + e.message; } };
+  expect(await read([{ name: "d", domain: ".slack.com", value: "V" }])).toBe("V");            // parent domain
+  expect(await read([{ name: "d", domain: ".slack.com", path: "/app", value: "P" }])).toBe("P"); // any path
+  expect(await read([{ name: "d", domain: "evil.com", value: "X" }])).toContain("ERR:");        // unrelated ignored
+  expect(await read([{ name: "d", domain: ".slack.com", value: "A" }, { name: "d", domain: "symphoneed.slack.com", value: "B" }])).toContain("disagree");
+});
