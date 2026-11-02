@@ -35,7 +35,7 @@ test("multiple sockets enforce profile/file policies and reload without browser 
     personal: { profileDir: "Personal", extensionId: "a".repeat(32), token: "other-token" },
   }));
   const qa = { name: "qa", host: "127.0.0.1", port: portA, key: "a".repeat(24), profiles: ["qa"], uploads: { maxBytes: 1024 }, prefix: "/rechrome/" };
-  const personal = { name: "personal", host: "127.0.0.1", port: portB, key: "b".repeat(24), profiles: ["personal"], prefix: "/" };
+  const personal = { name: "personal", host: "127.0.0.1", port: portB, key: "b".repeat(24), profiles: ["personal"], prefix: "/", uploads: false };
   const configPath = join(root, ".rechrome", "listeners.json");
   const save = (listeners: any[]) => writeFile(configPath, JSON.stringify({ version: 1, listeners }));
   await save([qa, personal]);
