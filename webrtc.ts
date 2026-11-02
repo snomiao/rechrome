@@ -210,7 +210,7 @@ export type HostHandler = (req: Request, token: string) => Promise<Response>;
 
 /** Keeps one signal room per credential and serves each joining peer through `handler`. */
 export class WebrtcHost {
-  private rooms = new Map<string, { cred: HostCredential; signal?: SignalSocket; peers: Map<string, { pc: any; channel?: SealedChannel }>; backoff: number; stopped: boolean; retry?: ReturnType<typeof setTimeout> }>();
+  private rooms = new Map<string, { cred: HostCredential; signal?: SignalSocket; peers: Map<string, { pc: any; channel?: SealedChannel }>; backoff: number; openedAt?: number; stopped: boolean; retry?: ReturnType<typeof setTimeout> }>();
   constructor(private handler: HostHandler, private log: Log) {}
 
   /** Open rooms for new credentials, close rooms for ones that are gone. */
