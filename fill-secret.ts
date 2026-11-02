@@ -508,23 +508,25 @@ export function buildReadStorageCode(area: "local" | "session", key: string, pat
   const patterns = allowDomains.map(d => domainGlobToRegExp(d).source);
   const store = area === "local" ? "localStorage" : "sessionStorage";
   return `async page => {
-  const host = String(await page.evaluate(() => location.hostname)).toLowerCase();
+  // One evaluate: the host checked is the origin read, with no navigation in between.
+  const out = await page.evaluate(({ key, path }) => {
+    const host = String(location.hostname).toLowerCase();
+    const raw = window.${store}.getItem(key);
+    if (raw === null) return { host, missing: true };
+    if (!path.length) return { host, value: raw };
+    let v;
+    try { v = JSON.parse(raw); } catch { return { host, notjson: true }; }
+    for (const seg of path) {
+      if (v == null || typeof v !== "object") return { host, nopath: true };
+      v = v[seg];
+    }
+    if (v === undefined) return { host, nopath: true };
+    return { host, value: typeof v === "string" ? v : JSON.stringify(v) };
+  }, { key: ${JSON.stringify(key)}, path: ${JSON.stringify(path)} });
+  const host = out.host;
   const allowed = ${JSON.stringify(patterns)};
   if (!allowed.some(p => new RegExp(p, "i").test(host)))
     throw new Error("read-storage refused: the page host " + JSON.stringify(host) + " is not allowed by --allow-domain");
-  const out = await page.evaluate(({ key, path }) => {
-    const raw = window.${store}.getItem(key);
-    if (raw === null) return { missing: true };
-    if (!path.length) return { value: raw };
-    let v;
-    try { v = JSON.parse(raw); } catch { return { notjson: true }; }
-    for (const seg of path) {
-      if (v == null || typeof v !== "object") return { nopath: true };
-      v = v[seg];
-    }
-    if (v === undefined) return { nopath: true };
-    return { value: typeof v === "string" ? v : JSON.stringify(v) };
-  }, { key: ${JSON.stringify(key)}, path: ${JSON.stringify(path)} });
   if (out.missing) throw new Error("read-storage: no ${store} key " + JSON.stringify(${JSON.stringify(key)}) + " on " + host);
   if (out.notjson) throw new Error("read-storage: the value is not JSON, so the path can't apply");
   if (out.nopath) throw new Error("read-storage: the json-path is not present in the value");
