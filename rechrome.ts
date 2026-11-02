@@ -2240,9 +2240,8 @@ async function run(url: string, args: string[], overrideEnv?: Record<string, str
     // Saved files belong to the project: <project>/.rechrome/output. The folder also holds
     // .env.local (secrets), so it is git-ignored as a whole when first created.
     const dlDir = join(identity.dataDir, "output");
+    await ensureProjectDir(identity.dataDir);
     mkdirSync(dlDir, { recursive: true });
-    const gitignorePath = join(identity.dataDir, ".gitignore");
-    if (!existsSync(gitignorePath)) await Bun.write(gitignorePath, "*\n");
     for (const name of files) {
       const fileRes = await fetch(serviceUrl(url, `files/${name}`), {
         headers: { Authorization: `Bearer ${parseUrl(url).key}` },
@@ -3406,9 +3405,7 @@ async function warnSecretFile(path: string | undefined): Promise<void> {
 /** Write RECHROME_URL to this project's .rechrome/.env.local (the folder git-ignores itself). */
 async function saveProjectUrl(url: string): Promise<string> {
   const { dataDir } = await getClientIdentity();
-  mkdirSync(dataDir, { recursive: true });
-  const gitignore = join(dataDir, ".gitignore");
-  if (!existsSync(gitignore)) await Bun.write(gitignore, "*\n");
+  await ensureProjectDir(dataDir);
   return writeEnvUrl(join(dataDir, ".env.local"), url);
 }
 
@@ -3419,10 +3416,40 @@ async function saveGlobalUrl(url: string): Promise<string> {
 }
 
 /** Replace RECHROME_URL in an env file, keeping its other lines; owner-only, since the URL holds a key. */
+/** Write a file whole or not at all: a temp file beside it, then rename (atomic on one filesystem). */
+export async function writeAtomic(path: string, data: string, mode?: number): Promise<void> {
+  // A symlinked .env.local stays a link: write the file it points to.
+  try { path = realpathSync(path); } catch { /* not there yet */ }
+  const tmp = `${path}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+  try {
+    await writeFile(tmp, data, mode === undefined ? {} : { mode });
+    if (mode !== undefined) await chmod(tmp, mode);
+    renameSync(tmp, path);
+  } catch (error) { try { unlinkSync(tmp); } catch { /* never written */ } throw error; }
+}
+
+export const PROJECT_DIR_README = `# .rechrome/
+
+rech's state for this project (like .git/). It ignores itself: see .gitignore.
+
+- .env.local  RECHROME_URL for this project. Holds a key: keep it private.
+- output/     files rech commands saved (screenshots, snapshots, downloads).
+
+Safe to delete; rech recreates it. More: https://github.com/snomiao/rechrome
+`;
+
+/** Create <project>/.rechrome with its .gitignore ("*") and README, so a key in it is never committed. */
+export async function ensureProjectDir(dir: string): Promise<void> {
+  mkdirSync(dir, { recursive: true });
+  const gitignore = join(dir, ".gitignore");
+  if (!existsSync(gitignore)) await writeAtomic(gitignore, "*\n");
+  const readme = join(dir, "README.md");
+  if (!existsSync(readme)) await writeAtomic(readme, PROJECT_DIR_README);
+}
+
 async function writeEnvUrl(envPath: string, url: string): Promise<string> {
   const lines = (await file(envPath).text().catch(() => "")).split("\n").filter(l => l.trim() && !l.startsWith(`${ENV_KEY}=`));
-  await writeFile(envPath, [...lines, envAssignment(ENV_KEY, url), ""].join("\n"), { mode: 0o600 });
-  await chmod(envPath, 0o600);
+  await writeAtomic(envPath, [...lines, envAssignment(ENV_KEY, url), ""].join("\n"), 0o600);
   await recordSavedLink(envPath).catch(() => {}); // only bookkeeping for later warnings
   return envPath;
 }
@@ -3886,7 +3913,7 @@ async function setup(opts: SetupOptions = {}): Promise<void> {
   )).trim();
   if (saveChoice !== "4") {
     const globalEnvPath = saveChoice === "3" ? homeEnvPath : saveChoice === "2" ? pwdRechPath : pwdEnvPath;
-    if (saveChoice === "2") mkdirSync(join(process.cwd(), ".rechrome"), { recursive: true });
+    if (saveChoice === "2") await ensureProjectDir(join(process.cwd(), ".rechrome"));
     const existedBefore = await file(globalEnvPath).exists();
     const existing = await file(globalEnvPath).text().catch(() => "");
     const keysToRemove = ["PLAYWRIGHT_MCP_USER_DATA_DIR", "PLAYWRIGHT_MCP_EXTENSION_ID", "PLAYWRIGHT_MCP_EXTENSION_TOKEN", "PLAYWRIGHT_MCP_PROFILE_DIRECTORY"];
@@ -3894,7 +3921,7 @@ async function setup(opts: SetupOptions = {}): Promise<void> {
     const rechIdx = lines.findIndex(l => l.startsWith("RECHROME_URL="));
     if (rechIdx >= 0) lines[rechIdx] = newLine;
     else lines.push(newLine);
-    await Bun.write(globalEnvPath, lines.join("\n").trim() + "\n");
+    await writeAtomic(globalEnvPath, lines.join("\n").trim() + "\n", 0o600);
     console.log(`\n${existedBefore ? "Updated" : "Created"} ${globalEnvPath}`);
   }
 
