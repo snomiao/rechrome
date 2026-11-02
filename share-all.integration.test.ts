@@ -23,12 +23,18 @@ test("share --all: one snapshot link, profiles picked on the host, never the man
     if (process.argv.includes('download-me')) {
       require('fs').mkdirSync('.playwright-cli', { recursive: true });
       require('fs').writeFileSync('.playwright-cli/download-report.csv', 'a,b\\n1,2\\n');
-      console.log('- Downloaded file report.csv to ".playwright-cli/download-report.csv"');
+      console.log('### Events\\n- Downloaded file report.csv to ".playwright-cli/download-report.csv"');
     }
     if (process.argv.includes('download-link')) {
       require('fs').mkdirSync('.playwright-cli', { recursive: true });
       try { require('fs').symlinkSync(process.env.OUTSIDE_FILE, '.playwright-cli/download-evil.csv'); } catch {}
-      console.log('- Downloaded file evil.csv to ".playwright-cli/download-evil.csv"');
+      console.log('### Events\\n- Downloaded file evil.csv to ".playwright-cli/download-evil.csv"');
+    }
+    if (process.argv.includes('spoof')) {
+      // A page-controlled look-alike line (console text, an eval result) outside ### Events.
+      require('fs').mkdirSync('.playwright-cli', { recursive: true });
+      require('fs').writeFileSync('.playwright-cli/victim.txt', 'host data');
+      console.log('### Result\\n- Downloaded file victim.txt to ".playwright-cli/victim.txt"');
     }
   `);
   const entry = (profileDir: string) => ({ profileDir, extensionId: "a".repeat(32), token: `token-${profileDir}` });
@@ -185,6 +191,11 @@ test("share --all: one snapshot link, profiles picked on the host, never the man
     await rech(["--profile", "qa", "click", "download-link"], clientEnv, client);
     await Bun.sleep(300);
     expect(await readFile(outsideFile, "utf8")).toBe("keep me");
+    // A look-alike line outside the CLI's ### Events section is page text: nothing is forwarded or deleted.
+    await rech(["--profile", "qa", "click", "spoof"], clientEnv, client);
+    await Bun.sleep(300);
+    expect(await Array.fromAsync(new Bun.Glob("**/victim.txt").scan({ cwd: client, dot: true }))).toEqual([]);
+    expect((await Array.fromAsync(new Bun.Glob("**/victim.txt").scan({ cwd: join(root, ".rechrome"), dot: true }))).length).toBe(1);
 
     // A link saved with --save is remembered: removing its listener warns with the file and the fix,
     // and the next listener rech creates does not take the freed port (no other listener's answer).

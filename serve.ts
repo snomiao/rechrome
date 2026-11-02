@@ -107,6 +107,25 @@ const pendingDownloads = new Map<string, ReturnType<typeof setTimeout>>();
 const DOWNLOAD_PICKUP_MS = 10 * 60_000;
 // playwright-cli's line for a finished download (tools/backend/response.ts).
 const DOWNLOADED_LINE = /^- Downloaded file (.+?) to "(.+)"$/gm;
+// Where the CLI saves downloads: its output dir under the session's cwd (context.ts outputDir).
+const CLI_OUTPUT_DIRS = new Set([".playwright-cli", ".playwright-mcp"]);
+
+/**
+ * The downloads the CLI itself reported: `- Downloaded file …` lines inside its own `### Events`
+ * section only, with paths in its output dir. The rest of the output carries page-controlled text
+ * (snapshots, console messages, eval results), and a page that prints a look-alike line must not
+ * be able to make the host forward and delete a file of its choosing.
+ */
+export function reportedDownloads(output: string): { name: string; rel: string }[] {
+  const out: { name: string; rel: string }[] = [];
+  for (const m of output.matchAll(/^### Events\n([\s\S]*?)(?=^### |(?![\s\S]))/gm)) {
+    for (const [, name, rel] of m[1]!.matchAll(DOWNLOADED_LINE)) {
+      const first = rel!.replaceAll("\\", "/").split("/")[0]!;
+      if (CLI_OUTPUT_DIRS.has(first)) out.push({ name: name!, rel: rel! });
+    }
+  }
+  return out;
+}
 function noteSession(sess: string, now: number): void {
   recentSessions.set(sess, now);
   if (recentSessions.size > 64) {
@@ -1142,6 +1161,7 @@ export async function serve() {
       }
 
       const commandStartedAt = Date.now();
+      const runStartedAt = Date.now(); // downloads must be newer than this
       const proc = Bun.spawn([bin, ...binArgs, ...filteredArgs, `-s=${namespacedSession}`], {
         cwd: runWorkDir,
         stdin: "ignore",
@@ -1265,13 +1285,15 @@ export async function serve() {
       }
 
       // Browser downloads, whatever their type: forwarded to the client and logged.
-      for (const [, name, rel] of rawOutput.matchAll(DOWNLOADED_LINE)) {
+      for (const { name, rel } of reportedDownloads(rawOutput)) {
         if (!isUnderDir(runWorkDir, rel)) continue;
         const path = resolve(runWorkDir, rel);
         if (!existsSync(path)) continue;
         // Only a regular file really inside the work dir: never follow a link to delete elsewhere.
         const real = realpathSync(path);
         if (!isUnderDir(realpathSync(runWorkDir), real) || !lstatSync(real).isFile()) continue;
+        // Written during this command: an older file named by a replayed line is left alone.
+        if (statSync(real).mtimeMs < runStartedAt - 2000) continue;
         const f = relative(runWorkDir, path).replaceAll("\\", "/");
         if (!outputFiles.includes(f)) outputFiles.push(f);
         const hash = createHash("sha256");
