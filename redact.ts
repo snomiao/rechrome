@@ -1,11 +1,11 @@
-// Secret redaction (ported from snomiao/slack-term PR #68) for page text rech prints:
-// stdout/stderr of every command; each secret becomes `[redacted:<rule id>]`.
-// RECH_REDACT=0 turns it off for one call.
+// Secret redaction, copied from snomiao/slack-term ts/redact.ts (PR #68, 73ae26e); keep
+// the two in sync. rech runs it on every command's stdout/stderr; each secret becomes
+// `[redacted:<rule id>]`. RECH_REDACT=0 turns it off for one call.
 //
 // Rules: gitleaks' default set (secret-rules/gitleaks.toml, v8.30.1, MIT — see
 // secret-rules/gitleaks.LICENSE), run in-process by the JS regex engine, plus
 // our own for what it does not cover (OWN_RULES). Measured 2026-11-02 on
-// 1,000 synthetic messages (slack-term tests/redact.test.ts):
+// 1,000 synthetic messages (tests/redact.test.ts builds the same set):
 // 0.1 ms and ~60 MB RSS per process, against ~0.9 s and ~62 MB per message
 // for spawning the gitleaks binary, with the same catches.
 import { readFileSync } from "node:fs";
@@ -19,9 +19,12 @@ export type SecretRule = {
   entropy?: number;
   /** Which capture group is the secret (gitleaks' `secretGroup`). */
   group?: number;
+  /** Allowlist regexes tested against the secret (gitleaks' regexTarget = secret, the default)… */
   allow: RegExp[];
-  /** Allowlist regexes gitleaks runs against the whole match (`regexTarget = "match"`). */
+  /** …against the whole match (regexTarget = match)… */
   allowMatch?: RegExp[];
+  /** …and against the line the match is on (regexTarget = line). */
+  allowLine?: RegExp[];
   stop: string[];
 };
 
@@ -58,6 +61,9 @@ export function goToJs(src: string): { source: string; flags: string } {
     if (src.startsWith("(?i)", i)) { out += "(?i:"; extra++; i += 3; continue; }
     if (c === "(") { closers.push(extra); extra = 0; out += c; continue; }
     if (c === ")") { out += ")".repeat(extra); extra = closers.pop() ?? 0; out += c; continue; }
+    // RE2's flag runs to the group's end across `|`; a JS scoped group must not swallow the
+    // alternation, so close it before `|` and reopen it after.
+    if (c === "|" && extra) { out += ")".repeat(extra) + "|" + "(?i:".repeat(extra); continue; }
     out += c;
   }
   out += ")".repeat(extra);
@@ -67,8 +73,7 @@ export function goToJs(src: string): { source: string; flags: string } {
 type TomlAllow = { regexTarget?: string; regexes?: string[]; stopwords?: string[] };
 type TomlRule = { id: string; regex?: string; keywords?: string[]; entropy?: number; secretGroup?: number; allowlists?: TomlAllow[]; allowlist?: TomlAllow };
 
-/** gitleaks' rules TOML → rules. Path-only rules (no regex) are skipped;
- *  allowlists that target the whole line are skipped (we see no lines). */
+/** gitleaks' rules TOML → rules. Path-only rules (no regex) are skipped. */
 export function loadGitleaksRules(toml: string): SecretRule[] {
   const c = Bun.TOML.parse(toml) as { rules: TomlRule[]; allowlist?: TomlAllow };
   const compile = (r: string): RegExp => { const j = goToJs(r); return new RegExp(j.source, j.flags); };
@@ -79,16 +84,20 @@ export function loadGitleaksRules(toml: string): SecretRule[] {
     if (!r.regex) continue;
     const allow = [...gAllow];
     const allowMatch: RegExp[] = [];
+    const allowLine: RegExp[] = [];
     const stop = [...gStop];
     for (const a of [...(r.allowlists ?? []), ...(r.allowlist ? [r.allowlist] : [])]) {
-      if (a.regexTarget && a.regexTarget !== "secret" && a.regexTarget !== "match") continue;
-      for (const x of a.regexes ?? []) (a.regexTarget === "match" ? allowMatch : allow).push(compile(x));
+      // Each allowlist is tested against what it names, not always the secret
+      // (generic-api-key's api_version exclusion is a regexTarget = match one).
+      const into = a.regexTarget === "match" ? allowMatch : a.regexTarget === "line" ? allowLine : allow;
+      for (const x of a.regexes ?? []) into.push(compile(x));
       for (const s of a.stopwords ?? []) stop.push(String(s).toLowerCase());
     }
     const j = goToJs(r.regex);
     rules.push({
-      id: r.id, re: new RegExp(j.source, j.flags + "g"), keywords: (r.keywords ?? []).map((k) => k.toLowerCase()),
-      ...(r.entropy ? { entropy: r.entropy } : {}), ...(r.secretGroup ? { group: r.secretGroup } : {}), allow, ...(allowMatch.length ? { allowMatch } : {}), stop,
+      id: r.id, re: new RegExp(j.source, j.flags + "gd"), keywords: (r.keywords ?? []).map((k) => k.toLowerCase()),
+      ...(r.entropy ? { entropy: r.entropy } : {}), ...(r.secretGroup ? { group: r.secretGroup } : {}), allow,
+      ...(allowMatch.length ? { allowMatch } : {}), ...(allowLine.length ? { allowLine } : {}), stop,
     });
   }
   return rules;
@@ -97,12 +106,12 @@ export function loadGitleaksRules(toml: string): SecretRule[] {
 /** Ours, for what gitleaks' set leaves out. */
 export const OWN_RULES: SecretRule[] = [
   // ?token=… / &sig=… in a URL; `<your token>` and xxx-style placeholders are not secrets.
-  { id: "url-secret-param", re: /[?&](?:access_token|token|key|api_key|apikey|secret|client_secret|password|passwd|pwd|sig|signature)=([^&\s#<>"'|]{6,})/gi, group: 1, keywords: ["="], allow: [/^(?:x+|\*+|\.\.\.|your[-_]?\w*|xxx\w*)$/i], stop: [] },
+  { id: "url-secret-param", re: /[?&](?:access_token|token|key|api_key|apikey|secret|client_secret|password|passwd|pwd|sig|signature)=([^&\s#<>"'|]{6,})/gid, group: 1, keywords: ["="], allow: [/^(?:x+|\*+|\.\.\.|your[-_]?\w*|xxx\w*)$/i], stop: [] },
   // OpenAI / Anthropic / OpenRouter style keys, whatever their exact layout.
-  { id: "sk-key", re: /\b(sk-(?:proj-|ant-|or-v1-|svcacct-)?[A-Za-z0-9_-]{20,})/g, keywords: ["sk-"], entropy: 3.5, allow: [], stop: [] },
+  { id: "sk-key", re: /\b(sk-(?:proj-|ant-|or-v1-|svcacct-)?[A-Za-z0-9_-]{20,})/gd, group: 1, keywords: ["sk-"], entropy: 3.5, allow: [], stop: [] },
   // A 6-digit code only right after a word that says it is one: a bare
   // 6-digit number is far more often an amount, an order or a build.
-  { id: "otp-code", re: /(?:code|コード|otp|pin|passcode|認証|確認番号|ワンタイム)[^\d\n]{0,20}(?<![\d.])(\d{6})(?![\d.])/gi, group: 1, keywords: [], allow: [], stop: [] },
+  { id: "otp-code", re: /(?:code|コード|otp|pin|passcode|認証|確認番号|ワンタイム)[^\d\n]{0,20}(?<![\d.])(\d{6})(?![\d.])/gid, group: 1, keywords: [], allow: [], stop: [] },
 ];
 
 let cached: SecretRule[] | undefined;
@@ -122,28 +131,70 @@ function shannon(s: string): number {
 
 export type SecretHit = { id: string; start: number; end: number };
 
-/** Every secret span in `text`. */
-export function findSecrets(text: string, rules = secretRules()): SecretHit[] {
-  const lower = text.toLowerCase();
+/** Every span of an exact value the caller knows is secret (its own token, a
+ *  value it filled in), longest first, plus the value's JSON-string spelling
+ *  (a `"` or `\\` in it is escaped there). The 4th rule, after rechrome's
+ *  fill-secret scrub; values shorter than 6 are ignored as unsafe to match. */
+function findKnown(text: string, known: readonly string[]): SecretHit[] {
+  const forms = new Set<string>();
+  for (const v of known) {
+    if (v.length < 6) continue;
+    forms.add(v);
+    forms.add(JSON.stringify(v).slice(1, -1));
+  }
   const out: SecretHit[] = [];
+  for (const f of [...forms].sort((a, b) => b.length - a.length)) {
+    for (let i = text.indexOf(f); i >= 0; i = text.indexOf(f, i + f.length)) out.push({ id: "known-secret", start: i, end: i + f.length });
+  }
+  return out;
+}
+
+export type RedactOptions = { rules?: SecretRule[]; known?: readonly string[] };
+
+/** Every secret span in `text`. */
+export function findSecrets(text: string, opts: RedactOptions = {}): SecretHit[] {
+  const rules = opts.rules ?? secretRules();
+  const lower = text.toLowerCase();
+  const out: SecretHit[] = opts.known?.length ? findKnown(text, opts.known) : [];
   for (const r of rules) {
     if (r.keywords.length && !r.keywords.some((k) => lower.includes(k))) continue;
-    // The `d` flag gives each group's own offsets; indexOf on the match could find an
-    // earlier copy (`access_token=access_token`) and leave the real value showing.
-    const re = r.re.hasIndices ? r.re : new RegExp(r.re.source, r.re.flags.includes("g") ? r.re.flags + "d" : r.re.flags + "gd");
-    for (const m of text.matchAll(re)) {
-      const gi = r.group ?? m.slice(1).findIndex((g) => g) + 1;
-      const secret = (gi > 0 ? m[gi] : undefined) ?? m[0];
+    for (const m of text.matchAll(r.re)) {
+      // What gitleaks calls the secret — the configured group, else the first
+      // that matched — decides entropy and the secret allowlist. What is
+      // MASKED is that group only when the rule names it; otherwise the whole
+      // match, since the first group can be a harmless fragment (a webhook's
+      // UUID, a JWT's fixed header) and the real secret would stay visible.
+      // Spans come from the match's own indices (the `d` flag): looking a
+      // value up in m[0] finds an EARLIER copy (`?secret=secret`, rechrome #55).
+      const gi = r.group ?? m.findIndex((g, i) => i > 0 && !!g);
+      const secret = gi > 0 ? m[gi] : m[0];
       if (!secret) continue;
       if (r.entropy && shannon(secret) < r.entropy) continue;
       if (r.allow.some((a) => a.test(secret))) continue;
       if (r.allowMatch?.some((a) => a.test(m[0]))) continue;
+      if (r.allowLine) {
+        const ls = text.lastIndexOf("\n", m.index) + 1;
+        const le = text.indexOf("\n", m.index + m[0].length);
+        if (r.allowLine.some((a) => a.test(text.slice(ls, le < 0 ? undefined : le)))) continue;
+      }
       const sl = secret.toLowerCase();
       if (r.stop.some((s) => sl.includes(s))) continue;
-      // Without an explicit secretGroup the first capture may be a harmless fragment (a
-      // webhook's UUID, a JWT's fixed header), so mask the whole match then.
-      const span = r.group && m.indices?.[r.group] ? m.indices[r.group]! : [m.index, m.index + m[0].length];
-      out.push({ id: r.id, start: span[0], end: span[1] });
+      const span = r.group ? m.indices?.[r.group] : undefined;
+      if (span) out.push({ id: r.id, start: span[0], end: span[1] });
+      else {
+        // gitleaks' patterns end (and some start) with a boundary — space,
+        // quote, `;`, a literal \n — that is context, not secret: keep it.
+        let a = m.index;
+        let b = m.index + m[0].length;
+        const edge = /[\s'"`;=:,]/;
+        while (a < b && edge.test(text[a]!)) a++;
+        for (;;) {
+          if (b > a && edge.test(text[b - 1]!)) b--;
+          else if (b - 2 >= a && /\\[nr]/.test(text.slice(b - 2, b))) b -= 2;
+          else break;
+        }
+        out.push({ id: r.id, start: a, end: b });
+      }
     }
   }
   return out;
@@ -151,8 +202,8 @@ export function findSecrets(text: string, rules = secretRules()): SecretHit[] {
 
 /** `text` with every secret replaced by `[redacted:<rule id>]`. Overlapping
  *  hits merge into one span, named by the longest. */
-export function redact(text: string, rules = secretRules()): { text: string; kinds: string[] } {
-  const hits = findSecrets(text, rules).sort((a, b) => a.start - b.start || b.end - a.end);
+export function redact(text: string, opts: RedactOptions = {}): { text: string; kinds: string[] } {
+  const hits = findSecrets(text, opts).sort((a, b) => a.start - b.start || b.end - a.end);
   if (!hits.length) return { text, kinds: [] };
   const spans: SecretHit[] = [];
   for (const h of hits) {
