@@ -443,6 +443,106 @@ export async function readSecretOnSession(opts: { socketRoot: string; session: s
   return out;
 }
 
+// ---------- read-storage: a localStorage/sessionStorage value to a pipe ----------
+//
+// Same contract as read-secret: value only in `secretOut`, never logged, masked later, client
+// pipe-only. For the live app token in storage (Slack's localConfig_v2 teams[T...].token). Reads
+// via page-level evaluate, so it works over the extension bridge. localStorage is per-origin, so
+// the session's page must be on the allowed host.
+
+export const READ_STORAGE_USAGE = `Usage: rech read-storage <local|session> <key> [json-path] --allow-domain <glob> | <command>
+  Writes the storage value, raw and without a newline, to stdout, which must be a pipe into the
+  program that stores it (never a terminal or a file). Never logged; masked in later outputs.
+  <local|session>       localStorage or sessionStorage
+  <key>                 the storage key, e.g. localConfig_v2
+  [json-path]           optional: a path into the JSON value, e.g. teams.T0123.token or teams[T0123].token
+  --allow-domain GLOB   required: the page's host must match, e.g. app.slack.com`;
+
+/** Split "teams[T0123].token" / "teams.T0123.token" into ["teams","T0123","token"]. */
+export function parseStoragePath(path: string): string[] {
+  return path.match(/[^.[\]]+/g) ?? [];
+}
+
+export function parseReadStorageArgs(args: string[]): { area: "local" | "session"; key: string; path: string[]; allowDomains: string[] } {
+  const [cmd, ...rest] = args;
+  if (cmd !== "read-storage") throw new Error("Expected read-storage");
+  const pos: string[] = [];
+  const allowDomains: string[] = [];
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i]!;
+    if (a === "--allow-domain" || a.startsWith("--allow-domain=")) {
+      const v = a === "--allow-domain" ? rest[++i] : a.slice("--allow-domain=".length);
+      if (!v) throw new Error("--allow-domain got an empty host");
+      for (const d of v.split(",")) { domainGlobToRegExp(d.trim()); allowDomains.push(d.trim()); }
+    } else if (a.startsWith("-")) throw new Error(`read-storage: unknown option ${a}`);
+    else pos.push(a);
+  }
+  if (pos.length < 2 || pos.length > 3) throw new Error("read-storage needs <local|session> <key> [json-path]");
+  const [area, key, rawPath] = pos;
+  if (area !== "local" && area !== "session") throw new Error("read-storage: first argument must be 'local' or 'session'");
+  if (!key) throw new Error("read-storage: a storage key is required");
+  if (!allowDomains.length) throw new Error("read-storage needs --allow-domain: name the site the value must come from");
+  return { area, key, path: rawPath ? parseStoragePath(rawPath) : [], allowDomains };
+}
+
+export function readStorageWireArgs(req: { area: string; key: string; path: string[]; allowDomains: string[] }): string[] {
+  return ["read-storage", req.area, req.key, ...(req.path.length ? [req.path.join(".")] : []), ...req.allowDomains.map(d => `--allow-domain=${d}`)];
+}
+
+export function parseReadStorageWire(args: string[]): { area: "local" | "session"; key: string; path: string[]; allowDomains: string[] } {
+  const [cmd, area, key, ...rest] = args;
+  if (cmd !== "read-storage" || (area !== "local" && area !== "session") || !key || key.startsWith("-")) throw new Error("read-storage needs <local|session> <key>");
+  const allowDomains: string[] = [];
+  let path: string[] = [];
+  for (const a of rest) {
+    if (a.startsWith("--allow-domain=")) { const d = a.slice("--allow-domain=".length); domainGlobToRegExp(d); allowDomains.push(d); }
+    else if (!a.startsWith("-") && !path.length) path = parseStoragePath(a);
+    else throw new Error(`read-storage: unexpected argument ${a.startsWith("-") ? a : "(positional)"}`);
+  }
+  if (!allowDomains.length) throw new Error("read-storage needs --allow-domain");
+  return { area, key, path, allowDomains };
+}
+
+/** run-code reading storage[key], optionally walking a JSON path; returns {host,value} JSON. */
+export function buildReadStorageCode(area: "local" | "session", key: string, path: string[], allowDomains: string[]): string {
+  const patterns = allowDomains.map(d => domainGlobToRegExp(d).source);
+  const store = area === "local" ? "localStorage" : "sessionStorage";
+  return `async page => {
+  const host = String(await page.evaluate(() => location.hostname)).toLowerCase();
+  const allowed = ${JSON.stringify(patterns)};
+  if (!allowed.some(p => new RegExp(p, "i").test(host)))
+    throw new Error("read-storage refused: the page host " + JSON.stringify(host) + " is not allowed by --allow-domain");
+  const out = await page.evaluate(({ key, path }) => {
+    const raw = window.${store}.getItem(key);
+    if (raw === null) return { missing: true };
+    if (!path.length) return { value: raw };
+    let v;
+    try { v = JSON.parse(raw); } catch { return { notjson: true }; }
+    for (const seg of path) {
+      if (v == null || typeof v !== "object") return { nopath: true };
+      v = v[seg];
+    }
+    if (v === undefined) return { nopath: true };
+    return { value: typeof v === "string" ? v : JSON.stringify(v) };
+  }, { key: ${JSON.stringify(key)}, path: ${JSON.stringify(path)} });
+  if (out.missing) throw new Error("read-storage: no ${store} key " + JSON.stringify(${JSON.stringify(key)}) + " on " + host);
+  if (out.notjson) throw new Error("read-storage: the value is not JSON, so the path can't apply");
+  if (out.nopath) throw new Error("read-storage: the json-path is not present in the value");
+  return JSON.stringify({ host, value: out.value });
+}`;
+}
+
+export async function readStorageOnSession(opts: { socketRoot: string; session: string; cwd: string; area: "local" | "session"; key: string; path: string[]; allowDomains: string[] }): Promise<{ host: string; value: string }> {
+  const { isError, text } = await runCodeOnSession({ ...opts, code: buildReadStorageCode(opts.area, opts.key, opts.path, opts.allowDomains), json: true });
+  if (isError) throw new Error(text.match(/read-storage(?: refused)?: [^\n]*/)?.[0] ?? (/no browser is open|could not reach/.test(text) ? text.trim().split("\n")[0]! : "read-storage: could not read the value"));
+  let raw: unknown;
+  try { raw = JSON.parse(text).result; } catch { raw = text.match(/### Result\n([^\n]*)/)?.[1]; }
+  let o: any = raw;
+  for (let i = 0; i < 2 && typeof o === "string"; i++) { try { o = JSON.parse(o); } catch { o = undefined; } }
+  if (!o || typeof o.host !== "string" || typeof o.value !== "string") throw new Error("read-storage: the page returned no value");
+  return o;
+}
+
 // ---------- read-cookie: a cookie value (incl. HttpOnly) to a pipe ----------
 //
 // Same contract as read-secret: the value travels only in the response's `secretOut`, is never
