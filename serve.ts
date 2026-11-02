@@ -1039,7 +1039,7 @@ export async function serve() {
       if (filteredArgs[0] === "upload") {
         const result = await receiveUpload({
           // The management key can already run any code, so uploads need no extra opt-in there.
-          policy: listener.uploads ?? (listener.profiles === "*" ? {} : undefined), payload: body.upload, args: filteredArgs,
+          policy: listener.uploads === false ? undefined : listener.uploads ?? {}, payload: body.upload, args: filteredArgs,
           audit: event => log(`upload: ${JSON.stringify({ listener: listener.name, profile: scopedProfile ?? body.identity?.profile ?? null, ...event })}`),
           run: async uploadArgs => {
             const child = Bun.spawn([bin, ...binArgs, ...uploadArgs, `-s=${namespacedSession}`], {

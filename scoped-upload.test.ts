@@ -47,12 +47,13 @@ test('delivery scripts embed the target and file as data, never as code', () => 
   expect(uploadScript('into', 'input#avatar', '/f', payload)).toContain('page.locator("input#avatar")');
 });
 
-test('uploads default off; enabling uploads does not enable eval or host paths', () => {
-  expect(() => authorizeProfileRequest(listener, body(['upload']))).toThrow();
+test('uploads default on, false turns them off; uploads never enable eval or host paths', () => {
+  expect(authorizeProfileRequest(listener, body(['upload', '-s=qa']))).toBe('qa');
+  expect(() => authorizeProfileRequest({ ...listener, uploads: false }, body(['upload']))).toThrow(/Uploads are off/);
   const enabled = { ...listener, uploads: {} };
   expect(authorizeProfileRequest(enabled, body(['upload', '-s=qa']))).toBe('qa');
-  for (const args of [['eval', '() => 1'], ['upload', '/etc/passwd'], ['upload', '../secret'], ['upload', '--filename=/etc/passwd'], ['upload', '--config=evil']])
-    expect(() => authorizeProfileRequest(enabled, body(args))).toThrow();
+  for (const l of [listener, enabled]) for (const args of [['eval', '() => 1'], ['upload', '/etc/passwd'], ['upload', '../secret'], ['upload', '--filename=/etc/passwd'], ['upload', '--config=evil']])
+    expect(() => authorizeProfileRequest(l, body(args))).toThrow();
   expect(() => authorizeProfileRequest(enabled, body(['upload'], null))).toThrow();
   for (const p of [true, null, { directory: '/tmp' }, { maxBytes: 0 }, { maxBytes: MAX_UPLOAD_BYTES + 1 }, { contentTypes: ['text/html'] }])
     expect(() => validateUploadPolicy(p)).toThrow();

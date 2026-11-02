@@ -3346,11 +3346,11 @@ async function setListener(name: string, opts: { publicUrl?: string; clearPublic
   if (opts.uploads !== undefined) {
     if (listener.profiles === "*") throw new Error(`"${name}" is the local management listener: uploads are always on there.`);
     // {} = the defaults (every supported image type, the full size cap); hand-tuned limits stay.
-    if (opts.uploads) listener.uploads ??= {}; else delete listener.uploads;
+    if (opts.uploads) listener.uploads = listener.uploads || {}; else listener.uploads = false;
   }
   await writeListeners(config);
   if (opts.publicUrl !== undefined || opts.clearPublicUrl) console.log(listener.publicUrl ? `${name} is reachable at ${listener.publicUrl}` : `${name}: public URL cleared`);
-  if (opts.uploads !== undefined) console.log(opts.uploads ? `${name}: uploads on (rech upload <file>; images up to ${(listener.uploads?.maxBytes ?? MAX_UPLOAD_BYTES) / 1024 / 1024} MiB)` : `${name}: uploads off`);
+  if (opts.uploads !== undefined) console.log(opts.uploads ? `${name}: uploads on (rech upload <file>; images up to ${((listener.uploads || {}).maxBytes ?? MAX_UPLOAD_BYTES) / 1024 / 1024} MiB)` : `${name}: uploads off`);
 }
 
 const hideKey = (url: string) => url.replace(/([#&?]key=)[^&]*/, "$1…");
@@ -4574,7 +4574,7 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
         .positional("name", { type: "string", demandOption: true })
         .option("public-url", { type: "string", requiresArg: true, describe: "e.g. https://host.example.ts.net/rechrome/" })
         .option("clear-public-url", { type: "boolean", conflicts: "public-url" })
-        .option("uploads", { type: "boolean", describe: "Let this listener's links upload images (rech upload); --no-uploads turns it off" })
+        .option("uploads", { type: "boolean", describe: "Uploads of images the link holder sends (rech upload) are on by default; --no-uploads turns them off" })
         .check(a => a.publicUrl !== undefined || a.clearPublicUrl || a.uploads !== undefined ? true : "Pass --public-url <url>, --clear-public-url, or --uploads/--no-uploads"),
         a => handlers.setListener(a.name, { publicUrl: a.publicUrl, clearPublicUrl: a.clearPublicUrl, ...(a.uploads !== undefined ? { uploads: a.uploads } : {}) }))
       .command("port [name]", "Print a listener's port (for a proxy command)", y => y.positional("name", { type: "string" }),

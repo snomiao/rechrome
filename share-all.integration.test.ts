@@ -142,23 +142,23 @@ test("share --all: one snapshot link, profiles picked on the host, never the man
     config = JSON.parse(await readFile(listenersPath, "utf8"));
     expect([...config.listeners.find((l: any) => l.name === "one").profiles].sort()).toEqual(["personal", "qa", "team-a@x.com"]);
 
-    // Uploads: off on a scoped listener until the host turns them on, and the refusal says how.
-    // The client reads the file; the host stages its bytes under the original name.
+    // Uploads: on by default (the client sends bytes it has; the host stages them privately).
     const shot = join(client, "shot.png");
     await writeFile(shot, Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jI1sAAAAASUVORK5CYII=", "base64"));
+    const on = await rech(["--profile", "qa", "upload", shot], clientEnv, client);
+    expect(on.stdout).toContain("Uploaded shot.png");
+    expect(on.stdout + on.stderr).not.toContain("rech-upload-");
+    // --no-uploads turns them off, and the refusal says how to turn them back on.
+    expect((await rech(["listener", "set", "share-all", "--no-uploads"], hostEnv)).stdout).toContain("uploads off");
+    await Bun.sleep(1500); // the daemon reloads listeners.json about every second
     const off = await rech(["--profile", "qa", "upload", shot], clientEnv, client);
     expect(off.code).not.toBe(0);
     expect(off.stdout + off.stderr).toContain(`Uploads are off on listener "share-all". The host can turn them on: rech listener set share-all --uploads`);
     expect((await rech(["listener", "set", "share-all", "--uploads"], hostEnv)).stdout).toContain("share-all: uploads on");
-    await Bun.sleep(1500); // the daemon reloads listeners.json about every second
-    const on = await rech(["--profile", "qa", "upload", shot], clientEnv, client);
-    expect(on.stdout).toContain("Uploaded shot.png");
-    expect(on.stdout + on.stderr).not.toContain("rech-upload-");
     const bad = await rech(["--profile", "qa", "upload", join(client, "missing.png")], clientEnv, client);
     expect(bad.code).toBe(2);
     expect(bad.stderr).toContain("no such file");
     expect(bad.stderr).toContain("Usage: rech upload <file>");
-    expect((await rech(["listener", "set", "share-all", "--no-uploads"], hostEnv)).stdout).toContain("uploads off");
 
     // A link saved with --save is remembered: removing its listener warns with the file and the fix,
     // and the next listener rech creates does not take the freed port (no other listener's answer).

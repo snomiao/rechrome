@@ -386,14 +386,17 @@ and the host check the size, and check the bytes against the type (PNG/JPEG/GIF/
 signatures; UTF-8 SVG without DTD/entities). These checks identify the format; they
 don't sanitize SVG or scan for malware. The host never renders the file.
 
-**Turning uploads on:** they are always on through the local management listener.
-On a shared (scoped) listener they are **off** until the host turns them on:
+**On by default:** uploads are on for every listener, shared ones too. The client
+reads the file and sends only its bytes, and the host never reads a path for an
+upload, so a link holder can only upload files they already have. Each upload is
+logged in the daemon log with its name, size, sha256 and the page's origin. The
+host can turn them off for a shared listener:
 
 ```bash
-rech listener set <listener> --uploads      # --no-uploads turns them off again
+rech listener set <listener> --no-uploads   # writes "uploads": false; --uploads turns them on again
 ```
 
-That writes an `uploads` object to the listener's entry in `~/.rechrome/listeners.json`.
+An `uploads` object in the listener's entry in `~/.rechrome/listeners.json` sets limits.
 The host can tune it by hand, lowering the byte limit or narrowing the types, but not
 going above the 10 MiB cap or adding other types:
 
