@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
-import { basename, join } from 'node:path';
+import { mkdtemp, writeFile, rm, realpath, stat, open } from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
+import { basename, join, isAbsolute, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 
 export const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
@@ -16,17 +17,20 @@ const EXTENSION_TYPES: Record<string, string> = { png: 'image/png', jpg: 'image/
  */
 export const UPLOAD_MODES = ['auto', 'chooser', 'into', 'drop', 'paste'] as const;
 export type UploadMode = typeof UPLOAD_MODES[number];
-export type UploadPolicy = { maxBytes?: number; contentTypes?: string[] };
-export type UploadPayload = { name: string; contentType: string; data: string; mode?: UploadMode; target?: string };
+/** hostDirs: opt-in, off by default. Lets a link holder upload a file that is already on the
+ *  host, inside one of these directories (rech upload --host <path>). */
+export type UploadPolicy = { maxBytes?: number; contentTypes?: string[]; hostDirs?: string[] };
+export type UploadPayload = { name: string; contentType: string; data?: string; hostPath?: string; mode?: UploadMode; target?: string };
 export type UploadResult = { status: number; stdout: string; stderr: string };
-export type UploadAudit = { name: string | null; size: number | null; sha256: string | null; origin: string | null; result: string; mode?: UploadMode };
+export type UploadAudit = { name: string | null; size: number | null; sha256: string | null; origin: string | null; result: string; mode?: UploadMode; hostPath?: string };
 
 export function validateUploadPolicy(value: unknown): asserts value is UploadPolicy {
   const p = value as UploadPolicy;
-  if (!p || typeof p !== 'object' || Array.isArray(p) || Object.keys(p).some(k => !['maxBytes', 'contentTypes'].includes(k))
+  if (!p || typeof p !== 'object' || Array.isArray(p) || Object.keys(p).some(k => !['maxBytes', 'contentTypes', 'hostDirs'].includes(k))
     || (p.maxBytes !== undefined && (!Number.isSafeInteger(p.maxBytes) || p.maxBytes < 1 || p.maxBytes > MAX_UPLOAD_BYTES))
-    || (p.contentTypes !== undefined && (!Array.isArray(p.contentTypes) || !p.contentTypes.length || p.contentTypes.some(t => !UPLOAD_TYPES.includes(t as any)))))
-    throw new Error(`uploads must be an object with optional maxBytes (1..${MAX_UPLOAD_BYTES}) and contentTypes (${UPLOAD_TYPES.join(', ')})`);
+    || (p.contentTypes !== undefined && (!Array.isArray(p.contentTypes) || !p.contentTypes.length || p.contentTypes.some(t => !UPLOAD_TYPES.includes(t as any))))
+    || (p.hostDirs !== undefined && (!Array.isArray(p.hostDirs) || !p.hostDirs.length || p.hostDirs.some(d => typeof d !== 'string' || !isAbsolute(d) || d.includes('\0') || d === sep))))
+    throw new Error(`uploads must be an object with optional maxBytes (1..${MAX_UPLOAD_BYTES}), contentTypes (${UPLOAD_TYPES.join(', ')}) and hostDirs (absolute directories, not /)`);
 }
 
 function validName(name: unknown): name is string {
@@ -62,6 +66,7 @@ export const UPLOAD_USAGE = `Usage: rech upload <file> [how]   (the file is read
   --drop <ref|selector>  a drag-and-drop zone
   --paste [ref|selector] an editor that takes pasted images (default: the focused element)
   --name <file>          read the bytes from stdin instead:  rech upload --name shot.png < shot.png
+  --host <path>          a file already on the host (only where its listener allows that directory)
 Types: ${UPLOAD_TYPES.join(', ')}, up to ${MAX_UPLOAD_BYTES / 1024 / 1024} MiB. Get refs from rech snapshot.`;
 
 /**
@@ -78,7 +83,7 @@ export async function prepareUpload(args: string[], stdin: AsyncIterable<Uint8Ar
   const setMode = (next: UploadMode) => { if (mode !== 'auto') throw new Error(`Pick one of --into, --drop, --paste.`); mode = next; };
   while (options.length) {
     const option = options.shift()!;
-    const match = option.match(/^--(name|content-type|into|drop|paste|chooser)(?:=(.*))?$/);
+    const match = option.match(/^--(name|content-type|into|drop|paste|chooser|host)(?:=(.*))?$/);
     if (!match) {
       if (option.startsWith('-') || path !== undefined) throw new Error(path !== undefined ? `One file per upload; unexpected ${option}` : `Unknown option ${option}`);
       path = option;
@@ -94,6 +99,19 @@ export async function prepareUpload(args: string[], stdin: AsyncIterable<Uint8Ar
     fields[flag] = value;
   }
   if (target !== undefined && !validTarget(target)) throw new Error('Upload target must be a snapshot ref (e12) or a selector');
+  if (fields.host !== undefined) {
+    // A file on the host: send only its path; the host reads it if its listener allows that directory.
+    if (path !== undefined || fields.name !== undefined) throw new Error('--host takes the host file instead of a local file or --name');
+    if (!isAbsolute(fields.host)) throw new Error('--host needs an absolute path on the host');
+    const hostName = basename(fields.host);
+    if (!validName(hostName)) throw new Error('The host file name must be a plain name');
+    const hostType = fields['content-type'] ?? EXTENSION_TYPES[hostName.toLowerCase().split('.').pop() ?? ''] ?? '';
+    if (!UPLOAD_TYPES.includes(hostType as any)) throw new Error(`Upload content type must be one of ${UPLOAD_TYPES.join(', ')} (from the file extension, or --content-type)`);
+    const upload: UploadPayload = { name: hostName, contentType: hostType, hostPath: fields.host };
+    if (mode !== 'auto') upload.mode = mode;
+    if (target !== undefined) upload.target = target;
+    return { args: ['upload', ...sessions], upload };
+  }
   if (path === undefined && !stdin) throw new Error(`upload needs a file.`);
   const name = fields.name ?? (path !== undefined ? basename(path) : undefined);
   if (!validName(name)) throw new Error(path !== undefined ? 'The file name must be a plain name; rename the file or pass --name' : 'Reading stdin needs --name with a plain filename (no path)');
@@ -195,6 +213,39 @@ function cleanOutput(text: string, path: string, dir: string, name: string): str
 /** No payload field is ever used as a host path. run() is a server-owned CLI runner,
  * not caller-supplied code. Audit records the selected origin immediately before upload.
  */
+/**
+ * A host file for `rech upload --host`: only when the listener lists hostDirs, and only a regular
+ * file whose real path (symlinks resolved) is inside one of them.
+ */
+export async function readHostFile(path: string, hostDirs: string[] | undefined, limit: number): Promise<Buffer> {
+  if (!hostDirs?.length) throw new Error('Host-path uploads are off on this listener (the host can allow a directory: rech listener set <name> --host-upload-dir <dir>)');
+  if (!isAbsolute(path) || path.includes('\0')) throw new Error('Host upload path must be absolute');
+  const roots = (await Promise.all(hostDirs.map(d => realpath(d).catch(() => null)))).filter((r): r is string => !!r);
+  const inside = (real: string) => roots.some(root => real.startsWith(root.endsWith(sep) ? root : root + sep));
+  const resolveInside = async () => {
+    let real: string;
+    try { real = await realpath(path); } catch { throw new Error('Host upload file not found'); }
+    if (!inside(real)) throw new Error('Host upload path is outside the listener\'s allowed directories');
+    return real;
+  };
+  // Open once, then prove the opened file is the one an allowed path names now (same device and
+  // inode), so swapping in a symlink between the check and the open can't reach outside. Read from
+  // that descriptor only, at most limit + 1 bytes, so a file growing after the check can't either.
+  const handle = await open(await resolveInside(), fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+  try {
+    const info = await handle.stat();
+    if (!info.isFile()) throw new Error('Host upload path is not a regular file');
+    const now = await stat(await resolveInside());
+    if (now.dev !== info.dev || now.ino !== info.ino) throw new Error('Host upload file changed while it was being opened');
+    if (info.size > limit) throw new Error("Upload is empty or exceeds maxBytes");
+    const buf = Buffer.alloc(limit + 1);
+    let n = 0;
+    for (let r; n < buf.length && (r = await handle.read(buf, n, buf.length - n, n)).bytesRead > 0;) n += r.bytesRead;
+    if (n > limit) throw new Error('Upload is empty or exceeds maxBytes');
+    return buf.subarray(0, n);
+  } finally { await handle.close(); }
+}
+
 export async function receiveUpload(options: {
   policy: UploadPolicy | undefined; payload: unknown; args: string[];
   run: (args: string[]) => Promise<UploadResult>; audit: (event: UploadAudit) => void;
@@ -208,18 +259,27 @@ export async function receiveUpload(options: {
     if (options.policy === undefined) throw new Error('Uploads are disabled on this listener');
     validateUploadPolicy(options.policy);
     if (options.args.length !== 1 || options.args[0] !== 'upload') throw new Error('Upload takes file bytes, not host paths or CLI options');
-    if (!p || !validName(p.name) || typeof p.contentType !== 'string' || typeof p.data !== 'string'
-      || Object.keys(p).some(k => !['name', 'contentType', 'data', 'mode', 'target'].includes(k))
+    const fromHost = p?.hostPath !== undefined;
+    if (!p || !validName(p.name) || typeof p.contentType !== 'string' || (fromHost ? p.data !== undefined || typeof p.hostPath !== 'string' : typeof p.data !== 'string')
+      || Object.keys(p).some(k => !['name', 'contentType', 'data', 'hostPath', 'mode', 'target'].includes(k))
       || (p.mode !== undefined && !UPLOAD_MODES.includes(p.mode)) || (p.target !== undefined && !validTarget(p.target))
       || ((p.mode === 'into' || p.mode === 'drop') && p.target === undefined) || ((p.mode === 'auto' || p.mode === 'chooser') && p.target !== undefined))
       throw new Error('Invalid upload payload');
     const limit = options.policy.maxBytes ?? MAX_UPLOAD_BYTES;
-    if (p.data.length > 4 * Math.ceil(limit / 3) || /[^A-Za-z0-9+/=]/.test(p.data))
-      throw new Error('Upload exceeds maxBytes or has invalid base64');
-    const bytes = Buffer.from(p.data, 'base64');
+    let bytes: Buffer;
+    if (fromHost) {
+      record.hostPath = p.hostPath!.slice(0, 512);
+      bytes = await readHostFile(p.hostPath!, options.policy.hostDirs, limit);
+      if (basename(p.hostPath!) !== p.name) throw new Error('Host upload name must be the file\'s own name');
+    } else {
+      if (p.data!.length > 4 * Math.ceil(limit / 3) || /[^A-Za-z0-9+/=]/.test(p.data!))
+        throw new Error('Upload exceeds maxBytes or has invalid base64');
+      bytes = Buffer.from(p.data!, 'base64');
+      if (bytes.toString('base64') !== p.data) throw new Error('Upload is not canonical base64');
+    }
     record.size = bytes.length;
     record.sha256 = createHash('sha256').update(bytes).digest('hex');
-    if (!bytes.length || bytes.length > limit || bytes.toString('base64') !== p.data) throw new Error('Upload is empty, exceeds maxBytes, or is not canonical base64');
+    if (!bytes.length || bytes.length > limit) throw new Error('Upload is empty or exceeds maxBytes');
     if (!(options.policy.contentTypes ?? UPLOAD_TYPES).includes(p.contentType) || !matchesType(bytes, p.contentType))
       throw new Error('Upload content type is not allowed or does not match the bytes');
     const tabs = await options.run(['tab-list']);

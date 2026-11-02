@@ -3338,7 +3338,7 @@ async function rotateKey(name: string): Promise<void> {
   console.log(`New key for ${name}; URLs carrying the old key stop working now. Print new ones with: rech share <profile> --listener ${name}`);
 }
 
-async function setListener(name: string, opts: { publicUrl?: string; clearPublicUrl?: boolean; uploads?: boolean }): Promise<void> {
+async function setListener(name: string, opts: { publicUrl?: string; clearPublicUrl?: boolean; uploads?: boolean; hostUploadDirs?: string[]; noHostUploads?: boolean }): Promise<void> {
   const config = await requireListeners();
   let listener = config.listeners.find(l => l.name === name);
   if (!listener) throw new Error(`Unknown listener "${name}". See rech listener ls.`);
@@ -3348,8 +3348,20 @@ async function setListener(name: string, opts: { publicUrl?: string; clearPublic
     // {} = the defaults (every supported image type, the full size cap); hand-tuned limits stay.
     if (opts.uploads) listener.uploads = listener.uploads || {}; else listener.uploads = false;
   }
+  if (opts.hostUploadDirs?.length || opts.noHostUploads) {
+    if (listener.profiles === "*") throw new Error(`"${name}" is the local management listener; host-path uploads are set on shared listeners.`);
+    if (listener.uploads === false) throw new Error(`Uploads are off on "${name}"; turn them on first: rech listener set ${name} --uploads`);
+    const policy = listener.uploads ?? {};
+    if (opts.noHostUploads) delete policy.hostDirs;
+    else policy.hostDirs = [...new Set([...(policy.hostDirs ?? []), ...opts.hostUploadDirs!.map(d => realpathSync(resolve(d)))])];
+    listener.uploads = policy;
+  }
   await writeListeners(config);
   if (opts.publicUrl !== undefined || opts.clearPublicUrl) console.log(listener.publicUrl ? `${name} is reachable at ${listener.publicUrl}` : `${name}: public URL cleared`);
+  if (opts.hostUploadDirs?.length || opts.noHostUploads) {
+    const dirs = (listener.uploads || {}).hostDirs;
+    console.log(dirs?.length ? `${name}: host-path uploads allowed from ${dirs.join(", ")} (rech upload --host <path>; each is logged)` : `${name}: host-path uploads off`);
+  }
   if (opts.uploads !== undefined) console.log(opts.uploads ? `${name}: uploads on (rech upload <file>; images up to ${((listener.uploads || {}).maxBytes ?? MAX_UPLOAD_BYTES) / 1024 / 1024} MiB)` : `${name}: uploads off`);
 }
 
@@ -4428,7 +4440,7 @@ export type RechHandlers = {
   allowListener(name: string, profiles: string[]): Promise<void>;
   denyListener(name: string, profiles: string[]): Promise<void>;
   rotateKey(name: string): Promise<void>;
-  setListener(name: string, opts: { publicUrl?: string; clearPublicUrl?: boolean; uploads?: boolean }): Promise<void>;
+  setListener(name: string, opts: { publicUrl?: string; clearPublicUrl?: boolean; uploads?: boolean; hostUploadDirs?: string[]; noHostUploads?: boolean }): Promise<void>;
   setup(opts: SetupOptions): Promise<void>;
   tray(action?: string): Promise<void>;
   provisionProfile(name: string, opts: { headed: boolean; experimental: boolean }): Promise<void>;
@@ -4575,8 +4587,10 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
         .option("public-url", { type: "string", requiresArg: true, describe: "e.g. https://host.example.ts.net/rechrome/" })
         .option("clear-public-url", { type: "boolean", conflicts: "public-url" })
         .option("uploads", { type: "boolean", describe: "Uploads of images the link holder sends (rech upload) are on by default; --no-uploads turns them off" })
-        .check(a => a.publicUrl !== undefined || a.clearPublicUrl || a.uploads !== undefined ? true : "Pass --public-url <url>, --clear-public-url, or --uploads/--no-uploads"),
-        a => handlers.setListener(a.name, { publicUrl: a.publicUrl, clearPublicUrl: a.clearPublicUrl, ...(a.uploads !== undefined ? { uploads: a.uploads } : {}) }))
+        .option("host-upload-dir", { type: "string", array: true, requiresArg: true, describe: "Off by default. Also let links upload files already on this host, from inside this directory (rech upload --host <path>); repeatable" })
+        .option("host-uploads", { type: "boolean", describe: "--no-host-uploads turns host-path uploads off again" })
+        .check(a => a.publicUrl !== undefined || a.clearPublicUrl || a.uploads !== undefined || a.hostUploadDir?.length || a.hostUploads === false ? true : "Pass --public-url <url>, --clear-public-url, --uploads/--no-uploads, or --host-upload-dir/--no-host-uploads"),
+        a => handlers.setListener(a.name, { publicUrl: a.publicUrl, clearPublicUrl: a.clearPublicUrl, ...(a.uploads !== undefined ? { uploads: a.uploads } : {}), ...(a.hostUploadDir?.length ? { hostUploadDirs: a.hostUploadDir as string[] } : {}), ...(a.hostUploads === false ? { noHostUploads: true } : {}) }))
       .command("port [name]", "Print a listener's port (for a proxy command)", y => y.positional("name", { type: "string" }),
         a => handlers.listenerPort(a.name))
       .command("rotate-key <name>", "Give a listener a new key (old URLs stop working)", y => y.positional("name", { type: "string", demandOption: true }),

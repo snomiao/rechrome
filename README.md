@@ -396,6 +396,19 @@ host can turn them off for a shared listener:
 rech listener set <listener> --no-uploads   # writes "uploads": false; --uploads turns them on again
 ```
 
+**Files already on the host (opt-in):** off by default. The host can let a shared
+listener's links upload files that are already on the host, but only from
+directories it names:
+
+```bash
+rech listener set <listener> --host-upload-dir ~/shots   # repeatable; --no-host-uploads turns it off
+rech upload --host /Users/me/shots/a.png                  # on the client: sends the path, not bytes
+```
+
+The host resolves symlinks and refuses anything outside those directories, anything
+that isn't a regular file, and anything over the size cap. The log line also records
+the host path.
+
 An `uploads` object in the listener's entry in `~/.rechrome/listeners.json` sets limits.
 The host can tune it by hand, lowering the byte limit or narrowing the types, but not
 going above the 10 MiB cap or adding other types:
