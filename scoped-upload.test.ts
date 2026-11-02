@@ -1,8 +1,8 @@
 import { expect, test } from 'bun:test';
 import { stat, readFile } from 'node:fs/promises';
-import { dirname, basename } from 'node:path';
+import { dirname, basename, join } from 'node:path';
 import { createHash } from 'node:crypto';
-import { prepareUpload, prepareStdinUpload, uploadScript, receiveUpload, validateUploadPolicy, currentPageOrigin, readRequestJson, MAX_UPLOAD_BYTES, MAX_REQUEST_BYTES, type UploadAudit } from './scoped-upload.ts';
+import { prepareUpload, prepareStdinUpload, uploadScript, receiveUpload, readHostFile, validateUploadPolicy, currentPageOrigin, readRequestJson, MAX_UPLOAD_BYTES, MAX_REQUEST_BYTES, type UploadAudit } from './scoped-upload.ts';
 import { authorizeProfileRequest, type Listener } from './listeners.ts';
 const svg = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><path d="M0 0"/></svg>');
 const payload = { name: 'app.svg', contentType: 'image/svg+xml', data: svg.toString('base64') };
@@ -150,4 +150,29 @@ test('PNG signature check and exact listener size boundary', async () => {
     const result = await receiveUpload({ policy: { maxBytes: limit }, payload: prepared.upload, args: ['upload'], audit: () => {}, run: async args => args[0] === 'tab-list' ? tabs : { status: 0, stdout: 'uploaded', stderr: '' } });
     expect(result.status).toBe(limit === png.length ? 0 : 1);
   }
+});
+
+test('host-path uploads: off unless the listener lists the directory; never outside it', async () => {
+  const { mkdtemp, writeFile, symlink, mkdir } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const root = await mkdtemp(join(tmpdir(), 'rech-host-'));
+  const allowed = join(root, 'allowed'); await mkdir(allowed);
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jI1sAAAAASUVORK5CYII=', 'base64');
+  await writeFile(join(allowed, 'a.png'), png);
+  await writeFile(join(root, 'secret.png'), png);
+  await symlink(join(root, 'secret.png'), join(allowed, 'link.png'));
+  expect(await readHostFile(join(allowed, 'a.png'), [allowed], MAX_UPLOAD_BYTES)).toEqual(png);
+  await expect(readHostFile(join(allowed, 'a.png'), undefined, MAX_UPLOAD_BYTES)).rejects.toThrow(/off on this listener/);
+  await expect(readHostFile(join(root, 'secret.png'), [allowed], MAX_UPLOAD_BYTES)).rejects.toThrow(/outside/);
+  await expect(readHostFile(join(allowed, '..', 'secret.png'), [allowed], MAX_UPLOAD_BYTES)).rejects.toThrow(/outside/);
+  await expect(readHostFile(join(allowed, 'link.png'), [allowed], MAX_UPLOAD_BYTES)).rejects.toThrow(/outside/);
+  await expect(readHostFile(join(allowed, 'a.png'), [allowed], 10)).rejects.toThrow(/maxBytes/);
+  expect(() => validateUploadPolicy({ hostDirs: ['/'] })).toThrow();
+  expect(() => validateUploadPolicy({ hostDirs: ['relative'] })).toThrow();
+});
+
+test('the client sends only the host path for --host, never bytes', async () => {
+  const { upload } = await prepareUpload(['upload', '--host', '/srv/shots/a.png'], null, () => Promise.reject(new Error('must not read locally')));
+  expect(upload).toEqual({ name: 'a.png', contentType: 'image/png', hostPath: '/srv/shots/a.png' });
+  await expect(prepareUpload(['upload', 'local.png', '--host', '/srv/a.png'], null)).rejects.toThrow();
 });
