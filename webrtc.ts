@@ -61,8 +61,9 @@ export function iceServersFromEnv(env = process.env): IceServer[] {
 // Short-lived Cloudflare TURN credentials from the HOST owner's own TURN key (CF_TURN_KEY_ID +
 // CF_TURN_API_TOKEN), handed to each peer in the offer. Without them: STUN only.
 let turnCache: { servers: IceServer[]; exp: number } | null = null;
-export async function hostIceServers(log: Log, env = process.env): Promise<IceServer[]> {
-  const base = iceServersFromEnv(env);
+export async function hostIceServers(log: Log, env = process.env, extra: IceServer[] = []): Promise<IceServer[]> {
+  // A listener's own STUN/TURN servers come after the base ones (RECH_ICE_SERVERS, else public STUN).
+  const base = [...iceServersFromEnv(env), ...extra];
   const keyId = env.CF_TURN_KEY_ID, apiToken = env.CF_TURN_API_TOKEN;
   if (!keyId || !apiToken) return base;
   if (turnCache && turnCache.exp > Date.now()) return [...base, ...turnCache.servers];
@@ -205,8 +206,9 @@ class SignalSocket {
 }
 
 // ---- host ------------------------------------------------------------------------------
-export type HostCredential = { token: string; signal: string; label: string };
-export type HostHandler = (req: Request, token: string) => Promise<Response>;
+// listener: the WebRTC listener this room belongs to (a share's `via` entry); ice: its STUN/TURN.
+export type HostCredential = { token: string; signal: string; label: string; listener?: string; ice?: IceServer[] };
+export type HostHandler = (req: Request, token: string, listener?: string) => Promise<Response>;
 
 /** Keeps one signal room per credential and serves each joining peer through `handler`. */
 export class WebrtcHost {
@@ -215,10 +217,13 @@ export class WebrtcHost {
 
   /** Open rooms for new credentials, close rooms for ones that are gone. */
   sync(creds: HostCredential[]): void {
-    const wanted = new Map(creds.map(c => [`${c.signal}\0${c.token}`, c]));
+    // One room per (signal server, credential): the first listener naming a signal server wins.
+    const wanted = new Map<string, HostCredential>();
+    for (const c of creds) { const key = `${c.signal}\0${c.token}`; if (!wanted.has(key)) wanted.set(key, c); }
     for (const [key, room] of this.rooms) if (!wanted.has(key)) { this.stopRoom(room); this.rooms.delete(key); }
     for (const [key, cred] of wanted) {
-      if (this.rooms.has(key)) continue;
+      const live = this.rooms.get(key);
+      if (live) { live.cred = cred; continue; } // a listener's ICE may have changed: next peer uses it
       const room = { cred, peers: new Map(), backoff: 1000, stopped: false } as any;
       this.rooms.set(key, room);
       void this.connect(room);
@@ -288,7 +293,7 @@ export class WebrtcHost {
 
   private async startPeer(room: any, peerId: string): Promise<void> {
     const { RTCPeerConnection } = await loadRTC(this.log);
-    const ice = await hostIceServers(this.log);
+    const ice = await hostIceServers(this.log, process.env, room.cred.ice ?? []);
     const pc = new RTCPeerConnection({ iceServers: ice });
     let keysReady!: (th: Uint8Array) => void;
     const keys = new Promise<Uint8Array>(r => (keysReady = r));
@@ -302,7 +307,7 @@ export class WebrtcHost {
     peer.channel = channel;
     const aborts = new Map<string, AbortController>();
     channel.onClose = () => { for (const a of aborts.values()) a.abort(); this.closePeer(room, peerId); };
-    channel.onFrame = frame => void this.onFrame(channel, room.cred.token, aborts, frame);
+    channel.onFrame = frame => void this.onFrame(channel, room.cred.token, aborts, frame, room.cred.listener);
     dc.onopen = async () => {
       await channel.setKeys(room.cred.token, await keys);
       if (await channel.confirm()) this.log(`webrtc ${room.cred.label}: peer ${peerId} connected`);
@@ -315,7 +320,7 @@ export class WebrtcHost {
     send({ type: "offer", sdp: pc.localDescription.sdp, ice });
   }
 
-  private async onFrame(channel: SealedChannel, token: string, aborts: Map<string, AbortController>, f: any): Promise<void> {
+  private async onFrame(channel: SealedChannel, token: string, aborts: Map<string, AbortController>, f: any, listener?: string): Promise<void> {
     if (f?.t === "abort") { aborts.get(f.id)?.abort(); aborts.delete(f.id); return; }
     if (f?.t !== "req" || typeof f.id !== "string" || typeof f.path !== "string" || !f.path.startsWith("/")) return;
     const ac = new AbortController();
@@ -327,7 +332,7 @@ export class WebrtcHost {
         body: f.body != null && !["GET", "HEAD"].includes(f.method) ? f.body : undefined,
         signal: ac.signal,
       });
-      const res = await this.handler(req, token);
+      const res = await this.handler(req, token, listener);
       await channel.sendFrame({ t: "res", id: f.id, status: res.status, ct: res.headers.get("content-type") ?? "" });
       if (res.body) {
         const reader = res.body.getReader();

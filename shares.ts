@@ -13,6 +13,8 @@ import { bearerOf, credentialIdOf, newToken, safeEqual } from "./secret.ts";
 
 export const WEBRTC = "webrtc";
 export const DEFAULT_SIGNAL = "https://rechrome.pages.dev/";
+// The built-in WebRTC listener's name (see listeners.ts): the public signal server above.
+export const DEFAULT_RTC = "webrtc-default";
 export const SHARES_FILE = join(homedir(), ".rechrome", "shares.json");
 
 export type Device = { id: string; name: string; token: string; addedAt: number; lastSeen?: number; approved: boolean };
@@ -127,6 +129,8 @@ export function createShare(config: ShareConfig, opts: NewShareOptions): Share {
     inviteTtlMs: opts.inviteTtlMs,
     profiles: [...new Set(opts.profiles)],
     via: [...new Set(opts.via)],
+    // Only the legacy "webrtc" transport keeps its signal server on the share; a WebRTC
+    // listener carries its own.
     signal: opts.via.includes(WEBRTC) ? normalizeSignal(opts.signal ?? DEFAULT_SIGNAL) : undefined,
     createdAt: now,
     expiresAt: opts.expiresAt,
@@ -244,10 +248,12 @@ export function parseDuration(text: string): number | undefined {
 }
 
 /** Every credential a WebRTC host should be reachable on: unused invites and devices. */
-export function webrtcCredentials(config: ShareConfig, now = Date.now()): Credential[] {
+/** Live credentials of shares offered on a WebRTC listener (`rtcNames`; the legacy "webrtc" always counts). */
+export function webrtcCredentials(config: ShareConfig, now = Date.now(), rtcNames: Iterable<string> = [DEFAULT_RTC]): Credential[] {
+  const names = new Set([WEBRTC, DEFAULT_RTC, ...rtcNames]);
   const out: Credential[] = [];
   for (const share of config.shares) {
-    if (!share.via.includes(WEBRTC) || shareProblem(share, now)) continue;
+    if (!share.via.some(v => names.has(v)) || shareProblem(share, now)) continue;
     // A used-up invite keeps its room while the share lives, so whoever tries it again hears
     // "already used" (a sign the link leaked) rather than "host offline".
     if (!(share.inviteExpiresAt && now >= share.inviteExpiresAt)) out.push({ share, kind: "invite", token: share.invite });
