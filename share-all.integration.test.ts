@@ -65,17 +65,24 @@ test("share --all: one snapshot link, profiles picked on the host, never the man
     expect(refused.stderr).toContain("never shared");
     expect((await rech(["share", "--all", "--listener", "local"], hostEnv)).stderr).toContain("never shared");
 
-    // One profile that no listener allows: without a terminal, `share` gives it its own link
-    // (loopback, own key) instead of stopping with instructions.
-    const own = await rech(["share", "personal"], hostEnv);
-    expect(own.code).toBe(0);
-    expect(own.stdout.trim()).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/rechrome\/personal\/\?profile=personal#key=[\w-]{20,}$/);
+    // One profile that no listener allows: rech share has no default transport, so without a
+    // terminal it says how to pick one and creates nothing.
+    const before = await readFile(listenersPath, "utf8");
+    const none = await rech(["share", "personal"], hostEnv);
+    expect(none.code).toBe(1);
+    expect(none.stderr).toContain("rech share has no default");
+    expect(none.stderr).toContain("--lan");
+    expect(none.stderr).toContain("--webrtc=<url>");
+    expect(none.stdout).toBe("");
+    expect(await readFile(listenersPath, "utf8")).toBe(before);
+    // Once a listener allows it, the same command prints that link.
+    expect((await rech(["listener", "add", "personal", "--listen", "local", "--profile", "personal", "--port", String(reserve()), "--prefix", "rechrome/personal"], hostEnv)).code).toBe(0);
     let ownConfig = JSON.parse(await readFile(listenersPath, "utf8"));
     const ownListener = ownConfig.listeners.find((l: any) => l.name === "personal");
     expect(ownListener.host).toBe("127.0.0.1");
     expect(ownListener.key).not.toBe(one.key);
     const reshared = await rech(["share", "personal"], hostEnv);
-    expect(reshared.stdout.trim()).toBe(own.stdout.trim());   // now shared: same link
+    expect(reshared.stdout.trim()).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/rechrome\/personal\/\?profile=personal#key=[\w-]{20,}$/);
     // ...but still loopback-only with no proxy: say so and how to expose it, not a bare 127.0.0.1 URL.
     expect(reshared.stderr).toContain("this link only works on this machine");
     expect(reshared.stderr).toContain(`rech listener set ${ownListener.name} --public-url`);
@@ -212,7 +219,8 @@ test("share --all: one snapshot link, profiles picked on the host, never the man
     expect(removed.stderr).toContain(join(saver, ".rechrome", ".env.local"));
     expect(removed.stderr).toContain(`rech share "team-b@x.com"`);
     expect(JSON.parse(await readFile(listenersPath, "utf8")).retiredPorts).toContain(savedPort);
-    const next = await rech(["share", "team-b@x.com"], hostEnv);
+    // (Without a terminal, a lone `rech share <profile>` no longer makes a listener: two profiles do.)
+    const next = await rech(["share", "team-b@x.com", "qa"], hostEnv);
     expect(Number(new URL(next.stdout.trim()).port)).not.toBe(savedPort);
     // An already-stale saved link stays quiet on later, unrelated changes.
     const nextName = JSON.parse(await readFile(listenersPath, "utf8")).listeners.find((l: any) => l.port === Number(new URL(next.stdout.trim()).port)).name;

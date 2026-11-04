@@ -10,7 +10,10 @@ import { startSignalRelay } from "./signal-relay.ts";
 // the profile and session it was given; ICE stays on loopback.
 const relay = startSignalRelay({ port: 0 });
 const signal = `http://127.0.0.1:${relay.port}/`;
-const cleanups: Array<() => void | Promise<void>> = [() => relay.stop(true)];
+// A second signal server: one share offered on two WebRTC listeners.
+const relay2 = startSignalRelay({ port: 0 });
+const signal2 = `http://127.0.0.1:${relay2.port}/`;
+const cleanups: Array<() => void | Promise<void>> = [() => relay.stop(true), () => relay2.stop(true)];
 afterAll(async () => { for (const c of cleanups.reverse()) await c(); });
 
 const MODULES = ["rechrome.ts", "serve.ts", "listeners.ts", "extension-token.ts", "daemon-manager.ts", "fill-secret.ts", "scoped-upload.ts", "shares.ts", "secret.ts", "e2e.ts", "webrtc.ts", "signal-relay.ts", "redact.ts", "secret-rules/gitleaks.toml"];
@@ -21,6 +24,8 @@ test("share new → connect → drive → session ls → reuse refused → appro
   const client = await mkdtemp(join(tmpdir(), "rech-rtc-client-"));
   const client2 = await mkdtemp(join(tmpdir(), "rech-rtc-client2-"));
   const client3 = await mkdtemp(join(tmpdir(), "rech-rtc-client3-"));
+  const client4 = await mkdtemp(join(tmpdir(), "rech-rtc-client4-"));
+  const client5 = await mkdtemp(join(tmpdir(), "rech-rtc-client5-"));
   const mgmtPort = reserve(), lanPort = reserve();
   await mkdir(join(root, ".rechrome"));
   await mkdir(join(root, "secret-rules"));
@@ -54,7 +59,7 @@ test("share new → connect → drive → session ls → reuse refused → appro
   const clientEnv = (home: string) => ({ HOME: home, USERPROFILE: home, RECHROME_URL: undefined });
   cleanups.push(async () => {
     // Bridges are detached processes of the client machines: stop them.
-    for (const home of [client, client2, client3]) {
+    for (const home of [client, client2, client3, client4, client5]) {
       const dir = join(home, ".rechrome", "bridges");
       for (const f of await readdir(dir).catch(() => [] as string[]))
         if (f.endsWith(".json")) { try { process.kill(JSON.parse(await readFile(join(dir, f), "utf8")).pid); } catch {} }
@@ -63,9 +68,17 @@ test("share new → connect → drive → session ls → reuse refused → appro
   for (let i = 0; i < 80; i++) { if (await fetch(`http://127.0.0.1:${mgmtPort}/ping`, { headers: { Authorization: `Bearer ${mgmt.key}` } }).then(r => r.ok).catch(() => false)) break; await Bun.sleep(100); }
 
   // --- WebRTC share ------------------------------------------------------------------------
+  // No transport named, no terminal: nothing is made, and the error lists the choices.
+  const unnamed = await rech(["share", "new", "qa", "--name", "nobody"], hostEnv);
+  expect(unnamed.code).toBe(1);
+  expect(unnamed.stderr).toContain("rech share has no default");
+  expect((await rech(["share", "ls"], hostEnv)).stdout).not.toContain("nobody");
+
+  // --signal alone is a WebRTC transport on that server: a listener for it is made.
   const made = await rech(["share", "new", "qa", "--name", "alice", "--signal", signal], hostEnv);
   expect(made.stderr).toBe("");
   expect(made.code).toBe(0);
+  expect(made.stdout).toContain('Added WebRTC listener "webrtc-127-0-0-1"');
   const link = made.stdout.match(/http:\/\/127\.0\.0\.1:\d+\/#rech1_\w{28}/)?.[0]!;
   expect(link).toBeTruthy();
   expect(made.stdout).toContain("Share expires:");             // webrtc shares default to 30 days
@@ -108,7 +121,7 @@ test("share new → connect → drive → session ls → reuse refused → appro
 
   // Host view.
   const ls = await rech(["share", "ls"], hostEnv);
-  expect(ls.stdout).toMatch(/alice\s+qa\s+webrtc\s+1\/1/);
+  expect(ls.stdout).toMatch(/alice\s+qa\s+webrtc-127-0-0-1\s+1\/1/);
   const devices = await rech(["share", "devices", "alice"], hostEnv);
   expect(devices.stdout).toContain("yes");
 
@@ -118,6 +131,35 @@ test("share new → connect → drive → session ls → reuse refused → appro
   const after = await rech(["tab-list"], clientEnv(client), client);
   expect(after.stdout).not.toContain("Profile:");
   expect(after.stderr).toMatch(/revoked|offline|WebRTC/);
+
+  // --- One share on two WebRTC listeners (two signal servers) ------------------------------
+  expect((await rech(["listener", "add", "second", "--webrtc", signal2], hostEnv)).code).toBe(0);
+  // TURN credentials go in as one URL (here from the environment) and are never shown back.
+  const turnAdded = await rech(["listener", "add", "relayed", "--webrtc", signal2, "--turn-env", "TEAM_TURN"], { ...hostEnv, TEAM_TURN: "turns://team:p%40ss-word@turn.example.com:5349?transport=tcp" });
+  expect(turnAdded.code).toBe(0);
+  expect(turnAdded.stdout + turnAdded.stderr).not.toContain("ss-word");
+  const rtcLs = await rech(["listener", "ls"], hostEnv);
+  expect(rtcLs.stdout).toMatch(/second\s+http:\/\/127\.0\.0\.1:\d+\/\s+public STUN/);
+  expect(rtcLs.stdout).toContain("turns://team:…@turn.example.com:5349?transport=tcp");
+  expect(rtcLs.stdout).not.toContain("ss-word");
+  expect(rtcLs.stdout).toContain("webrtc-default");
+  const stored = JSON.parse(await readFile(join(root, ".rechrome", "listeners.json"), "utf8"));
+  expect(stored.rtcListeners.find((l: any) => l.name === "relayed").ice).toEqual([{ urls: "turns:turn.example.com:5349?transport=tcp", username: "team", credential: "p@ss-word" }]);
+  expect((await rech(["listener", "remove", "relayed"], hostEnv)).code).toBe(0);
+  const two = await rech(["share", "new", "qa", "--name", "dave", "--devices", "2", "--via", "webrtc-127-0-0-1,second"], hostEnv);
+  expect(two.code).toBe(0);
+  const links = [...two.stdout.matchAll(/http:\/\/127\.0\.0\.1:(\d+)\/#rech1_\w{28}/g)];
+  expect(links.map(m => Number(m[1]))).toEqual([relay.port, relay2.port]);   // one invite link per signal server
+  await Bun.sleep(1500);
+  // The daemon is in the share's room on each signal server: a device can join through either.
+  const viaSecond = await rech(["connect", "--project", links[1]![0]], clientEnv(client4), client4);
+  expect(viaSecond.stderr + viaSecond.stdout).toContain('Connected to share "dave"');
+  expect((await rech(["tab-list"], clientEnv(client4), client4)).stdout).toContain("Profile: QA");
+  const viaFirst = await rech(["connect", "--project", links[0]![0]], clientEnv(client5), client5);
+  expect(viaFirst.stderr + viaFirst.stdout).toContain('Connected to share "dave"');
+  // A listener a share still uses can't be removed.
+  expect((await rech(["listener", "remove", "second"], hostEnv)).stderr).toContain("Shares still use");
+  expect((await rech(["share", "revoke", "dave"], hostEnv)).code).toBe(0);
 
   // --- LAN share with approval --------------------------------------------------------------
   const lanMade = await rech(["share", "new", "personal", "--name", "bob", "--via", "lan1", "--approve"], hostEnv);

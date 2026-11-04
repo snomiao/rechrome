@@ -1,5 +1,5 @@
 import { receiveUpload, readRequestJson } from "./scoped-upload.ts";
-import { readListeners, listenerAddress, authorizeProfileRequest, canReadProfileFile, profileOutputPrefix, normalizePrefix, resolveAllowedProfile, type Listener } from "./listeners.ts";
+import { readListeners, listenerAddress, authorizeProfileRequest, canReadProfileFile, profileOutputPrefix, normalizePrefix, resolveAllowedProfile, shareRtcListeners, rtcListeners, type Listener } from "./listeners.ts";
 import { WEBRTC, authorizeCredential, credentialForBearer, readShares, redeemInvite, shareProblem, updateShares, webrtcCredentials, type Credential, type ShareConfig } from "./shares.ts";
 import { bearerOf, safeEqual } from "./secret.ts";
 import { WebrtcHost } from "./webrtc.ts";
@@ -1350,11 +1350,18 @@ export async function serve() {
 
   // WebRTC: the same handler, reached over an encrypted DataChannel. Each request carries the
   // bearer of the credential whose room it came in on, so share checks apply unchanged.
-  const webrtcListener: Listener = { name: WEBRTC, host: "webrtc", port: 0, key: randomBytes(24).toString("base64url"), profiles: [] };
-  const webrtc = new WebrtcHost(async (req, token) => {
+  // Each WebRTC listener is its own transport: a share is checked against the one its room is on.
+  const webrtcKey = randomBytes(24).toString("base64url");
+  const webrtcListeners = new Map<string, Listener>();
+  const webrtcListener = (name = WEBRTC): Listener => {
+    let l = webrtcListeners.get(name);
+    if (!l) webrtcListeners.set(name, l = { name, host: "webrtc", port: 0, key: webrtcKey, profiles: [] });
+    return l;
+  };
+  const webrtc = new WebrtcHost(async (req, token, listenerName) => {
     const headers = new Headers(req.headers);
     headers.set("Authorization", `Bearer ${bearerOf(token)}`);
-    return handle(new Request(req, { headers }), webrtcListener, () => "webrtc");
+    return handle(new Request(req, { headers }), webrtcListener(listenerName), () => "webrtc");
   }, log);
 
   const startServer = (initial: Listener, reusePort = false) => Bun.serve({
@@ -1446,10 +1453,11 @@ export async function serve() {
   let appliedShares = "";
   const reloadShares = async () => {
     const next = await readShares();
+    const listenerConfig = await readListeners().catch(() => null);
     // Expiry is time-based: fold "what is live right now" into the fingerprint so an expiring
     // share or invite closes its rooms and sessions without anyone touching the file.
     const now = Date.now();
-    const fingerprint = JSON.stringify(next) + JSON.stringify(next.shares.map(s => [!!shareProblem(s, now), !!(s.inviteExpiresAt && now >= s.inviteExpiresAt)]));
+    const fingerprint = JSON.stringify(next) + JSON.stringify(listenerConfig?.rtcListeners ?? []) + JSON.stringify(next.shares.map(s => [!!shareProblem(s, now), !!(s.inviteExpiresAt && now >= s.inviteExpiresAt)]));
     if (fingerprint === appliedShares) return;
     const allowed = new Set(next.shares.filter(s => !shareProblem(s, now)).flatMap(s => s.devices.map(d => `share:${s.id}:${d.id}`)));
     const dropped = [...sessionOwners.entries()].filter(([, o]) => o.owner.startsWith("share:") && !allowed.has(o.owner));
@@ -1464,9 +1472,14 @@ export async function serve() {
         log(`closed session ${session} of ${o.label}: its share was revoked or its device removed`);
       }
     }
-    const creds = webrtcCredentials(next);
-    webrtc.sync(creds.map(c => ({ token: c.token, signal: c.share.signal!, label: c.kind === "device" ? `${c.share.label}/${c.device.name}` : `${c.share.label} (invite)` })));
-    if (creds.length || webrtc.size) log(`webrtc: listening for ${creds.length} share credential(s)`);
+    // One room per share credential on each WebRTC listener the share names.
+    const creds = webrtcCredentials(next, now, rtcListeners(listenerConfig).map(l => l.name));
+    const rooms = creds.flatMap(c => shareRtcListeners(c.share, listenerConfig).map(l => ({
+      token: c.token, signal: l.signal, listener: l.name, ...(l.ice?.length ? { ice: l.ice } : {}),
+      label: `${c.kind === "device" ? `${c.share.label}/${c.device.name}` : `${c.share.label} (invite)`} via ${l.name}`,
+    })));
+    webrtc.sync(rooms);
+    if (rooms.length || webrtc.size) log(`webrtc: listening for ${creds.length} share credential(s) in ${rooms.length} room(s)`);
   };
   await reloadShares().catch(error => log(`shares.json rejected: ${error}`));
   await reload(true);

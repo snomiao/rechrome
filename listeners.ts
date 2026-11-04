@@ -4,12 +4,89 @@ import { createHash, randomBytes } from "crypto";
 import { homedir } from "os";
 import { join } from "path";
 import { mkdir, readFile, rename, writeFile } from "fs/promises";
+import { DEFAULT_RTC, DEFAULT_SIGNAL, normalizeSignal } from "./shares.ts";
 
 // publicUrl: where a reverse proxy (Tailscale Serve, Caddy, nginx, ...) exposes this listener.
 export type Listener = { name: string; host: string; port: number; key: string; profiles: string[] | "*"; prefix?: string; publicUrl?: string; uploads?: UploadPolicy | false; readSecrets?: boolean; readCookies?: boolean; keepDownloads?: boolean };
 // retiredPorts: ports of removed listeners, newest last. New listeners skip them so a link
 // saved for a removed listener gets "connection refused", not some other listener's answer.
-export type ListenerConfig = { version: 1; listeners: Listener[]; retiredPorts?: number[] };
+// rtcListeners: WebRTC transports (a signal server, plus optional STUN/TURN). They live under
+// their own key so a daemon from before they existed reads the file unchanged and ignores them.
+export type ListenerConfig = { version: 1; listeners: Listener[]; retiredPorts?: number[]; rtcListeners?: RtcListener[] };
+export type IceServer = { urls: string | string[]; username?: string; credential?: string };
+export type RtcListener = { name: string; kind: "webrtc"; signal: string; ice?: IceServer[]; builtin?: true };
+
+// The built-in WebRTC listener: the public signal server, for trying sharing out. Never written
+// to listeners.json; a share names it in `via`. The legacy `via: ["webrtc"]` (+ share.signal)
+// maps to a virtual listener named "webrtc".
+export { DEFAULT_RTC };
+export const LEGACY_RTC = "webrtc";
+export const DEFAULT_RTC_NOTE = "best effort, for trying it out: no speed or uptime promise. Host your own: rech listener add <name> --webrtc=<url>";
+export const defaultRtcListener = (): RtcListener => ({ name: DEFAULT_RTC, kind: "webrtc", signal: DEFAULT_SIGNAL, builtin: true });
+
+/** Every WebRTC listener a share can name: the saved ones plus the built-in default. */
+export function rtcListeners(config: ListenerConfig | null): RtcListener[] {
+  return [...(config?.rtcListeners ?? []), defaultRtcListener()];
+}
+
+/** The WebRTC listeners a share is offered on, in `via` order. */
+export function shareRtcListeners(share: { via: string[]; signal?: string }, config: ListenerConfig | null): RtcListener[] {
+  const all = rtcListeners(config);
+  const out: RtcListener[] = [];
+  for (const via of share.via) {
+    if (via === LEGACY_RTC) out.push({ name: LEGACY_RTC, kind: "webrtc", signal: normalizeSignal(share.signal ?? DEFAULT_SIGNAL), builtin: true });
+    else { const l = all.find(x => x.name === via); if (l) out.push(l); }
+  }
+  return out;
+}
+
+/**
+ * One STUN/TURN server from a URL: `turn[s]://user:pass@host:port?transport=tcp` (user and
+ * password percent-encoded) becomes {urls: "turn[s]:host:port?transport=tcp", username, credential}.
+ * `stun:host:port` and `turn:host:port` without credentials are accepted as they are.
+ */
+export function parseIceUrl(value: string): IceServer {
+  const raw = value.trim();
+  const m = /^(stuns?|turns?):(?:\/\/)?(?:([^:@/\s]*)(?::([^@/\s]*))?@)?([^/?#@\s]+)(\?[^#]*)?$/i.exec(raw);
+  if (!m) throw new Error("A STUN/TURN server is a URL like turns://user:pass@turn.example.com:5349 or stun:stun.example.com:3478");
+  const [, scheme, user, pass, hostPort, query = ""] = m;
+  const kind = scheme!.toLowerCase();
+  if (query && !/^\?transport=(udp|tcp)$/i.test(query)) throw new Error("A STUN/TURN URL may only carry ?transport=udp or ?transport=tcp");
+  const urls = `${kind}:${hostPort}${query}`;
+  if (user === undefined) return { urls };
+  if (kind.startsWith("stun")) throw new Error("A STUN server takes no username or password");
+  let username: string, credential: string;
+  try { username = decodeURIComponent(user); credential = decodeURIComponent(pass ?? ""); }
+  catch { throw new Error("The TURN username or password has a bad %-escape"); }
+  if (!username || !credential) throw new Error("A TURN URL with credentials needs both: turns://user:pass@host:port");
+  return { urls, username, credential };
+}
+
+/** How a STUN/TURN server is shown: the username, never the password. */
+export function iceLabel(s: IceServer): string {
+  const url = [s.urls].flat()[0] ?? "";
+  if (!s.username) return url;
+  const [scheme, ...rest] = url.split(":");
+  return `${scheme}://${encodeURIComponent(s.username)}:…@${rest.join(":")}`;
+}
+
+function validateRtcListeners(value: unknown, socketNames: Set<string>): void {
+  if (value === undefined) return;
+  if (!Array.isArray(value)) throw new Error("listeners.json rtcListeners must be a list");
+  const names = new Set<string>();
+  for (const l of value as RtcListener[]) {
+    if (!l || l.kind !== "webrtc" || typeof l.name !== "string" || !/^[a-zA-Z0-9_-]{1,40}$/.test(l.name) || typeof l.signal !== "string")
+      throw new Error("Each WebRTC listener needs a name and a signal server URL");
+    if (l.name === DEFAULT_RTC || l.name === LEGACY_RTC || names.has(l.name) || socketNames.has(l.name))
+      throw new Error(`Listener names must be unique ("${DEFAULT_RTC}" and "${LEGACY_RTC}" are built in)`);
+    l.signal = normalizeSignal(l.signal);
+    if (l.ice !== undefined && (!Array.isArray(l.ice) || l.ice.some(s => !s || (typeof s.urls !== "string" && !Array.isArray(s.urls))
+      || (s.username !== undefined && typeof s.username !== "string") || (s.credential !== undefined && typeof s.credential !== "string"))))
+      throw new Error(`WebRTC listener "${l.name}": ice must be a list of {urls, username?, credential?}`);
+    delete l.builtin;
+    names.add(l.name);
+  }
+}
 const MAX_RETIRED_PORTS = 32;
 export const LISTENERS_FILE = join(homedir(), ".rechrome", "listeners.json");
 export const isLoopback = (host: string) => host === "::1" || /^127\./.test(host);
@@ -68,6 +145,7 @@ export function validateListeners(value: unknown): ListenerConfig {
     if (names.has(l.name) || addresses.has(address) || keys.has(l.key)) throw new Error("Listener names, addresses, and credentials must be unique");
     names.add(l.name); addresses.add(address); keys.add(l.key);
   }
+  validateRtcListeners(config.rtcListeners, names);
   if (config.retiredPorts !== undefined && (!Array.isArray(config.retiredPorts) || config.retiredPorts.some(p => !Number.isInteger(p) || p < 1 || p > 65535)))
     throw new Error("listeners.json retiredPorts must be a list of ports");
   return config;
