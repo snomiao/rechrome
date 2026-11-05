@@ -254,9 +254,10 @@ export function webrtcCredentials(config: ShareConfig, now = Date.now(), rtcName
   const out: Credential[] = [];
   for (const share of config.shares) {
     if (!share.via.some(v => names.has(v)) || shareProblem(share, now)) continue;
-    // A used-up invite keeps its room while the share lives, so whoever tries it again hears
-    // "already used" (a sign the link leaked) rather than "host offline".
-    if (!(share.inviteExpiresAt && now >= share.inviteExpiresAt)) out.push({ share, kind: "invite", token: share.invite });
+    // A used-up or expired invite keeps its room while the share lives, so whoever tries it hears
+    // "already used" (a sign the link leaked) or "expired" rather than "host offline". Such a
+    // room only ever answers with that refusal (see inviteProblem).
+    out.push({ share, kind: "invite", token: share.invite });
     for (const device of share.devices) out.push({ share, kind: "device", token: device.token, device });
   }
   return out;
