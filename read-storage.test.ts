@@ -18,26 +18,48 @@ test("read-storage requires area, key, --allow-domain", () => {
   expect(() => parseReadStorageWire(["read-storage", "local", "k"])).toThrow();
 });
 
-test("the code returns the value only when the host it read from is allowed", async () => {
+test("the code returns the value only when the frame it read from is allowed", async () => {
   const code = buildReadStorageCode("local", "localConfig_v2", ["teams", "T0", "token"], ["app.example.com"]);
   expect(code).toContain("window.localStorage");
   const fn = eval("(" + code + ")");
-  // A fake page: evaluate runs the callback against a fake window/location.
-  const page = (host: string, stored: string | null) => ({
+  // A fake frame: url() is what Playwright reports; evaluate runs the callback against a fake
+  // document/window whose URL can differ (the frame navigated after it was picked).
+  const frame = (url: string, stored: string | null, liveUrl = url) => ({
+    url: () => url,
     evaluate: async (cb: any, arg: any) => {
       const g = globalThis as any;
-      const saved = { location: g.location, window: g.window };
-      g.location = { hostname: host };
+      const saved = { document: g.document, window: g.window };
+      g.document = { URL: liveUrl };
       g.window = { localStorage: { getItem: () => stored } };
-      try { return cb(arg); } finally { g.location = saved.location; g.window = saved.window; }
+      try { return cb(arg); } finally { g.document = saved.document; g.window = saved.window; }
     },
   });
+  const page = (...frames: any[]) => ({ url: () => frames[0].url(), frames: () => frames });
   const cfg = JSON.stringify({ teams: { T0: { token: "SECRET-VALUE" } } });
-  expect(JSON.parse(await fn(page("app.example.com", cfg))).value).toBe("SECRET-VALUE");
-  const refused = await fn(page("evil.example.net", cfg)).then(() => "returned", (e: Error) => e.message);
+  // The top frame can be a blank wrapper over the bridge; the allowed child frame is read.
+  const ok = JSON.parse(await fn(page(frame("about:blank", null), frame("https://app.example.com/client", cfg))));
+  expect(ok).toEqual({ host: "app.example.com", value: "SECRET-VALUE" });
+  const message = (p: any) => fn(p).then(() => "returned", (e: Error) => e.message);
+  const refused = await message(page(frame("https://evil.example.net/", cfg)));
   expect(refused).toContain("read-storage refused");
   expect(refused).not.toContain("SECRET-VALUE");
-  await expect(fn(page("app.example.com", null))).rejects.toThrow(/no localStorage key/);
+  // Picked while on the allowed host, but navigated away before the read.
+  const moved = await message(page(frame("https://app.example.com/", cfg, "https://evil.example.net/")));
+  expect(moved).toContain("read-storage refused");
+  expect(moved).not.toContain("SECRET-VALUE");
+  // A look-alike host in the userinfo or path doesn't count.
+  expect(await message(page(frame("https://app.example.com@evil.example.net/", cfg)))).toContain("refused");
+  await expect(fn(page(frame("https://app.example.com/", null)))).rejects.toThrow(/no localStorage key/);
+});
+
+test("--goto must be http(s) on an allowed host, on the client and on the wire", () => {
+  const req = parseReadStorageArgs(["read-storage", "local", "k", "--allow-domain", "app.example.com", "--goto", "https://app.example.com/client/T0"]);
+  expect(req.gotoUrl).toBe("https://app.example.com/client/T0");
+  expect(parseReadStorageWire(readStorageWireArgs(req))).toEqual(req);
+  expect(() => parseReadStorageArgs(["read-storage", "local", "k", "--allow-domain=app.example.com", "--goto=https://evil.example.net/"])).toThrow(/must match --allow-domain/);
+  expect(() => parseReadStorageArgs(["read-storage", "local", "k", "--allow-domain=app.example.com", "--goto=javascript:alert(1)"])).toThrow(/http\(s\)/);
+  // serve re-checks: a crafted wire request can't navigate elsewhere.
+  expect(() => parseReadStorageWire(["read-storage", "local", "k", "--allow-domain=app.example.com", "--goto=https://evil.example.net/"])).toThrow(/must match --allow-domain/);
 });
 
 const listener = { name: "team", host: "127.0.0.1", port: 1, key: "k", profiles: ["qa"] };
