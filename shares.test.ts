@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtempSync, statSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { authorizeCredential, createShare, credentialForBearer, inviteLink, parseDuration, readShares, redeemInvite, updateShares, webrtcCredentials, type ShareConfig } from "./shares.ts";
+import { authorizeCredential, createShare, credentialForBearer, inviteLink, inviteState, shareSessions, parseDuration, readShares, redeemInvite, updateShares, webrtcCredentials, type ShareConfig } from "./shares.ts";
 import { bearerOf } from "./secret.ts";
 
 const empty = (): ShareConfig => ({ version: 1, shares: [] });
@@ -100,4 +100,31 @@ test("updateShares persists owner-only and serializes concurrent writers", async
     updateShares(c => { createShare(c, { label, profiles: ["p"], via: ["lan"] }); }, path)));
   expect((await readShares(path)).shares.map(s => s.label).sort()).toEqual(["a", "b", "c", "d"]);
   if (process.platform !== "win32") expect(statSync(path).mode & 0o777).toBe(0o600);
+});
+
+test("inviteState: open, then used; expired only while it can still be used", () => {
+  const config = empty();
+  const s = createShare(config, { label: "s", profiles: ["p"], via: ["webrtc"], now: NOW, inviteTtlMs: 1000 });
+  expect(inviteState(s, NOW)).toEqual({ state: "open", maxDevices: 1, used: 0, expiresAt: NOW + 1000 });
+  expect(inviteState(s, NOW + 1000).state).toBe("expired");
+  redeemInvite(config, s.id, "d", NOW);
+  expect(inviteState(s, NOW).state).toBe("used");
+  expect(inviteState(s, NOW + 1000).state).toBe("used");
+});
+
+test("shareSessions lists this share's live sessions by name and device, and no one else's", () => {
+  const config = empty();
+  const a = createShare(config, { label: "a", profiles: ["p"], via: ["webrtc"], now: NOW });
+  const b = createShare(config, { label: "b", profiles: ["p"], via: ["webrtc"], now: NOW });
+  const da = redeemInvite(config, a.id, "laptop", NOW), db = redeemInvite(config, b.id, "other", NOW);
+  const owners: [string, { owner: string; name: string; profile: string }][] = [
+    ["s1", { owner: `share:${a.id}:${da.id}`, name: "default", profile: "secret-profile" }],
+    ["s2", { owner: `share:${a.id}:${da.id}`, name: "closed", profile: "p" }],
+    ["s3", { owner: `share:${b.id}:${db.id}`, name: "theirs", profile: "p" }],
+    ["s4", { owner: "listener:local", name: "mine", profile: "p" }],
+    ["s5", { owner: `share:${a.id}:gone`, name: "removed-device", profile: "p" }],
+  ];
+  const live = new Set(["s1", "s3", "s4", "s5"]);
+  expect(shareSessions(a, owners, live)).toEqual([{ name: "default", device: "laptop" }]);
+  expect(shareSessions(b, owners, live)).toEqual([{ name: "theirs", device: "other" }]);
 });
