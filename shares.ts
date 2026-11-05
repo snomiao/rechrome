@@ -195,6 +195,25 @@ export function inviteProblem(share: Share, now = Date.now()): string | null {
   return null;
 }
 
+/** What an invite's holder is told about it before redeeming (the /ping of an invite). */
+export function inviteState(share: Share, now = Date.now()): { state: "open" | "used" | "expired"; maxDevices: number; used: number; expiresAt?: number } {
+  const used = share.devices.length;
+  const state = used >= share.maxDevices ? "used" : share.inviteExpiresAt && now >= share.inviteExpiresAt ? "expired" : "open";
+  return { state, maxDevices: share.maxDevices, used, ...(share.inviteExpiresAt ? { expiresAt: share.inviteExpiresAt } : {}) };
+}
+
+/** A share's live browser sessions: names and device names only, none of another share's. */
+export function shareSessions(share: Share, owners: Iterable<[string, { owner: string; name: string }]>, live: ReadonlySet<string>): { name: string; device: string }[] {
+  const prefix = `share:${share.id}:`;
+  const out: { name: string; device: string }[] = [];
+  for (const [session, o] of owners) {
+    if (!o.owner.startsWith(prefix) || !live.has(session)) continue;
+    const device = share.devices.find(d => d.id === o.owner.slice(prefix.length));
+    if (device) out.push({ name: o.name, device: device.name });
+  }
+  return out;
+}
+
 /**
  * Whether a credential may make this request. Invites may only ping and redeem; a device may
  * do everything its share allows once approved. `via` is the transport the request came in on.

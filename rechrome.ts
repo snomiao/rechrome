@@ -3694,14 +3694,20 @@ export function nearerUrlSource(cwd: string, inherited: boolean, globalFile = GL
   }
 }
 
-type ConnectedShare = { share?: string; device?: { id: string; name: string; approved: boolean }; profiles: string[]; webrtc: boolean };
+type ConnectedShare = { share?: string; device?: { id: string; name: string; approved: boolean }; profiles: string[]; webrtc: boolean; sessions?: { name: string; device: string }[] };
 
 async function connect(url: string, opts: { global?: boolean; project?: boolean } = {}, shared?: ConnectedShare): Promise<void> {
   if (opts.global && opts.project) throw new Error("Pass --global or --project, not both.");
   // A bare rech1_ token means the default signal server.
   if (looksLikeToken(url)) url = `${DEFAULT_SIGNAL}#${url.trim()}`;
   const share = shareLinkParts(url);
-  if (share && !shared) return connectShare(url, share, opts);
+  if (share && !shared) {
+    // node-datachannel's native threads can keep the process alive after every connection is
+    // closed, so the command leaves explicitly: done, it must not hang on.
+    try { await connectShare(url, share, opts); }
+    catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exit(1); }
+    process.exit(0);
+  }
   if (share && shared) return saveConnection(url, opts, shared);
   const parsed = parseUrl(url);
   if (!parsed.key) throw new Error("That URL has no key (#key=…). Ask the host for the full URL from: rech share <profile>");
@@ -3762,6 +3768,10 @@ async function saveConnection(url: string, opts: { global?: boolean; project?: b
     for (const p of shared.profiles) console.log(`  ${p}`);
     console.log(`Pick one per command: rech --profile <name> open https://example.com   (see them again with rech profile)`);
   } else if (shared.profiles.length === 1) console.log(`Profile: ${shared.profiles[0]}. Try: rech open https://example.com`);
+  if (shared.sessions?.length) {
+    console.log(`\nOpen sessions on this share:`);
+    for (const x of shared.sessions) console.log(`  ${x.name}  (device ${x.device})`);
+  }
 }
 
 export function detectSetupAgent(env: Record<string, string | undefined> = process.env): "Codex" | "Claude Code" | null {
@@ -4530,7 +4540,8 @@ async function connectShare(url: string, parts: { token: string; origin: string 
   const saved = new URL(parts.origin);
   if (profiles.length === 1) saved.searchParams.set("profile", profiles[0]);
   saved.hash = `${token}${webrtc ? `&via=${WEBRTC}` : ""}`;
-  await connect(saved.toString(), opts, { share, device, profiles, webrtc });
+  const sessions = Array.isArray(ping?.sessions) ? ping.sessions as { name: string; device: string }[] : [];
+  await connect(saved.toString(), opts, { share, device, profiles, webrtc, sessions });
 }
 
 // ---- WebRTC client bridge -------------------------------------------------------------------

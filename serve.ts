@@ -1,6 +1,6 @@
 import { receiveUpload, readRequestJson } from "./scoped-upload.ts";
 import { readListeners, listenerAddress, authorizeProfileRequest, canReadProfileFile, profileOutputPrefix, normalizePrefix, resolveAllowedProfile, shareRtcListeners, rtcListeners, type Listener } from "./listeners.ts";
-import { WEBRTC, authorizeCredential, credentialForBearer, readShares, redeemInvite, shareProblem, updateShares, webrtcCredentials, type Credential, type ShareConfig } from "./shares.ts";
+import { WEBRTC, authorizeCredential, credentialForBearer, inviteState, readShares, redeemInvite, shareProblem, shareSessions, updateShares, webrtcCredentials, type Credential, type ShareConfig } from "./shares.ts";
 import { bearerOf, safeEqual } from "./secret.ts";
 import { WebrtcHost } from "./webrtc.ts";
 import { file } from "bun";
@@ -701,6 +701,16 @@ export async function serve() {
     }).catch(error => log(`could not record device use: ${error}`));
   };
 
+  const profileInfo = async (profiles: string[] | "*") => {
+    const registry = await readTokenRegistry().catch(() => ({} as Awaited<ReturnType<typeof readTokenRegistry>>));
+    const cache = await readChromeProfileCache().catch(() => null) ?? {};
+    const keys = profiles === "*" ? Object.keys(registry) : profiles;
+    return keys.map(k => ({ key: k, name: cache[registry[k]?.profileDir ?? ""]?.name ?? "", registered: !!registry[k] }));
+  };
+  const liveSessions = () => {
+    try { return new Set(readdirSync(tmpSocketRoot()).filter(f => f.endsWith(".sock")).map(f => f.slice(0, -5))); } catch { return new Set<string>(); }
+  };
+
   const handle = async (req: Request, initialListener: Listener, remoteAddr: () => string): Promise<Response> => {
       let listener = initialListener;
       const reqUrl = new URL(req.url);
@@ -744,17 +754,13 @@ export async function serve() {
       if (reqUrl.pathname === "/profiles") {
         const denied = authCheck(req, key);
         if (denied) return denied;
-        const registry = await readTokenRegistry().catch(() => ({} as Awaited<ReturnType<typeof readTokenRegistry>>));
-        const cache = await readChromeProfileCache().catch(() => null) ?? {};
-        const keys = listener.profiles === "*" ? Object.keys(registry) : listener.profiles;
-        return Response.json({ share: cred?.share.label, profiles: keys.map(k => ({ key: k, name: cache[registry[k]?.profileDir ?? ""]?.name ?? "", registered: !!registry[k] })) });
+        return Response.json({ share: cred?.share.label, profiles: await profileInfo(listener.profiles) });
       }
 
       if (reqUrl.pathname === "/sessions") {
         const denied = authCheck(req, key);
         if (denied) return denied;
-        let live = new Set<string>();
-        try { live = new Set(readdirSync(tmpSocketRoot()).filter(f => f.endsWith(".sock")).map(f => f.slice(0, -5))); } catch {}
+        const live = liveSessions();
         const all = listener.profiles === "*" && !cred;
         const rows = [...sessionOwners.entries()]
           .filter(([, o]) => all || o.owner === owner)
@@ -812,7 +818,10 @@ export async function serve() {
         if (scoped || !reqUrl.searchParams.get("deep"))
           return Response.json({
             ok: true, bind: listenHost, listener: listener.name, profiles: listener.profiles, multiListener: true, consecutiveTimeouts, degraded, chromeAccessProblem,
-            ...(cred ? { share: cred.share.label, kind: cred.kind, ...(cred.kind === "device" ? { device: { id: cred.device.id, name: cred.device.name, approved: cred.device.approved } } : {}), expiresAt: cred.share.expiresAt } : {}),
+            ...(cred ? {
+              share: cred.share.label, kind: cred.kind, ...(cred.kind === "device" ? { device: { id: cred.device.id, name: cred.device.name, approved: cred.device.approved } } : { invite: inviteState(cred.share) }), expiresAt: cred.share.expiresAt,
+              profileInfo: await profileInfo(cred.share.profiles), sessions: shareSessions(cred.share, sessionOwners, liveSessions()),
+            } : {}),
           });
         // Deep probe: exercise the relay read-only via `tab-list` (opens nothing) against the
         // most-recently-used session — never a fresh one, which could spawn a browser window.
