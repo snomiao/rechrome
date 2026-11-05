@@ -24,7 +24,7 @@ import {
   checkTailscaleServe,
   chromeDataAccessHint,
 } from "./rechrome.ts";
-import { SecretMasker, parseReadCookieWire, readCookieOnSession, parseReadStorageWire, readStorageOnSession, parseReadSecretWire, readSecretOnSession, parseFillSecretWire, fillSecretOnSession, passwordValuesOnSession, hasSnapshot, maskPasswordLines, withholdSnapshots } from "./fill-secret.ts";
+import { SecretMasker, parseReadCookieWire, readCookieOnSession, parseReadStorageWire, readStorageOnSession, parseReadSecretWire, readSecretOnSession, parseReadHeadersWire, readHeadersOnSession, parseFillSecretWire, fillSecretOnSession, passwordValuesOnSession, hasSnapshot, maskPasswordLines, withholdSnapshots } from "./fill-secret.ts";
 
 const TAILSCALE_BIN = process.env.TAILSCALE_BIN || "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
 const CERT_RENEW_THRESHOLD_DAYS = 7;
@@ -1028,6 +1028,24 @@ export async function serve() {
         } catch (error) {
           const message = secretMasker.mask(error instanceof Error ? error.message : String(error));
           log(`exit: 1 | read-cookie: ${message.split("\n")[0]}`);
+          return Response.json({ status: 1, stdout: "", stderr: `[rech] ${message}\n`, files: [] });
+        }
+      }
+
+      // read-headers: response status + headers (no bodies) for an --allow-domain host over a
+      // window, cookie/set-cookie/authorization values redacted. Written as a JSON evidence file in
+      // the output dir and returned in `files`; header values never reach stdout or a log line.
+      if (filteredArgs[0] === "read-headers") {
+        try {
+          const { allowDomains, seconds, gotoUrl } = parseReadHeadersWire(filteredArgs);
+          const { host, captured } = await readHeadersOnSession({ socketRoot: tmpSocketRoot(), session: namespacedSession, cwd: runWorkDir, allowDomains, seconds, gotoUrl });
+          const name = `read-headers-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
+          await Bun.write(join(runWorkDir, name), JSON.stringify(captured, null, 2) + "\n");
+          log(`exit: 0 | read-headers ${allowDomains.join(",")} (${captured.length} responses, ${seconds}s window, header values redacted)`);
+          return Response.json({ status: 0, stdout: `[rech] read-headers: captured ${captured.length} responses on ${host} to ${name}\n`, stderr: "", files: [(outputPrefix + name).replaceAll("\\", "/")] });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          log(`exit: 1 | read-headers: ${message.split("\n")[0]}`);
           return Response.json({ status: 1, stdout: "", stderr: `[rech] ${message}\n`, files: [] });
         }
       }
