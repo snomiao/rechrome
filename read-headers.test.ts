@@ -74,6 +74,9 @@ test("buildReadHeadersCode: embeds host filter, redaction set and window; includ
   expect(withGoto).toContain("page.on(\"response\"");
   expect(withGoto).toContain("<redacted>");
   expect(withGoto).toContain("7 * 1000");
+  // the window-wait must use a page API that exists in the run-code sandbox; setTimeout is NOT defined there
+  expect(withGoto).toContain("page.waitForTimeout(7 * 1000)");
+  expect(withGoto).not.toMatch(/setTimeout\(r,/);
   expect(withGoto).toContain("page.goto(\"https://app.example.com/home\"");
   const noGoto = buildReadHeadersCode(["app.example.com"], 5);
   expect(noGoto).not.toContain("page.goto");

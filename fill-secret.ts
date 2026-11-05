@@ -827,7 +827,7 @@ export function buildReadHeadersCode(allowDomains: string[], seconds: number, go
   page.on("response", onResponse);
   try {
     ${gotoUrl ? `try { await page.goto(${JSON.stringify(gotoUrl)}, { waitUntil: "load", timeout: ${Math.min(seconds * 1000, 30000)} }); } catch {}` : ""}
-    await new Promise(r => setTimeout(r, ${seconds} * 1000));
+    await page.waitForTimeout(${seconds} * 1000);
   } finally {
     try { page.off("response", onResponse); } catch {}
   }
