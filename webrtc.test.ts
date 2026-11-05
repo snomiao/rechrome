@@ -60,7 +60,7 @@ test("a client with a different secret can't even enter the room", async () => {
 
 test("connecting to a room with no host fails fast with a clear reason", async () => {
   const client = new WebrtcClient(newToken(), signal, quiet);
-  await expect(client.connect()).rejects.toThrow(/host is offline/);
+  await expect(client.connect()).rejects.toThrow(/nobody is answering this link/);
 }, 15_000);
 
 test("the loopback bridge carries plain HTTP and needs its own key", async () => {

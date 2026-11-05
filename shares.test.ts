@@ -63,7 +63,7 @@ test("expiry, invite TTL and revocation", () => {
   expect(authorizeCredential(dev, "webrtc", "ping", NOW)?.message).toMatch(/revoked/);
 });
 
-test("the WebRTC host listens for unused invites and every device of live shares only", () => {
+test("the WebRTC host listens for the invite and every device of live shares only", () => {
   const config = empty();
   const a = createShare(config, { label: "a", profiles: ["p"], via: ["webrtc"], now: NOW });
   createShare(config, { label: "lan-only", profiles: ["p"], via: ["lan"], now: NOW });
@@ -72,8 +72,16 @@ test("the WebRTC host listens for unused invites and every device of live shares
   expect(webrtcCredentials(config, NOW).map(c => c.kind)).toEqual(["invite"]);
   redeemInvite(config, a.id, "d", NOW);
   expect(webrtcCredentials(config, NOW).map(c => c.kind)).toEqual(["invite", "device"]);
+  // An expired invite keeps its room, so the taker hears "expired", not "host offline"…
   a.inviteExpiresAt = NOW;
-  expect(webrtcCredentials(config, NOW).map(c => c.kind)).toEqual(["device"]);
+  const creds = webrtcCredentials(config, NOW);
+  expect(creds.map(c => c.kind)).toEqual(["invite", "device"]);
+  // …and that room can only say so: it can't redeem or run anything.
+  const invite = creds[0]!;
+  expect(authorizeCredential(invite, "webrtc", "ping", NOW)).toBeNull();
+  expect(authorizeCredential(invite, "webrtc", "redeem", NOW)?.message).toContain("expired");
+  expect(authorizeCredential(invite, "webrtc", "run", NOW)?.status).toBe(403);
+  expect(() => redeemInvite(config, a.id, "e", NOW)).toThrow(/expired/);
 });
 
 test("names, profiles and transports are validated", () => {
