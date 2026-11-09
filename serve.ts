@@ -5,7 +5,7 @@ import { bearerOf, safeEqual } from "./secret.ts";
 import { WebrtcHost } from "./webrtc.ts";
 import { file } from "bun";
 import { createHash, randomBytes, X509Certificate } from "crypto";
-import { mkdirSync, lstatSync, statSync, chmodSync, unlinkSync, accessSync, readdirSync, realpathSync, existsSync, readFileSync, constants as fsConstants } from "fs";
+import { mkdirSync, lstatSync, statSync, chmodSync, unlinkSync, accessSync, readdirSync, realpathSync, existsSync, readFileSync, writeFileSync, rmSync, constants as fsConstants } from "fs";
 import { join, resolve, relative, isAbsolute, sep } from "path";
 import { tmpdir } from "os";
 import {
@@ -24,7 +24,8 @@ import {
   checkTailscaleServe,
   chromeDataAccessHint,
 } from "./rechrome.ts";
-import { SecretMasker, parseReadCookieWire, readCookieOnSession, parseReadStorageWire, readStorageOnSession, parseReadSecretWire, readSecretOnSession, parseFillSecretWire, fillSecretOnSession, passwordValuesOnSession, hasSnapshot, maskPasswordLines, withholdSnapshots } from "./fill-secret.ts";
+import { SecretMasker, runCodeOnSession, parseReadCookieWire, readCookieOnSession, parseReadStorageWire, readStorageOnSession, parseReadSecretWire, readSecretOnSession, parseFillSecretWire, fillSecretOnSession, passwordValuesOnSession, hasSnapshot, maskPasswordLines, withholdSnapshots } from "./fill-secret.ts";
+import { parseRecordStart, parseRecordStop, buildRecordStartCode, buildRecordStopCode, resolveFfmpeg, resolveFormat, ffmpegArgs, frameFileName, RECORD_FRAME_PATTERN, type StopResult } from "./record.ts";
 
 const TAILSCALE_BIN = process.env.TAILSCALE_BIN || "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
 const CERT_RENEW_THRESHOLD_DAYS = 7;
@@ -1028,6 +1029,67 @@ export async function serve() {
         } catch (error) {
           const message = secretMasker.mask(error instanceof Error ? error.message : String(error));
           log(`exit: 1 | read-cookie: ${message.split("\n")[0]}`);
+          return Response.json({ status: 1, stdout: "", stderr: `[rech] ${message}\n`, files: [] });
+        }
+      }
+
+      // record: screencast the attached tab. `start` and `stop` are two separate calls; the frame
+      // buffer lives in the cliDaemon (globalThis) between them, reached over the session socket.
+      // On stop, serve encodes the returned JPEG frames into a video under the output dir. See record.ts.
+      if (filteredArgs[0] === "record" && filteredArgs[1] === "start") {
+        try {
+          const a = parseRecordStart(filteredArgs);
+          const { isError, text } = await runCodeOnSession({ socketRoot: tmpSocketRoot(), session: namespacedSession, cwd: runWorkDir, code: buildRecordStartCode(a), json: true });
+          if (isError) throw new Error(text.match(/record[^\n]*/)?.[0] ?? text.trim().split("\n")[0] ?? "record: could not start");
+          let info: any = {}; try { info = JSON.parse(JSON.parse(text).result ?? text.match(/### Result\n([^\n]*)/)?.[1] ?? "{}"); } catch {}
+          const msg = info.already ? `record: already recording (since ${new Date(info.startedAt).toISOString()})` : `record: started at ${a.fps} fps — run \`rech record stop\` to save`;
+          log(`exit: 0 | record start (${a.fps} fps)`);
+          return Response.json({ status: 0, stdout: `${msg}\n`, stderr: "", files: [] });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          log(`exit: 1 | record start: ${message.split("\n")[0]}`);
+          return Response.json({ status: 1, stdout: "", stderr: `[rech] ${message}\n`, files: [] });
+        }
+      }
+      if (filteredArgs[0] === "record" && filteredArgs[1] === "stop") {
+        try {
+          const a = parseRecordStop(filteredArgs);
+          const { isError, text } = await runCodeOnSession({ socketRoot: tmpSocketRoot(), session: namespacedSession, cwd: runWorkDir, code: buildRecordStopCode(), json: true });
+          if (isError) throw new Error(text.match(/record[^\n]*/)?.[0] ?? text.trim().split("\n")[0] ?? "record: could not stop");
+          let res: StopResult; try { res = JSON.parse(JSON.parse(text).result ?? text.match(/### Result\n([^\n]*)/)?.[1] ?? "{}"); } catch { throw new Error("record: the daemon returned no frames"); }
+          if (!res.frames?.length) throw new Error("record: no frames were captured (did `record start` run, and was the tab rendering?)");
+          const stamp = `${Date.now().toString(36)}-${randomBytes(3).toString("hex")}`;
+          const framesDir = join(runWorkDir, `.rec-${stamp}`);
+          mkdirSync(framesDir, { recursive: true });
+          try {
+            for (let i = 0; i < res.frames.length; i++) writeFileSync(join(framesDir, frameFileName(i)), Buffer.from(res.frames[i]!, "base64"));
+            const ffmpegBin = resolveFfmpeg();
+            const format = resolveFormat(a.format, ffmpegBin !== null);
+            const avgFps = res.durationMs > 0 ? Math.max(1, Math.round((res.frames.length * 1000) / res.durationMs)) : res.fps;
+            const name = a.filename ?? `recording-${stamp}.${format}`;
+            const out = join(runWorkDir, name);
+            if (format === "mjpeg") {
+              // No encoder available: concatenate the JPEGs into one MJPEG stream (playable, no dependency).
+              writeFileSync(out, Buffer.concat(res.frames.map((f) => Buffer.from(f, "base64"))));
+            } else {
+              const ff = Bun.spawnSync([ffmpegBin!, ...ffmpegArgs(framesDir, RECORD_FRAME_PATTERN, avgFps, format, out)], { stderr: "pipe", stdout: "ignore" });
+              if (ff.exitCode !== 0 || !existsSync(out)) throw new Error(`record: ffmpeg could not encode ${format} (${(ff.stderr?.toString() || "").split("\n").filter(Boolean).slice(-1)[0] ?? "no ffmpeg output"})`);
+            }
+            const rel = relative(runWorkDir, out).replaceAll("\\", "/");
+            const keep = listener.keepDownloads === true;
+            log(`record: ${JSON.stringify({ listener: listener.name, name, frames: res.frames.length, fps: avgFps, format, size: statSync(out).size, kept: keep })}`);
+            if (!keep) {
+              const real = realpathSync(out);
+              clearTimeout(pendingDownloads.get(real));
+              pendingDownloads.set(real, setTimeout(() => { pendingDownloads.delete(real); try { unlinkSync(real); } catch {} }, DOWNLOAD_PICKUP_MS));
+            }
+            return Response.json({ status: 0, stdout: `record: saved ${res.frames.length} frames as ${name} (${format}, ~${avgFps} fps)\n`, stderr: "", files: [(outputPrefix + rel).replaceAll("\\", "/")] });
+          } finally {
+            try { rmSync(framesDir, { recursive: true, force: true }); } catch {}
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          log(`exit: 1 | record stop: ${message.split("\n")[0]}`);
           return Response.json({ status: 1, stdout: "", stderr: `[rech] ${message}\n`, files: [] });
         }
       }
