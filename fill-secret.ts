@@ -321,14 +321,14 @@ export function socketRequest(path: string, method: string, params: unknown, tim
 }
 
 /** Run a run-code function on the session's live browser over its cliDaemon socket (no child argv). */
-export async function runCodeOnSession(opts: { socketRoot: string; session: string; cwd: string; code: string; json?: boolean }): Promise<{ isError: boolean; text: string }> {
+export async function runCodeOnSession(opts: { socketRoot: string; session: string; cwd: string; code: string; json?: boolean; timeoutMs?: number }): Promise<{ isError: boolean; text: string }> {
   const candidates = [...new Set([...sessionSocketCandidates(opts.socketRoot, opts.session), ...daemonSessionSockets(opts.session)])];
   if (!candidates.length) throw new Error("no browser is open in this session; run `rech open <url>` first");
   const errors: string[] = [];
   for (const path of candidates) {
     let reply: { result?: any; error?: string };
     try {
-      reply = await socketRequest(path, "run", { args: { _: ["run-code", opts.code] }, cwd: opts.cwd, ...(opts.json ? { json: true } : {}) });
+      reply = await socketRequest(path, "run", { args: { _: ["run-code", opts.code] }, cwd: opts.cwd, ...(opts.json ? { json: true } : {}) }, opts.timeoutMs);
     } catch (e) {
       errors.push(e instanceof Error ? e.message : String(e)); // stale socket: try the next one
       continue;

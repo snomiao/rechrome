@@ -11,7 +11,7 @@ test("share --all: one snapshot link, profiles picked on the host, never the man
   const mgmtPort = reserve(), onePort = reserve();
   await mkdir(join(root, ".rechrome"));
   await mkdir(join(root, "secret-rules"));
-  for (const name of ["rechrome.ts", "serve.ts", "listeners.ts", "extension-token.ts", "daemon-manager.ts", "fill-secret.ts", "scoped-upload.ts", "shares.ts", "secret.ts", "e2e.ts", "webrtc.ts", "signal-relay.ts", "redact.ts", "secret-rules/gitleaks.toml"])
+  for (const name of ["rechrome.ts", "serve.ts", "listeners.ts", "extension-token.ts", "daemon-manager.ts", "fill-secret.ts", "record.ts", "scoped-upload.ts", "shares.ts", "secret.ts", "e2e.ts", "webrtc.ts", "signal-relay.ts", "redact.ts", "secret-rules/gitleaks.toml"])
     await copyFile(join(import.meta.dir, name), join(root, name));
   await symlink(join(import.meta.dir, "node_modules"), join(root, "node_modules"), "junction");
   // Stand-in playwright-cli: report the profile the host chose and the session it was given.

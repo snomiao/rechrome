@@ -4743,6 +4743,13 @@ const HELP_EPILOGUE = `Browser commands (sent to this project's Chrome session):
                      copy a cookie (incl. HttpOnly) into a pipe, never shown or logged
   rech read-storage <local|session> <key> [json-path] --allow-domain <host> | <command>
                      copy a localStorage/sessionStorage value into a pipe, never shown or logged
+  rech record start [--fps <n>] [--quality <1-100>] [--format mp4|webm|mjpeg] [--max-seconds <n>]
+  rech record stop [--filename <name>]
+                     record the active tab, streamed into ffmpeg on the host, until stop (or
+                     --max-seconds, default 600); stop hands you the video. No click, no new
+                     permission; mjpeg if the host has no ffmpeg
+  rech record [--seconds <n>] [...]
+                     the same in one call: record n seconds (max 60) and return the file
   rech pw <args>     forward verbatim to playwright-cli, e.g. \`rech pw --version\`
   rech --version     rechrome's version
 
