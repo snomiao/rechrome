@@ -30,6 +30,24 @@ test("denies profile switching and CLI escape routes", () => {
   expect(authorizeProfileRequest(listener, request(["-s=qa1", "open", "https://example.com"]))).toBe("qa");
 });
 
+test("the eval flag grants full code/CDP access for the listener's profiles, host filesystem still closed", () => {
+  const full: Listener = { ...listener, eval: true };
+  // off by default: arbitrary code, raw CDP and option overrides are refused
+  expect(() => authorizeProfileRequest(listener, request(["eval", "() => 1"]))).toThrow(/Command is unavailable/);
+  expect(() => authorizeProfileRequest(listener, request(["run-code", "async page => {}"]))).toThrow(/Command is unavailable/);
+  // on: the same commands and arbitrary options now pass (eval, run-code, raw CDP, any flags)
+  expect(authorizeProfileRequest(full, request(["eval", "() => 1"]))).toBe("qa");
+  expect(authorizeProfileRequest(full, request(["run-code", "async page => { await page.emulateMedia({ colorScheme: 'dark' }); }"]))).toBe("qa");
+  expect(authorizeProfileRequest(full, request(["cdp", "Emulation.setEmulatedMedia"]))).toBe("qa");
+  expect(authorizeProfileRequest(full, request(["screenshot", "--filename", "shot.png"]))).toBe("qa");
+  expect(authorizeProfileRequest(full, request(["open", "file:///etc/hosts"]))).toBe("qa");
+  // the profile allowlist and profile-override checks still apply even with full access
+  expect(() => authorizeProfileRequest(full, { ...request(["eval", "() => 1"]), identity: { key: "/worktree", profile: "personal" } })).toThrow(/Profile is not allowed/);
+  expect(() => authorizeProfileRequest(full, { ...request(["eval", "() => 1"]), env: { PLAYWRIGHT_MCP_PROFILE_DIRECTORY: "personal" } })).toThrow(/Profile override/);
+  // host filesystem stays closed: upload still takes stdin bytes only, never a host path
+  expect(() => authorizeProfileRequest(full, request(["upload", "/etc/passwd"]))).toThrow(/stdin bytes; host paths are unavailable/);
+});
+
 test("reading or clearing the page's console is as page-scoped as a snapshot", () => {
   expect(authorizeProfileRequest(listener, request(["console"]))).toBe("qa");
   expect(authorizeProfileRequest(listener, request(["console", "error"]))).toBe("qa");

@@ -7,7 +7,10 @@ import { mkdir, readFile, rename, writeFile } from "fs/promises";
 import { DEFAULT_RTC, DEFAULT_SIGNAL, normalizeSignal } from "./shares.ts";
 
 // publicUrl: where a reverse proxy (Tailscale Serve, Caddy, nginx, ...) exposes this listener.
-export type Listener = { name: string; host: string; port: number; key: string; profiles: string[] | "*"; prefix?: string; publicUrl?: string; uploads?: UploadPolicy | false; readSecrets?: boolean; readCookies?: boolean; keepDownloads?: boolean };
+// eval: the host has shared the whole browser profile with this listener's links — arbitrary code
+// (eval/run-code) and full CDP are allowed for its profiles, the same capability as the local
+// management listener. Off by default; only set it on a listener you trust with those accounts.
+export type Listener = { name: string; host: string; port: number; key: string; profiles: string[] | "*"; prefix?: string; publicUrl?: string; uploads?: UploadPolicy | false; readSecrets?: boolean; readCookies?: boolean; keepDownloads?: boolean; eval?: boolean };
 // retiredPorts: ports of removed listeners, newest last. New listeners skip them so a link
 // saved for a removed listener gets "connection refused", not some other listener's answer.
 // rtcListeners: WebRTC transports (a signal server, plus optional STUN/TURN). They live under
@@ -186,6 +189,15 @@ export function authorizeProfileRequest(listener: Listener, body: any): string {
   if (typeof profile !== "string" || listener.profiles === "*" || !listener.profiles.includes(profile)) throw new Error("Profile is not allowed on this listener");
   if (body.env?.PLAYWRIGHT_MCP_PROFILE_DIRECTORY && body.env.PLAYWRIGHT_MCP_PROFILE_DIRECTORY !== profile) throw new Error("Profile override does not match request identity");
   const args = body.args.filter((a: string) => /^-s=[a-zA-Z0-9_-]{1,64}$/.test(a) === false);
+  // Host filesystem stays closed on every network listener, full access included: the upload
+  // receiver takes stdin bytes only, so a caller can never name a host path. Checked before any
+  // mode branch so --eval can't widen it.
+  if (args[0] === "upload" && (args.length !== 1 || !body.upload)) throw new Error("Upload requires stdin bytes; host paths are unavailable");
+  if (args[0] !== "upload" && body.upload !== undefined) throw new Error("Unexpected upload payload");
+  // --eval: the host has shared the whole browser profile with this listener's links, so arbitrary
+  // code (eval/run-code) and full CDP are allowed for its allowlisted profiles — the same capability
+  // as the local management listener. Off by default; set with `rech listener set <name> --eval`.
+  if (listener.eval === true) return profile;
   if (args[0] === "upload" && listener.uploads === false)
     throw new Error(`Uploads are off on listener "${listener.name}". The host can turn them on: rech listener set ${listener.name} --uploads`);
   if (args[0] === "read-secret" && listener.readSecrets !== true)
@@ -197,9 +209,6 @@ export function authorizeProfileRequest(listener: Listener, body: any): string {
   if (args[0] !== "upload" && args[0] !== "read-secret" && args[0] !== "read-cookie" && args[0] !== "read-storage" && !SCOPED_COMMANDS.has(args[0])) throw new Error("Command is unavailable on profile-scoped listeners; use the local management listener for arbitrary code or host access");
   if (body.args.filter((a: string) => a.startsWith("-s=")).length > 1 || args.slice(1).some((a: string) => a.startsWith("-") && !(args[0] === "screenshot" && a === "--full-page") && !(args[0] === "console" && a === "--clear") && !(args[0] === "fill-secret" && (a === "--submit" || a === "--totp" || a.startsWith("--allow-domain="))) && !(args[0] === "read-secret" && a.startsWith("--allow-domain=")) && !(args[0] === "read-cookie" && a.startsWith("--allow-domain=")) && !(args[0] === "read-storage" && a.startsWith("--allow-domain=")))) throw new Error("CLI option overrides are unavailable on profile-scoped listeners");
   if (["open", "goto", "tab-new"].includes(args[0]) && args[1] && !/^https?:\/\//i.test(args[1]) && args[1] !== "about:blank") throw new Error("Scoped navigation accepts only HTTP(S) or about:blank");
-  // Upload is handled by the byte-only receiver; the caller cannot supply host paths.
-  if (args[0] === "upload" && (args.length !== 1 || !body.upload)) throw new Error("Upload requires stdin bytes; host paths are unavailable");
-  if (args[0] !== "upload" && body.upload !== undefined) throw new Error("Unexpected upload payload");
   return profile;
 }
 

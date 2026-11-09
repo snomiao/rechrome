@@ -3330,9 +3330,13 @@ function printTable(rows: string[][]): void {
 
 async function listListeners(): Promise<void> {
   const config = await requireListeners();
-  const rows = [["NAME", "ADDRESS", "PROFILES", "PUBLIC URL"]];
-  for (const l of config.listeners)
-    rows.push([l.name, `${listenerAddress(l)}${normalizePrefix(l.prefix)}`, l.profiles === "*" ? "(all — local management)" : l.profiles.join(", "), l.publicUrl ?? "-"]);
+  const rows = [["NAME", "ADDRESS", "PROFILES", "GRANTS", "PUBLIC URL"]];
+  for (const l of config.listeners) {
+    const grants = l.profiles === "*"
+      ? "full (local)"
+      : [l.eval && "eval", l.readSecrets && "read-secrets", l.readCookies && "read-cookies", l.uploads === false && "no-uploads", l.keepDownloads && "keep-downloads"].filter(Boolean).join(", ") || "-";
+    rows.push([l.name, `${listenerAddress(l)}${normalizePrefix(l.prefix)}`, l.profiles === "*" ? "(all — local management)" : l.profiles.join(", "), grants, l.publicUrl ?? "-"]);
+  }
   printTable(rows);
   console.log("");
   printTable(rtcListenerRows(config));
@@ -3489,7 +3493,7 @@ async function rotateKey(name: string): Promise<void> {
   console.log(`New key for ${name}; URLs carrying the old key stop working now. Print new ones with: rech share <profile> --listener ${name}`);
 }
 
-async function setListener(name: string, opts: { publicUrl?: string; clearPublicUrl?: boolean; uploads?: boolean; hostUploadDirs?: string[]; noHostUploads?: boolean; readSecrets?: boolean; readCookies?: boolean; keepDownloads?: boolean }): Promise<void> {
+async function setListener(name: string, opts: { publicUrl?: string; clearPublicUrl?: boolean; uploads?: boolean; hostUploadDirs?: string[]; noHostUploads?: boolean; readSecrets?: boolean; readCookies?: boolean; keepDownloads?: boolean; evalCode?: boolean }): Promise<void> {
   const config = await requireListeners();
   let listener = config.listeners.find(l => l.name === name);
   if (!listener) throw new Error(`Unknown listener "${name}". See rech listener ls.`);
@@ -3515,8 +3519,13 @@ async function setListener(name: string, opts: { publicUrl?: string; clearPublic
     if (listener.profiles === "*") throw new Error(`"${name}" is the local management listener: read-cookie is always available there.`);
     if (opts.readCookies) listener.readCookies = true; else delete listener.readCookies;
   }
+  if (opts.evalCode !== undefined) {
+    if (listener.profiles === "*") throw new Error(`"${name}" is the local management listener: eval and full CDP are always available there.`);
+    if (opts.evalCode) listener.eval = true; else delete listener.eval;
+  }
   if (opts.keepDownloads !== undefined) { if (opts.keepDownloads) listener.keepDownloads = true; else delete listener.keepDownloads; }
   await writeListeners(config);
+  if (opts.evalCode !== undefined) console.log(opts.evalCode ? `${name}: eval on. Anyone with this link can run arbitrary JavaScript (rech pw eval / run-code) and drive full CDP in this listener's profiles — the whole signed-in browser profile, enough to read any page, cookie or token and act as the user. Only for links you trust with those accounts` : `${name}: eval off`);
   if (opts.keepDownloads !== undefined) console.log(opts.keepDownloads ? `${name}: browser downloads are also kept on this host (each is logged)` : `${name}: browser downloads go to the client only, then are deleted here`);
   if (opts.readCookies !== undefined) console.log(opts.readCookies ? `${name}: read-cookie on. Anyone with this link can copy any cookie (HttpOnly session cookies included) of any site its profiles are signed in to, which is enough to take over those sessions; --allow-domain only checks the domain the caller names. Each read is logged without the value` : `${name}: read-cookie off`);
   if (opts.readSecrets !== undefined) console.log(opts.readSecrets ? `${name}: read-secret on. Anyone with this link can copy the value of any field (saved passwords included) on any site its profiles have open; --allow-domain only checks the site the caller names. Each read is logged without the value` : `${name}: read-secret off`);
@@ -4704,7 +4713,7 @@ export type RechHandlers = {
   allowListener(name: string, profiles: string[]): Promise<void>;
   denyListener(name: string, profiles: string[]): Promise<void>;
   rotateKey(name: string): Promise<void>;
-  setListener(name: string, opts: { publicUrl?: string; clearPublicUrl?: boolean; uploads?: boolean; hostUploadDirs?: string[]; noHostUploads?: boolean; readSecrets?: boolean; readCookies?: boolean; keepDownloads?: boolean }): Promise<void>;
+  setListener(name: string, opts: { publicUrl?: string; clearPublicUrl?: boolean; uploads?: boolean; hostUploadDirs?: string[]; noHostUploads?: boolean; readSecrets?: boolean; readCookies?: boolean; keepDownloads?: boolean; evalCode?: boolean }): Promise<void>;
   setup(opts: SetupOptions): Promise<void>;
   tray(action?: string): Promise<void>;
   provisionProfile(name: string, opts: { headed: boolean; experimental: boolean }): Promise<void>;
@@ -4885,8 +4894,9 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
         .option("read-cookies", { type: "boolean", describe: "Off by default. Let this listener's links copy any cookie, HttpOnly session cookies too (rech read-cookie): enough to take over the profiles' signed-in sessions, so only for links you trust with those accounts. --no-read-cookies turns it off" })
         .option("keep-downloads", { type: "boolean", describe: "Off by default: browser downloads go to the client, then are deleted here. --keep-downloads also keeps them on this host" })
         .option("host-uploads", { type: "boolean", describe: "--no-host-uploads turns host-path uploads off again" })
-        .check(a => a.publicUrl !== undefined || a.clearPublicUrl || a.uploads !== undefined || a.hostUploadDir?.length || a.hostUploads === false || a.readSecrets !== undefined || a.readCookies !== undefined || a.keepDownloads !== undefined ? true : "Pass --public-url <url>, --clear-public-url, --uploads/--no-uploads, --host-upload-dir/--no-host-uploads, --read-secrets/--read-cookies, or --keep-downloads"),
-        a => handlers.setListener(a.name, { publicUrl: a.publicUrl, clearPublicUrl: a.clearPublicUrl, ...(a.uploads !== undefined ? { uploads: a.uploads } : {}), ...(a.hostUploadDir?.length ? { hostUploadDirs: a.hostUploadDir as string[] } : {}), ...(a.hostUploads === false ? { noHostUploads: true } : {}), ...(a.readSecrets !== undefined ? { readSecrets: a.readSecrets } : {}), ...(a.readCookies !== undefined ? { readCookies: a.readCookies } : {}), ...(a.keepDownloads !== undefined ? { keepDownloads: a.keepDownloads } : {}) }))
+        .option("eval", { type: "boolean", describe: "Off by default. Let this listener's links run arbitrary JavaScript (rech pw eval / run-code) and drive full CDP in its profiles — the whole signed-in browser profile, enough to read any page, cookie or token and act as the user: only for links you trust with those accounts. --no-eval turns it off" })
+        .check(a => a.publicUrl !== undefined || a.clearPublicUrl || a.uploads !== undefined || a.hostUploadDir?.length || a.hostUploads === false || a.readSecrets !== undefined || a.readCookies !== undefined || a.keepDownloads !== undefined || a.eval !== undefined ? true : "Pass --public-url <url>, --clear-public-url, --uploads/--no-uploads, --host-upload-dir/--no-host-uploads, --read-secrets/--read-cookies, --eval/--no-eval, or --keep-downloads"),
+        a => handlers.setListener(a.name, { publicUrl: a.publicUrl, clearPublicUrl: a.clearPublicUrl, ...(a.uploads !== undefined ? { uploads: a.uploads } : {}), ...(a.hostUploadDir?.length ? { hostUploadDirs: a.hostUploadDir as string[] } : {}), ...(a.hostUploads === false ? { noHostUploads: true } : {}), ...(a.readSecrets !== undefined ? { readSecrets: a.readSecrets } : {}), ...(a.readCookies !== undefined ? { readCookies: a.readCookies } : {}), ...(a.keepDownloads !== undefined ? { keepDownloads: a.keepDownloads } : {}), ...(a.eval !== undefined ? { evalCode: a.eval } : {}) }))
       .command("port [name]", "Print a listener's port (for a proxy command)", y => y.positional("name", { type: "string" }),
         a => handlers.listenerPort(a.name))
       .command("rotate-key <name>", "Give a listener a new key (old URLs stop working)", y => y.positional("name", { type: "string", demandOption: true }),
