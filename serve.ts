@@ -25,7 +25,7 @@ import {
   chromeDataAccessHint,
 } from "./rechrome.ts";
 import { SecretMasker, runCodeOnSession, parseReadCookieWire, readCookieOnSession, parseReadStorageWire, readStorageOnSession, parseReadSecretWire, readSecretOnSession, parseFillSecretWire, fillSecretOnSession, passwordValuesOnSession, hasSnapshot, maskPasswordLines, withholdSnapshots } from "./fill-secret.ts";
-import { parseRecordStart, parseRecordStop, buildRecordStartCode, buildRecordStopCode, resolveFfmpeg, resolveFormat, ffmpegArgs, frameFileName, RECORD_FRAME_PATTERN, type StopResult } from "./record.ts";
+import { parseRecordArgs, buildRecordCode, resolveFfmpeg, resolveFormat, ffmpegArgs, frameFileName, RECORD_FRAME_PATTERN, type RecordResult } from "./record.ts";
 
 const TAILSCALE_BIN = process.env.TAILSCALE_BIN || "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
 const CERT_RENEW_THRESHOLD_DAYS = 7;
@@ -1033,31 +1033,16 @@ export async function serve() {
         }
       }
 
-      // record: screencast the attached tab. `start` and `stop` are two separate calls; the frame
-      // buffer lives in the cliDaemon (globalThis) between them, reached over the session socket.
-      // On stop, serve encodes the returned JPEG frames into a video under the output dir. See record.ts.
-      if (filteredArgs[0] === "record" && filteredArgs[1] === "start") {
+      // record: capture a window of JPEG screenshots of the attached tab in ONE run-code call
+      // (the relay has no CDP sessions and run-code state does not persist across calls, so no
+      // open-ended start/stop), then encode the frames into a video under the output dir. See record.ts.
+      if (filteredArgs[0] === "record") {
         try {
-          const a = parseRecordStart(filteredArgs);
-          const { isError, text } = await runCodeOnSession({ socketRoot: tmpSocketRoot(), session: namespacedSession, cwd: runWorkDir, code: buildRecordStartCode(a), json: true });
-          if (isError) throw new Error(text.match(/record[^\n]*/)?.[0] ?? text.trim().split("\n")[0] ?? "record: could not start");
-          let info: any = {}; try { info = JSON.parse(JSON.parse(text).result ?? text.match(/### Result\n([^\n]*)/)?.[1] ?? "{}"); } catch {}
-          const msg = info.already ? `record: already recording (since ${new Date(info.startedAt).toISOString()})` : `record: started at ${a.fps} fps — run \`rech record stop\` to save`;
-          log(`exit: 0 | record start (${a.fps} fps)`);
-          return Response.json({ status: 0, stdout: `${msg}\n`, stderr: "", files: [] });
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          log(`exit: 1 | record start: ${message.split("\n")[0]}`);
-          return Response.json({ status: 1, stdout: "", stderr: `[rech] ${message}\n`, files: [] });
-        }
-      }
-      if (filteredArgs[0] === "record" && filteredArgs[1] === "stop") {
-        try {
-          const a = parseRecordStop(filteredArgs);
-          const { isError, text } = await runCodeOnSession({ socketRoot: tmpSocketRoot(), session: namespacedSession, cwd: runWorkDir, code: buildRecordStopCode(), json: true });
-          if (isError) throw new Error(text.match(/record[^\n]*/)?.[0] ?? text.trim().split("\n")[0] ?? "record: could not stop");
-          let res: StopResult; try { res = JSON.parse(JSON.parse(text).result ?? text.match(/### Result\n([^\n]*)/)?.[1] ?? "{}"); } catch { throw new Error("record: the daemon returned no frames"); }
-          if (!res.frames?.length) throw new Error("record: no frames were captured (did `record start` run, and was the tab rendering?)");
+          const a = parseRecordArgs(filteredArgs);
+          const { isError, text } = await runCodeOnSession({ socketRoot: tmpSocketRoot(), session: namespacedSession, cwd: runWorkDir, code: buildRecordCode(a), json: true, timeoutMs: (a.seconds + 20) * 1000 });
+          if (isError) throw new Error(text.match(/record[^\n]*/)?.[0] ?? text.trim().split("\n")[0] ?? "record: could not capture");
+          let res: RecordResult; try { res = JSON.parse(JSON.parse(text).result ?? text.match(/### Result\n([^\n]*)/)?.[1] ?? "{}"); } catch { throw new Error("record: the daemon returned no frames"); }
+          if (!res.frames?.length) throw new Error("record: no frames were captured (is a tab open and rendering? run `rech open <url>` first)");
           const stamp = `${Date.now().toString(36)}-${randomBytes(3).toString("hex")}`;
           const framesDir = join(runWorkDir, `.rec-${stamp}`);
           mkdirSync(framesDir, { recursive: true });
