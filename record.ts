@@ -81,7 +81,9 @@ export function buildRecordCode(a: RecordArgs): string {
     let b;
     try { b = await page.screenshot({ type: "jpeg", quality: ${a.quality} }); }
     catch (e) { if (!frames.length) throw new Error("record: could not screenshot the tab (" + (e && e.message || e) + ")"); break; }
-    frames.push(Buffer.from(b).toString("base64"));
+    // The sandbox has no Buffer global, but page.screenshot() returns a Buffer whose own
+    // .toString("base64") works without it.
+    frames.push(b.toString("base64"));
     offsets.push(Date.now() - t0);
     const rest = interval - (Date.now() - shotAt);
     if (rest > 0) await page.waitForTimeout(rest);

@@ -1041,8 +1041,12 @@ export async function serve() {
           const a = parseRecordArgs(filteredArgs);
           const { isError, text } = await runCodeOnSession({ socketRoot: tmpSocketRoot(), session: namespacedSession, cwd: runWorkDir, code: buildRecordCode(a), json: true, timeoutMs: (a.seconds + 20) * 1000 });
           if (isError) throw new Error(text.match(/record[^\n]*/)?.[0] ?? text.trim().split("\n")[0] ?? "record: could not capture");
-          let res: RecordResult; try { res = JSON.parse(JSON.parse(text).result ?? text.match(/### Result\n([^\n]*)/)?.[1] ?? "{}"); } catch { throw new Error("record: the daemon returned no frames"); }
-          if (!res.frames?.length) throw new Error("record: no frames were captured (is a tab open and rendering? run `rech open <url>` first)");
+          // The run-code return (a JSON string) is itself JSON-wrapped by the daemon, so it comes back
+          // double-encoded; unwrap up to twice, exactly like readStorageOnSession.
+          let parsed: unknown; try { parsed = JSON.parse(text).result; } catch { parsed = text.match(/### Result\n([^\n]*)/)?.[1]; }
+          for (let i = 0; i < 2 && typeof parsed === "string"; i++) { try { parsed = JSON.parse(parsed); } catch { parsed = undefined; } }
+          const res = parsed as RecordResult | undefined;
+          if (!res?.frames?.length) throw new Error("record: no frames were captured (is a tab open and rendering? run `rech open <url>` first)");
           const stamp = `${Date.now().toString(36)}-${randomBytes(3).toString("hex")}`;
           const framesDir = join(runWorkDir, `.rec-${stamp}`);
           mkdirSync(framesDir, { recursive: true });
