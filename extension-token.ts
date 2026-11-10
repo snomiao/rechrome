@@ -93,18 +93,24 @@ function* logRecords(b: Buffer): Generator<Buffer> {
 function readExtensionTokenFromSqlite(userDataDir: string, profileDir: string, extensionId: string): string | null {
   const path = join(userDataDir, profileDir, "LocalStorage");
   if (!existsSync(path)) return null;
-  let db: Database | undefined;
-  try {
-    // Chrome keeps the file in WAL mode, and a plain read-only open fails (SQLITE_CANTOPEN) once
-    // Chrome has exited and removed the -shm file; `immutable=1` reads the file as-is.
-    db = new Database(`file:${encodeURI(path).replace(/[?#]/g, encodeURIComponent)}?immutable=1`, { readonly: true });
-    const row = db.query(
-      "SELECT e.value AS value, e.value_compression_type AS compression FROM map_entries e JOIN maps m ON m.row_id = e.map_id WHERE m.storage_key = ? AND e.key = ?",
-    ).get(Buffer.from(`chrome-extension://${extensionId}/`, "latin1"), Buffer.from("\x01auth-token", "latin1")) as { value: Uint8Array; compression: number } | null;
-    if (!row || row.compression !== 0) return null;
-    const value = Buffer.from(row.value).toString("latin1");
-    return /^\x01[A-Za-z0-9_-]{43}$/.test(value) ? value.slice(1) : null;
-  } catch { return null; } finally { db?.close(); }
+  const uri = `file:${encodeURI(path).replace(/[?#]/g, encodeURIComponent)}`;
+  // Chrome keeps the file in WAL mode. While Chrome runs, a recent write (a freshly minted token)
+  // can sit in the -wal file only: a plain read-only open sees it, `immutable=1` does not. Once
+  // Chrome has exited and removed the -shm file, a plain read-only open fails (SQLITE_CANTOPEN)
+  // and `immutable=1` reads the checkpointed file as-is. So: read-only first, then immutable.
+  for (const mode of ["?mode=ro", "?immutable=1"]) {
+    let db: Database | undefined;
+    try {
+      db = new Database(uri + mode, { readonly: true });
+      const row = db.query(
+        "SELECT e.value AS value, e.value_compression_type AS compression FROM map_entries e JOIN maps m ON m.row_id = e.map_id WHERE m.storage_key = ? AND e.key = ?",
+      ).get(Buffer.from(`chrome-extension://${extensionId}/`, "latin1"), Buffer.from("\x01auth-token", "latin1")) as { value: Uint8Array; compression: number } | null;
+      if (!row || row.compression !== 0) return null;
+      const value = Buffer.from(row.value).toString("latin1");
+      return /^\x01[A-Za-z0-9_-]{43}$/.test(value) ? value.slice(1) : null;
+    } catch { continue; } finally { db?.close(); }
+  }
+  return null;
 }
 
 export function readExtensionTokenFromProfile(userDataDir: string, profileDir: string, extensionId: string): string | null {
