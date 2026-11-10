@@ -7,7 +7,7 @@ import { file } from "bun";
 import yargs from "yargs";
 import { readExtensionTokenFromProfile } from "./extension-token.ts";
 import { redact } from "./redact.ts";
-import { READ_COOKIE_USAGE, parseReadCookieArgs, readCookieWireArgs, READ_STORAGE_USAGE, parseReadStorageArgs, readStorageWireArgs, READ_SECRET_USAGE, parseReadSecretArgs, readSecretWireArgs, FILL_SECRET_USAGE, SECRET_MASK, parseFillSecretArgs, fillSecretWireArgs, readSecretSource, totpCode, totpWaitMs } from "./fill-secret.ts";
+import { READ_COOKIE_USAGE, parseReadCookieArgs, readCookieWireArgs, READ_STORAGE_USAGE, parseReadStorageArgs, readStorageWireArgs, READ_SECRET_USAGE, parseReadSecretArgs, readSecretWireArgs, READ_HEADERS_USAGE, parseReadHeadersArgs, readHeadersWireArgs, FILL_SECRET_USAGE, SECRET_MASK, parseFillSecretArgs, fillSecretWireArgs, readSecretSource, totpCode, totpWaitMs } from "./fill-secret.ts";
 import { createHash, randomBytes } from "crypto";
 import { mkdirSync, fstatSync, appendFileSync, existsSync, realpathSync, accessSync, cpSync, unlinkSync, readFileSync, readdirSync, renameSync, readlinkSync, rmdirSync, constants as fsConstants } from "fs";
 import { hostname, homedir, networkInterfaces } from "os";
@@ -2263,6 +2263,19 @@ async function run(url: string, args: string[], overrideEnv?: Record<string, str
     console.error(`[rech] read-secret: wrote ${res.secretOut.length} characters to stdout`);
     process.exit(0);
   }
+  if (args[cmdIdx] === "read-headers") {
+    // read-headers writes a JSON evidence file (no bodies, credential header values redacted), so it
+    // goes through the normal file-download path below, not the secretOut pipe. Validate and
+    // normalize the args here for an early error and help text, then fall through.
+    if (args.some(a => a === "--help" || a === "-h")) { console.log(READ_HEADERS_USAGE); process.exit(0); }
+    try {
+      const hwire = readHeadersWireArgs(parseReadHeadersArgs(args.slice(cmdIdx)));
+      args = [...args.filter(a => a.startsWith("-s=")), ...hwire];
+    } catch (err) {
+      console.error(`[rech] ${err instanceof Error ? err.message : String(err)}\n${READ_HEADERS_USAGE}`);
+      process.exit(2);
+    }
+  }
   if (args[cmdIdx] === "fill-secret") {
     if (args.some(a => a === "--help" || a === "-h")) { console.log(FILL_SECRET_USAGE); process.exit(0); }
     try {
@@ -3536,7 +3549,7 @@ async function rotateKey(name: string): Promise<void> {
   console.log(`New key for ${name}; URLs carrying the old key stop working now. Print new ones with: rech share <profile> --listener ${name}`);
 }
 
-async function setListener(name: string, opts: { publicUrl?: string; clearPublicUrl?: boolean; uploads?: boolean; hostUploadDirs?: string[]; noHostUploads?: boolean; readSecrets?: boolean; readCookies?: boolean; keepDownloads?: boolean }): Promise<void> {
+async function setListener(name: string, opts: { publicUrl?: string; clearPublicUrl?: boolean; uploads?: boolean; hostUploadDirs?: string[]; noHostUploads?: boolean; readSecrets?: boolean; readCookies?: boolean; readHeaders?: boolean; keepDownloads?: boolean }): Promise<void> {
   const config = await requireListeners();
   let listener = config.listeners.find(l => l.name === name);
   if (!listener) throw new Error(`Unknown listener "${name}". See rech listener ls.`);
@@ -3562,11 +3575,16 @@ async function setListener(name: string, opts: { publicUrl?: string; clearPublic
     if (listener.profiles === "*") throw new Error(`"${name}" is the local management listener: read-cookie is always available there.`);
     if (opts.readCookies) listener.readCookies = true; else delete listener.readCookies;
   }
+  if (opts.readHeaders !== undefined) {
+    if (listener.profiles === "*") throw new Error(`"${name}" is the local management listener: read-headers is always available there.`);
+    if (opts.readHeaders) listener.readHeaders = true; else delete listener.readHeaders;
+  }
   if (opts.keepDownloads !== undefined) { if (opts.keepDownloads) listener.keepDownloads = true; else delete listener.keepDownloads; }
   await writeListeners(config);
   if (opts.keepDownloads !== undefined) console.log(opts.keepDownloads ? `${name}: browser downloads are also kept on this host (each is logged)` : `${name}: browser downloads go to the client only, then are deleted here`);
   if (opts.readCookies !== undefined) console.log(opts.readCookies ? `${name}: read-cookie on. Anyone with this link can copy any cookie (HttpOnly session cookies included) of any site its profiles are signed in to, which is enough to take over those sessions; --allow-domain only checks the domain the caller names. Each read is logged without the value` : `${name}: read-cookie off`);
   if (opts.readSecrets !== undefined) console.log(opts.readSecrets ? `${name}: read-secret on. Anyone with this link can copy the value of any field (saved passwords included) on any site its profiles have open; --allow-domain only checks the site the caller names. Each read is logged without the value` : `${name}: read-secret off`);
+  if (opts.readHeaders !== undefined) console.log(opts.readHeaders ? `${name}: read-headers on. Anyone with this link can capture response status + headers for any site its profiles reach; credential header values (cookie, authorization, tokens) and URL query values are redacted. Each capture is logged without those values` : `${name}: read-headers off`);
   if (opts.publicUrl !== undefined || opts.clearPublicUrl) console.log(listener.publicUrl ? `${name} is reachable at ${listener.publicUrl}` : `${name}: public URL cleared`);
   if (opts.hostUploadDirs?.length || opts.noHostUploads) {
     const dirs = (listener.uploads || {}).hostDirs;
@@ -4828,6 +4846,9 @@ const HELP_EPILOGUE = `Browser commands (sent to this project's Chrome session):
                      copy a cookie (incl. HttpOnly) into a pipe, never shown or logged
   rech read-storage <local|session> <key> [json-path] --allow-domain <host> [--goto <url>] | <command>
                      copy a localStorage/sessionStorage value into a pipe, never shown or logged
+  rech read-headers --allow-domain <host> [--seconds N] [--goto <url>]
+                     capture response status + headers (no bodies) to a JSON evidence file;
+                     credential header values and URL query values are redacted
   rech record start [--fps <n>] [--quality <1-100>] [--format mp4|webm|mjpeg] [--max-seconds <n>]
   rech record stop [--filename <name>]
                      record the active tab, streamed into ffmpeg on the host, until stop (or
@@ -4976,10 +4997,11 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
         .option("host-upload-dir", { type: "string", array: true, requiresArg: true, describe: "Off by default. Also let links upload files already on this host, from inside this directory (rech upload --host <path>); repeatable" })
         .option("read-secrets", { type: "boolean", describe: "Off by default. Let this listener's links copy any field's value (saved passwords too) or localStorage/sessionStorage value (app tokens) into a pipe (rech read-secret, read-storage): only for links you trust with those accounts. --no-read-secrets turns it off" })
         .option("read-cookies", { type: "boolean", describe: "Off by default. Let this listener's links copy any cookie, HttpOnly session cookies too (rech read-cookie): enough to take over the profiles' signed-in sessions, so only for links you trust with those accounts. --no-read-cookies turns it off" })
+        .option("read-headers", { type: "boolean", describe: "Off by default. Let this listener's links capture response status + headers (no bodies) for an allowed host (rech read-headers); credential header values and URL query values are redacted. --no-read-headers turns it off" })
         .option("keep-downloads", { type: "boolean", describe: "Off by default: browser downloads go to the client, then are deleted here. --keep-downloads also keeps them on this host" })
         .option("host-uploads", { type: "boolean", describe: "--no-host-uploads turns host-path uploads off again" })
-        .check(a => a.publicUrl !== undefined || a.clearPublicUrl || a.uploads !== undefined || a.hostUploadDir?.length || a.hostUploads === false || a.readSecrets !== undefined || a.readCookies !== undefined || a.keepDownloads !== undefined ? true : "Pass --public-url <url>, --clear-public-url, --uploads/--no-uploads, --host-upload-dir/--no-host-uploads, --read-secrets/--read-cookies, or --keep-downloads"),
-        a => handlers.setListener(a.name, { publicUrl: a.publicUrl, clearPublicUrl: a.clearPublicUrl, ...(a.uploads !== undefined ? { uploads: a.uploads } : {}), ...(a.hostUploadDir?.length ? { hostUploadDirs: a.hostUploadDir as string[] } : {}), ...(a.hostUploads === false ? { noHostUploads: true } : {}), ...(a.readSecrets !== undefined ? { readSecrets: a.readSecrets } : {}), ...(a.readCookies !== undefined ? { readCookies: a.readCookies } : {}), ...(a.keepDownloads !== undefined ? { keepDownloads: a.keepDownloads } : {}) }))
+        .check(a => a.publicUrl !== undefined || a.clearPublicUrl || a.uploads !== undefined || a.hostUploadDir?.length || a.hostUploads === false || a.readSecrets !== undefined || a.readCookies !== undefined || a.readHeaders !== undefined || a.keepDownloads !== undefined ? true : "Pass --public-url <url>, --clear-public-url, --uploads/--no-uploads, --host-upload-dir/--no-host-uploads, --read-secrets/--read-cookies/--read-headers, or --keep-downloads"),
+        a => handlers.setListener(a.name, { publicUrl: a.publicUrl, clearPublicUrl: a.clearPublicUrl, ...(a.uploads !== undefined ? { uploads: a.uploads } : {}), ...(a.hostUploadDir?.length ? { hostUploadDirs: a.hostUploadDir as string[] } : {}), ...(a.hostUploads === false ? { noHostUploads: true } : {}), ...(a.readSecrets !== undefined ? { readSecrets: a.readSecrets } : {}), ...(a.readCookies !== undefined ? { readCookies: a.readCookies } : {}), ...(a.readHeaders !== undefined ? { readHeaders: a.readHeaders } : {}), ...(a.keepDownloads !== undefined ? { keepDownloads: a.keepDownloads } : {}) }))
       .command("port [name]", "Print a listener's port (for a proxy command)", y => y.positional("name", { type: "string" }),
         a => handlers.listenerPort(a.name))
       .command("rotate-key <name>", "Give a listener a new key (old URLs stop working)", y => y.positional("name", { type: "string", demandOption: true }),

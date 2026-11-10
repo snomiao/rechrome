@@ -16,6 +16,7 @@ import { connect } from "net";
 import { readdirSync, readFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
+import { redact } from "./redact.ts";
 
 export const SECRET_MASK = "***";
 export const SECRET_MASK_TTL_MS = 15 * 60_000;
@@ -475,7 +476,7 @@ export const READ_STORAGE_USAGE = `Usage: rech read-storage <local|session> <key
                         so the value is read from it, e.g. --goto https://app.slack.com/client/T0`;
 
 /** --goto must be http(s) on an --allow-domain host (checked by the client and again by serve). */
-function checkGotoUrl(gotoUrl: string, allowDomains: string[]): void {
+export function checkGotoUrl(gotoUrl: string, allowDomains: string[]): void {
   let u: URL;
   try { u = new URL(gotoUrl); } catch { throw new Error("--goto must be an http(s) URL"); }
   if (!/^https?:$/.test(u.protocol)) throw new Error("--goto must be an http(s) URL");
@@ -694,6 +695,206 @@ export async function readCookieOnSession(opts: { socketRoot: string; session: s
   for (let i = 0; i < 2 && typeof out === "string"; i++) { try { out = JSON.parse(out); } catch { out = undefined; } }
   if (!out || typeof out.domain !== "string" || typeof out.value !== "string") throw new Error("read-cookie: the browser returned no value");
   return out;
+}
+
+// ---------- read-headers: response status + headers (no bodies) to an evidence file ----------
+//
+// Captures the status code and response headers of every request on an --allow-domain host over a
+// capture window, with an optional --goto that navigates the attached tab first. Headers are not
+// secrets in general, but some carry credentials, so their VALUES are redacted (the name is kept), as
+// are URL query values, fragments and userinfo; the file then goes through the secret scanner.
+// Unlike read-secret/read-storage/read-cookie this writes a JSON evidence FILE (an array of
+// {url, status, headers}) to the run's output dir and returns its path; nothing is piped. On a
+// profile-scoped listener it is refused unless the host turned it on (listener.readHeaders).
+
+/** Header names whose VALUES carry credentials: keep the name, replace the value. */
+export const REDACTED_HEADERS = [
+  "set-cookie", "cookie", "authorization", "proxy-authorization", "www-authenticate", "proxy-authenticate",
+  "x-api-key", "x-csrf-token", "x-xsrf-token",
+];
+/** …and any header named like one: `*-token`, `*-secret`, `*-api-key` (also with `_`). */
+export const REDACTED_HEADER_PATTERN = "[-_](?:token|secret|api[-_]?key)$";
+/** Headers whose value is a URL: its query values, fragment and userinfo are redacted. */
+export const URL_HEADERS = ["location", "content-location"];
+export const HEADER_REDACTION = "<redacted>";
+export const READ_HEADERS_DEFAULT_SECONDS = 5;
+// The whole capture (a --goto included) runs inside one /run, and the client gives up at 70 s.
+export const READ_HEADERS_MAX_SECONDS = 50;
+
+export const READ_HEADERS_USAGE = `Usage: rech read-headers --allow-domain <host> [--allow-domain <host>]... [--seconds N] [--goto <url>]
+  Captures the status code and response headers (NO bodies) of every request on an --allow-domain
+  host over a capture window, and writes them as a JSON evidence file in the output dir (an array of
+  {url, status, headers}). Credential header values (cookie, set-cookie, authorization,
+  *-authenticate, x-api-key, *-token, *-secret, ...) are redacted, as are URL query values,
+  fragments and userinfo; then the file goes through the secret scanner.
+  --allow-domain GLOB   required: capture only responses whose host matches, e.g. app.example.com
+  --seconds N           capture window in seconds (default ${READ_HEADERS_DEFAULT_SECONDS}, max ${READ_HEADERS_MAX_SECONDS})
+  --goto URL            first navigate the attached tab to URL (host must match --allow-domain),
+                        then capture, so a page load's requests are captured (within the window)`;
+
+/** The host of a URL string, lowercased, without userinfo or port ("" when it has none). */
+export function hostFromUrl(u: string): string {
+  const m = /^[a-z][a-z0-9+.-]*:\/\/([^/?#]+)/i.exec(String(u || ""));
+  return m ? m[1]!.replace(/^[^@]*@/, "").replace(/:\d+$/, "").toLowerCase() : "";
+}
+
+export type CapturedResponse = { url: string; status: number; headers: Record<string, string> };
+
+/**
+ * One captured response with its credentials taken out: credential header values, and in the URL
+ * and URL-valued headers the query values, fragment and userinfo. Self-contained (only its
+ * arguments and builtins), because the browser runs it too via toString(), so raw values never
+ * leave the browser; serve runs it again on what comes back.
+ */
+export function redactResponse(e: { url?: unknown; status?: unknown; headers?: unknown }, names: readonly string[], pattern: string, urlHeaders: readonly string[], mask: string): CapturedResponse {
+  const maskUrl = (u: string): string => {
+    u = u.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/?#]*@/i, `$1${mask}@`);
+    const hash = u.indexOf("#");
+    const frag = hash >= 0 ? `#${mask}` : "";
+    if (hash >= 0) u = u.slice(0, hash);
+    const q = u.indexOf("?");
+    if (q < 0) return u + frag;
+    const query = u.slice(q + 1).split("&").map(p => (p.includes("=") ? `${p.slice(0, p.indexOf("="))}=${mask}` : p ? mask : p)).join("&");
+    return `${u.slice(0, q)}?${query}${frag}`;
+  };
+  const credential = new RegExp(pattern, "i");
+  const raw = e.headers && typeof e.headers === "object" ? (e.headers as Record<string, unknown>) : {};
+  const headers: Record<string, string> = {};
+  for (const k of Object.keys(raw)) {
+    const n = k.toLowerCase();
+    headers[k] = names.includes(n) || credential.test(n) ? mask : urlHeaders.includes(n) ? maskUrl(String(raw[k])) : String(raw[k]);
+  }
+  const status = Number(e.status);
+  return { url: maskUrl(String(e.url ?? "")), status: Number.isFinite(status) ? status : 0, headers };
+}
+
+/**
+ * The evidence file's text: the (already redacted) responses, then anything `mask` knows (filled
+ * passwords, TOTPs) and anything the secret scanner recognizes, e.g. a token in an unusual header.
+ */
+export function readHeadersEvidence(captured: CapturedResponse[], mask: (text: string) => string): string {
+  return redact(mask(JSON.stringify(captured.map(redactCaptured), null, 2))).text + "\n";
+}
+
+/** redactResponse with this module's lists. */
+export function redactCaptured(e: { url?: unknown; status?: unknown; headers?: unknown }): CapturedResponse {
+  return redactResponse(e, REDACTED_HEADERS, REDACTED_HEADER_PATTERN, URL_HEADERS, HEADER_REDACTION);
+}
+
+/** Keep every header name; replace the value of a credential-bearing header with <redacted>. */
+export function redactHeaders(headers: Record<string, unknown>): Record<string, string> {
+  return redactCaptured({ headers }).headers;
+}
+
+function validateSeconds(seconds: number): number {
+  if (!Number.isInteger(seconds) || seconds < 1 || seconds > READ_HEADERS_MAX_SECONDS)
+    throw new Error(`read-headers: --seconds must be an integer between 1 and ${READ_HEADERS_MAX_SECONDS}`);
+  return seconds;
+}
+
+
+export function parseReadHeadersArgs(args: string[]): { allowDomains: string[]; seconds: number; gotoUrl?: string } {
+  const [cmd, ...rest] = args;
+  if (cmd !== "read-headers") throw new Error("Expected read-headers");
+  const allowDomains: string[] = [];
+  let seconds = READ_HEADERS_DEFAULT_SECONDS;
+  let gotoUrl: string | undefined;
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i]!;
+    if (a === "--allow-domain" || a.startsWith("--allow-domain=")) {
+      const v = a === "--allow-domain" ? rest[++i] : a.slice("--allow-domain=".length);
+      if (!v) throw new Error("--allow-domain got an empty host");
+      for (const d of v.split(",")) { domainGlobToRegExp(d.trim()); allowDomains.push(d.trim()); }
+    } else if (a === "--seconds" || a.startsWith("--seconds=")) {
+      const v = a === "--seconds" ? rest[++i] : a.slice("--seconds=".length);
+      if (!v) throw new Error("--seconds needs a value");
+      seconds = validateSeconds(Number(v));
+    } else if (a === "--goto" || a.startsWith("--goto=")) {
+      gotoUrl = a === "--goto" ? rest[++i] : a.slice("--goto=".length);
+      if (!gotoUrl) throw new Error("--goto got an empty URL");
+    } else if (a.startsWith("-")) throw new Error(`read-headers: unknown option ${a}`);
+    else throw new Error(`read-headers: unexpected argument ${a}`);
+  }
+  if (!allowDomains.length) throw new Error("read-headers needs --allow-domain: name the host to capture responses from");
+  if (gotoUrl) checkGotoUrl(gotoUrl, allowDomains);
+  return { allowDomains, seconds, gotoUrl };
+}
+
+export function readHeadersWireArgs(req: { allowDomains: string[]; seconds: number; gotoUrl?: string }): string[] {
+  return ["read-headers", ...req.allowDomains.map(d => `--allow-domain=${d}`), `--seconds=${req.seconds}`, ...(req.gotoUrl ? [`--goto=${req.gotoUrl}`] : [])];
+}
+
+/** Parse what the daemon received; exactly the shape readHeadersWireArgs sends. */
+export function parseReadHeadersWire(args: string[]): { allowDomains: string[]; seconds: number; gotoUrl?: string } {
+  const [cmd, ...rest] = args;
+  if (cmd !== "read-headers") throw new Error("read-headers expected");
+  const allowDomains: string[] = [];
+  let seconds = READ_HEADERS_DEFAULT_SECONDS;
+  let gotoUrl: string | undefined;
+  for (const a of rest) {
+    if (a.startsWith("--allow-domain=")) { const d = a.slice("--allow-domain=".length); domainGlobToRegExp(d); allowDomains.push(d); }
+    else if (a.startsWith("--seconds=")) { seconds = validateSeconds(Number(a.slice("--seconds=".length))); }
+    else if (a.startsWith("--goto=")) { gotoUrl = a.slice("--goto=".length); }
+    else throw new Error(`read-headers: unexpected argument ${a.startsWith("-") ? a : "(positional)"}`);
+  }
+  if (!allowDomains.length) throw new Error("read-headers needs --allow-domain");
+  if (gotoUrl) checkGotoUrl(gotoUrl, allowDomains);
+  return { allowDomains, seconds, gotoUrl };
+}
+
+/**
+ * run-code that captures responses on the attached page, optionally navigates to gotoUrl first, waits
+ * the window, and returns {host, count, captured} JSON. Only responses whose host matches an
+ * --allow-domain glob are kept, and credential-bearing header values are redacted IN the browser so
+ * their raw values never leave it. Uses page.on("response") (Playwright's view of the CDP Network
+ * domain), so it works over the extension bridge the same way read-cookie's run-code does.
+ */
+export function buildReadHeadersCode(allowDomains: string[], seconds: number, gotoUrl?: string): string {
+  const patterns = allowDomains.map(d => domainGlobToRegExp(d).source);
+  return `async page => {
+  const allowed = ${JSON.stringify(patterns)};
+  const redact = ${redactResponse.toString()};
+  const hostOf = (u) => { const m = /^[a-z][a-z0-9+.-]*:\\/\\/([^/?#]+)/i.exec(String(u || "")); return m ? m[1].replace(/^[^@]*@/, "").replace(/:\\d+$/, "").toLowerCase() : ""; };
+  const ok = (h) => h && allowed.some(p => new RegExp(p, "i").test(h));
+  const captured = [];
+  const onResponse = async (response) => {
+    try {
+      const url = String(response.url());
+      const host = hostOf(url);
+      if (!ok(host)) return;
+      let headers = {};
+      try { headers = await response.allHeaders(); } catch { try { headers = response.headers(); } catch { headers = {}; } }
+      captured.push(redact({ url, status: response.status(), headers }, ${JSON.stringify(REDACTED_HEADERS)}, ${JSON.stringify(REDACTED_HEADER_PATTERN)}, ${JSON.stringify(URL_HEADERS)}, ${JSON.stringify(HEADER_REDACTION)}));
+    } catch {}
+  };
+  page.on("response", onResponse);
+  // The window includes the --goto: the whole capture fits in the one request.
+  const endAt = Date.now() + ${seconds} * 1000;
+  try {
+    ${gotoUrl ? `try { await page.goto(${JSON.stringify(gotoUrl)}, { waitUntil: "load", timeout: ${seconds * 1000} }); } catch {}` : ""}
+    await page.waitForTimeout(Math.max(0, endAt - Date.now()));
+  } finally {
+    try { page.off("response", onResponse); } catch {}
+  }
+  return JSON.stringify({ host: ${JSON.stringify(allowDomains[0] ?? "")}, count: captured.length, captured });
+}`;
+}
+
+/**
+ * Capture response status + headers on the session's live browser over the window. Returns the
+ * captured array (re-redacted daemon-side as defence in depth); the caller writes the evidence file.
+ */
+export async function readHeadersOnSession(opts: { socketRoot: string; session: string; cwd: string; allowDomains: string[]; seconds: number; gotoUrl?: string }): Promise<{ host: string; captured: CapturedResponse[] }> {
+  const timeoutMs = opts.seconds * 1000 + 15_000;
+  const { isError, text } = await runCodeOnSession({ socketRoot: opts.socketRoot, session: opts.session, cwd: opts.cwd, code: buildReadHeadersCode(opts.allowDomains, opts.seconds, opts.gotoUrl), json: true, timeoutMs });
+  if (isError) throw new Error(text.match(/read-headers(?: refused)?: [^\n]*/)?.[0] ?? (/no browser is open|could not reach/.test(text) ? text.trim().split("\n")[0]! : "read-headers: could not capture responses"));
+  let raw: unknown;
+  try { raw = JSON.parse(text).result; } catch { raw = text.match(/### Result\n([^\n]*)/)?.[1]; }
+  let out: any = raw;
+  for (let i = 0; i < 2 && typeof out === "string"; i++) { try { out = JSON.parse(out); } catch { out = undefined; } }
+  if (!out || !Array.isArray(out.captured)) throw new Error("read-headers: the browser returned no capture");
+  const captured = out.captured.map((e: any) => redactCaptured(e && typeof e === "object" ? e : {}));
+  return { host: typeof out.host === "string" ? out.host : (opts.allowDomains[0] ?? ""), captured };
 }
 
 // ---------- password fields in snapshots ----------
