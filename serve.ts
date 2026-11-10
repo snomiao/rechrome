@@ -25,7 +25,7 @@ import {
   chromeDataAccessHint,
 } from "./rechrome.ts";
 import { SecretMasker, runCodeOnSession, parseReadCookieWire, readCookieOnSession, parseReadStorageWire, readStorageOnSession, parseReadSecretWire, readSecretOnSession, parseReadHeadersWire, readHeadersOnSession, readHeadersEvidence, parseFillSecretWire, fillSecretOnSession, passwordValuesOnSession, hasSnapshot, maskPasswordLines, withholdSnapshots } from "./fill-secret.ts";
-import { parseRecordArgs, buildCaptureChunkCode, resolveFfmpeg, resolveFormat, recordSink, Recording, freeName, RECORD_CHUNK_MS, RECORD_MAX_SECONDS, type CaptureChunk, type RecordingSummary } from "./record.ts";
+import { parseRecordArgs, buildCaptureChunkCode, resolveFfmpeg, resolveFormat, recordSink, Recording, freeName, withFormatExt, RECORD_CHUNK_MS, RECORD_MAX_SECONDS, type CaptureChunk, type RecordingSummary } from "./record.ts";
 
 const TAILSCALE_BIN = process.env.TAILSCALE_BIN || "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
 const CERT_RENEW_THRESHOLD_DAYS = 7;
@@ -123,7 +123,9 @@ function deliverRecording(entry: RecordingEntry, s: RecordingSummary, filename: 
   }
   if (s.encodeError) { try { unlinkSync(s.out); } catch {} throw new Error(s.encodeError); }
   // Never over an existing file: `--filename clip.mp4` twice keeps both (clip.mp4, clip-2.mp4).
-  const out = filename ? join(entry.dir, freeName(filename, n => existsSync(join(entry.dir, n)))) : s.out.replace(/\/\.(recording-[^/]+)\.part$/, "/$1");
+  // The name says what the file is: no ffmpeg on the host means mjpeg, whatever --filename asked for.
+  const wanted = filename ? withFormatExt(filename, s.format) : undefined;
+  const out = wanted ? join(entry.dir, freeName(wanted, n => existsSync(join(entry.dir, n)))) : s.out.replace(/\/\.(recording-[^/]+)\.part$/, "/$1");
   if (out !== s.out) renameSync(s.out, out);
   log(`record: ${JSON.stringify({ listener: entry.listener, name: relative(entry.dir, out), frames: s.frames, captured: s.captured, fps: s.fps, format: s.format, size: statSync(out).size, kept: entry.keep, ...(s.error ? { ended: s.error.split("\n")[0] } : {}) })}`);
   if (!entry.keep) {
@@ -131,7 +133,8 @@ function deliverRecording(entry: RecordingEntry, s: RecordingSummary, filename: 
     clearTimeout(pendingDownloads.get(real));
     pendingDownloads.set(real, setTimeout(() => { pendingDownloads.delete(real); try { unlinkSync(real); } catch {} }, DOWNLOAD_PICKUP_MS));
   }
-  const note = s.error ? ` — capture ended early: ${s.error.split("\n")[0]}` : "";
+  const note = (filename && wanted !== filename ? ` — saved as ${s.format}, not ${filename}${s.format === "mjpeg" ? " (no ffmpeg on the host)" : ""}` : "")
+    + (s.error ? ` — capture ended early: ${s.error.split("\n")[0]}` : "");
   return { stdout: `record: saved ${relative(entry.dir, out)} (${s.format}, ${s.seconds.toFixed(1)} s at ${s.fps} fps, ${s.captured} screenshots)${note}\n`, files: [(entry.outputPrefix + relative(entry.dir, out)).replaceAll("\\", "/")] };
 }
 // playwright-cli's line for a finished download (tools/backend/response.ts).
