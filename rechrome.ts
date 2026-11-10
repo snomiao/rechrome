@@ -17,7 +17,7 @@ import { createRequire } from "node:module";
 import { spawn as cpSpawn } from "child_process";
 import { readFile, writeFile, rename, chmod, mkdir, stat } from "node:fs/promises";
 import { isDeprecatedPm2Fallback, listsProcess, oxmgrInstallCommand, pickDaemonManager, PM2_DEPRECATION, type DaemonManager } from "./daemon-manager.ts";
-import { DEFAULT_SIGNAL, WEBRTC, createShare, normalizeSignal, findDevice, findShare, inviteLink, inviteProblem, parseDuration, readShares, updateShares, type Share } from "./shares.ts";
+import { DEFAULT_SIGNAL, WEBRTC, createShare, normalizeSignal, findDevice, findShare, inviteLink, inviteProblem, parseDuration, REUSABLE_DEFAULT_TTL, REUSABLE_MAX_DEVICES, readShares, updateShares, type Share } from "./shares.ts";
 import { bearerOf, looksLikeToken, newToken, parseToken, redactSecrets } from "./secret.ts";
 import { WebrtcClient, loadRTC, runBridge, spawnBridge } from "./webrtc.ts";
 import { startSignalRelay } from "./signal-relay.ts";
@@ -4349,7 +4349,10 @@ async function shareLinks(share: Share): Promise<{ via: string; link: string; si
 function printInvite(share: Share, links: { via: string; link: string; signal?: string }[]): void {
   const expiry = share.inviteExpiresAt ? `unused, it expires ${fmtDate(share.inviteExpiresAt)}` : "it never expires unused";
   console.log(`Share "${share.label}": ${share.profiles.join(", ")}`);
-  console.log(`Invite for ${share.maxDevices === 1 ? "one device" : `${share.maxDevices} devices`} (${expiry}; secret: send it privately):\n`);
+  if (share.reusable) {
+    const until = share.inviteExpiresAt ? `until ${fmtDate(share.inviteExpiresAt)}` : "with no expiry";
+    console.log(`Reusable invite: up to ${share.maxDevices} devices may redeem it ${until}, each getting its own credential (secret: anyone with it can join; kill it with rech share rotate ${share.label}):\n`);
+  } else console.log(`Invite for ${share.maxDevices === 1 ? "one device" : `${share.maxDevices} devices`} (${expiry}; secret: send it privately):\n`);
   const width = Math.max(...links.map(l => l.via.length));
   for (const { via, link } of links) console.log(`  ${links.length > 1 ? `${via.padEnd(width)}  ` : ""}${link}`);
   if (links.some(l => l.signal === DEFAULT_SIGNAL)) {
@@ -4361,7 +4364,7 @@ function printInvite(share: Share, links: { via: string; link: string; signal?: 
   console.log(`Share expires: ${fmtDay(share.expiresAt)}${share.expiresAt ? ` (renew: rech share renew ${share.label})` : ""}`);
 }
 
-export type ShareNewOptions = { name?: string; via?: string[]; webrtc?: string[]; lan?: boolean; tailscale?: boolean; signal?: string; expires?: string; inviteTtl?: string; devices?: number; approve?: boolean };
+export type ShareNewOptions = { name?: string; via?: string[]; webrtc?: string[]; lan?: boolean; tailscale?: boolean; signal?: string; expires?: string; inviteTtl?: string; devices?: number; approve?: boolean; reusable?: boolean };
 
 /**
  * The transports named on the command line, in order: --via entries (comma-separated), then
@@ -4417,8 +4420,8 @@ async function shareNew(selectors: string[], opts: ShareNewOptions): Promise<voi
   const share = await updateShares(config => createShare(config, {
     label, profiles, via,
     expiresAt: expiresMs ? Date.now() + expiresMs : undefined,
-    inviteTtlMs: parseDuration(opts.inviteTtl ?? "24h"),
-    maxDevices: opts.devices ?? 1, approve: opts.approve,
+    inviteTtlMs: parseDuration(opts.inviteTtl ?? (opts.reusable ? REUSABLE_DEFAULT_TTL : "24h")),
+    maxDevices: opts.devices ?? (opts.reusable ? REUSABLE_MAX_DEVICES : 1), approve: opts.approve, reusable: opts.reusable,
   }));
   // The daemon answers WebRTC peers with node-datachannel: install it now, not on the first peer.
   if (rtc.length) await loadRTC().catch(error => console.error(`[rech] warning: ${error instanceof Error ? error.message : error}`));
@@ -4429,12 +4432,15 @@ async function shareList(): Promise<void> {
   const { shares } = await readShares();
   if (shares.length) {
     const now = Date.now();
-    const rows = [["SHARE", "PROFILES", "VIA", "DEVICES", "EXPIRES", "STATUS"]];
+    const rows = [["SHARE", "PROFILES", "VIA", "DEVICES", "EXPIRES", "INVITE", "STATUS"]];
     for (const s of shares) {
       const pending = s.devices.filter(d => !d.approved).length;
       const status = s.revokedAt ? "revoked" : s.expiresAt && now >= s.expiresAt ? "expired"
         : inviteProblem(s, now) ? (pending ? `${pending} waiting for approval` : "active") : `invite open${pending ? `, ${pending} waiting` : ""}`;
-      rows.push([s.label, s.profiles.join(", "), s.via.join(", "), `${s.devices.length}/${s.maxDevices}`, fmtDay(s.expiresAt), status]);
+      const invite = s.reusable
+        ? `reusable, ${s.redeemed ?? 0} redeemed, ${s.inviteExpiresAt && now >= s.inviteExpiresAt ? "expired" : `until ${s.inviteExpiresAt ? fmtDate(s.inviteExpiresAt) : "never"}`}`
+        : "single-use";
+      rows.push([s.label, s.profiles.join(", "), s.via.join(", "), `${s.devices.length}/${s.maxDevices}`, fmtDay(s.expiresAt), invite, status]);
     }
     printTable(rows);
     console.log(`\nDevices: rech share devices <share> · invite link again: rech share rotate <share> · stop: rech share revoke <share>\n`);
@@ -4481,7 +4487,8 @@ async function shareEdit(action: string, name: string, args: string[], opts: { e
       const s = findShare(config, name);
       s.invite = newToken();
       s.inviteExpiresAt = s.inviteTtlMs ? Date.now() + s.inviteTtlMs : undefined;
-      if (s.devices.length >= s.maxDevices) s.maxDevices = s.devices.length + 1;
+      if (!s.reusable && s.devices.length >= s.maxDevices) s.maxDevices = s.devices.length + 1;
+      if (s.reusable) s.redeemed = 0;
       return s;
     });
     console.log("New invite; the previous invite link no longer works (devices already connected keep working).\n");
@@ -4868,7 +4875,8 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
       .option("webrtc", { type: "string", describe: `Share over WebRTC: bare = ${DEFAULT_RTC} (${DEFAULT_SIGNAL}, best effort); --webrtc=<signal-url> = that server's listener (made if needed); repeatable` })
       .option("signal", { type: "string", requiresArg: true, describe: `Signal server for a bare --webrtc / --via webrtc (else RECH_SIGNAL, else ${DEFAULT_SIGNAL})` })
       .option("expires", { type: "string", requiresArg: true, describe: "With new/renew: 30d, 2w, 24h, never (new default: 30d over webrtc, else never)" })
-      .option("invite-ttl", { type: "string", requiresArg: true, describe: "With new: an unused invite stops working after this (default 24h)" })
+      .option("invite-ttl", { type: "string", requiresArg: true, alias: "ttl", describe: "With new: the invite stops working after this (default 24h; 7d with --reusable)" })
+      .option("reusable", { type: "boolean", describe: "With new: many devices may redeem the same invite link (each gets its own credential) until --ttl or rech share rotate" })
       .option("devices", { type: "number", requiresArg: true, describe: "With new: how many devices may redeem the invite (default 1)" })
       .option("approve", { type: "boolean", describe: "With new: each new device waits for `rech share approve`" })
       .option("rm", { type: "string", requiresArg: true, describe: "With devices: remove this device" })
@@ -4881,7 +4889,7 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
         const [action, target, ...rest] = profiles;
         const webrtc = a.webrtc === undefined ? undefined : ([a.webrtc].flat() as string[]).map(String);
         const transport = { via: a.via as string[] | undefined, webrtc, lan: a.lan, tailscale: a.tailscale, signal: a.signal };
-        const newOpts = { name: a.name, ...transport, expires: a.expires, inviteTtl: a.inviteTtl, devices: a.devices, approve: a.approve };
+        const newOpts = { name: a.name, ...transport, expires: a.expires, inviteTtl: a.inviteTtl, devices: a.devices, approve: a.approve, reusable: a.reusable };
         if (action === "new") return handlers.shareNew(profiles.slice(1), newOpts);
         // Transport flags make a share (an invite link) for the named profiles.
         if (transportTokens(transport).length && !(action && SHARE_ACTIONS.has(action)) && !(profiles.length === 1 && ["ls", "list"].includes(profiles[0]))) {

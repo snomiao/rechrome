@@ -31,6 +31,8 @@ export type Share = {
   expiresAt?: number;
   maxDevices: number;
   approve: boolean;          // each new device waits for `rech share approve`
+  reusable?: boolean;        // the invite is not used up by one device: many redeem it (up to maxDevices) until it expires or is rotated
+  redeemed?: number;         // how many times the invite was redeemed (devices removed since still count)
   devices: Device[];
   revokedAt?: number;
 };
@@ -112,8 +114,13 @@ export function findShare(config: ShareConfig, name: string): Share {
 
 export type NewShareOptions = {
   label: string; profiles: string[]; via: string[]; signal?: string;
-  expiresAt?: number; inviteTtlMs?: number; maxDevices?: number; approve?: boolean; now?: number;
+  expiresAt?: number; inviteTtlMs?: number; maxDevices?: number; approve?: boolean; reusable?: boolean; now?: number;
 };
+
+/** Device cap of a reusable invite when --devices isn't given: bounds what a leaked link can enroll. */
+export const REUSABLE_MAX_DEVICES = 100;
+/** Invite lifetime of a reusable invite when --ttl isn't given. */
+export const REUSABLE_DEFAULT_TTL = "7d";
 
 export function createShare(config: ShareConfig, opts: NewShareOptions): Share {
   const now = opts.now ?? Date.now();
@@ -134,10 +141,11 @@ export function createShare(config: ShareConfig, opts: NewShareOptions): Share {
     signal: opts.via.includes(WEBRTC) ? normalizeSignal(opts.signal ?? DEFAULT_SIGNAL) : undefined,
     createdAt: now,
     expiresAt: opts.expiresAt,
-    maxDevices: opts.maxDevices ?? 1,
+    maxDevices: opts.maxDevices ?? (opts.reusable ? REUSABLE_MAX_DEVICES : 1),
     approve: !!opts.approve,
     devices: [],
   };
+  if (opts.reusable) { share.reusable = true; share.redeemed = 0; }
   config.shares.push(share);
   return share;
 }
@@ -190,7 +198,11 @@ export function shareProblem(share: Share, now = Date.now()): string | null {
 
 /** Why an unused invite can't be redeemed right now, or null. */
 export function inviteProblem(share: Share, now = Date.now()): string | null {
-  if (share.inviteExpiresAt && now >= share.inviteExpiresAt) return `This invite expired unused. Ask the host for a fresh one: rech share rotate ${share.label}`;
+  if (share.inviteExpiresAt && now >= share.inviteExpiresAt) return `This invite expired${share.reusable ? "" : " unused"}. Ask the host for a fresh one: rech share rotate ${share.label}`;
+  if (share.reusable) {
+    if (share.devices.length >= share.maxDevices) return `This reusable invite reached its limit of ${share.maxDevices} devices. Ask the host to remove unused devices (rech share devices ${share.label} --rm <id>) or to rotate it.`;
+    return null;
+  }
   if (share.devices.length >= share.maxDevices) return `This invite was already used${share.maxDevices > 1 ? ` by ${share.maxDevices} devices` : ""}. Ask the host for a fresh one (rech share rotate ${share.label}); if you didn't use it, tell them, since someone else did.`;
   return null;
 }
@@ -228,6 +240,7 @@ export function redeemInvite(config: ShareConfig, shareId: string, name: string,
     token, addedAt: now, approved: !share.approve,
   };
   share.devices.push(device);
+  if (share.reusable) share.redeemed = (share.redeemed ?? 0) + 1;
   return device;
 }
 

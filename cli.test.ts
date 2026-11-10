@@ -74,9 +74,9 @@ test("share prints, saves, or lists connection URLs; connect takes a shared URL"
 
 test("share new/devices/approve/allow/deny/rotate/renew/revoke/rm route to share handlers", async () => {
   expect(await run(["share", "new", "a@x.com", "Profile 5", "--name", "alice", "--via", "webrtc", "--via", "lan", "--expires", "7d", "--devices", "2", "--approve", "--invite-ttl", "1h"]))
-    .toEqual([["shareNew", ["a@x.com", "Profile 5"], { name: "alice", via: ["webrtc", "lan"], signal: undefined, expires: "7d", inviteTtl: "1h", devices: 2, approve: true }]]);
+    .toEqual([["shareNew", ["a@x.com", "Profile 5"], { name: "alice", via: ["webrtc", "lan"], signal: undefined, expires: "7d", inviteTtl: "1h", devices: 2, approve: true, reusable: undefined }]]);
   expect(await run(["share", "new", "qa", "--signal", "https://sig.example/"]))
-    .toEqual([["shareNew", ["qa"], { name: undefined, via: undefined, signal: "https://sig.example/", expires: undefined, inviteTtl: undefined, devices: undefined, approve: undefined }]]);
+    .toEqual([["shareNew", ["qa"], { name: undefined, via: undefined, signal: "https://sig.example/", expires: undefined, inviteTtl: undefined, devices: undefined, approve: undefined, reusable: undefined }]]);
   expect(await run(["share", "devices", "alice"])).toEqual([["shareDevices", "alice", undefined]]);
   expect(await run(["share", "devices", "alice", "--rm", "abc"])).toEqual([["shareDevices", "alice", "abc"]]);
   expect(await run(["share", "approve", "alice"])).toEqual([["shareEdit", "approve", "alice", [], { expires: undefined }]]);
