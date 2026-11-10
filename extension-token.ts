@@ -1,4 +1,5 @@
-import { readFileSync, readdirSync } from "fs";
+import { Database } from "bun:sqlite";
+import { existsSync, readFileSync, readdirSync } from "fs";
 import { join } from "path";
 
 function varint(b: Buffer, cursor: { p: number }): number {
@@ -87,7 +88,30 @@ function* logRecords(b: Buffer): Generator<Buffer> {
 // Read files without opening the database or taking Chrome's LevelDB lock. Internal
 // sequence numbers, not filenames/byte order, determine the latest value. Decode
 // SST prefix compression and Snappy, and scope the key to the exact extension origin.
+// Chromium 156+ keeps localStorage in a SQLite file `<profile>/LocalStorage` (maps + map_entries)
+// instead of `Local Storage/leveldb`; keys and values keep the same 0x01-prefixed Latin-1 encoding.
+function readExtensionTokenFromSqlite(userDataDir: string, profileDir: string, extensionId: string): string | null {
+  const path = join(userDataDir, profileDir, "LocalStorage");
+  if (!existsSync(path)) return null;
+  let db: Database | undefined;
+  try {
+    // Chrome keeps the file in WAL mode, and a plain read-only open fails (SQLITE_CANTOPEN) once
+    // Chrome has exited and removed the -shm file; `immutable=1` reads the file as-is.
+    db = new Database(`file:${encodeURI(path).replace(/[?#]/g, encodeURIComponent)}?immutable=1`, { readonly: true });
+    const row = db.query(
+      "SELECT e.value AS value, e.value_compression_type AS compression FROM map_entries e JOIN maps m ON m.row_id = e.map_id WHERE m.storage_key = ? AND e.key = ?",
+    ).get(Buffer.from(`chrome-extension://${extensionId}/`, "latin1"), Buffer.from("\x01auth-token", "latin1")) as { value: Uint8Array; compression: number } | null;
+    if (!row || row.compression !== 0) return null;
+    const value = Buffer.from(row.value).toString("latin1");
+    return /^\x01[A-Za-z0-9_-]{43}$/.test(value) ? value.slice(1) : null;
+  } catch { return null; } finally { db?.close(); }
+}
+
 export function readExtensionTokenFromProfile(userDataDir: string, profileDir: string, extensionId: string): string | null {
+  return readExtensionTokenFromSqlite(userDataDir, profileDir, extensionId) ?? readExtensionTokenFromLeveldb(userDataDir, profileDir, extensionId);
+}
+
+function readExtensionTokenFromLeveldb(userDataDir: string, profileDir: string, extensionId: string): string | null {
   const dir = join(userDataDir, profileDir, "Local Storage", "leveldb");
   const wanted = Buffer.from(`_chrome-extension://${extensionId}\0\x01auth-token`, "latin1");
   let newest = -1n, token: string | null = null;
