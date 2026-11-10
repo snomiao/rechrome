@@ -2333,7 +2333,12 @@ async function run(url: string, args: string[], overrideEnv?: Record<string, str
     }
     process.stderr.write(stderr);
   }
-  if (stdout) process.stdout.write(stdout);
+  // Wait for the write: process.exit() below would otherwise cut a pipe off at its buffer
+  // (128 KiB), e.g. a large run-code result read through `| jq`. A reader that stops early
+  // (`| head`) closes the pipe: that is EPIPE, not an error.
+  if (stdout) await new Promise<void>((done, fail) => process.stdout.write(stdout, e => {
+    if (!e || (e as NodeJS.ErrnoException).code === "EPIPE") done(); else fail(e);
+  }));
 
   if (files?.length) {
     // Saved files belong to the project: <project>/.rechrome/output. The folder also holds

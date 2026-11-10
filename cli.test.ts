@@ -159,6 +159,40 @@ test("rech pw --version reaches playwright-cli, not rech", async () => {
   } finally { server.stop(true); }
 });
 
+test("a large reply reaches a pipe whole (the client waits for stdout before exiting)", async () => {
+  const big = "x".repeat(2 * 1024 * 1024) + "\nend\n"; // far past a pipe's 64-128 KiB buffer
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch(req) {
+    if (new URL(req.url).pathname === "/run") return Response.json({ status: 0, stdout: big, stderr: "" });
+    return new Response("rech server\n");
+  } });
+  try {
+    const proc = Bun.spawn([process.execPath, `${import.meta.dir}/rechrome.ts`, "pw", "--version"], {
+      env: { ...process.env, RECHROME_URL: `http://127.0.0.1:${server.port}/#key=stub-key-0123456789` }, stdout: "pipe", stderr: "pipe",
+    });
+    // Read slowly, like a consumer that is busy, so the pipe fills before the client is done.
+    await Bun.sleep(500);
+    const [code, stdout] = await Promise.all([proc.exited, new Response(proc.stdout).text()]);
+    expect(code).toBe(0);
+    expect(stdout.length).toBe(big.length);
+  } finally { server.stop(true); }
+});
+
+test("a reader that stops early (| head) is not an error", async () => {
+  const big = "x".repeat(2 * 1024 * 1024);
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch(req) {
+    if (new URL(req.url).pathname === "/run") return Response.json({ status: 0, stdout: big, stderr: "" });
+    return new Response("rech server\n");
+  } });
+  try {
+    const proc = Bun.spawn(["sh", "-c", `"$0" "$1" pw --version | head -c 5`, process.execPath, `${import.meta.dir}/rechrome.ts`], {
+      env: { ...process.env, RECHROME_URL: `http://127.0.0.1:${server.port}/#key=stub-key-0123456789` }, stdout: "pipe", stderr: "pipe",
+    });
+    const [, stdout, stderr] = await Promise.all([proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+    expect(stdout).toBe("xxxxx");
+    expect(stderr).not.toContain("EPIPE");
+  } finally { server.stop(true); }
+});
+
 // playwright-cli's reply to an unknown command: the error on stderr, its usage listing on stdout.
 const playwrightUsage = `Unknown command: listner
 
