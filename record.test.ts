@@ -12,6 +12,8 @@ import {
   ffmpegStreamArgs,
   resolveFormat,
   resolveFfmpeg,
+  freeName,
+  recordHoldMs,
   RECORD_DEFAULT_SECONDS,
   RECORD_DEFAULT_MAX_SECONDS,
   RECORD_DEFAULT_FPS,
@@ -43,11 +45,28 @@ test("parseRecordArgs: start / stop / timed forms, each with only its own option
   expect(() => parseRecordArgs(["record", "stop", "--filename=a/b.mp4"])).toThrow(/--filename/);
 });
 
+test("recordHoldMs: only a timed recording holds the request (the client waits that much longer)", () => {
+  expect(recordHoldMs(["record", "--seconds", "60"])).toBe(60_000);
+  expect(recordHoldMs(["-s=demo", "record", "--seconds=7"])).toBe(7_000);
+  expect(recordHoldMs(["record"])).toBe(RECORD_DEFAULT_SECONDS * 1000);
+  expect(recordHoldMs(["record", "start"])).toBe(0);
+  expect(recordHoldMs(["record", "stop"])).toBe(0);
+  expect(recordHoldMs(["record", "--seconds", "9999"])).toBe(0); // refused by serve anyway
+  expect(recordHoldMs(["open", "https://example.com"])).toBe(0);
+});
+
+test("freeName: never an existing name", () => {
+  const taken = new Set(["clip.mp4", "clip-2.mp4", "notes"]);
+  expect(freeName("new.mp4", n => taken.has(n))).toBe("new.mp4");
+  expect(freeName("clip.mp4", n => taken.has(n))).toBe("clip-3.mp4");
+  expect(freeName("notes", n => taken.has(n))).toBe("notes-2");
+});
+
 test("buildCaptureChunkCode runs in run-code's sandbox (fresh vm context, no Buffer global)", async () => {
   // run-code evaluates the snippet the way tools/backend/runCode.ts does: a new context holding only `page`.
   let shots = 0;
   const page = {
-    screenshot: async (o: { type: string; quality: number }) => { shots++; expect(o).toEqual({ type: "jpeg", quality: 55, scale: "css" }); return Buffer.from(`jpeg-${shots}`); },
+    screenshot: async (o: { type: string; quality: number; scale?: string }) => { shots++; expect(o).toEqual({ type: "jpeg", quality: 55, scale: "css" }); return Buffer.from(`jpeg-${shots}`); },
     waitForTimeout: (ms: number) => new Promise(r => setTimeout(r, ms)),
   };
   const context: any = { page };

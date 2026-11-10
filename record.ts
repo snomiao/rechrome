@@ -49,6 +49,24 @@ function intOpt(value: string | undefined, name: string, min: number, max: numbe
   return n;
 }
 
+/** How long a timed `record --seconds N` holds its request, so the client waits that much longer. */
+export function recordHoldMs(args: string[]): number {
+  const at = args.findIndex(a => !a.startsWith("-"));
+  if (args[at] !== "record") return 0;
+  try {
+    const parsed = parseRecordArgs(args.slice(at));
+    return parsed.mode === "timed" ? parsed.seconds * 1000 : 0;
+  } catch { return 0; }
+}
+
+/** `name`, or `name-2`, `name-3`… before the extension: the first that is not taken. */
+export function freeName(name: string, taken: (name: string) => boolean): string {
+  if (!taken(name)) return name;
+  const dot = name.lastIndexOf(".");
+  const [stem, ext] = dot > 0 ? [name.slice(0, dot), name.slice(dot)] : [name, ""];
+  for (let n = 2; ; n++) if (!taken(`${stem}-${n}${ext}`)) return `${stem}-${n}${ext}`;
+}
+
 const SAFE_NAME = /^[A-Za-z0-9._-]+$/;
 
 /** Parse `record [start|stop] …` client args. */
@@ -195,6 +213,8 @@ export class Recording {
     this.loop.then(() => { if (!this.stopping) this.stop().then(s => opts.onAutoStop?.(s)); });
   }
   get active(): boolean { return !this.stopping; }
+  /** Settles when capturing ends: stopped, --max-seconds reached, or the tab went away. */
+  get ended(): Promise<void> { return this.loop; }
   /** Stop capturing, flush the sink, and report what was written. Never rejects; safe to call twice. */
   stop(): Promise<RecordingSummary> {
     if (this.summary) return this.summary;

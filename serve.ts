@@ -25,7 +25,7 @@ import {
   chromeDataAccessHint,
 } from "./rechrome.ts";
 import { SecretMasker, runCodeOnSession, parseReadCookieWire, readCookieOnSession, parseReadStorageWire, readStorageOnSession, parseReadSecretWire, readSecretOnSession, parseFillSecretWire, fillSecretOnSession, passwordValuesOnSession, hasSnapshot, maskPasswordLines, withholdSnapshots } from "./fill-secret.ts";
-import { parseRecordArgs, buildCaptureChunkCode, resolveFfmpeg, resolveFormat, recordSink, Recording, RECORD_CHUNK_MS, type CaptureChunk, type RecordingSummary } from "./record.ts";
+import { parseRecordArgs, buildCaptureChunkCode, resolveFfmpeg, resolveFormat, recordSink, Recording, freeName, RECORD_CHUNK_MS, RECORD_MAX_SECONDS, type CaptureChunk, type RecordingSummary } from "./record.ts";
 
 const TAILSCALE_BIN = process.env.TAILSCALE_BIN || "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
 const CERT_RENEW_THRESHOLD_DAYS = 7;
@@ -106,6 +106,8 @@ const deniedFiles = new Set<string>();
 // keeps them on the host instead (opt-in).
 const pendingDownloads = new Map<string, ReturnType<typeof setTimeout>>();
 const DOWNLOAD_PICKUP_MS = 10 * 60_000;
+// Per-request idle limit for POSTs (Bun's default is 10 s): past the client's 70 s plus the longest timed recording.
+export const RUN_IDLE_SECONDS = 70 + RECORD_MAX_SECONDS + 20;
 // rech record start/stop: the recording in progress (or finished by --max-seconds and not yet
 // collected) per namespaced session. serve owns the capture loop; see record.ts.
 type RecordingEntry = { rec: Recording; dir: string; outputPrefix: string; listener: string; keep: boolean; done?: RecordingSummary; expire?: ReturnType<typeof setTimeout> };
@@ -113,9 +115,15 @@ const recordings = new Map<string, RecordingEntry>();
 
 /** Rename a finished recording to its final name and hand it to the client like a download. */
 function deliverRecording(entry: RecordingEntry, s: RecordingSummary, filename: string | undefined): { stdout: string; files: string[] } {
+  // Nothing captured is the real story (no tab, session gone); ffmpeg's "no stream" only follows from it.
+  if (!s.frames || !existsSync(s.out)) {
+    try { unlinkSync(s.out); } catch {}
+    const why = s.error?.split("\n")[0];
+    throw new Error(`record: nothing was captured${why ? ` (${why})` : ""}${why?.includes("rech open") ? "" : "; is a tab open? run \`rech open <url>\` first"}`);
+  }
   if (s.encodeError) { try { unlinkSync(s.out); } catch {} throw new Error(s.encodeError); }
-  if (!s.frames || !existsSync(s.out)) throw new Error(`record: nothing was captured${s.error ? ` (${s.error.split("\n")[0]})` : ""}; is a tab open? run \`rech open <url>\` first`);
-  const out = filename ? join(entry.dir, filename) : s.out.replace(/\/\.(recording-[^/]+)\.part$/, "/$1");
+  // Never over an existing file: `--filename clip.mp4` twice keeps both (clip.mp4, clip-2.mp4).
+  const out = filename ? join(entry.dir, freeName(filename, n => existsSync(join(entry.dir, n)))) : s.out.replace(/\/\.(recording-[^/]+)\.part$/, "/$1");
   if (out !== s.out) renameSync(s.out, out);
   log(`record: ${JSON.stringify({ listener: entry.listener, name: relative(entry.dir, out), frames: s.frames, captured: s.captured, fps: s.fps, format: s.format, size: statSync(out).size, kept: entry.keep, ...(s.error ? { ended: s.error.split("\n")[0] } : {}) })}`);
   if (!entry.keep) {
@@ -1058,7 +1066,7 @@ export async function serve() {
       // open-ended recording; plain `record --seconds N` does both in one call. See record.ts.
       if (filteredArgs[0] === "record") {
         const fail = (message: string) => {
-          log(`exit: 1 | record: ${message.split("\n")[0]}`);
+          log(`exit: 1 | ${message.split("\n")[0]}`);
           return Response.json({ status: 1, stdout: "", stderr: `[rech] ${message}\n`, files: [] });
         };
         try {
@@ -1105,7 +1113,8 @@ export async function serve() {
             log(`exit: 0 | record start (${a.fps} fps, ${format}, max ${a.maxSeconds} s)`);
             return Response.json({ status: 0, stdout: `record: recording at ${a.fps} fps to ${format}${note}; run \`rech record stop\` to save (stops by itself after ${a.maxSeconds} s)\n`, stderr: "", files: [] });
           }
-          await Bun.sleep(a.seconds * 1000);
+          // Answer early if the capture ends on its own (the tab went away).
+          await Promise.race([Bun.sleep(a.seconds * 1000), entry.rec.ended]);
           recordings.delete(namespacedSession);
           clearTimeout(entry.expire);
           const s = await entry.rec.stop();
@@ -1460,6 +1469,10 @@ export async function serve() {
       return Response.json({ status: 1, stdout: "", stderr: err.message }, { status: 500 });
     },
     async fetch(req, server) {
+      // Bun's default idle limit is 10 s. Bun 1.4 does not apply it to a POST with a body, but don't
+      // rely on that: a /run can take longer (`record --seconds 60`, a slow page). Allow it longer
+      // than the client waits (70 s + a recording's length).
+      if (req.method === "POST") server.timeout(req, RUN_IDLE_SECONDS);
       const listener = policies.get(listenerAddress(initial));
       if (!listener) return new Response("Listener removed", { status: 403 });
       return handle(req, listener, () => `${req.headers.get("x-forwarded-for") || server.requestIP(req)?.address || "unknown"}`);
