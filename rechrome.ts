@@ -3456,7 +3456,7 @@ async function setListener(name: string, opts: { publicUrl?: string; clearPublic
   if (opts.keepDownloads !== undefined) console.log(opts.keepDownloads ? `${name}: browser downloads are also kept on this host (each is logged)` : `${name}: browser downloads go to the client only, then are deleted here`);
   if (opts.readCookies !== undefined) console.log(opts.readCookies ? `${name}: read-cookie on. Anyone with this link can copy any cookie (HttpOnly session cookies included) of any site its profiles are signed in to, which is enough to take over those sessions; --allow-domain only checks the domain the caller names. Each read is logged without the value` : `${name}: read-cookie off`);
   if (opts.readSecrets !== undefined) console.log(opts.readSecrets ? `${name}: read-secret on. Anyone with this link can copy the value of any field (saved passwords included) on any site its profiles have open; --allow-domain only checks the site the caller names. Each read is logged without the value` : `${name}: read-secret off`);
-  if (opts.readHeaders !== undefined) console.log(opts.readHeaders ? `${name}: read-headers on. Anyone with this link can capture response status + headers for any site its profiles reach; cookie, set-cookie and authorization header values are redacted. Each capture is logged without those values` : `${name}: read-headers off`);
+  if (opts.readHeaders !== undefined) console.log(opts.readHeaders ? `${name}: read-headers on. Anyone with this link can capture response status + headers for any site its profiles reach; credential header values (cookie, authorization, tokens) and URL query values are redacted. Each capture is logged without those values` : `${name}: read-headers off`);
   if (opts.publicUrl !== undefined || opts.clearPublicUrl) console.log(listener.publicUrl ? `${name} is reachable at ${listener.publicUrl}` : `${name}: public URL cleared`);
   if (opts.hostUploadDirs?.length || opts.noHostUploads) {
     const dirs = (listener.uploads || {}).hostDirs;
@@ -4580,8 +4580,8 @@ const HELP_EPILOGUE = `Browser commands (sent to this project's Chrome session):
   rech read-storage <local|session> <key> [json-path] --allow-domain <host> [--goto <url>] | <command>
                      copy a localStorage/sessionStorage value into a pipe, never shown or logged
   rech read-headers --allow-domain <host> [--seconds N] [--goto <url>]
-                     capture response status + headers (no bodies) to a JSON evidence file; cookie,
-                     set-cookie and authorization header values are redacted
+                     capture response status + headers (no bodies) to a JSON evidence file;
+                     credential header values and URL query values are redacted
   rech pw <args>     forward verbatim to playwright-cli, e.g. \`rech pw --version\`
   rech --version     rechrome's version
 
@@ -4699,7 +4699,7 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
         .option("host-upload-dir", { type: "string", array: true, requiresArg: true, describe: "Off by default. Also let links upload files already on this host, from inside this directory (rech upload --host <path>); repeatable" })
         .option("read-secrets", { type: "boolean", describe: "Off by default. Let this listener's links copy any field's value (saved passwords too) or localStorage/sessionStorage value (app tokens) into a pipe (rech read-secret, read-storage): only for links you trust with those accounts. --no-read-secrets turns it off" })
         .option("read-cookies", { type: "boolean", describe: "Off by default. Let this listener's links copy any cookie, HttpOnly session cookies too (rech read-cookie): enough to take over the profiles' signed-in sessions, so only for links you trust with those accounts. --no-read-cookies turns it off" })
-        .option("read-headers", { type: "boolean", describe: "Off by default. Let this listener's links capture response status + headers (no bodies) for an allowed host (rech read-headers); cookie, set-cookie and authorization header values are redacted. --no-read-headers turns it off" })
+        .option("read-headers", { type: "boolean", describe: "Off by default. Let this listener's links capture response status + headers (no bodies) for an allowed host (rech read-headers); credential header values and URL query values are redacted. --no-read-headers turns it off" })
         .option("keep-downloads", { type: "boolean", describe: "Off by default: browser downloads go to the client, then are deleted here. --keep-downloads also keeps them on this host" })
         .option("host-uploads", { type: "boolean", describe: "--no-host-uploads turns host-path uploads off again" })
         .check(a => a.publicUrl !== undefined || a.clearPublicUrl || a.uploads !== undefined || a.hostUploadDir?.length || a.hostUploads === false || a.readSecrets !== undefined || a.readCookies !== undefined || a.readHeaders !== undefined || a.keepDownloads !== undefined ? true : "Pass --public-url <url>, --clear-public-url, --uploads/--no-uploads, --host-upload-dir/--no-host-uploads, --read-secrets/--read-cookies/--read-headers, or --keep-downloads"),
