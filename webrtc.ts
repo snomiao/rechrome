@@ -372,7 +372,7 @@ export class WebrtcClient {
       const timer = setTimeout(() => fail("timed out connecting to the host over WebRTC (no direct path; the host may be behind a strict NAT: ask them to enable TURN, or use a Tailscale/LAN share)"), CONNECT_TIMEOUT_MS);
       sock = new SignalSocket(signalSocketUrl(this.signal, roomOf(token)), { role: "client", auth: roomAuthOf(token) }, async m => {
         try {
-          if (m.type === "welcome" && m.hostPresent === false) fail("the host is offline (its rech daemon isn't connected to the signal server)");
+          if (m.type === "welcome" && m.hostPresent === false) fail("nobody is answering this link: the host's rech daemon may be down, or the link was revoked. Ask the host to check, or for a fresh link");
           else if (m.type === "host-leave" && !this.connected) fail("the host left before the connection finished");
           else if (m.type === "offer" && typeof m.sdp === "string" && !this.pc) {
             const pc = new RTCPeerConnection({ iceServers: Array.isArray(m.ice) ? m.ice : iceServersFromEnv() });
@@ -404,7 +404,7 @@ export class WebrtcClient {
             await this.pc.addIceCandidate(m.candidate).catch(() => {});
           }
         } catch (error) { fail(String(error)); }
-      }, (code, reason) => { if (!this.connected) fail(code === 4404 ? "the host is offline (its rech daemon isn't connected to the signal server)" : code === 1008 ? `the signal server refused this link (${reason || "forbidden"})` : `signal server closed the connection (${reason || code})`); });
+      }, (code, reason) => { if (!this.connected) fail(code === 4404 ? "nobody is answering this link: the host's rech daemon may be down, or the link was revoked. Ask the host to check, or for a fresh link" : code === 1008 ? `the signal server refused this link (${reason || "forbidden"})` : `signal server closed the connection (${reason || code})`); });
       sock.open().catch(e => fail(e.message));
     });
     try { await result; }
