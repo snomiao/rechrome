@@ -3046,10 +3046,28 @@ async function trayCommand(sub?: string): Promise<void> {
   }
 }
 
+// The Chromium revision pinned by the playwright-core that the relay (playwright-cli) runs, read
+// from its browsers.json. Provisioning must seed with that same build: the relay later reopens the
+// profile with it, and a profile written by a newer Chromium (e.g. 156, whose localStorage moved to
+// SQLite) loses the seeded token, so the extension mints a new one and the bridge never connects.
+export function relayChromiumRevision(cli: string = resolvePlaywrightCli()): string | null {
+  try {
+    const entry = cli.split(" ").pop()!;
+    let dir = dirname(createRequire(entry).resolve("playwright-core/lib/tools/cli-client/program"));
+    for (let i = 0; i < 8 && dir !== dirname(dir); i++, dir = dirname(dir)) {
+      const browsers = join(dir, "browsers.json");
+      if (!existsSync(browsers)) continue;
+      const chromium = JSON.parse(readFileSync(browsers, "utf8")).browsers?.find((b: { name?: string }) => b.name === "chromium");
+      return chromium?.revision ? String(chromium.revision) : null;
+    }
+  } catch {}
+  return null;
+}
+
 // Resolve a Chromium / Chrome-for-Testing executable from the Playwright browsers cache.
 // Managed (provisioned) profiles must run on Chromium because branded Google Chrome 149+ rejects
 // --load-extension. Returns null if no Chromium is installed (`npx playwright install chromium`).
-function findChromiumForTesting(): string | null {
+function findChromiumForTesting(preferredRevision: string | null = relayChromiumRevision()): string | null {
   // Honor PLAYWRIGHT_BROWSERS_PATH (the user's convention) first, then the platform default —
   // `playwright install` doesn't always write to the env path, so check both.
   const bases = [
@@ -3062,6 +3080,8 @@ function findChromiumForTesting(): string | null {
     let revs: string[];
     try { revs = readdirSync(base).filter(d => /^chromium-\d+$/.test(d)).sort((a, b) => parseInt(b.slice(9)) - parseInt(a.slice(9))); }
     catch { continue; }
+    // The relay's own build first; the newest installed one only if it is missing.
+    if (preferredRevision) revs = revs.filter(r => r === `chromium-${preferredRevision}`).concat(revs.filter(r => r !== `chromium-${preferredRevision}`));
     for (const rev of revs) {
       const root = join(base, rev);
       const candidates = process.platform === "darwin"
