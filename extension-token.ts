@@ -95,7 +95,9 @@ function readExtensionTokenFromSqlite(userDataDir: string, profileDir: string, e
   if (!existsSync(path)) return null;
   let db: Database | undefined;
   try {
-    db = new Database(path, { readonly: true });
+    // Chrome keeps the file in WAL mode, and a plain read-only open fails (SQLITE_CANTOPEN) once
+    // Chrome has exited and removed the -shm file; `immutable=1` reads the file as-is.
+    db = new Database(`file:${encodeURI(path).replace(/[?#]/g, encodeURIComponent)}?immutable=1`, { readonly: true });
     const row = db.query(
       "SELECT e.value AS value, e.value_compression_type AS compression FROM map_entries e JOIN maps m ON m.row_id = e.map_id WHERE m.storage_key = ? AND e.key = ?",
     ).get(Buffer.from(`chrome-extension://${extensionId}/`, "latin1"), Buffer.from("\x01auth-token", "latin1")) as { value: Uint8Array; compression: number } | null;

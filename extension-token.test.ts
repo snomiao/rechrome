@@ -68,6 +68,7 @@ test('reads the Chromium 156+ SQLite LocalStorage store; other origins never sup
   mkdirSync(join(root, 'Profile 2'), {recursive:true});
   try {
     const db = new Database(join(root, 'Profile 2', 'LocalStorage'));
+    db.run('PRAGMA journal_mode=WAL'); // As Chrome writes it; a plain read-only open then fails.
     db.run('CREATE TABLE maps(row_id INTEGER PRIMARY KEY AUTOINCREMENT,storage_key BLOB NOT NULL,last_accessed INTEGER,last_modified INTEGER,total_size INTEGER)');
     db.run('CREATE TABLE map_entries(map_id INTEGER NOT NULL,value_compression_type INTEGER NOT NULL,key BLOB NOT NULL,value BLOB NOT NULL,PRIMARY KEY(map_id, key)) WITHOUT ROWID');
     const k = Buffer.from('\x01auth-token', 'latin1');
