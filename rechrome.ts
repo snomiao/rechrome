@@ -2059,7 +2059,7 @@ export function withDefaultScheme(target: string): string {
 // `open --profile <dir>`, a user-data-dir path) and must pass through untouched. Throws on a
 // missing value; accepts multiple occurrences (last one wins).
 /**
- * `rech [--profile X] [--isolate] pw <args>` forwards <args> to playwright-cli verbatim, so
+ * `rech [--profile X] [--isolate[=<name>]] pw <args>` forwards <args> to playwright-cli verbatim, so
  * `rech pw --version` or `rech pw status` reach playwright instead of rech. `--` works the
  * same after a rech flag (`rech --profile X -- status`); a bare leading `--` cannot, because
  * Bun consumes the `--` right after the script path. The separator counts only when
@@ -2071,10 +2071,30 @@ export function rechSeparatorIndex(args: string[]): number {
     const a = args[i];
     if (a === "--" || a === "pw" || a === "playwright") return i;
     if (a === "--profile") { i++; continue; }
-    if (a.startsWith("--profile=") || a === "--isolate" || a === "--isolated") continue;
+    if (a.startsWith("--profile=") || a === "--isolate" || a === "--isolated" || /^--isolated?=/.test(a)) continue;
     return -1;
   }
   return -1;
+}
+
+/** Prefix of a named isolated session (`--isolate=<name>` -> `-s=iso_<name>`); `_` keeps it out of the iso-<hex> reaper. */
+export const NAMED_ISO_PREFIX = "iso_";
+
+/**
+ * Turn rech's `--isolate` / `--isolate=<name>` into a session flag. Bare `--isolate` is a
+ * throwaway `-s=iso-<random>` (reaped when idle); `--isolate=<name>` is the persistent
+ * `-s=iso_<name>`, reused by later commands with the same name until `rech session close <name>`.
+ */
+export function applyIsolateArg(args: string[]): string[] {
+  const idx = args.findIndex(a => a === "--isolate" || a === "--isolated" || /^--isolated?=/.test(a));
+  if (idx === -1) return args;
+  const flag = args[idx];
+  const rest = args.filter((_, i) => i !== idx);
+  if (!flag.includes("=")) return [...rest, `-s=iso-${randomBytes(8).toString("hex")}`];
+  const name = flag.slice(flag.indexOf("=") + 1);
+  if (!/^[a-zA-Z0-9_-]{1,60}$/.test(name)) throw new Error(`--isolate=<name> takes 1-60 letters, digits, '-' or '_' (got "${name}")`);
+  if (rest.some(a => a.startsWith("-s="))) throw new Error("Pass --isolate=<name> or -s=<session>, not both.");
+  return [...rest, `-s=${NAMED_ISO_PREFIX}${name}`];
 }
 
 /** rechrome's own version, from the package.json shipped next to this file. */
@@ -4585,22 +4605,40 @@ async function bridgeCommand(): Promise<void> {
 
 // ---- sessions (client view) -----------------------------------------------------------------
 
+type SessionRow = { session: string; profile?: string; client?: string; owner?: string; lastUsed: number; live: boolean };
+
+async function fetchSessions(url: string): Promise<{ res: Response; body: { sessions?: SessionRow[]; stderr?: string } | null }> {
+  const res = await fetch(serviceUrl(url, "sessions"), { headers: { Authorization: `Bearer ${parseUrl(url).key}` }, signal: AbortSignal.timeout(10_000) });
+  return { res, body: await res.json().catch(() => null) as { sessions?: SessionRow[]; stderr?: string } | null };
+}
+
+/** `name` as given, unless only the named isolated session `iso_<name>` exists. */
+export function pickSessionName(name: string, known: string[]): string {
+  if (name.startsWith(NAMED_ISO_PREFIX) || known.includes(name)) return name;
+  return known.includes(NAMED_ISO_PREFIX + name) ? NAMED_ISO_PREFIX + name : name;
+}
+
+async function resolveSessionName(url: string, name: string): Promise<string> {
+  const known = await fetchSessions(url).then(({ body }) => (body?.sessions ?? []).map(s => s.session)).catch(() => [] as string[]);
+  return pickSessionName(name, known);
+}
+
 async function sessionCommand(action: string, name?: string): Promise<void> {
   const raw = process.env[ENV_KEY];
   if (!raw) throw new Error(notConnectedMessage());
   const url = await transportUrl(raw);
   if (action === "close") {
     if (!name) throw new Error("Which session? rech session close <name>   (see rech session ls)");
-    return run(url, ["close", `-s=${name}`]);
+    // A named isolated session closes by its --isolate name too (`login` for iso_login).
+    return run(url, ["close", `-s=${await resolveSessionName(url, name)}`]);
   }
-  const res = await fetch(serviceUrl(url, "sessions"), { headers: { Authorization: `Bearer ${parseUrl(url).key}` }, signal: AbortSignal.timeout(10_000) });
-  const body = await res.json().catch(() => null) as { sessions?: { session: string; profile?: string; client?: string; owner?: string; lastUsed: number; live: boolean }[]; stderr?: string } | null;
+  const { res, body } = await fetchSessions(url);
   if (!res.ok || !body?.sessions) throw new Error(body?.stderr?.trim() || `The host does not list sessions (HTTP ${res.status}); it may run an older rech.`);
   if (!body.sessions.length) { console.log("No sessions yet (since the host's daemon started)."); return; }
   const rows = [["SESSION", "PROFILE", "CLIENT", "LAST USED", "STATE"]];
   for (const s of body.sessions) rows.push([s.session, s.profile ?? "-", s.client ?? "-", fmtDate(s.lastUsed), s.live ? "open" : "closed"]);
   printTable(rows);
-  console.log(`\nUse one: rech -s=<session> open https://example.com · close it: rech session close <session>`);
+  console.log(`\nUse one: rech -s=<session> open https://example.com (an ${NAMED_ISO_PREFIX}<name> session: rech --isolate=<name> …) · close it: rech session close <session>`);
 }
 
 async function signalServe(opts: { host?: string; port?: number }): Promise<void> {
@@ -4731,10 +4769,12 @@ const HELP_USAGE = `rechrome (rech) — drive your real, logged-in Chrome from s
 Usage: rech <command> [options]   ·   rech <browser-command> [args]`;
 
 const HELP_EPILOGUE = `Browser commands (sent to this project's Chrome session):
-  rech [--profile <p>] [--isolate] <browser-command> [args]
+  rech [--profile <p>] [--isolate[=<name>]] <browser-command> [args]
       open, goto, click, fill, screenshot, eval, tab-list…  (\`rech pw --help\` lists all)
       --profile <p>  as another registered profile (email, name or folder); put it first
-      --isolate      in a throwaway session, e.g. for a login flow
+      --isolate      in a throwaway session (a new one per command)
+      --isolate=<n>  in the named isolated session <n>: made on first use, reused by later
+                     commands (same tabs, same page) until \`rech session close <n>\`
   rech fill-secret <ref> --from-env VAR | --totp-from-env VAR [--env-file f] [--allow-domain '*.example.com']
                      type a password / TOTP code without it reaching argv, logs or output
   rech read-secret <ref> --allow-domain <host> | <vault command>
@@ -4894,7 +4934,7 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
       .command("remove <name>", "Remove a listener", y => y.positional("name", { type: "string", demandOption: true }),
         a => handlers.removeListener(a.name))
       .demandCommand(1).strict())
-    .command(["session [action] [name]", "sessions [action] [name]"], "This link's browser sessions on the host: ls (default) | close <name>", y => y
+    .command(["session [action] [name]", "sessions [action] [name]"], "This link's browser sessions on the host: ls (default) | close <name> (also an --isolate=<name> session)", y => y
       .positional("action", { type: "string", choices: ["ls", "list", "close"], default: "ls" })
       .positional("name", { type: "string", describe: "With close: the session (as `rech session ls` shows it)" }),
       a => handlers.session(a.action === "list" ? "ls" : a.action!, a.name))
@@ -5041,10 +5081,13 @@ if (import.meta.main) {
     // flows (OAuth/login) that must not share tabs with the worktree's default session. The `iso-`
     // marker lets the daemon reap these throwaway sessions on an idle TTL (see serve.ts), so an
     // OAuth drive can't leak an orphaned browser context.
-    const isolateIdx = args.findIndex((a) => a === "--isolate" || a === "--isolated");
-    if (isolateIdx !== -1) {
-      args.splice(isolateIdx, 1);
-      args.push(`-s=iso-${randomBytes(8).toString("hex")}`);
+    // --isolate=<name>: a named isolated session (-s=iso_<name>), kept across commands until
+    // `rech session close <name>`, for multi-step flows (email, password, TOTP).
+    try { args = applyIsolateArg(args); }
+    catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      envWatcher?.close();
+      process.exit(1);
     }
     args = [...forwarded, ...args];
     await run(url, args, overrideEnv, { verbatim: separator !== -1 });

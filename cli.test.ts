@@ -3,6 +3,8 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { rechCli, listenerNextSteps, unknownCommandHint, notConnectedMessage, chooseShareListener, matchProfileLoosely, preferManagementListener, promptChoice, type RechHandlers } from "./rechrome.ts";
+import { applyIsolateArg, pickSessionName, rechSeparatorIndex as rechSep } from "./rechrome.ts";
+import { isIsoSession } from "./serve.ts";
 
 async function run(argv: string[]) {
   const calls: [string, ...unknown[]][] = [];
@@ -461,4 +463,31 @@ test("a URL for this machine's own scoped listener goes through the loopback man
   for (const url of ["http://other-key-0123456@100.64.0.9:13775/", "http://scoped-key-0123456@tak.ts.net/", "https://scoped-key-0123456@100.64.0.7:13775/"])
     expect(preferManagementListener(url, config)).toBe(url);
   expect(preferManagementListener("http://scoped-key-0123456@100.64.0.7:13775/", null)).toBe("http://scoped-key-0123456@100.64.0.7:13775/");
+});
+
+describe("--isolate=<name>", () => {
+  test("named: a persistent iso_<name> session, the same on every command", () => {
+    expect(applyIsolateArg(["--isolate=login", "open", "about:blank"])).toEqual(["open", "about:blank", "-s=iso_login"]);
+    expect(applyIsolateArg(["--isolated=login", "click", "e3"])).toEqual(["click", "e3", "-s=iso_login"]);
+    expect(isIsoSession("a1b2c3d4-iso_login")).toBe(false); // not reaped on the idle TTL
+    expect(isIsoSession("a1b2c3d4-iso_deadbeef")).toBe(false);
+  });
+  test("bare --isolate stays throwaway", () => {
+    const a = applyIsolateArg(["--isolate", "open"]), b = applyIsolateArg(["--isolate", "open"]);
+    expect(a[1]).toMatch(/^-s=iso-[0-9a-f]{16}$/);
+    expect(a[1]).not.toBe(b[1]);
+  });
+  test("refuses bad names and a second -s", () => {
+    expect(() => applyIsolateArg(["--isolate=", "open"])).toThrow("--isolate=<name>");
+    expect(() => applyIsolateArg(["--isolate=a/b", "open"])).toThrow("--isolate=<name>");
+    expect(() => applyIsolateArg(["--isolate=x", "-s=y", "open"])).toThrow("not both");
+  });
+  test("is a rech flag before pw", () => {
+    expect(rechSep(["--isolate=login", "pw", "open"])).toBe(1);
+  });
+  test("session close takes the --isolate name", () => {
+    expect(pickSessionName("login", ["iso_login"])).toBe("iso_login");
+    expect(pickSessionName("login", ["login", "iso_login"])).toBe("login");
+    expect(pickSessionName("other", ["iso_login"])).toBe("other");
+  });
 });
