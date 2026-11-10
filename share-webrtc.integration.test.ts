@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, copyFile, writeFile, readFile, readdir, symlink } from 
 import { tmpdir } from "os";
 import { join } from "path";
 import { startSignalRelay } from "./signal-relay.ts";
+import type { InviteResult } from "./invite-page.ts";
 import { readShares } from "./shares.ts";
 
 // End to end, with the real CLI and daemon: a host shares a profile, a second "machine" (its own
@@ -17,7 +18,7 @@ const signal2 = `http://127.0.0.1:${relay2.port}/`;
 const cleanups: Array<() => void | Promise<void>> = [() => relay.stop(true), () => relay2.stop(true)];
 afterAll(async () => { for (const c of cleanups.reverse()) await c(); });
 
-const MODULES = ["rechrome.ts", "serve.ts", "listeners.ts", "extension-token.ts", "daemon-manager.ts", "fill-secret.ts", "scoped-upload.ts", "shares.ts", "secret.ts", "e2e.ts", "webrtc.ts", "signal-relay.ts", "redact.ts", "secret-rules/gitleaks.toml"];
+const MODULES = ["rechrome.ts", "serve.ts", "listeners.ts", "extension-token.ts", "daemon-manager.ts", "fill-secret.ts", "scoped-upload.ts", "shares.ts", "secret.ts", "token.ts", "rtc-channel.ts", "e2e.ts", "webrtc.ts", "signal-relay.ts", "redact.ts", "secret-rules/gitleaks.toml"];
 const reserve = () => { const s = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() }); const p = s.port!; s.stop(true); return p; };
 
 test("share new → connect → drive → session ls → reuse refused → approve → revoke, over WebRTC and LAN", async () => {
@@ -32,10 +33,13 @@ test("share new → connect → drive → session ls → reuse refused → appro
   const mgmtPort = reserve(), lanPort = reserve();
   await mkdir(join(root, ".rechrome"));
   await mkdir(join(root, "secret-rules"));
+  await mkdir(join(root, "socks", "cli"), { recursive: true });
   for (const name of MODULES) await copyFile(join(import.meta.dir, name), join(root, name));
   await symlink(join(import.meta.dir, "node_modules"), join(root, "node_modules"), "junction");
   await writeFile(join(root, "fake-cli.ts"), `
     const session = process.argv.find(a => a.startsWith('-s='))?.slice(3);
+    // A live session, as the daemon sees one: a socket file named after it.
+    require('fs').writeFileSync(require('path').join(process.env.PLAYWRIGHT_SOCKETS_DIR, 'cli', session + '.sock'), '');
     if (process.argv.includes('screenshot')) {
       require('fs').mkdirSync('.playwright-cli', { recursive: true });
       const name = '.playwright-cli/shot-' + Date.now() + '.png';
@@ -51,7 +55,7 @@ test("share new → connect → drive → session ls → reuse refused → appro
   await writeFile(join(root, ".rechrome", "listeners.json"), JSON.stringify({ version: 1, listeners: [mgmt, lan] }));
 
   const baseEnv = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith("PLAYWRIGHT_MCP_") && k !== "RECHROME_URL"));
-  const hostEnv = { ...baseEnv, HOME: root, USERPROFILE: root, RECH_ICE_SERVERS: "[]", RECHROME_URL: `http://127.0.0.1:${mgmtPort}/#key=${mgmt.key}`, PLAYWRIGHT_CLI: `${process.execPath} ${join(root, "fake-cli.ts")}` };
+  const hostEnv = { ...baseEnv, HOME: root, USERPROFILE: root, RECH_ICE_SERVERS: "[]", PLAYWRIGHT_SOCKETS_DIR: join(root, "socks"), RECHROME_URL: `http://127.0.0.1:${mgmtPort}/#key=${mgmt.key}`, PLAYWRIGHT_CLI: `${process.execPath} ${join(root, "fake-cli.ts")}` };
   const daemon = Bun.spawn([process.execPath, join(root, "rechrome.ts"), "serve"], { cwd: root, env: hostEnv, stdin: "ignore", stdout: "ignore", stderr: "ignore" });
   cleanups.push(() => { daemon.kill(); });
   const rech = async (args: string[], env: Record<string, string | undefined>, cwd = root) => {
@@ -88,6 +92,24 @@ test("share new → connect → drive → session ls → reuse refused → appro
 
   // The daemon picks the share up and opens its room; then the client redeems the invite.
   await Bun.sleep(1500);
+  // The invite page: what the link gives, over the same room, without redeeming it.
+  // Its own process, as a browser would be: the secret goes by env, and native WebRTC stays out of this one.
+  const pageView = async (token: string): Promise<InviteResult> => {
+    const code = `import { fetchInviteInfo } from ${JSON.stringify(join(import.meta.dir, "invite-page.ts"))}; import { loadRTC } from ${JSON.stringify(join(import.meta.dir, "webrtc.ts"))};
+      const { RTCPeerConnection } = await loadRTC();
+      console.log(JSON.stringify(await fetchInviteInfo(process.env.PAGE_TOKEN, { signal: process.env.PAGE_SIGNAL, RTCPeerConnection, timeoutMs: 15000 })));
+      process.exit(0);`;
+    const proc = Bun.spawn([process.execPath, "--eval", code], { env: { ...baseEnv, PAGE_TOKEN: token, PAGE_SIGNAL: signal }, stdin: "ignore", stdout: "pipe", stderr: "ignore" });
+    return JSON.parse(await new Response(proc.stdout).text());
+  };
+  const inviteToken = link.split("#")[1]!;
+  const viewed = await pageView(inviteToken);
+  if (viewed.state !== "online") throw new Error(`invite page: ${JSON.stringify(viewed)}`);
+  expect(viewed.info.share).toBe("alice");
+  expect(viewed.info.invite).toMatchObject({ state: "open", used: 0, maxDevices: 1 });
+  expect(viewed.info.profileInfo).toEqual([{ key: "qa", name: "", registered: true }]);
+  expect(viewed.info.sessions).toEqual([]);
+  expect((await rech(["share", "ls"], hostEnv)).stdout).toMatch(/alice\s+qa\s+webrtc-127-0-0-1\s+0\/1/); // not redeemed
   const connected = await rech(["connect", "--project", link], clientEnv(client), client);
   expect(connected.stderr + connected.stdout).toContain('Connected to share "alice"');
   expect(connected.code).toBe(0);
@@ -122,6 +144,13 @@ test("share new → connect → drive → session ls → reuse refused → appro
   expect(reused.code).toBe(1);
   expect(reused.stderr).toContain("already used");
 
+  // The page on the used invite says so, and lists this share's live sessions.
+  const usedView = await pageView(inviteToken);
+  if (usedView.state !== "online") throw new Error(`invite page: ${JSON.stringify(usedView)}`);
+  expect(usedView.info.invite).toMatchObject({ state: "used", used: 1 });
+  expect(usedView.info.sessions!.map(x => x.name).sort()).toEqual(["default", "login"]);
+  for (const x of usedView.info.sessions!) expect(Object.keys(x).sort()).toEqual(["device", "name"]);
+
   // Host view.
   const ls = await rech(["share", "ls"], hostEnv);
   expect(ls.stdout).toMatch(/alice\s+qa\s+webrtc-127-0-0-1\s+1\/1/);
@@ -134,6 +163,7 @@ test("share new → connect → drive → session ls → reuse refused → appro
   const after = await rech(["tab-list"], clientEnv(client), client);
   expect(after.stdout).not.toContain("Profile:");
   expect(after.stderr).toMatch(/revoked|offline|WebRTC/);
+  expect((await pageView(inviteToken)).state).toBe("offline");   // the room is gone: the page says so
 
   // --- A reusable invite: two machines redeem the same link, each gets its own credential ----
   const team = await rech(["share", "new", "qa", "--name", "team", "--signal", signal, "--reusable", "--ttl", "12h"], hostEnv);
@@ -195,6 +225,9 @@ test("share new → connect → drive → session ls → reuse refused → appro
   expect((await rech(["tab-list"], clientEnv(client4), client4)).stdout).toContain("Profile: QA");
   const viaFirst = await rech(["connect", "--project", links[0]![0]], clientEnv(client5), client5);
   expect(viaFirst.stderr + viaFirst.stdout).toContain('Connected to share "dave"');
+  // A session that's already open on the share is listed right after connecting.
+  expect(viaFirst.stdout).toContain("Open sessions on this share:");
+  expect(viaFirst.stdout).toMatch(/^\s+default\s+\(device /m);
   // A listener a share still uses can't be removed.
   expect((await rech(["listener", "remove", "second"], hostEnv)).stderr).toContain("Shares still use");
   expect((await rech(["share", "revoke", "dave"], hostEnv)).code).toBe(0);
@@ -228,6 +261,14 @@ test("share new → connect → drive → session ls → reuse refused → appro
   const carolBearer = bearerOf(new URL(carolUrl).hash.slice(1).split("&")[0]);
   const bobUrl = (await readFile(join(client2, ".rechrome", ".env.local"), "utf8")).match(/RECHROME_URL="([^"]+)"/)![1];
   const bobBearer = bearerOf(new URL(bobUrl).hash.slice(1).split("&")[0]);
+  // Another share's sessions aren't listed: bob has some on this listener, carol has none.
+  const pingAs = async (bearer: string) => (await fetch(`http://127.0.0.1:${lanPort}/ping`, { headers: { Authorization: `Bearer ${bearer}` } })).json() as Promise<any>;
+  expect((await pingAs(bobBearer)).sessions.map((x: any) => x.name)).toContain("default");
+  const carolPing = await pingAs(carolBearer);
+  expect(carolPing.sessions).toEqual([]);
+  expect(carolPing.invite).toBeUndefined();                     // a device's link, so no invite state
+  expect(carolPing.device.approved).toBe(true);
+  expect(carolPing.profileInfo).toEqual([{ key: "personal", name: "", registered: true }]);
   const shotPath = shot.stdout.match(/\.playwright-cli\/shot-\d+\.png/)?.[0];
   const listed = await (await fetch(`http://127.0.0.1:${lanPort}/run`, { method: "POST", headers: { Authorization: `Bearer ${bobBearer}`, "Content-Type": "application/json" }, body: JSON.stringify({ args: ["screenshot"], identity: { key: "probe", label: "probe", profile: "personal" }, env: {} }) })).json();
   const bobFile = listed.files[0] as string;

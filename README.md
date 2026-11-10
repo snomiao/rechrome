@@ -177,6 +177,10 @@ Over **WebRTC** the two machines need no open port, VPN or domain. A small signa
 encrypted with keys the signal server never sees. The first `rech` command after connecting starts
 a small local bridge that keeps the connection open between commands.
 
+**Opening the link in a browser shows what it gives**, without redeeming it: whether the host is
+online, the share and when it ends, whether the invite is still open, its profiles, and its open
+sessions. Anyone holding the link can see that. `rech connect` lists the open sessions too.
+
 **The link is an invite, not a key.** `rech connect` redeems it once: this machine gets its own
 device credential (saved to `.rechrome/.env.local`) and the invite stops working, so a link that
 leaks after it was used is harmless, and if someone else used it first you'll know. Unused invites
