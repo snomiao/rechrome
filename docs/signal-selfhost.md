@@ -92,7 +92,7 @@ bunx rechrome signal serve --port 8787
 tailscale funnel --bg 8787     # Funnel must be allowed in your tailnet policy
 ```
 
-If every client is on your tailnet anyway, skip WebRTC: `rech share new <profile> --via tailscale`.
+If every client is on your tailnet anyway, skip WebRTC: `rech share <profile> --tailscale`.
 
 ## D. Docker
 
@@ -118,14 +118,25 @@ The hostname changes on every run, and every link made with it dies with it.
 
 ## Point rech at it
 
-Only the **host** chooses; the signal origin becomes the link, so clients need no setup:
+Only the **host** chooses; the signal origin becomes the link, so clients need no setup. Save it
+as a WebRTC listener, optionally with STUN/TURN servers, then share over it:
 
 ```bash
-rech share new you@example.com --signal https://signal.example.com/
+rech listener add home --webrtc=https://signal.example.com/ --turn-env TEAM_TURN
+#   TEAM_TURN=turns://user:pass@turn.example.com:5349   (user and password percent-encoded)
+rech share you@example.com --via home
 # → https://signal.example.com/#rech1_…
 
-export RECH_SIGNAL=https://signal.example.com/    # default for new shares on this machine
+rech share you@example.com --webrtc=https://signal.example.com/   # same, making the listener if needed
+rech share you@example.com --via home,webrtc-default             # one link per signal server
 ```
+
+WebRTC listeners live in `~/.rechrome/listeners.json` under `rtcListeners` (a daemon older than
+them ignores that key). `rech listener ls` lists them, with TURN shown as `turns://user:…@host:port`;
+`rech listener remove <name>` drops one that no share uses. The built-in `webrtc-default`
+(rechrome.pages.dev) is for trying sharing out: best effort, with no speed or uptime promise.
+`RECH_SIGNAL` still picks the server for a bare `--webrtc`, and `RECH_ICE_SERVERS` /
+`CF_TURN_KEY_ID` + `CF_TURN_API_TOKEN` still apply to every WebRTC listener.
 
 Check it: `curl https://signal.example.com/ping` answers `{"rech-signal":1}`, which is also how
 `rech connect` tells a signal server from a rech daemon.

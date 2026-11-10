@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { prepareUpload, UPLOAD_USAGE, MAX_UPLOAD_BYTES, type UploadPayload } from "./scoped-upload.ts";
-import { readListeners, writeListeners as writeListenersFile, listenerAddress, isLoopback, normalizePrefix, serviceUrl, allowProfiles, denyProfiles, rotateListenerKey, setPublicUrl, canonicalProfileKeys, planProfileRemoval, type Listener, type ListenerConfig } from "./listeners.ts";
+import { readListeners, writeListeners as writeListenersFile, listenerAddress, isLoopback, normalizePrefix, serviceUrl, allowProfiles, denyProfiles, rotateListenerKey, setPublicUrl, canonicalProfileKeys, planProfileRemoval, parseIceUrl, iceLabel, rtcListeners, shareRtcListeners, defaultRtcListener, DEFAULT_RTC, DEFAULT_RTC_NOTE, LEGACY_RTC, type IceServer, type Listener, type ListenerConfig, type RtcListener } from "./listeners.ts";
+import { recordHoldMs } from "./record.ts";
 
 import { file } from "bun";
 import yargs from "yargs";
@@ -10,14 +11,14 @@ import { READ_COOKIE_USAGE, parseReadCookieArgs, readCookieWireArgs, READ_STORAG
 import { createHash, randomBytes } from "crypto";
 import { mkdirSync, fstatSync, appendFileSync, existsSync, realpathSync, accessSync, cpSync, unlinkSync, readFileSync, readdirSync, renameSync, readlinkSync, rmdirSync, constants as fsConstants } from "fs";
 import { hostname, homedir, networkInterfaces } from "os";
-import { isIPv4 } from "net";
+import { isIP, isIPv4 } from "net";
 import { join, basename, dirname, resolve } from "path";
 import { pathToFileURL } from "url";
 import { createRequire } from "node:module";
 import { spawn as cpSpawn } from "child_process";
 import { readFile, writeFile, rename, chmod, mkdir, stat } from "node:fs/promises";
 import { isDeprecatedPm2Fallback, listsProcess, oxmgrInstallCommand, pickDaemonManager, PM2_DEPRECATION, type DaemonManager } from "./daemon-manager.ts";
-import { DEFAULT_SIGNAL, WEBRTC, createShare, normalizeSignal, findDevice, findShare, inviteLink, inviteProblem, parseDuration, readShares, updateShares, type Share } from "./shares.ts";
+import { DEFAULT_SIGNAL, WEBRTC, createShare, normalizeSignal, findDevice, findShare, inviteLink, inviteProblem, parseDuration, REUSABLE_DEFAULT_TTL, REUSABLE_MAX_DEVICES, readShares, updateShares, type Share } from "./shares.ts";
 import { bearerOf, looksLikeToken, newToken, parseToken, redactSecrets } from "./secret.ts";
 import { WebrtcClient, loadRTC, runBridge, spawnBridge } from "./webrtc.ts";
 import { startSignalRelay } from "./signal-relay.ts";
@@ -1490,7 +1491,7 @@ export function chooseShareListener(profile: string, listeners: Listener[]): str
   throw new ShareListenerError([
     `"${profile}" isn't shared on any listener yet.`,
     scoped.length ? `  Allow it on one:  rech listener allow ${scoped[0].name} ${JSON.stringify(profile)}   (listeners: ${scoped.map(l => l.name).join(", ")})` : "",
-    `  ${scoped.length ? "Or give" : "Give"} it its own link:  rech share ${JSON.stringify(profile)}   (in a terminal it asks who should connect)`,
+    `  ${scoped.length ? "Or share" : "Share"} it:  rech share ${JSON.stringify(profile)} --lan|--tailscale|--webrtc   (in a terminal, rech share asks)`,
   ].filter(Boolean).join("\n"), "none", scoped);
 }
 
@@ -1788,11 +1789,13 @@ async function printProfileUri(selector?: string, listener?: string, opts: { loc
     config = await readListeners(); // setup may have added a listener: never write back a stale copy
     return key;
   };
+  let shownLinks = false;
   if (!selector) {
     // No profile given: show what is already shared, then ask, defaulting to the current one
     // (?profile= in the URL, else PLAYWRIGHT_MCP_PROFILE_DIRECTORY).
     if (interactive && Object.keys(registry).length) {
       printExistingLinks(config?.listeners ?? [], opts.local);
+      shownLinks = true;
       selector = await pickProfile("Share which profile?");
     }
     else {
@@ -1817,6 +1820,12 @@ async function printProfileUri(selector?: string, listener?: string, opts: { loc
       } else throw error;
     }
   }
+  // On a host, in a terminal, with no listener named: tick the transports for a new share (the
+  // links already handed out are listed first). --save/--local keep the listener-link flow.
+  if (interactive && config && !listener && !opts.save && !opts.local) {
+    if (!shownLinks) printExistingLinks(config.listeners, opts.local);
+    return shareNew([profile], {});
+  }
   const listeners = config?.listeners ?? [];
   // On a host, share through a scoped listener by default, never the management key.
   if (!listener && config) {
@@ -1824,7 +1833,8 @@ async function printProfileUri(selector?: string, listener?: string, opts: { loc
     catch (error) {
       if (!(error instanceof ShareListenerError)) throw error;
       // Not shared yet: give it its own link rather than stopping with instructions.
-      if (!interactive) { if (error.kind === "none") return shareNewLink(profile, opts); throw error; }
+      // No default transport: without a terminal, say how to pick one.
+      if (!interactive) { if (error.kind === "none") throw noTransportError(profile); throw error; }
       const describe = (l: Listener) => `${l.name}  ${l.publicUrl ?? `${listenerAddress(l)}${normalizePrefix(l.prefix)}`}`;
       if (error.kind === "several") {
         listener = (await promptChoice(`"${profile}" is on several listeners. Share through which?`, error.listeners.map(l => ({ label: describe(l), value: l.name })))) ?? undefined;
@@ -1952,7 +1962,8 @@ async function callServe(
     // dataDir is a client-local path; the daemon (possibly remote) only needs the session identity.
     // `secret` (fill-secret only) rides in its own field so it is never part of the logged args.
     body: JSON.stringify({ args, identity: { key: identity.key, label: identity.label, profile: identity.profile }, env, ...(upload ? { upload } : {}), ...(secret ? { secret } : {}) }),
-    signal: AbortSignal.timeout(70_000),
+    // A timed `record --seconds N` holds the request for N seconds before it answers.
+    signal: AbortSignal.timeout(70_000 + recordHoldMs(args)),
   }).catch(async (e) => {
     if (throwOnFailure) throw new Error("Cannot reach the rechrome daemon. Check that it is running.");
     console.error(`[rech] ${e.message}`);
@@ -2050,7 +2061,7 @@ export function withDefaultScheme(target: string): string {
 // `open --profile <dir>`, a user-data-dir path) and must pass through untouched. Throws on a
 // missing value; accepts multiple occurrences (last one wins).
 /**
- * `rech [--profile X] [--isolate] pw <args>` forwards <args> to playwright-cli verbatim, so
+ * `rech [--profile X] [--isolate[=<name>]] pw <args>` forwards <args> to playwright-cli verbatim, so
  * `rech pw --version` or `rech pw status` reach playwright instead of rech. `--` works the
  * same after a rech flag (`rech --profile X -- status`); a bare leading `--` cannot, because
  * Bun consumes the `--` right after the script path. The separator counts only when
@@ -2062,10 +2073,30 @@ export function rechSeparatorIndex(args: string[]): number {
     const a = args[i];
     if (a === "--" || a === "pw" || a === "playwright") return i;
     if (a === "--profile") { i++; continue; }
-    if (a.startsWith("--profile=") || a === "--isolate" || a === "--isolated") continue;
+    if (a.startsWith("--profile=") || a === "--isolate" || a === "--isolated" || /^--isolated?=/.test(a)) continue;
     return -1;
   }
   return -1;
+}
+
+/** Prefix of a named isolated session (`--isolate=<name>` -> `-s=iso_<name>`); `_` keeps it out of the iso-<hex> reaper. */
+export const NAMED_ISO_PREFIX = "iso_";
+
+/**
+ * Turn rech's `--isolate` / `--isolate=<name>` into a session flag. Bare `--isolate` is a
+ * throwaway `-s=iso-<random>` (reaped when idle); `--isolate=<name>` is the persistent
+ * `-s=iso_<name>`, reused by later commands with the same name until `rech session close <name>`.
+ */
+export function applyIsolateArg(args: string[]): string[] {
+  const idx = args.findIndex(a => a === "--isolate" || a === "--isolated" || /^--isolated?=/.test(a));
+  if (idx === -1) return args;
+  const flag = args[idx];
+  const rest = args.filter((_, i) => i !== idx);
+  if (!flag.includes("=")) return [...rest, `-s=iso-${randomBytes(8).toString("hex")}`];
+  const name = flag.slice(flag.indexOf("=") + 1);
+  if (!/^[a-zA-Z0-9_-]{1,60}$/.test(name)) throw new Error(`--isolate=<name> takes 1-60 letters, digits, '-' or '_' (got "${name}")`);
+  if (rest.some(a => a.startsWith("-s="))) throw new Error("Pass --isolate=<name> or -s=<session>, not both.");
+  return [...rest, `-s=${NAMED_ISO_PREFIX}${name}`];
 }
 
 /** rechrome's own version, from the package.json shipped next to this file. */
@@ -2317,7 +2348,12 @@ async function run(url: string, args: string[], overrideEnv?: Record<string, str
     }
     process.stderr.write(stderr);
   }
-  if (stdout) process.stdout.write(stdout);
+  // Wait for the write: process.exit() below would otherwise cut a pipe off at its buffer
+  // (128 KiB), e.g. a large run-code result read through `| jq`. A reader that stops early
+  // (`| head`) closes the pipe: that is EPIPE, not an error.
+  if (stdout) await new Promise<void>((done, fail) => process.stdout.write(stdout, e => {
+    if (!e || (e as NodeJS.ErrnoException).code === "EPIPE") done(); else fail(e);
+  }));
 
   if (files?.length) {
     // Saved files belong to the project: <project>/.rechrome/output. The folder also holds
@@ -3030,10 +3066,28 @@ async function trayCommand(sub?: string): Promise<void> {
   }
 }
 
+// The Chromium revision pinned by the playwright-core that the relay (playwright-cli) runs, read
+// from its browsers.json. Provisioning must seed with that same build: the relay later reopens the
+// profile with it, and a profile written by a newer Chromium (e.g. 156, whose localStorage moved to
+// SQLite) loses the seeded token, so the extension mints a new one and the bridge never connects.
+export function relayChromiumRevision(cli: string = resolvePlaywrightCli()): string | null {
+  try {
+    const entry = cli.split(" ").pop()!;
+    let dir = dirname(createRequire(entry).resolve("playwright-core/lib/tools/cli-client/program"));
+    for (let i = 0; i < 8 && dir !== dirname(dir); i++, dir = dirname(dir)) {
+      const browsers = join(dir, "browsers.json");
+      if (!existsSync(browsers)) continue;
+      const chromium = JSON.parse(readFileSync(browsers, "utf8")).browsers?.find((b: { name?: string }) => b.name === "chromium");
+      return chromium?.revision ? String(chromium.revision) : null;
+    }
+  } catch {}
+  return null;
+}
+
 // Resolve a Chromium / Chrome-for-Testing executable from the Playwright browsers cache.
 // Managed (provisioned) profiles must run on Chromium because branded Google Chrome 149+ rejects
 // --load-extension. Returns null if no Chromium is installed (`npx playwright install chromium`).
-function findChromiumForTesting(): string | null {
+function findChromiumForTesting(preferredRevision: string | null = relayChromiumRevision()): string | null {
   // Honor PLAYWRIGHT_BROWSERS_PATH (the user's convention) first, then the platform default —
   // `playwright install` doesn't always write to the env path, so check both.
   const bases = [
@@ -3046,6 +3100,8 @@ function findChromiumForTesting(): string | null {
     let revs: string[];
     try { revs = readdirSync(base).filter(d => /^chromium-\d+$/.test(d)).sort((a, b) => parseInt(b.slice(9)) - parseInt(a.slice(9))); }
     catch { continue; }
+    // The relay's own build first; the newest installed one only if it is missing.
+    if (preferredRevision) revs = revs.filter(r => r === `chromium-${preferredRevision}`).concat(revs.filter(r => r !== `chromium-${preferredRevision}`));
     for (const rev of revs) {
       const root = join(base, rev);
       const candidates = process.platform === "darwin"
@@ -3333,14 +3389,86 @@ function printTable(rows: string[][]): void {
 }
 
 async function listListeners(): Promise<void> {
+  const config = await requireListeners();
   const rows = [["NAME", "ADDRESS", "PROFILES", "PUBLIC URL"]];
-  for (const l of (await requireListeners()).listeners)
+  for (const l of config.listeners)
     rows.push([l.name, `${listenerAddress(l)}${normalizePrefix(l.prefix)}`, l.profiles === "*" ? "(all — local management)" : l.profiles.join(", "), l.publicUrl ?? "-"]);
   printTable(rows);
+  console.log("");
+  printTable(rtcListenerRows(config));
+}
+
+/** `rech listener ls`'s WebRTC table. STUN/TURN servers show their username, never the password. */
+export function rtcListenerRows(config: ListenerConfig | null): string[][] {
+  const rows = [["WEBRTC", "SIGNAL SERVER", "STUN/TURN"]];
+  for (const l of rtcListeners(config))
+    rows.push([l.name, l.signal, l.builtin ? `public STUN (built in; ${DEFAULT_RTC_NOTE.split(".")[0]})` : l.ice?.length ? l.ice.map(iceLabel).join(", ") : "public STUN"]);
+  return rows;
+}
+
+/** STUN/TURN servers for a WebRTC listener: --turn URLs, then the URLs held in --turn-env variables. */
+export function iceFromOptions(turn: string[] = [], turnEnv: string[] = [], env: Record<string, string | undefined> = process.env): IceServer[] {
+  const urls = [...turn];
+  for (const name of turnEnv) {
+    const value = env[name];
+    if (!value) throw new Error(`--turn-env ${name}: that environment variable is empty or unset`);
+    urls.push(value);
+  }
+  return urls.map(parseIceUrl);
+}
+
+/** A new WebRTC listener named `name` (or one derived from the signal host), saved to listeners.json. */
+export function addRtcListenerTo(config: ListenerConfig, opts: { name?: string; signal: string; ice?: IceServer[] }): RtcListener {
+  const signal = normalizeSignal(opts.signal);
+  const taken = new Set([...config.listeners.map(l => l.name), ...rtcListeners(config).map(l => l.name), LEGACY_RTC]);
+  let name = opts.name;
+  if (name !== undefined) {
+    if (taken.has(name)) throw new Error(`Listener "${name}" already exists (see rech listener ls)`);
+  } else {
+    const host = new URL(signal).hostname;
+    const base = `webrtc-${(isIP(host.replace(/^\[|\]$/g, "")) ? host : host.split(".")[0]!).replace(/[^a-zA-Z0-9_]+/g, "-").replace(/^-|-$/g, "")}`.slice(0, 36);
+    name = base;
+    for (let i = 2; taken.has(name); i++) name = `${base}-${i}`;
+  }
+  const listener: RtcListener = { name, kind: "webrtc", signal, ...(opts.ice?.length ? { ice: opts.ice } : {}) };
+  (config.rtcListeners ??= []).push(listener);
+  return listener;
+}
+
+/** The WebRTC listener for a signal URL: the default one, an existing one on that server, or a new one. */
+async function ensureRtcListener(signalUrl: string, ice: IceServer[] = []): Promise<string> {
+  const signal = normalizeSignal(signalUrl);
+  const config = await requireListeners();
+  if (!ice.length) {
+    const found = rtcListeners(config).find(l => l.signal === signal);
+    if (found) return found.name;
+  }
+  const listener = addRtcListenerTo(config, { signal, ice });
+  await writeListeners(config);
+  console.log(`Added WebRTC listener "${listener.name}" (${signal}${ice.length ? `; ${ice.map(iceLabel).join(", ")}` : ""}).`);
+  return listener.name;
+}
+
+async function addWebrtcListener(name: string, opts: { webrtc: string; turn?: string[]; turnEnv?: string[] }): Promise<void> {
+  const config = await requireListeners();
+  const listener = addRtcListenerTo(config, { name, signal: opts.webrtc, ice: iceFromOptions(opts.turn, opts.turnEnv) });
+  await writeListeners(config);
+  console.log(`WebRTC listener "${listener.name}" saved (${listener.signal}${listener.ice?.length ? `; ${listener.ice.map(iceLabel).join(", ")}` : ""}).`);
+  console.log(`Share over it: rech share <profile> --via ${listener.name}`);
 }
 
 async function removeListener(name: string): Promise<void> {
   const config = await requireListeners();
+  if (name === DEFAULT_RTC || name === LEGACY_RTC) throw new Error(`"${name}" is built in; it can't be removed. Shares stop using it when they are revoked (rech share revoke <share>).`);
+  const rtc = config.rtcListeners?.find(l => l.name === name);
+  if (rtc) {
+    const using = (await readShares()).shares.filter(s => !s.revokedAt && s.via.includes(name)).map(s => s.label);
+    if (using.length) throw new Error(`Shares still use WebRTC listener "${name}": ${using.join(", ")}. Revoke them first (rech share revoke <share>).`);
+    config.rtcListeners = config.rtcListeners!.filter(l => l !== rtc);
+    await writeListeners(config);
+    console.log("WebRTC listener removed; daemon reloads automatically.");
+    return;
+  }
   const listener = config.listeners.find(l => l.name === name);
   if (!listener) throw new Error("Unknown listener");
   if (listener.profiles === "*") throw new Error("Keep the local management listener for setup and recovery");
@@ -3631,14 +3759,20 @@ export function nearerUrlSource(cwd: string, inherited: boolean, globalFile = GL
   }
 }
 
-type ConnectedShare = { share?: string; device?: { id: string; name: string; approved: boolean }; profiles: string[]; webrtc: boolean };
+type ConnectedShare = { share?: string; device?: { id: string; name: string; approved: boolean }; profiles: string[]; webrtc: boolean; sessions?: { name: string; device: string }[] };
 
 async function connect(url: string, opts: { global?: boolean; project?: boolean } = {}, shared?: ConnectedShare): Promise<void> {
   if (opts.global && opts.project) throw new Error("Pass --global or --project, not both.");
   // A bare rech1_ token means the default signal server.
   if (looksLikeToken(url)) url = `${DEFAULT_SIGNAL}#${url.trim()}`;
   const share = shareLinkParts(url);
-  if (share && !shared) return connectShare(url, share, opts);
+  if (share && !shared) {
+    // node-datachannel's native threads can keep the process alive after every connection is
+    // closed, so the command leaves explicitly: done, it must not hang on.
+    try { await connectShare(url, share, opts); }
+    catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exit(1); }
+    process.exit(0);
+  }
   if (share && shared) return saveConnection(url, opts, shared);
   const parsed = parseUrl(url);
   if (!parsed.key) throw new Error("That URL has no key (#key=…). Ask the host for the full URL from: rech share <profile>");
@@ -3699,6 +3833,10 @@ async function saveConnection(url: string, opts: { global?: boolean; project?: b
     for (const p of shared.profiles) console.log(`  ${p}`);
     console.log(`Pick one per command: rech --profile <name> open https://example.com   (see them again with rech profile)`);
   } else if (shared.profiles.length === 1) console.log(`Profile: ${shared.profiles[0]}. Try: rech open https://example.com`);
+  if (shared.sessions?.length) {
+    console.log(`\nOpen sessions on this share:`);
+    for (const x of shared.sessions) console.log(`  ${x.name}  (device ${x.device})`);
+  }
 }
 
 export function detectSetupAgent(env: Record<string, string | undefined> = process.env): "Codex" | "Claude Code" | null {
@@ -4074,8 +4212,9 @@ async function setup(opts: SetupOptions = {}): Promise<void> {
     guide?.close();
     console.log(`      Saved token for ${extraDisplay}`);
   }
-  if (bridgeVerified && isTTY && !opts.listen && !opts.skipShare) await setupShareStep(ask, profileEmail);
+  // The share step asks with its own prompts (a hidden one for TURN passwords): free stdin first.
   rl?.close();
+  if (bridgeVerified && isTTY && !opts.listen && !opts.skipShare) await setupShareStep(profileEmail);
   envWatcher?.close();
   if (bridgeVerified)
     console.log(`\nDone! Test with:\n  rech open github.com/snomiao`);
@@ -4085,65 +4224,125 @@ async function setup(opts: SetupOptions = {}): Promise<void> {
 
 const SIGNAL_SELFHOST_DOC = "https://github.com/snomiao/rechrome/blob/main/docs/signal-selfhost.md";
 
-/** The menu of setupShareStep: existing listeners first, then the new kinds. */
-export function shareMenu(listeners: Listener[], choices: ListenChoice[]): { key: string; label: string; listener?: string; kind?: "lan" | "tailscale" | "webrtc" | "webrtc-own" }[] {
-  const menu: ReturnType<typeof shareMenu> = [{ key: "1", label: "Don't add sharing (local access is always on; existing shares stay: rech share ls)" }];
+/** One entry of the share picker: an existing listener (`via`) or a new one to create (`kind`). */
+export type TransportItem = { key: string; label: string; via?: string; kind?: "lan" | "tailscale" | "webrtc" };
+
+/**
+ * The share picker's transports: existing scoped listeners, the WebRTC listeners (the built-in
+ * default included), then new ones for the networks detected here. "local" is always on, so it is
+ * shown above the list, not offered in it. `tailscaleHost`: the machine's MagicDNS name.
+ */
+export function transportMenu(listeners: Listener[], rtc: RtcListener[], choices: ListenChoice[], tailscaleHost?: string): TransportItem[] {
+  const menu: TransportItem[] = [];
+  const add = (item: Omit<TransportItem, "key">) => menu.push({ key: String(menu.length + 1), ...item });
   for (const l of listeners.filter(l => l.profiles !== "*"))
-    menu.push({ key: String(menu.length + 1), label: `Existing listener "${l.name}" (${listenerAddress(l)}${l.publicUrl ? `, ${l.publicUrl}` : ""})`, listener: l.name });
-  const has = (k: string) => choices.some(c => c.kind === k);
-  if (has("lan")) menu.push({ key: String(menu.length + 1), label: "New: LAN (machines on this network)", kind: "lan" });
-  if (has("tailscale")) menu.push({ key: String(menu.length + 1), label: "New: Tailscale only (your tailnet)", kind: "tailscale" });
-  menu.push({ key: String(menu.length + 1), label: "New: WebRTC via rechrome.pages.dev (works across networks, nothing to run)", kind: "webrtc" });
-  menu.push({ key: String(menu.length + 1), label: "New: WebRTC via your own signal server (and TURN)", kind: "webrtc-own" });
+    add({ label: `${l.name}  (${l.publicUrl ?? `${listenerAddress(l)}${normalizePrefix(l.prefix)}`})`, via: l.name });
+  for (const l of rtc)
+    add({ label: `${l.name}  (WebRTC via ${new URL(l.signal).host}${l.builtin ? `; ${DEFAULT_RTC_NOTE.split(".")[0]}` : ""})`, via: l.name });
+  const lan = choices.find(c => c.kind === "lan");
+  if (lan) add({ label: `+ new LAN listener  (http://${lan.address}, machines on this network)`, kind: "lan" });
+  const ts = choices.find(c => c.kind === "tailscale");
+  if (ts) add({ label: `+ new tailscale listener  (${tailscaleHost ?? ts.address}, your tailnet)`, kind: "tailscale" });
+  add({ label: "+ new WebRTC listener…  (your own signal server, optional TURN)", kind: "webrtc" });
   return menu;
 }
 
-/** setup's last step: once the profile works here, offer to share it with other machines. */
-async function setupShareStep(ask: (q: string, def?: string) => Promise<string>, profile: string): Promise<void> {
-  const listeners = (await readListeners().catch(() => null))?.listeners ?? [];
-  const choices = await detectListenChoices();
-  const menu = shareMenu(listeners, choices);
-  console.log(`\n○ Share ${profile} with other machines?`);
-  for (const m of menu) console.log(`        ${m.key}. ${m.label}`);
-  let pick: (typeof menu)[number] | undefined;
-  while (!pick) {
-    const answer = (await ask("      Choice [1]: ", "1")).trim();
-    pick = menu.find(m => m.key === answer);
-    if (!pick) console.log("      Enter one of the numbers shown above.");
+/** The picker's answer: numbers separated by commas or spaces; empty picks nothing. */
+export function parseTransportPicks(answer: string, menu: TransportItem[]): TransportItem[] {
+  const keys = answer.trim().split(/[\s,]+/).filter(Boolean);
+  const picked: TransportItem[] = [];
+  for (const key of keys) {
+    const item = menu.find(m => m.key === key);
+    if (!item) throw new Error(`Enter numbers from 1 to ${menu.length}, separated by commas or spaces (empty: share nothing).`);
+    if (!picked.includes(item)) picked.push(item);
   }
-  try {
-    if (pick.key === "1") { console.log("✓ Not shared. Later: rech share new " + JSON.stringify(profile)); return; }
-    if (pick.listener) {
-      const config = await requireListeners();
-      allowProfiles(config, pick.listener, [profile]);
-      await writeListeners(config);
-      await printProfileUri(profile, pick.listener);
-      return;
+  return picked;
+}
+
+/** Ask one line in the terminal; with `hidden`, nothing typed is echoed (passwords). null on EOF. */
+async function askLine(question: string, hidden = false): Promise<string | null> {
+  const { createInterface } = await import("readline");
+  const rl = createInterface({ input: process.stdin, output: process.stderr, terminal: !!process.stdin.isTTY });
+  if (hidden) (rl as any)._writeToOutput = (text: string) => { if (text.startsWith(question)) process.stderr.write(question); };
+  return new Promise(resolve => {
+    let answered = false;
+    rl.question(question, answer => { answered = true; if (hidden) process.stderr.write("\n"); rl.close(); resolve(answer); });
+    rl.once("close", () => { if (!answered) resolve(null); });
+  });
+}
+
+const NO_TRANSPORT_LINES = (profile: string) => [
+  `Pick how other machines reach ${profile} (rech share has no default):`,
+  `  rech share ${profile} --lan             machines on this network`,
+  `  rech share ${profile} --tailscale       your tailnet`,
+  `  rech share ${profile} --webrtc          any network, via the public signal server (${DEFAULT_RTC_NOTE.split(".")[0]})`,
+  `  rech share ${profile} --webrtc=<url>    any network, via your own signal server`,
+  `  rech share ${profile} --via <listener>  an existing listener (rech listener ls)`,
+  `Or run it in a terminal to pick from a list.`,
+];
+export const noTransportError = (profile: string) => new Error(NO_TRANSPORT_LINES(JSON.stringify(profile)).join("\n"));
+
+/**
+ * The share picker (rech share in a terminal, and setup's last step): tick the listeners to
+ * share over, creating new ones as asked. Returns the share's `via`; empty means share nothing.
+ */
+async function pickShareTransports(profiles: string[], label: string): Promise<string[]> {
+  const config = await requireListeners();
+  const choices = await detectListenChoices();
+  const tailscaleHost = choices.some(c => c.kind === "tailscale")
+    ? (JSON.parse(await runTailscale(["status", "--json"]) ?? "null")?.Self?.DNSName as string | undefined)?.replace(/\.$/, "") : undefined;
+  const menu = transportMenu(config.listeners, rtcListeners(config), choices, tailscaleHost);
+  console.error(`\nShare ${profiles.join(", ")} over (numbers, comma or space separated; empty: nothing):`);
+  console.error(`  [x] local  this machine, always on`);
+  for (const m of menu) console.error(`  [ ] ${m.key.padStart(2)}. ${m.label}`);
+  let picks: TransportItem[] | undefined;
+  while (!picks) {
+    const answer = await askLine("Share over: ");
+    if (answer === null) return [];
+    try { picks = parseTransportPicks(answer, menu); } catch (error) { console.error(error instanceof Error ? error.message : error); }
+  }
+  const via: string[] = [];
+  for (const pick of picks) {
+    if (pick.via) via.push(pick.via);
+    else if (pick.kind === "lan") via.push(await shareTransportListener("lan", profiles, label));
+    else if (pick.kind === "tailscale") {
+      if (!tailscaleHost?.endsWith(".ts.net")) console.error(`! Tailscale's hostname is ${tailscaleHost ? `"${tailscaleHost}", not under ts.net` : "unknown (is tailscale up?)"}; the link uses the tailnet IP.`);
+      via.push(await shareTransportListener("tailscale", profiles, label));
+    } else {
+      const rtc = await askNewRtcListener();
+      if (rtc) via.push(rtc);
     }
-    if (pick.kind === "tailscale") {
-      const dns = (JSON.parse(await runTailscale(["status", "--json"]) ?? "null")?.Self?.DNSName as string | undefined)?.replace(/\.$/, "");
-      if (!dns?.endsWith(".ts.net")) console.log(`      ! Tailscale's hostname is ${dns ? `"${dns}", not under ts.net` : "unknown (is tailscale up?)"}; the link uses the tailnet IP.`);
-      else console.log(`      Tailscale hostname: ${dns}`);
-    }
-    let signal: string | undefined;
-    if (pick.kind === "webrtc-own") {
-      console.log(`\n      Run a signal server, then paste its URL here:`);
-      console.log(`        1. Read ${SIGNAL_SELFHOST_DOC}`);
-      console.log(`           (A: Cloudflare Workers is the easiest; C: Tailscale Funnel needs no domain).`);
-      console.log(`        2. Deploy it and open its URL in a browser to check that it answers.`);
-      console.log(`        3. For TURN (strict NATs), set CF_TURN_KEY_ID and CF_TURN_API_TOKEN in the daemon's env (see "TURN" in that doc).`);
-      while (!signal) {
-        const raw = (await ask("      Signal server URL (empty: cancel): ")).trim();
-        if (!raw) { console.log("      Not shared. Later: rech share new <profile> --signal <url>"); return; }
-        try { signal = normalizeSignal(raw); } catch (error) { console.log(`      ${error instanceof Error ? error.message : error}`); continue; }
-        const ok = await fetch(signal, { signal: AbortSignal.timeout(5000) }).then(() => true).catch(() => false);
-        if (!ok) console.log(`      ! ${signal} did not answer; the share is made anyway, check the server before sending the link.`);
-      }
-    }
-    const via = pick.kind === "webrtc" || pick.kind === "webrtc-own" ? WEBRTC : pick.kind!;
-    await shareNew([profile], { via: [via], ...(signal ? { signal } : {}) });
-  } catch (error) {
-    console.error(`      Sharing failed: ${error instanceof Error ? error.message : error}. Setup itself is saved; retry with rech share new ${JSON.stringify(profile)}.`);
+  }
+  return [...new Set(via)];
+}
+
+/** "+ new WebRTC listener…": a signal URL (the public one by default) and an optional TURN URL. */
+async function askNewRtcListener(): Promise<string | null> {
+  console.error(`  A signal server introduces the two machines; the browser traffic itself is end-to-end encrypted.`);
+  console.error(`  Default: ${DEFAULT_SIGNAL} (${DEFAULT_RTC_NOTE}). Self-hosting: ${SIGNAL_SELFHOST_DOC}`);
+  let signal: string | undefined;
+  while (!signal) {
+    const raw = await askLine(`  Signal server URL [${DEFAULT_SIGNAL}]: `);
+    if (raw === null) return null;
+    try { signal = normalizeSignal(raw.trim() || DEFAULT_SIGNAL); } catch (error) { console.error(`  ${error instanceof Error ? error.message : error}`); continue; }
+    const ok = await fetch(signal, { signal: AbortSignal.timeout(5000) }).then(() => true).catch(() => false);
+    if (!ok) console.error(`  ! ${signal} did not answer; the listener is saved anyway, check the server before sending the link.`);
+  }
+  const ice: IceServer[] = [];
+  while (true) {
+    const raw = await askLine(`  TURN server, e.g. turns://user:pass@turn.example.com:5349 (hidden; empty: none, STUN only): `, true);
+    if (!raw?.trim()) break;
+    try { ice.push(parseIceUrl(raw)); break; } catch (error) { console.error(`  ${error instanceof Error ? error.message : error}`); }
+  }
+  return ensureRtcListener(signal, ice);
+}
+
+/** setup's last step: once the profile works here, offer to share it with other machines. */
+async function setupShareStep(profile: string): Promise<void> {
+  console.log(`\n○ Share ${profile} with other machines? (local access is always on; existing shares stay: rech share ls)`);
+  try { await shareNew([profile], {}); }
+  catch (error) {
+    console.error(`      Sharing failed: ${error instanceof Error ? error.message : error}. Setup itself is saved; retry with rech share ${JSON.stringify(profile)}.`);
   }
 }
 
@@ -4157,7 +4356,7 @@ async function shareTransportListener(selector: string, profiles: string[], labe
   const config = await requireListeners();
   const named = config.listeners.find(l => l.name === selector);
   if (named) {
-    if (named.profiles === "*") throw new Error(`"${selector}" is the local management listener; share over lan, tailscale or webrtc instead.`);
+    if (named.profiles === "*") throw new Error(`"${selector}" is the local management listener; share over --lan, --tailscale or --webrtc instead.`);
     return named.name;
   }
   const address = chooseListenAddress(await detectListenChoices(), selector);
@@ -4171,29 +4370,61 @@ async function shareTransportListener(selector: string, profiles: string[], labe
 }
 
 /** Where a share's invite can be used, as full links (each holds the secret). */
-async function shareLinks(share: Share): Promise<{ via: string; link: string }[]> {
-  const listeners = (await readListeners().catch(() => null))?.listeners ?? [];
+async function shareLinks(share: Share): Promise<{ via: string; link: string; signal?: string }[]> {
+  const config = await readListeners().catch(() => null);
   return share.via.map(via => {
-    if (via === WEBRTC) return { via: "webrtc", link: inviteLink(share, share.signal ?? DEFAULT_SIGNAL) };
-    const l = listeners.find(x => x.name === via);
+    const rtc = shareRtcListeners({ via: [via], signal: share.signal }, config)[0];
+    if (rtc) return { via: rtc.name, link: inviteLink(share, rtc.signal), signal: rtc.signal };
+    const l = config?.listeners.find(x => x.name === via);
     if (!l) return { via, link: "(listener removed)" };
     return { via: l.name, link: inviteLink(share, l.publicUrl ?? `http://${listenerAddress(l)}${normalizePrefix(l.prefix)}`) };
   });
 }
 
-function printInvite(share: Share, links: { via: string; link: string }[]): void {
+function printInvite(share: Share, links: { via: string; link: string; signal?: string }[]): void {
   const expiry = share.inviteExpiresAt ? `unused, it expires ${fmtDate(share.inviteExpiresAt)}` : "it never expires unused";
   console.log(`Share "${share.label}": ${share.profiles.join(", ")}`);
-  console.log(`Invite for ${share.maxDevices === 1 ? "one device" : `${share.maxDevices} devices`} (${expiry}; secret: send it privately):\n`);
-  for (const { via, link } of links) console.log(`  ${links.length > 1 ? `${via.padEnd(10)} ` : ""}${link}`);
-  const rtc = links.find(l => l.via === "webrtc");
-  if (rtc && share.signal === DEFAULT_SIGNAL) console.log(`\n  or in a terminal:  rech connect ${share.invite}`);
-  console.log(`\nThe other machine runs: rech connect '<link>'`);
+  if (share.reusable) {
+    const until = share.inviteExpiresAt ? `until ${fmtDate(share.inviteExpiresAt)}` : "with no expiry";
+    console.log(`Reusable invite: up to ${share.maxDevices} devices may redeem it ${until}, each getting its own credential (secret: anyone with it can join; kill it with rech share rotate ${share.label}):\n`);
+  } else console.log(`Invite for ${share.maxDevices === 1 ? "one device" : `${share.maxDevices} devices`} (${expiry}; secret: send it privately):\n`);
+  const width = Math.max(...links.map(l => l.via.length));
+  for (const { via, link } of links) console.log(`  ${links.length > 1 ? `${via.padEnd(width)}  ` : ""}${link}`);
+  if (links.some(l => l.signal === DEFAULT_SIGNAL)) {
+    console.log(`\n  or in a terminal:  rech connect ${share.invite}`);
+    console.log(`  ${new URL(DEFAULT_SIGNAL).host} is ${DEFAULT_RTC_NOTE}`);
+  }
+  console.log(`\nThe other machine runs: rech connect '<link>'${links.length > 1 ? " (any one of them)" : ""}`);
   if (share.approve) console.log(`Each new device waits for you: rech share approve ${share.label}`);
   console.log(`Share expires: ${fmtDay(share.expiresAt)}${share.expiresAt ? ` (renew: rech share renew ${share.label})` : ""}`);
 }
 
-export type ShareNewOptions = { name?: string; via?: string[]; signal?: string; expires?: string; inviteTtl?: string; devices?: number; approve?: boolean };
+export type ShareNewOptions = { name?: string; via?: string[]; webrtc?: string[]; lan?: boolean; tailscale?: boolean; signal?: string; expires?: string; inviteTtl?: string; devices?: number; approve?: boolean; reusable?: boolean };
+
+/**
+ * The transports named on the command line, in order: --via entries (comma-separated), then
+ * --lan, --tailscale and each --webrtc. A bare --webrtc is "webrtc" (resolved to the built-in
+ * listener, or to --signal / RECH_SIGNAL); --webrtc=<url> is that signal server's listener.
+ */
+export function transportTokens(opts: Pick<ShareNewOptions, "via" | "webrtc" | "lan" | "tailscale" | "signal">): string[] {
+  const tokens = (opts.via ?? []).flatMap(v => v.split(",")).map(v => v.trim()).filter(Boolean);
+  if (opts.lan) tokens.push("lan");
+  if (opts.tailscale) tokens.push("tailscale");
+  for (const w of opts.webrtc ?? []) tokens.push(w.trim() ? `webrtc=${w.trim()}` : WEBRTC);
+  // --signal on its own names a WebRTC transport too (on that server).
+  if (opts.signal && !tokens.length) tokens.push(WEBRTC);
+  return [...new Set(tokens)];
+}
+
+/** One transport token to a share `via` entry, creating the listener it needs. */
+async function resolveTransport(token: string, profiles: string[], label: string, signal?: string): Promise<string> {
+  if (token === WEBRTC) return signal ? ensureRtcListener(signal) : DEFAULT_RTC;
+  if (token.startsWith("webrtc=")) return ensureRtcListener(token.slice("webrtc=".length));
+  if (/^https?:\/\//i.test(token)) return ensureRtcListener(token);
+  const config = await readListeners().catch(() => null);
+  if (rtcListeners(config).some(l => l.name === token)) return token;
+  return shareTransportListener(token, profiles, label);
+}
 
 async function shareNew(selectors: string[], opts: ShareNewOptions): Promise<void> {
   if (!selectors.length) throw new Error("Which profiles? rech share new <profile..>   (see rech profile)");
@@ -4206,19 +4437,29 @@ async function shareNew(selectors: string[], opts: ShareNewOptions): Promise<voi
   // Fail on the name before binding any listener for it.
   if (taken.has(label)) throw new Error(`A share named "${label}" already exists. Pick another --name, or: rech share rotate ${label}`);
   if (!/^[a-z0-9][a-z0-9_-]{0,39}$/.test(label)) throw new Error(`Share names use a-z, 0-9, "-" and "_" (up to 40), e.g. alice or ci-bot; got "${label}"`);
-  const wanted = (opts.via?.length ? opts.via : [WEBRTC]).flatMap(v => v.split(",")).map(v => v.trim()).filter(Boolean);
-  const via: string[] = [];
-  for (const v of wanted) via.push(v === WEBRTC ? WEBRTC : await shareTransportListener(v, profiles, label));
-  const expires = opts.expires ?? (via.includes(WEBRTC) ? "30d" : "never");
+  // No default transport: name one, or pick in a terminal.
+  const tokens = transportTokens(opts);
+  let via: string[];
+  if (tokens.length) {
+    via = [];
+    for (const t of tokens) via.push(await resolveTransport(t, profiles, label, opts.signal ?? process.env.RECH_SIGNAL));
+    via = [...new Set(via)];
+  } else {
+    if (!isInteractive()) throw noTransportError(profiles.length === 1 ? profiles[0]! : "<profile>");
+    via = await pickShareTransports(profiles, label);
+    if (!via.length) { console.error(`Nothing shared. Later: rech share ${JSON.stringify(profiles[0])}`); return; }
+  }
+  const rtc = shareRtcListeners({ via }, await readListeners().catch(() => null));
+  const expires = opts.expires ?? (rtc.length ? "30d" : "never");
   const expiresMs = parseDuration(expires);
   const share = await updateShares(config => createShare(config, {
-    label, profiles, via, signal: opts.signal ?? process.env.RECH_SIGNAL,
+    label, profiles, via,
     expiresAt: expiresMs ? Date.now() + expiresMs : undefined,
-    inviteTtlMs: parseDuration(opts.inviteTtl ?? "24h"),
-    maxDevices: opts.devices ?? 1, approve: opts.approve,
+    inviteTtlMs: parseDuration(opts.inviteTtl ?? (opts.reusable ? REUSABLE_DEFAULT_TTL : "24h")),
+    maxDevices: opts.devices ?? (opts.reusable ? REUSABLE_MAX_DEVICES : 1), approve: opts.approve, reusable: opts.reusable,
   }));
   // The daemon answers WebRTC peers with node-datachannel: install it now, not on the first peer.
-  if (via.includes(WEBRTC)) await loadRTC().catch(error => console.error(`[rech] warning: ${error instanceof Error ? error.message : error}`));
+  if (rtc.length) await loadRTC().catch(error => console.error(`[rech] warning: ${error instanceof Error ? error.message : error}`));
   printInvite(share, await shareLinks(share));
 }
 
@@ -4226,12 +4467,15 @@ async function shareList(): Promise<void> {
   const { shares } = await readShares();
   if (shares.length) {
     const now = Date.now();
-    const rows = [["SHARE", "PROFILES", "VIA", "DEVICES", "EXPIRES", "STATUS"]];
+    const rows = [["SHARE", "PROFILES", "VIA", "DEVICES", "EXPIRES", "INVITE", "STATUS"]];
     for (const s of shares) {
       const pending = s.devices.filter(d => !d.approved).length;
       const status = s.revokedAt ? "revoked" : s.expiresAt && now >= s.expiresAt ? "expired"
         : inviteProblem(s, now) ? (pending ? `${pending} waiting for approval` : "active") : `invite open${pending ? `, ${pending} waiting` : ""}`;
-      rows.push([s.label, s.profiles.join(", "), s.via.join(", "), `${s.devices.length}/${s.maxDevices}`, fmtDay(s.expiresAt), status]);
+      const invite = s.reusable
+        ? `reusable, ${s.redeemed ?? 0} redeemed, ${s.inviteExpiresAt && now >= s.inviteExpiresAt ? "expired" : `until ${s.inviteExpiresAt ? fmtDate(s.inviteExpiresAt) : "never"}`}`
+        : "single-use";
+      rows.push([s.label, s.profiles.join(", "), s.via.join(", "), `${s.devices.length}/${s.maxDevices}`, fmtDay(s.expiresAt), invite, status]);
     }
     printTable(rows);
     console.log(`\nDevices: rech share devices <share> · invite link again: rech share rotate <share> · stop: rech share revoke <share>\n`);
@@ -4278,7 +4522,8 @@ async function shareEdit(action: string, name: string, args: string[], opts: { e
       const s = findShare(config, name);
       s.invite = newToken();
       s.inviteExpiresAt = s.inviteTtlMs ? Date.now() + s.inviteTtlMs : undefined;
-      if (s.devices.length >= s.maxDevices) s.maxDevices = s.devices.length + 1;
+      if (!s.reusable && s.devices.length >= s.maxDevices) s.maxDevices = s.devices.length + 1;
+      if (s.reusable) s.redeemed = 0;
       return s;
     });
     console.log("New invite; the previous invite link no longer works (devices already connected keep working).\n");
@@ -4367,7 +4612,8 @@ async function connectShare(url: string, parts: { token: string; origin: string 
   const saved = new URL(parts.origin);
   if (profiles.length === 1) saved.searchParams.set("profile", profiles[0]);
   saved.hash = `${token}${webrtc ? `&via=${WEBRTC}` : ""}`;
-  await connect(saved.toString(), opts, { share, device, profiles, webrtc });
+  const sessions = Array.isArray(ping?.sessions) ? ping.sessions as { name: string; device: string }[] : [];
+  await connect(saved.toString(), opts, { share, device, profiles, webrtc, sessions });
 }
 
 // ---- WebRTC client bridge -------------------------------------------------------------------
@@ -4422,28 +4668,46 @@ async function bridgeCommand(): Promise<void> {
 
 // ---- sessions (client view) -----------------------------------------------------------------
 
+type SessionRow = { session: string; profile?: string; client?: string; owner?: string; lastUsed: number; live: boolean };
+
+async function fetchSessions(url: string): Promise<{ res: Response; body: { sessions?: SessionRow[]; stderr?: string } | null }> {
+  const res = await fetch(serviceUrl(url, "sessions"), { headers: { Authorization: `Bearer ${parseUrl(url).key}` }, signal: AbortSignal.timeout(10_000) });
+  return { res, body: await res.json().catch(() => null) as { sessions?: SessionRow[]; stderr?: string } | null };
+}
+
+/** `name` as given, unless only the named isolated session `iso_<name>` exists. */
+export function pickSessionName(name: string, known: string[]): string {
+  if (name.startsWith(NAMED_ISO_PREFIX) || known.includes(name)) return name;
+  return known.includes(NAMED_ISO_PREFIX + name) ? NAMED_ISO_PREFIX + name : name;
+}
+
+async function resolveSessionName(url: string, name: string): Promise<string> {
+  const known = await fetchSessions(url).then(({ body }) => (body?.sessions ?? []).map(s => s.session)).catch(() => [] as string[]);
+  return pickSessionName(name, known);
+}
+
 async function sessionCommand(action: string, name?: string): Promise<void> {
   const raw = process.env[ENV_KEY];
   if (!raw) throw new Error(notConnectedMessage());
   const url = await transportUrl(raw);
   if (action === "close") {
     if (!name) throw new Error("Which session? rech session close <name>   (see rech session ls)");
-    return run(url, ["close", `-s=${name}`]);
+    // A named isolated session closes by its --isolate name too (`login` for iso_login).
+    return run(url, ["close", `-s=${await resolveSessionName(url, name)}`]);
   }
-  const res = await fetch(serviceUrl(url, "sessions"), { headers: { Authorization: `Bearer ${parseUrl(url).key}` }, signal: AbortSignal.timeout(10_000) });
-  const body = await res.json().catch(() => null) as { sessions?: { session: string; profile?: string; client?: string; owner?: string; lastUsed: number; live: boolean }[]; stderr?: string } | null;
+  const { res, body } = await fetchSessions(url);
   if (!res.ok || !body?.sessions) throw new Error(body?.stderr?.trim() || `The host does not list sessions (HTTP ${res.status}); it may run an older rech.`);
   if (!body.sessions.length) { console.log("No sessions yet (since the host's daemon started)."); return; }
   const rows = [["SESSION", "PROFILE", "CLIENT", "LAST USED", "STATE"]];
   for (const s of body.sessions) rows.push([s.session, s.profile ?? "-", s.client ?? "-", fmtDate(s.lastUsed), s.live ? "open" : "closed"]);
   printTable(rows);
-  console.log(`\nUse one: rech -s=<session> open https://example.com · close it: rech session close <session>`);
+  console.log(`\nUse one: rech -s=<session> open https://example.com (an ${NAMED_ISO_PREFIX}<name> session: rech --isolate=<name> …) · close it: rech session close <session>`);
 }
 
 async function signalServe(opts: { host?: string; port?: number }): Promise<void> {
   const server = startSignalRelay({ host: opts.host ?? "127.0.0.1", port: opts.port ?? 8787, log });
   console.log(`rech signal server (rech-signal-1) on http://${server.hostname}:${server.port}/`);
-  console.log(`Put HTTPS in front of it, then share through it: rech share new <profile> --signal https://<your-host>/`);
+  console.log(`Put HTTPS in front of it, then share through it: rech share <profile> --webrtc=https://<your-host>/`);
 }
 
 async function status(): Promise<void> {
@@ -4529,6 +4793,7 @@ export type RechHandlers = {
   status(): Promise<void>;
   listListeners(): Promise<void>;
   addListener(name: string, opts: { listen: string; profile: string[]; port?: number; prefix?: string }): Promise<void>;
+  addWebrtcListener(name: string, opts: { webrtc: string; turn?: string[]; turnEnv?: string[] }): Promise<void>;
   removeListener(name: string): Promise<void>;
   listProfiles(): Promise<void>;
   removeProfile(selector: string, opts: { yes?: boolean; close?: boolean }): Promise<void>;
@@ -4567,10 +4832,12 @@ const HELP_USAGE = `rechrome (rech) — drive your real, logged-in Chrome from s
 Usage: rech <command> [options]   ·   rech <browser-command> [args]`;
 
 const HELP_EPILOGUE = `Browser commands (sent to this project's Chrome session):
-  rech [--profile <p>] [--isolate] <browser-command> [args]
+  rech [--profile <p>] [--isolate[=<name>]] <browser-command> [args]
       open, goto, click, fill, screenshot, eval, tab-list…  (\`rech pw --help\` lists all)
       --profile <p>  as another registered profile (email, name or folder); put it first
-      --isolate      in a throwaway session, e.g. for a login flow
+      --isolate      in a throwaway session (a new one per command)
+      --isolate=<n>  in the named isolated session <n>: made on first use, reused by later
+                     commands (same tabs, same page) until \`rech session close <n>\`
   rech fill-secret <ref> --from-env VAR | --totp-from-env VAR [--env-file f] [--allow-domain '*.example.com']
                      type a password / TOTP code without it reaching argv, logs or output
   rech read-secret <ref> --allow-domain <host> | <vault command>
@@ -4582,6 +4849,13 @@ const HELP_EPILOGUE = `Browser commands (sent to this project's Chrome session):
   rech read-headers --allow-domain <host> [--seconds N] [--goto <url>]
                      capture response status + headers (no bodies) to a JSON evidence file;
                      credential header values and URL query values are redacted
+  rech record start [--fps <n>] [--quality <1-100>] [--format mp4|webm|mjpeg] [--max-seconds <n>]
+  rech record stop [--filename <name>]
+                     record the active tab, streamed into ffmpeg on the host, until stop (or
+                     --max-seconds, default 600); stop hands you the video. No click, no new
+                     permission; mjpeg if the host has no ffmpeg
+  rech record [--seconds <n>] [...]
+                     the same in one call: record n seconds (max 60) and return the file
   rech pw <args>     forward verbatim to playwright-cli, e.g. \`rech pw --version\`
   rech --version     rechrome's version
 
@@ -4596,7 +4870,8 @@ Examples:
   rech setup --profile you@example.com         set up Chrome on this machine
   rech open https://example.com                open a page in this project's session
   rech screenshot                              saved to <project>/.rechrome/output/
-  rech share new you@example.com               invite link for another machine (WebRTC, no open port)
+  rech share                                   pick a profile and how to share it (in a terminal)
+  rech share you@example.com --webrtc          invite link for another machine (WebRTC, no open port)
   rech connect '<link>'                        use that link in this project
   rech share ls                                shares, devices, expiry
 
@@ -4637,13 +4912,17 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
         throw new Error(`To share "${a.name}" with another machine: rech share ${JSON.stringify(a.name)}. To list profiles: rech profile`);
       })
     // Share with and connect from other machines
-    .command("share [profiles..]", "Share profiles: `share new <profile..>` makes an invite link (WebRTC by default); `share ls` lists all", y => y
+    .command("share [profiles..]", "Share profiles: `share <profile> --lan|--tailscale|--webrtc[=url]|--via <listener>` makes an invite link (no default: a terminal asks); `share ls` lists all", y => y
       .positional("profiles", { type: "string", array: true, describe: "new <profile..> | ls | devices|approve|allow|deny|rotate|renew|revoke|rm <share> […]; or a profile for its legacy listener link" })
       .option("name", { type: "string", requiresArg: true, describe: "With new: the share's name (default: from the first profile)" })
-      .option("via", { type: "string", array: true, requiresArg: true, describe: "With new: webrtc (default) | lan | tailscale | <IP> | <listener>; repeat or comma-separate for several" })
-      .option("signal", { type: "string", requiresArg: true, describe: `With new: signal server for webrtc (default ${DEFAULT_SIGNAL}, or RECH_SIGNAL)` })
+      .option("via", { type: "string", array: true, requiresArg: true, describe: "Share over these: lan | tailscale | webrtc | <IP> | <listener> (rech listener ls); repeat or comma-separate for several" })
+      .option("lan", { type: "boolean", describe: "Share over this network (a LAN listener, made if needed)" })
+      .option("tailscale", { type: "boolean", describe: "Share over your tailnet (a tailscale listener, made if needed)" })
+      .option("webrtc", { type: "string", describe: `Share over WebRTC: bare = ${DEFAULT_RTC} (${DEFAULT_SIGNAL}, best effort); --webrtc=<signal-url> = that server's listener (made if needed); repeatable` })
+      .option("signal", { type: "string", requiresArg: true, describe: `Signal server for a bare --webrtc / --via webrtc (else RECH_SIGNAL, else ${DEFAULT_SIGNAL})` })
       .option("expires", { type: "string", requiresArg: true, describe: "With new/renew: 30d, 2w, 24h, never (new default: 30d over webrtc, else never)" })
-      .option("invite-ttl", { type: "string", requiresArg: true, describe: "With new: an unused invite stops working after this (default 24h)" })
+      .option("invite-ttl", { type: "string", requiresArg: true, alias: "ttl", describe: "With new: the invite stops working after this (default 24h; 7d with --reusable)" })
+      .option("reusable", { type: "boolean", describe: "With new: many devices may redeem the same invite link (each gets its own credential) until --ttl or rech share rotate" })
       .option("devices", { type: "number", requiresArg: true, describe: "With new: how many devices may redeem the invite (default 1)" })
       .option("approve", { type: "boolean", describe: "With new: each new device waits for `rech share approve`" })
       .option("rm", { type: "string", requiresArg: true, describe: "With devices: remove this device" })
@@ -4654,7 +4933,16 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
       a => {
         const profiles = (a.profiles ?? []) as string[];
         const [action, target, ...rest] = profiles;
-        if (action === "new") return handlers.shareNew(profiles.slice(1), { name: a.name, via: a.via as string[] | undefined, signal: a.signal, expires: a.expires, inviteTtl: a.inviteTtl, devices: a.devices, approve: a.approve });
+        const webrtc = a.webrtc === undefined ? undefined : ([a.webrtc].flat() as string[]).map(String);
+        const transport = { via: a.via as string[] | undefined, webrtc, lan: a.lan, tailscale: a.tailscale, signal: a.signal };
+        const newOpts = { name: a.name, ...transport, expires: a.expires, inviteTtl: a.inviteTtl, devices: a.devices, approve: a.approve, reusable: a.reusable };
+        if (action === "new") return handlers.shareNew(profiles.slice(1), newOpts);
+        // Transport flags make a share (an invite link) for the named profiles.
+        if (transportTokens(transport).length && !(action && SHARE_ACTIONS.has(action)) && !(profiles.length === 1 && ["ls", "list"].includes(profiles[0]))) {
+          if (a.all || a.listener) throw new Error("--lan/--tailscale/--webrtc/--via make a new share; --all and --listener print an existing listener's link. Use one or the other.");
+          if (!profiles.length) throw new Error("Which profiles? rech share <profile..> --lan|--tailscale|--webrtc|--via <listener>   (see rech profile)");
+          return handlers.shareNew(profiles, newOpts);
+        }
         if (action && SHARE_ACTIONS.has(action)) {
           if (!target) throw new Error(`Which share? rech share ${action} <share>   (see rech share ls)`);
           if (action === "devices") return handlers.shareDevices(target, a.rm);
@@ -4678,13 +4966,23 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
       a => a.global || a.project ? handlers.connect(a.url, { global: a.global, project: a.project }) : handlers.connect(a.url))
     .command(["listener", "listeners"], "Control who can connect: listeners, allowed profiles, keys, public URLs", y => y
       .command(["ls", "list", "$0"], "List listeners (keys hidden)", {}, () => handlers.listListeners())
-      .command("add <name>", "Expose registered profiles on an address (local for a proxy, lan, tailscale, IP)", y => y
+      .command("add <name>", "Expose registered profiles on an address (local for a proxy, lan, tailscale, IP), or add a WebRTC signal server (--webrtc)", y => y
         .positional("name", { type: "string", demandOption: true })
-        .option("listen", { type: "string", requiresArg: true, demandOption: true, describe: "local | lan | tailscale | <detected IP>" })
-        .option("profile", { type: "string", array: true, requiresArg: true, demandOption: true, describe: "Allowed profile; repeat for several" })
+        .option("listen", { type: "string", requiresArg: true, describe: "local | lan | tailscale | <detected IP>" })
+        .option("profile", { type: "string", array: true, requiresArg: true, describe: "Allowed profile; repeat for several" })
         .option("port", portOption)
-        .option("prefix", { type: "string", requiresArg: true, describe: "URL path prefix, e.g. rechrome" }),
-        a => handlers.addListener(a.name, { listen: a.listen, profile: a.profile, port: a.port, prefix: a.prefix }))
+        .option("prefix", { type: "string", requiresArg: true, describe: "URL path prefix, e.g. rechrome" })
+        .option("webrtc", { type: "string", requiresArg: true, describe: "A WebRTC listener on this signal server, e.g. https://signal.example.com/ (shares name it with --via)" })
+        .option("turn", { type: "string", array: true, requiresArg: true, describe: "With --webrtc: a STUN/TURN server, e.g. turns://user:pass@turn.example.com:5349; repeatable" })
+        .option("turn-env", { type: "string", array: true, requiresArg: true, describe: "With --webrtc: read a TURN URL from this environment variable (keeps the password out of shell history); repeatable" })
+        .check(a => a.webrtc !== undefined
+          ? (a.listen || a.profile || a.port || a.prefix ? "--webrtc takes no --listen/--profile/--port/--prefix" : true)
+          : a.turn || a.turnEnv ? "--turn/--turn-env go with --webrtc <signal-url>"
+          : a.listen && a.profile?.length ? true : "Pass --listen <where> --profile <profile>, or --webrtc <signal-url>")
+        .example("rech listener add home --webrtc=https://signal.example.com/ --turn-env MY_TURN_URL", ""),
+        a => a.webrtc !== undefined
+          ? handlers.addWebrtcListener(a.name, { webrtc: a.webrtc, turn: a.turn as string[] | undefined, turnEnv: a.turnEnv as string[] | undefined })
+          : handlers.addListener(a.name, { listen: a.listen!, profile: a.profile as string[], port: a.port, prefix: a.prefix }))
       .command("allow <name> <profiles..>", "Allow more profiles on a listener", y => y
         .positional("name", { type: "string", demandOption: true }).positional("profiles", { type: "string", array: true, demandOption: true }),
         a => handlers.allowListener(a.name, a.profiles))
@@ -4711,7 +5009,7 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
       .command("remove <name>", "Remove a listener", y => y.positional("name", { type: "string", demandOption: true }),
         a => handlers.removeListener(a.name))
       .demandCommand(1).strict())
-    .command(["session [action] [name]", "sessions [action] [name]"], "This link's browser sessions on the host: ls (default) | close <name>", y => y
+    .command(["session [action] [name]", "sessions [action] [name]"], "This link's browser sessions on the host: ls (default) | close <name> (also an --isolate=<name> session)", y => y
       .positional("action", { type: "string", choices: ["ls", "list", "close"], default: "ls" })
       .positional("name", { type: "string", describe: "With close: the session (as `rech session ls` shows it)" }),
       a => handlers.session(a.action === "list" ? "ls" : a.action!, a.name))
@@ -4754,7 +5052,7 @@ if (import.meta.main) {
   const handlers: RechHandlers = {
     serve: async () => { const { serve } = await import("./serve.ts"); serve(); }, // long-lived; watcher intentionally kept alive
     status,
-    listListeners, addListener, removeListener, printProfileUri,
+    listListeners, addListener, addWebrtcListener, removeListener, printProfileUri,
     listProfiles: async () => {
       const raw = process.env[ENV_KEY];
       const url = raw ? await transportUrl(raw) : raw;
@@ -4858,10 +5156,13 @@ if (import.meta.main) {
     // flows (OAuth/login) that must not share tabs with the worktree's default session. The `iso-`
     // marker lets the daemon reap these throwaway sessions on an idle TTL (see serve.ts), so an
     // OAuth drive can't leak an orphaned browser context.
-    const isolateIdx = args.findIndex((a) => a === "--isolate" || a === "--isolated");
-    if (isolateIdx !== -1) {
-      args.splice(isolateIdx, 1);
-      args.push(`-s=iso-${randomBytes(8).toString("hex")}`);
+    // --isolate=<name>: a named isolated session (-s=iso_<name>), kept across commands until
+    // `rech session close <name>`, for multi-step flows (email, password, TOTP).
+    try { args = applyIsolateArg(args); }
+    catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      envWatcher?.close();
+      process.exit(1);
     }
     args = [...forwarded, ...args];
     await run(url, args, overrideEnv, { verbatim: separator !== -1 });

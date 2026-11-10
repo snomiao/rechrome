@@ -13,6 +13,8 @@ import { bearerOf, credentialIdOf, newToken, safeEqual } from "./secret.ts";
 
 export const WEBRTC = "webrtc";
 export const DEFAULT_SIGNAL = "https://rechrome.pages.dev/";
+// The built-in WebRTC listener's name (see listeners.ts): the public signal server above.
+export const DEFAULT_RTC = "webrtc-default";
 export const SHARES_FILE = join(homedir(), ".rechrome", "shares.json");
 
 export type Device = { id: string; name: string; token: string; addedAt: number; lastSeen?: number; approved: boolean };
@@ -29,6 +31,8 @@ export type Share = {
   expiresAt?: number;
   maxDevices: number;
   approve: boolean;          // each new device waits for `rech share approve`
+  reusable?: boolean;        // the invite is not used up by one device: many redeem it (up to maxDevices) until it expires or is rotated
+  redeemed?: number;         // how many times the invite was redeemed (devices removed since still count)
   devices: Device[];
   revokedAt?: number;
 };
@@ -110,8 +114,13 @@ export function findShare(config: ShareConfig, name: string): Share {
 
 export type NewShareOptions = {
   label: string; profiles: string[]; via: string[]; signal?: string;
-  expiresAt?: number; inviteTtlMs?: number; maxDevices?: number; approve?: boolean; now?: number;
+  expiresAt?: number; inviteTtlMs?: number; maxDevices?: number; approve?: boolean; reusable?: boolean; now?: number;
 };
+
+/** Device cap of a reusable invite when --devices isn't given: bounds what a leaked link can enroll. */
+export const REUSABLE_MAX_DEVICES = 100;
+/** Invite lifetime of a reusable invite when --ttl isn't given. */
+export const REUSABLE_DEFAULT_TTL = "7d";
 
 export function createShare(config: ShareConfig, opts: NewShareOptions): Share {
   const now = opts.now ?? Date.now();
@@ -127,13 +136,16 @@ export function createShare(config: ShareConfig, opts: NewShareOptions): Share {
     inviteTtlMs: opts.inviteTtlMs,
     profiles: [...new Set(opts.profiles)],
     via: [...new Set(opts.via)],
+    // Only the legacy "webrtc" transport keeps its signal server on the share; a WebRTC
+    // listener carries its own.
     signal: opts.via.includes(WEBRTC) ? normalizeSignal(opts.signal ?? DEFAULT_SIGNAL) : undefined,
     createdAt: now,
     expiresAt: opts.expiresAt,
-    maxDevices: opts.maxDevices ?? 1,
+    maxDevices: opts.maxDevices ?? (opts.reusable ? REUSABLE_MAX_DEVICES : 1),
     approve: !!opts.approve,
     devices: [],
   };
+  if (opts.reusable) { share.reusable = true; share.redeemed = 0; }
   config.shares.push(share);
   return share;
 }
@@ -186,9 +198,32 @@ export function shareProblem(share: Share, now = Date.now()): string | null {
 
 /** Why an unused invite can't be redeemed right now, or null. */
 export function inviteProblem(share: Share, now = Date.now()): string | null {
-  if (share.inviteExpiresAt && now >= share.inviteExpiresAt) return `This invite expired unused. Ask the host for a fresh one: rech share rotate ${share.label}`;
+  if (share.inviteExpiresAt && now >= share.inviteExpiresAt) return `This invite expired${share.reusable ? "" : " unused"}. Ask the host for a fresh one: rech share rotate ${share.label}`;
+  if (share.reusable) {
+    if (share.devices.length >= share.maxDevices) return `This reusable invite reached its limit of ${share.maxDevices} devices. Ask the host to remove unused devices (rech share devices ${share.label} --rm <id>) or to rotate it.`;
+    return null;
+  }
   if (share.devices.length >= share.maxDevices) return `This invite was already used${share.maxDevices > 1 ? ` by ${share.maxDevices} devices` : ""}. Ask the host for a fresh one (rech share rotate ${share.label}); if you didn't use it, tell them, since someone else did.`;
   return null;
+}
+
+/** What an invite's holder is told about it before redeeming (the /ping of an invite). */
+export function inviteState(share: Share, now = Date.now()): { state: "open" | "used" | "expired"; maxDevices: number; used: number; expiresAt?: number } {
+  const used = share.devices.length;
+  const state = used >= share.maxDevices ? "used" : share.inviteExpiresAt && now >= share.inviteExpiresAt ? "expired" : "open";
+  return { state, maxDevices: share.maxDevices, used, ...(share.inviteExpiresAt ? { expiresAt: share.inviteExpiresAt } : {}) };
+}
+
+/** A share's live browser sessions: names and device names only, none of another share's. */
+export function shareSessions(share: Share, owners: Iterable<[string, { owner: string; name: string }]>, live: ReadonlySet<string>): { name: string; device: string }[] {
+  const prefix = `share:${share.id}:`;
+  const out: { name: string; device: string }[] = [];
+  for (const [session, o] of owners) {
+    if (!o.owner.startsWith(prefix) || !live.has(session)) continue;
+    const device = share.devices.find(d => d.id === o.owner.slice(prefix.length));
+    if (device) out.push({ name: o.name, device: device.name });
+  }
+  return out;
 }
 
 /**
@@ -224,6 +259,7 @@ export function redeemInvite(config: ShareConfig, shareId: string, name: string,
     token, addedAt: now, approved: !share.approve,
   };
   share.devices.push(device);
+  if (share.reusable) share.redeemed = (share.redeemed ?? 0) + 1;
   return device;
 }
 
@@ -244,13 +280,16 @@ export function parseDuration(text: string): number | undefined {
 }
 
 /** Every credential a WebRTC host should be reachable on: unused invites and devices. */
-export function webrtcCredentials(config: ShareConfig, now = Date.now()): Credential[] {
+/** Live credentials of shares offered on a WebRTC listener (`rtcNames`; the legacy "webrtc" always counts). */
+export function webrtcCredentials(config: ShareConfig, now = Date.now(), rtcNames: Iterable<string> = [DEFAULT_RTC]): Credential[] {
+  const names = new Set([WEBRTC, DEFAULT_RTC, ...rtcNames]);
   const out: Credential[] = [];
   for (const share of config.shares) {
-    if (!share.via.includes(WEBRTC) || shareProblem(share, now)) continue;
-    // A used-up invite keeps its room while the share lives, so whoever tries it again hears
-    // "already used" (a sign the link leaked) rather than "host offline".
-    if (!(share.inviteExpiresAt && now >= share.inviteExpiresAt)) out.push({ share, kind: "invite", token: share.invite });
+    if (!share.via.some(v => names.has(v)) || shareProblem(share, now)) continue;
+    // A used-up or expired invite keeps its room while the share lives, so whoever tries it hears
+    // "already used" (a sign the link leaked) or "expired" rather than "host offline". Such a
+    // room only ever answers with that refusal (see inviteProblem).
+    out.push({ share, kind: "invite", token: share.invite });
     for (const device of share.devices) out.push({ share, kind: "device", token: device.token, device });
   }
   return out;

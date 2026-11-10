@@ -56,6 +56,9 @@ rech tab-list
 rech eval "() => document.title"
 rech --profile work@example.com open https://example.com   # another registered profile
 rech --isolate open https://accounts.example.com           # throwaway session, e.g. for a login flow
+rech --isolate=login open https://accounts.example.com     # named isolated session: reused by later
+rech --isolate=login fill-secret e12 --from-env PASSWORD   #   --isolate=login commands (same tabs)
+rech session close login                                   #   until you close it (rech session ls lists it)
 ```
 
 Any [playwright-cli](https://github.com/snomiao/playwright-cli) command works after `rech`. When a
@@ -151,10 +154,12 @@ comment for some .env loaders. rech quotes it when it saves one.
 
 ### 4. Share with another machine
 
-On the host (the machine with Chrome), make an invite:
+On the host (the machine with Chrome), make an invite. `rech share` has no default transport:
+in a terminal, `rech share` asks which profile and which listeners to share over; in a script,
+name them:
 
 ```bash
-rech share new you@example.com --name alice
+rech share you@example.com --webrtc --name alice
 # Share "alice": you@example.com
 # Invite for one device (unused, it expires …; secret: send it privately):
 #   https://rechrome.pages.dev/#rech1_7fQxC9tZp2mVb8wLrN4hdK3kT9aQ
@@ -168,10 +173,13 @@ rech connect 'https://rechrome.pages.dev/#rech1_…'
 rech open https://example.com
 ```
 
-By default the two machines meet over **WebRTC**: neither needs an open port, a VPN or a
-domain. A small signal server introduces them, and then traffic flows peer to peer, end-to-end
+Over **WebRTC** the two machines need no open port, VPN or domain. A small signal server introduces them, and then traffic flows peer to peer, end-to-end
 encrypted with keys the signal server never sees. The first `rech` command after connecting starts
 a small local bridge that keeps the connection open between commands.
+
+**Opening the link in a browser shows what it gives**, without redeeming it: whether the host is
+online, the share and when it ends, whether the invite is still open, its profiles, and its open
+sessions. Anyone holding the link can see that. `rech connect` lists the open sessions too.
 
 **The link is an invite, not a key.** `rech connect` redeems it once: this machine gets its own
 device credential (saved to `.rechrome/.env.local`) and the invite stops working, so a link that
@@ -180,10 +188,12 @@ expire after 24 hours, and WebRTC shares after 30 days unless renewed.
 
 | On the host | |
 |---|---|
-| `rech share new <profile..> [--name n]` | Invite link (`--via webrtc` by default) |
-| `--via lan` · `--via tailscale` · `--via <IP or listener>` | Direct HTTP instead of (or as well as) WebRTC |
+| `rech share [<profile..>] [--name n]` | Invite link; in a terminal, with no transport flag, pick profile and listeners from a list |
+| `--webrtc` · `--webrtc=<signal-url>` | WebRTC via the built-in `webrtc-default` listener (rechrome.pages.dev: best effort, for trying it out; no speed or uptime promise) · via your own signal server (its listener is made if needed) |
+| `--lan` · `--tailscale` · `--via <listener,…>` | Direct HTTP on this network · your tailnet · existing listeners (`rech listener ls`); combine several for one link each |
 | `--devices 3` · `--approve` | Let 3 devices redeem it · make each new device wait for `rech share approve` |
-| `--expires 7d` · `--invite-ttl 1h` · `--signal <url>` | Lifetimes · your [own signal server](docs/signal-selfhost.md) |
+| `--expires 7d` · `--invite-ttl 1h` | Lifetimes |
+| `rech listener add <name> --webrtc=<signal-url> [--turn <url>]… [--turn-env VAR]…` | A WebRTC listener on your [own signal server](docs/signal-selfhost.md), with optional STUN/TURN |
 | `rech share ls` · `rech share devices <share> [--rm <device>]` | Shares, devices, expiry · drop one device |
 | `rech share allow\|deny <share> <profile..>` | Change the profiles; the link and devices stay |
 | `rech share rotate <share>` | A fresh invite; the old one stops working |
@@ -201,9 +211,12 @@ navigation, tabs, snapshots, screenshots and basic interactions, but not `eval`/
 filesystem commands (see [Remote access](#remote-access)).
 
 **WebRTC needs** `node-datachannel`, installed on first use into `~/.rechrome/webrtc`. When a
-direct path can't be found (some corporate networks, symmetric NAT), give the host TURN: set
-`CF_TURN_KEY_ID` and `CF_TURN_API_TOKEN` (a [Cloudflare TURN](https://developers.cloudflare.com/realtime/turn/)
-key; its free tier is 1,000 GB/month) in the daemon's environment, or share `--via tailscale`.
+direct path can't be found (some corporate networks, symmetric NAT), give the host TURN: add it to
+a WebRTC listener as one URL, `rech listener add home --webrtc=https://signal.example.com/ --turn-env TEAM_TURN`
+with `TEAM_TURN=turns://user:pass@turn.example.com:5349` (user and password percent-encoded;
+`rech listener ls` shows the username, never the password). Or set `CF_TURN_KEY_ID` and
+`CF_TURN_API_TOKEN` (a [Cloudflare TURN](https://developers.cloudflare.com/realtime/turn/) key; its
+free tier is 1,000 GB/month) in the daemon's environment, or share `--tailscale`.
 
 **Keep links out of git.** `rech status`, `rech connect` and `rech share --save` warn when the file
 holding `RECHROME_URL` is committed, staged, not git-ignored, or readable by other users. Links
@@ -539,7 +552,11 @@ Each client gets its own browser session, keyed by the **git worktree root path*
 roll up to their parent), or the current directory outside git. So two worktrees of one repo
 get separate sessions, and `git checkout` keeps you in the same one. `RECH_IDENTITY=branch`
 restores the older `<remote>/tree/<branch>` keying and `RECH_IDENTITY=cwd` keys on the exact
-directory. Pass `-s=<name>` for a named sub-session, or `--isolate` for a throwaway one.
+directory. Pass `-s=<name>` for a named sub-session, `--isolate` for a throwaway one (a new session per
+command), or `--isolate=<name>` for a named isolated session (`-s=iso_<name>`) that later
+`--isolate=<name>` commands from the same worktree reuse until `rech session close <name>`.
+An isolated session is its own tab group in the same Chrome profile: it shares the profile's
+cookies, so profile-scoped listeners still refuse `eval`, `run-code` and other arbitrary code in it.
 A share device's sessions are additionally keyed by its share and device, so they never meet
 another device's or a listener link's; `rech session ls` lists the ones this link drove.
 

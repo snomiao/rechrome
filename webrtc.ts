@@ -14,11 +14,11 @@ import { join } from "path";
 import { homedir } from "os";
 import { randomBytes } from "crypto";
 import { roomAuthOf, roomOf } from "./secret.ts";
-import { CONFIRM_TIMEOUT_MS, FLAG_CONFIRM, MAX_CHUNK, deriveDirKeys, newRecvState, newSendState, open, pack, randomHex, seal, transcriptHash, unpack, type RecvState, type SendState } from "./e2e.ts";
+import { MAX_CHUNK, randomHex, transcriptHash } from "./e2e.ts";
+import { SealedChannel, SignalSocket, signalSocketUrl } from "./rtc-channel.ts";
 
-export const SIGNAL_PROTO = "rech-signal-1";
-const PING = '{"type":"ping"}';
-const KEEPALIVE_MS = 25_000;
+export { SIGNAL_PROTO, signalSocketUrl } from "./rtc-channel.ts";
+
 const CONNECT_TIMEOUT_MS = 25_000;
 const MAX_PEERS_PER_ROOM = 8;
 const DEFAULT_STUN = [{ urls: "stun:stun.cloudflare.com:3478" }, { urls: "stun:stun.l.google.com:19302" }];
@@ -61,8 +61,9 @@ export function iceServersFromEnv(env = process.env): IceServer[] {
 // Short-lived Cloudflare TURN credentials from the HOST owner's own TURN key (CF_TURN_KEY_ID +
 // CF_TURN_API_TOKEN), handed to each peer in the offer. Without them: STUN only.
 let turnCache: { servers: IceServer[]; exp: number } | null = null;
-export async function hostIceServers(log: Log, env = process.env): Promise<IceServer[]> {
-  const base = iceServersFromEnv(env);
+export async function hostIceServers(log: Log, env = process.env, extra: IceServer[] = []): Promise<IceServer[]> {
+  // A listener's own STUN/TURN servers come after the base ones (RECH_ICE_SERVERS, else public STUN).
+  const base = [...iceServersFromEnv(env), ...extra];
   const keyId = env.CF_TURN_KEY_ID, apiToken = env.CF_TURN_API_TOKEN;
   if (!keyId || !apiToken) return base;
   if (turnCache && turnCache.exp > Date.now()) return [...base, ...turnCache.servers];
@@ -82,131 +83,10 @@ export async function hostIceServers(log: Log, env = process.env): Promise<IceSe
   }
 }
 
-export function signalSocketUrl(signal: string, room: string): string {
-  const u = new URL(signal);
-  u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
-  u.pathname = `${u.pathname.replace(/\/+$/, "")}/${room}`;
-  u.search = ""; u.hash = "";
-  return u.toString();
-}
-
-// ---- sealed channel (shared by both ends) -------------------------------------------------
-type Role = "host" | "client";
-
-/** A DataChannel with the e2e seal/open and confirmation handshake on top. */
-class SealedChannel {
-  private send = newSendState() as SendState;
-  private recv = newRecvState() as RecvState;
-  private sendChain = Promise.resolve();
-  private recvChain = Promise.resolve();
-  private keys?: { mine: CryptoKey; theirs: CryptoKey; th: Uint8Array };
-  // Frames can arrive the moment the channel opens, before this side has derived its keys
-  // (an async HKDF): hold them until then rather than dropping the connection.
-  private keysSet!: () => void;
-  private keysReady = new Promise<void>(r => (this.keysSet = r));
-  confirmed = false;
-  private confirmWaiters: Array<(ok: boolean) => void> = [];
-  onFrame: (frame: any) => void = () => {};
-  onClose: () => void = () => {};
-  private closed = false;
-
-  constructor(private dc: any, private role: Role) {
-    dc.binaryType = "arraybuffer";
-    dc.onmessage = (e: { data: ArrayBuffer | Uint8Array | string }) => {
-      this.recvChain = this.recvChain.then(() => this.receive(e.data)).catch(() => this.close());
-    };
-    dc.onclose = () => this.close();
-  }
-
-  async setKeys(token: string, th: Uint8Array): Promise<void> {
-    const { h2c, c2h } = await deriveDirKeys(token, th);
-    this.keys = this.role === "host" ? { mine: h2c, theirs: c2h, th } : { mine: c2h, theirs: h2c, th };
-    this.keysSet();
-  }
-
-  /** Send our confirm frame (counter 0) and wait for the peer's; false on timeout or failure. */
-  confirm(): Promise<boolean> {
-    const done = new Promise<boolean>(resolve => {
-      this.confirmWaiters.push(resolve);
-      setTimeout(() => resolve(false), CONFIRM_TIMEOUT_MS);
-    });
-    void this.sendFrame({ t: "confirm", nonce: randomHex(16), proto: "rech-e2e-1" }, FLAG_CONFIRM);
-    return done;
-  }
-
-  sendFrame(obj: unknown, flags = 0): Promise<void> {
-    this.sendChain = this.sendChain.then(async () => {
-      if (this.closed || !this.keys || this.dc.readyState !== "open") return;
-      const frame = await seal(this.keys.mine, this.send, flags, this.keys.th, pack(obj));
-      // A DataChannel queues without bound; wait out a large backlog (screenshots) instead.
-      while (this.dc.bufferedAmount > 4 * 1024 * 1024 && this.dc.readyState === "open") await new Promise(r => setTimeout(r, 10));
-      try { this.dc.send(new Uint8Array(frame)); } catch { this.close(); }
-    }).catch(() => this.close());
-    return this.sendChain;
-  }
-
-  private async receive(data: ArrayBuffer | Uint8Array | string): Promise<void> {
-    if (this.closed) return;
-    if (typeof data === "string") return this.close(); // plaintext is never accepted
-    await Promise.race([this.keysReady, new Promise(r => setTimeout(r, CONFIRM_TIMEOUT_MS))]);
-    if (!this.keys) return this.close();
-    const { plaintext } = await open(this.keys.theirs, data, this.keys.th, this.recv);
-    const frame = unpack(plaintext);
-    if (!this.confirmed) {
-      // The first frame must be the peer's confirm: decrypting it proves the same secret and the
-      // same DTLS transcript (no relay in the middle); the transcript makes it unreplayable.
-      if (frame?.t !== "confirm") return this.close();
-      this.confirmed = true;
-      for (const w of this.confirmWaiters.splice(0)) w(true);
-      return;
-    }
-    if (frame?.t === "confirm") return;
-    this.onFrame(frame);
-  }
-
-  get open(): boolean { return !this.closed && this.dc.readyState === "open"; }
-
-  close(): void {
-    if (this.closed) return;
-    this.closed = true;
-    for (const w of this.confirmWaiters.splice(0)) w(false);
-    try { this.dc.close(); } catch {}
-    this.onClose();
-  }
-}
-
-// Wire frames inside the sealed channel:
-//   client → host : {t:"req", id, method, path, ct?, body?} | {t:"abort", id}
-//   host → client : {t:"res", id, status, ct} | {t:"data", id, b64} | {t:"end", id, error?}
-
-// ---- signal socket ---------------------------------------------------------------------
-class SignalSocket {
-  ws?: WebSocket;
-  private timer?: ReturnType<typeof setInterval>;
-  constructor(private url: string, private hello: { role: Role; auth: string }, private onMessage: (m: any) => void, private onClose: (code: number, reason: string) => void) {}
-  open(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const ws = new WebSocket(this.url, [SIGNAL_PROTO]);
-      this.ws = ws;
-      let opened = false;
-      ws.onopen = () => {
-        opened = true;
-        ws.send(JSON.stringify({ type: "hello", ...this.hello }));
-        this.timer = setInterval(() => { try { ws.send(PING); } catch {} }, KEEPALIVE_MS);
-        resolve();
-      };
-      ws.onmessage = e => { try { const m = JSON.parse(String(e.data)); if (m?.type !== "pong") this.onMessage(m); } catch {} };
-      ws.onclose = e => { clearInterval(this.timer); if (!opened) reject(new Error(`signal server ${new URL(this.url).host}: ${e.reason || `closed (${e.code})`}`)); this.onClose(e.code, e.reason); };
-      ws.onerror = () => {};
-    });
-  }
-  send(obj: unknown): void { try { this.ws?.send(JSON.stringify(obj)); } catch {} }
-  close(): void { clearInterval(this.timer); try { this.ws?.close(); } catch {} }
-}
-
 // ---- host ------------------------------------------------------------------------------
-export type HostCredential = { token: string; signal: string; label: string };
-export type HostHandler = (req: Request, token: string) => Promise<Response>;
+// listener: the WebRTC listener this room belongs to (a share's `via` entry); ice: its STUN/TURN.
+export type HostCredential = { token: string; signal: string; label: string; listener?: string; ice?: IceServer[] };
+export type HostHandler = (req: Request, token: string, listener?: string) => Promise<Response>;
 
 /** Keeps one signal room per credential and serves each joining peer through `handler`. */
 export class WebrtcHost {
@@ -215,10 +95,13 @@ export class WebrtcHost {
 
   /** Open rooms for new credentials, close rooms for ones that are gone. */
   sync(creds: HostCredential[]): void {
-    const wanted = new Map(creds.map(c => [`${c.signal}\0${c.token}`, c]));
+    // One room per (signal server, credential): the first listener naming a signal server wins.
+    const wanted = new Map<string, HostCredential>();
+    for (const c of creds) { const key = `${c.signal}\0${c.token}`; if (!wanted.has(key)) wanted.set(key, c); }
     for (const [key, room] of this.rooms) if (!wanted.has(key)) { this.stopRoom(room); this.rooms.delete(key); }
     for (const [key, cred] of wanted) {
-      if (this.rooms.has(key)) continue;
+      const live = this.rooms.get(key);
+      if (live) { live.cred = cred; continue; } // a listener's ICE may have changed: next peer uses it
       const room = { cred, peers: new Map(), backoff: 1000, stopped: false } as any;
       this.rooms.set(key, room);
       void this.connect(room);
@@ -288,7 +171,7 @@ export class WebrtcHost {
 
   private async startPeer(room: any, peerId: string): Promise<void> {
     const { RTCPeerConnection } = await loadRTC(this.log);
-    const ice = await hostIceServers(this.log);
+    const ice = await hostIceServers(this.log, process.env, room.cred.ice ?? []);
     const pc = new RTCPeerConnection({ iceServers: ice });
     let keysReady!: (th: Uint8Array) => void;
     const keys = new Promise<Uint8Array>(r => (keysReady = r));
@@ -302,7 +185,7 @@ export class WebrtcHost {
     peer.channel = channel;
     const aborts = new Map<string, AbortController>();
     channel.onClose = () => { for (const a of aborts.values()) a.abort(); this.closePeer(room, peerId); };
-    channel.onFrame = frame => void this.onFrame(channel, room.cred.token, aborts, frame);
+    channel.onFrame = frame => void this.onFrame(channel, room.cred.token, aborts, frame, room.cred.listener);
     dc.onopen = async () => {
       await channel.setKeys(room.cred.token, await keys);
       if (await channel.confirm()) this.log(`webrtc ${room.cred.label}: peer ${peerId} connected`);
@@ -315,7 +198,7 @@ export class WebrtcHost {
     send({ type: "offer", sdp: pc.localDescription.sdp, ice });
   }
 
-  private async onFrame(channel: SealedChannel, token: string, aborts: Map<string, AbortController>, f: any): Promise<void> {
+  private async onFrame(channel: SealedChannel, token: string, aborts: Map<string, AbortController>, f: any, listener?: string): Promise<void> {
     if (f?.t === "abort") { aborts.get(f.id)?.abort(); aborts.delete(f.id); return; }
     if (f?.t !== "req" || typeof f.id !== "string" || typeof f.path !== "string" || !f.path.startsWith("/")) return;
     const ac = new AbortController();
@@ -327,7 +210,7 @@ export class WebrtcHost {
         body: f.body != null && !["GET", "HEAD"].includes(f.method) ? f.body : undefined,
         signal: ac.signal,
       });
-      const res = await this.handler(req, token);
+      const res = await this.handler(req, token, listener);
       await channel.sendFrame({ t: "res", id: f.id, status: res.status, ct: res.headers.get("content-type") ?? "" });
       if (res.body) {
         const reader = res.body.getReader();
@@ -367,7 +250,7 @@ export class WebrtcClient {
       const timer = setTimeout(() => fail("timed out connecting to the host over WebRTC (no direct path; the host may be behind a strict NAT: ask them to enable TURN, or use a Tailscale/LAN share)"), CONNECT_TIMEOUT_MS);
       sock = new SignalSocket(signalSocketUrl(this.signal, roomOf(token)), { role: "client", auth: roomAuthOf(token) }, async m => {
         try {
-          if (m.type === "welcome" && m.hostPresent === false) fail("the host is offline (its rech daemon isn't connected to the signal server)");
+          if (m.type === "welcome" && m.hostPresent === false) fail("nobody is answering this link: the host's rech daemon may be down, or the link was revoked. Ask the host to check, or for a fresh link");
           else if (m.type === "host-leave" && !this.connected) fail("the host left before the connection finished");
           else if (m.type === "offer" && typeof m.sdp === "string" && !this.pc) {
             const pc = new RTCPeerConnection({ iceServers: Array.isArray(m.ice) ? m.ice : iceServersFromEnv() });
@@ -399,7 +282,7 @@ export class WebrtcClient {
             await this.pc.addIceCandidate(m.candidate).catch(() => {});
           }
         } catch (error) { fail(String(error)); }
-      }, (code, reason) => { if (!this.connected) fail(code === 4404 ? "the host is offline (its rech daemon isn't connected to the signal server)" : code === 1008 ? `the signal server refused this link (${reason || "forbidden"})` : `signal server closed the connection (${reason || code})`); });
+      }, (code, reason) => { if (!this.connected) fail(code === 4404 ? "nobody is answering this link: the host's rech daemon may be down, or the link was revoked. Ask the host to check, or for a fresh link" : code === 1008 ? `the signal server refused this link (${reason || "forbidden"})` : `signal server closed the connection (${reason || code})`); });
       sock.open().catch(e => fail(e.message));
     });
     try { await result; }
