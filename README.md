@@ -56,6 +56,9 @@ rech tab-list
 rech eval "() => document.title"
 rech --profile work@example.com open https://example.com   # another registered profile
 rech --isolate open https://accounts.example.com           # throwaway session, e.g. for a login flow
+rech --isolate=login open https://accounts.example.com     # named isolated session: reused by later
+rech --isolate=login fill-secret e12 --from-env PASSWORD   #   --isolate=login commands (same tabs)
+rech session close login                                   #   until you close it (rech session ls lists it)
 ```
 
 Any [playwright-cli](https://github.com/snomiao/playwright-cli) command works after `rech`. When a
@@ -173,6 +176,10 @@ rech open https://example.com
 Over **WebRTC** the two machines need no open port, VPN or domain. A small signal server introduces them, and then traffic flows peer to peer, end-to-end
 encrypted with keys the signal server never sees. The first `rech` command after connecting starts
 a small local bridge that keeps the connection open between commands.
+
+**Opening the link in a browser shows what it gives**, without redeeming it: whether the host is
+online, the share and when it ends, whether the invite is still open, its profiles, and its open
+sessions. Anyone holding the link can see that. `rech connect` lists the open sessions too.
 
 **The link is an invite, not a key.** `rech connect` redeems it once: this machine gets its own
 device credential (saved to `.rechrome/.env.local`) and the invite stops working, so a link that
@@ -545,7 +552,11 @@ Each client gets its own browser session, keyed by the **git worktree root path*
 roll up to their parent), or the current directory outside git. So two worktrees of one repo
 get separate sessions, and `git checkout` keeps you in the same one. `RECH_IDENTITY=branch`
 restores the older `<remote>/tree/<branch>` keying and `RECH_IDENTITY=cwd` keys on the exact
-directory. Pass `-s=<name>` for a named sub-session, or `--isolate` for a throwaway one.
+directory. Pass `-s=<name>` for a named sub-session, `--isolate` for a throwaway one (a new session per
+command), or `--isolate=<name>` for a named isolated session (`-s=iso_<name>`) that later
+`--isolate=<name>` commands from the same worktree reuse until `rech session close <name>`.
+An isolated session is its own tab group in the same Chrome profile: it shares the profile's
+cookies, so profile-scoped listeners still refuse `eval`, `run-code` and other arbitrary code in it.
 A share device's sessions are additionally keyed by its share and device, so they never meet
 another device's or a listener link's; `rech session ls` lists the ones this link drove.
 

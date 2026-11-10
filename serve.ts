@@ -1,6 +1,6 @@
 import { receiveUpload, readRequestJson } from "./scoped-upload.ts";
 import { readListeners, listenerAddress, authorizeProfileRequest, canReadProfileFile, profileOutputPrefix, normalizePrefix, resolveAllowedProfile, shareRtcListeners, rtcListeners, type Listener } from "./listeners.ts";
-import { WEBRTC, authorizeCredential, credentialForBearer, readShares, redeemInvite, shareProblem, updateShares, webrtcCredentials, type Credential, type ShareConfig } from "./shares.ts";
+import { WEBRTC, authorizeCredential, credentialForBearer, inviteState, readShares, redeemInvite, shareProblem, shareSessions, updateShares, webrtcCredentials, type Credential, type ShareConfig } from "./shares.ts";
 import { bearerOf, safeEqual } from "./secret.ts";
 import { WebrtcHost } from "./webrtc.ts";
 import { file } from "bun";
@@ -730,6 +730,16 @@ export async function serve() {
     }).catch(error => log(`could not record device use: ${error}`));
   };
 
+  const profileInfo = async (profiles: string[] | "*") => {
+    const registry = await readTokenRegistry().catch(() => ({} as Awaited<ReturnType<typeof readTokenRegistry>>));
+    const cache = await readChromeProfileCache().catch(() => null) ?? {};
+    const keys = profiles === "*" ? Object.keys(registry) : profiles;
+    return keys.map(k => ({ key: k, name: cache[registry[k]?.profileDir ?? ""]?.name ?? "", registered: !!registry[k] }));
+  };
+  const liveSessions = () => {
+    try { return new Set(readdirSync(tmpSocketRoot()).filter(f => f.endsWith(".sock")).map(f => f.slice(0, -5))); } catch { return new Set<string>(); }
+  };
+
   const handle = async (req: Request, initialListener: Listener, remoteAddr: () => string): Promise<Response> => {
       let listener = initialListener;
       const reqUrl = new URL(req.url);
@@ -764,7 +774,8 @@ export async function serve() {
         const { name } = await req.json().catch(() => ({})) as { name?: string };
         try {
           const device = await updateShares(config => redeemInvite(config, cred.share.id, String(name ?? "")));
-          shares = await readShares();
+          // Open the device's room now, not on the next 1 s reload: the client uses it right away.
+          await reloadShares().catch(error => log(`shares.json reload rejected; previous shares retained: ${error}`));
           log(`share ${cred.share.label}: invite redeemed by device ${device.id} (${device.name})${device.approved ? "" : ", waiting for approval"}`);
           return Response.json({ token: device.token, device: { id: device.id, name: device.name, approved: device.approved }, share: cred.share.label, profiles: cred.share.profiles });
         } catch (error) { return Response.json({ error: error instanceof Error ? error.message : String(error) }, { status: 403 }); }
@@ -773,17 +784,13 @@ export async function serve() {
       if (reqUrl.pathname === "/profiles") {
         const denied = authCheck(req, key);
         if (denied) return denied;
-        const registry = await readTokenRegistry().catch(() => ({} as Awaited<ReturnType<typeof readTokenRegistry>>));
-        const cache = await readChromeProfileCache().catch(() => null) ?? {};
-        const keys = listener.profiles === "*" ? Object.keys(registry) : listener.profiles;
-        return Response.json({ share: cred?.share.label, profiles: keys.map(k => ({ key: k, name: cache[registry[k]?.profileDir ?? ""]?.name ?? "", registered: !!registry[k] })) });
+        return Response.json({ share: cred?.share.label, profiles: await profileInfo(listener.profiles) });
       }
 
       if (reqUrl.pathname === "/sessions") {
         const denied = authCheck(req, key);
         if (denied) return denied;
-        let live = new Set<string>();
-        try { live = new Set(readdirSync(tmpSocketRoot()).filter(f => f.endsWith(".sock")).map(f => f.slice(0, -5))); } catch {}
+        const live = liveSessions();
         const all = listener.profiles === "*" && !cred;
         const rows = [...sessionOwners.entries()]
           .filter(([, o]) => all || o.owner === owner)
@@ -841,7 +848,10 @@ export async function serve() {
         if (scoped || !reqUrl.searchParams.get("deep"))
           return Response.json({
             ok: true, bind: listenHost, listener: listener.name, profiles: listener.profiles, multiListener: true, consecutiveTimeouts, degraded, chromeAccessProblem,
-            ...(cred ? { share: cred.share.label, kind: cred.kind, ...(cred.kind === "device" ? { device: { id: cred.device.id, name: cred.device.name, approved: cred.device.approved } } : {}), expiresAt: cred.share.expiresAt } : {}),
+            ...(cred ? {
+              share: cred.share.label, kind: cred.kind, ...(cred.kind === "device" ? { device: { id: cred.device.id, name: cred.device.name, approved: cred.device.approved } } : { invite: inviteState(cred.share) }), expiresAt: cred.share.expiresAt,
+              profileInfo: await profileInfo(cred.share.profiles), sessions: shareSessions(cred.share, sessionOwners, liveSessions()),
+            } : {}),
           });
         // Deep probe: exercise the relay read-only via `tab-list` (opens nothing) against the
         // most-recently-used session — never a fresh one, which could spawn a browser window.
@@ -1032,8 +1042,8 @@ export async function serve() {
       // read-storage: a localStorage/sessionStorage value, page-level; secretOut only.
       if (filteredArgs[0] === "read-storage") {
         try {
-          const { area, key, path, allowDomains } = parseReadStorageWire(filteredArgs);
-          const { host, value } = await readStorageOnSession({ socketRoot: tmpSocketRoot(), session: namespacedSession, cwd: runWorkDir, area, key, path, allowDomains });
+          const { area, key, path, allowDomains, gotoUrl } = parseReadStorageWire(filteredArgs);
+          const { host, value } = await readStorageOnSession({ socketRoot: tmpSocketRoot(), session: namespacedSession, cwd: runWorkDir, area, key, path, allowDomains, gotoUrl });
           if (!value) throw new Error(`read-storage: ${area} ${key} on ${host} is empty`);
           secretMasker.add(value, Infinity);
           log(`exit: 0 | read-storage ${area} ${key}${path.length ? " " + path.join(".") : ""} on ${host} (${value.length} chars, value not logged)`);

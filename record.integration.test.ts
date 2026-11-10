@@ -18,7 +18,7 @@ test.skipIf(!ffmpeg)("record: a timed recording holds the request past 10 s, sta
   reserve.stop(true);
   await mkdir(join(root, ".rechrome"));
   await mkdir(join(root, "secret-rules"));
-  for (const name of ["rechrome.ts", "serve.ts", "listeners.ts", "extension-token.ts", "daemon-manager.ts", "fill-secret.ts", "record.ts", "scoped-upload.ts", "shares.ts", "secret.ts", "e2e.ts", "webrtc.ts", "signal-relay.ts", "redact.ts", "secret-rules/gitleaks.toml"])
+  for (const name of ["rechrome.ts", "serve.ts", "listeners.ts", "extension-token.ts", "daemon-manager.ts", "fill-secret.ts", "record.ts", "scoped-upload.ts", "shares.ts", "secret.ts", "token.ts", "rtc-channel.ts", "e2e.ts", "webrtc.ts", "signal-relay.ts", "redact.ts", "secret-rules/gitleaks.toml"])
     await copyFile(join(import.meta.dir, name), join(root, name));
   await symlink(join(import.meta.dir, "node_modules"), join(root, "node_modules"), "junction");
   const argvLog = join(root, "argv.log");
