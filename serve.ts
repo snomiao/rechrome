@@ -5,7 +5,7 @@ import { bearerOf, safeEqual } from "./secret.ts";
 import { WebrtcHost } from "./webrtc.ts";
 import { file } from "bun";
 import { createHash, randomBytes, X509Certificate } from "crypto";
-import { mkdirSync, lstatSync, statSync, chmodSync, unlinkSync, accessSync, readdirSync, realpathSync, existsSync, readFileSync, constants as fsConstants } from "fs";
+import { mkdirSync, lstatSync, statSync, chmodSync, unlinkSync, accessSync, readdirSync, realpathSync, existsSync, readFileSync, renameSync, constants as fsConstants } from "fs";
 import { join, resolve, relative, isAbsolute, sep } from "path";
 import { tmpdir } from "os";
 import {
@@ -24,7 +24,8 @@ import {
   checkTailscaleServe,
   chromeDataAccessHint,
 } from "./rechrome.ts";
-import { SecretMasker, parseReadCookieWire, readCookieOnSession, parseReadStorageWire, readStorageOnSession, parseReadSecretWire, readSecretOnSession, parseFillSecretWire, fillSecretOnSession, passwordValuesOnSession, hasSnapshot, maskPasswordLines, withholdSnapshots } from "./fill-secret.ts";
+import { SecretMasker, runCodeOnSession, parseReadCookieWire, readCookieOnSession, parseReadStorageWire, readStorageOnSession, parseReadSecretWire, readSecretOnSession, parseFillSecretWire, fillSecretOnSession, passwordValuesOnSession, hasSnapshot, maskPasswordLines, withholdSnapshots } from "./fill-secret.ts";
+import { parseRecordArgs, buildCaptureChunkCode, resolveFfmpeg, resolveFormat, recordSink, Recording, freeName, RECORD_CHUNK_MS, RECORD_MAX_SECONDS, type CaptureChunk, type RecordingSummary } from "./record.ts";
 
 const TAILSCALE_BIN = process.env.TAILSCALE_BIN || "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
 const CERT_RENEW_THRESHOLD_DAYS = 7;
@@ -105,6 +106,34 @@ const deniedFiles = new Set<string>();
 // keeps them on the host instead (opt-in).
 const pendingDownloads = new Map<string, ReturnType<typeof setTimeout>>();
 const DOWNLOAD_PICKUP_MS = 10 * 60_000;
+// Per-request idle limit for POSTs (Bun's default is 10 s): past the client's 70 s plus the longest timed recording.
+export const RUN_IDLE_SECONDS = 70 + RECORD_MAX_SECONDS + 20;
+// rech record start/stop: the recording in progress (or finished by --max-seconds and not yet
+// collected) per namespaced session. serve owns the capture loop; see record.ts.
+type RecordingEntry = { rec: Recording; dir: string; outputPrefix: string; listener: string; keep: boolean; done?: RecordingSummary; expire?: ReturnType<typeof setTimeout> };
+const recordings = new Map<string, RecordingEntry>();
+
+/** Rename a finished recording to its final name and hand it to the client like a download. */
+function deliverRecording(entry: RecordingEntry, s: RecordingSummary, filename: string | undefined): { stdout: string; files: string[] } {
+  // Nothing captured is the real story (no tab, session gone); ffmpeg's "no stream" only follows from it.
+  if (!s.frames || !existsSync(s.out)) {
+    try { unlinkSync(s.out); } catch {}
+    const why = s.error?.split("\n")[0];
+    throw new Error(`record: nothing was captured${why ? ` (${why})` : ""}${why?.includes("rech open") ? "" : "; is a tab open? run \`rech open <url>\` first"}`);
+  }
+  if (s.encodeError) { try { unlinkSync(s.out); } catch {} throw new Error(s.encodeError); }
+  // Never over an existing file: `--filename clip.mp4` twice keeps both (clip.mp4, clip-2.mp4).
+  const out = filename ? join(entry.dir, freeName(filename, n => existsSync(join(entry.dir, n)))) : s.out.replace(/\/\.(recording-[^/]+)\.part$/, "/$1");
+  if (out !== s.out) renameSync(s.out, out);
+  log(`record: ${JSON.stringify({ listener: entry.listener, name: relative(entry.dir, out), frames: s.frames, captured: s.captured, fps: s.fps, format: s.format, size: statSync(out).size, kept: entry.keep, ...(s.error ? { ended: s.error.split("\n")[0] } : {}) })}`);
+  if (!entry.keep) {
+    const real = realpathSync(out);
+    clearTimeout(pendingDownloads.get(real));
+    pendingDownloads.set(real, setTimeout(() => { pendingDownloads.delete(real); try { unlinkSync(real); } catch {} }, DOWNLOAD_PICKUP_MS));
+  }
+  const note = s.error ? ` — capture ended early: ${s.error.split("\n")[0]}` : "";
+  return { stdout: `record: saved ${relative(entry.dir, out)} (${s.format}, ${s.seconds.toFixed(1)} s at ${s.fps} fps, ${s.captured} screenshots)${note}\n`, files: [(entry.outputPrefix + relative(entry.dir, out)).replaceAll("\\", "/")] };
+}
 // playwright-cli's line for a finished download (tools/backend/response.ts).
 const DOWNLOADED_LINE = /^- Downloaded file (.+?) to "(.+)"$/gm;
 // Where the CLI saves downloads: its output dir under the session's cwd (context.ts outputDir).
@@ -1042,6 +1071,69 @@ export async function serve() {
         }
       }
 
+      // record: serve runs the capture loop (short run-code screenshot chunks, back to back) and
+      // streams every frame into ffmpeg as it arrives. `record start` / `record stop` bracket an
+      // open-ended recording; plain `record --seconds N` does both in one call. See record.ts.
+      if (filteredArgs[0] === "record") {
+        const fail = (message: string) => {
+          log(`exit: 1 | ${message.split("\n")[0]}`);
+          return Response.json({ status: 1, stdout: "", stderr: `[rech] ${message}\n`, files: [] });
+        };
+        try {
+          const a = parseRecordArgs(filteredArgs);
+          const existing = recordings.get(namespacedSession);
+          if (a.mode === "stop") {
+            if (!existing) return fail("record: no recording in progress; run `rech record start` first");
+            recordings.delete(namespacedSession);
+            clearTimeout(existing.expire);
+            const s = existing.done ?? await existing.rec.stop();
+            return Response.json({ status: 0, stderr: "", ...deliverRecording(existing, s, a.filename) });
+          }
+          if (existing) return fail(existing.done ? "record: a finished recording is waiting; run `rech record stop` to collect it first" : `record: already recording (since ${new Date(existing.rec.startAt).toISOString()}); run \`rech record stop\``);
+          const ffmpegBin = resolveFfmpeg();
+          const format = resolveFormat(a.format, ffmpegBin !== null);
+          const out = join(runWorkDir, `.recording-${Date.now().toString(36)}-${randomBytes(3).toString("hex")}.${format}.part`);
+          const code = buildCaptureChunkCode(a);
+          const capture = async (): Promise<CaptureChunk> => {
+            const { isError, text } = await runCodeOnSession({ socketRoot: tmpSocketRoot(), session: namespacedSession, cwd: runWorkDir, code, json: true, timeoutMs: RECORD_CHUNK_MS + 30_000 });
+            if (isError) throw new Error(text.trim().split("\n")[0] || "record: could not screenshot the tab");
+            // The run-code return (a JSON string) comes back JSON-wrapped by the daemon; unwrap up to twice.
+            let parsed: unknown; try { parsed = JSON.parse(text).result; } catch { parsed = text.match(/### Result\n([^\n]*)/)?.[1]; }
+            for (let i = 0; i < 2 && typeof parsed === "string"; i++) { try { parsed = JSON.parse(parsed); } catch { parsed = undefined; } }
+            const chunk = parsed as CaptureChunk | undefined;
+            if (!Array.isArray(chunk?.frames) || !Array.isArray(chunk?.times)) throw new Error("record: the browser returned no frames");
+            return chunk;
+          };
+          const entry: RecordingEntry = {
+            dir: runWorkDir, outputPrefix, listener: listener.name, keep: listener.keepDownloads === true,
+            rec: new Recording({
+              fps: a.fps, format, out, maxMs: (a.mode === "timed" ? a.seconds : a.maxSeconds) * 1000,
+              capture, sink: recordSink(format, ffmpegBin, a.fps, out),
+              onAutoStop: s => {
+                entry.done = s;
+                // Nobody came for it: drop it like an uncollected download.
+                entry.expire = setTimeout(() => { if (recordings.get(namespacedSession) === entry) recordings.delete(namespacedSession); try { unlinkSync(s.out); } catch {} }, DOWNLOAD_PICKUP_MS);
+                log(`record: ${namespacedSession} stopped by itself after ${s.seconds.toFixed(1)} s${s.error ? ` (${s.error.split("\n")[0]})` : ""}`);
+              },
+            }),
+          };
+          recordings.set(namespacedSession, entry);
+          if (a.mode === "start") {
+            const note = format !== a.format ? ` (no ffmpeg on the host, so ${format})` : "";
+            log(`exit: 0 | record start (${a.fps} fps, ${format}, max ${a.maxSeconds} s)`);
+            return Response.json({ status: 0, stdout: `record: recording at ${a.fps} fps to ${format}${note}; run \`rech record stop\` to save (stops by itself after ${a.maxSeconds} s)\n`, stderr: "", files: [] });
+          }
+          // Answer early if the capture ends on its own (the tab went away).
+          await Promise.race([Bun.sleep(a.seconds * 1000), entry.rec.ended]);
+          recordings.delete(namespacedSession);
+          clearTimeout(entry.expire);
+          const s = await entry.rec.stop();
+          return Response.json({ status: 0, stderr: "", ...deliverRecording(entry, s, a.filename) });
+        } catch (error) {
+          return fail(error instanceof Error ? error.message : String(error));
+        }
+      }
+
       // For open commands, default to about:blank to avoid leaving connect.html visible
       const isOpenCmd = filteredArgs[0] === "open";
       const isOpenNoUrl = isOpenCmd && filteredArgs.length === 1;
@@ -1387,6 +1479,10 @@ export async function serve() {
       return Response.json({ status: 1, stdout: "", stderr: err.message }, { status: 500 });
     },
     async fetch(req, server) {
+      // Bun's default idle limit is 10 s. Bun 1.4 does not apply it to a POST with a body, but don't
+      // rely on that: a /run can take longer (`record --seconds 60`, a slow page). Allow it longer
+      // than the client waits (70 s + a recording's length).
+      if (req.method === "POST") server.timeout(req, RUN_IDLE_SECONDS);
       const listener = policies.get(listenerAddress(initial));
       if (!listener) return new Response("Listener removed", { status: 403 });
       return handle(req, listener, () => `${req.headers.get("x-forwarded-for") || server.requestIP(req)?.address || "unknown"}`);

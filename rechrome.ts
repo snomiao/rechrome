@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { prepareUpload, UPLOAD_USAGE, MAX_UPLOAD_BYTES, type UploadPayload } from "./scoped-upload.ts";
 import { readListeners, writeListeners as writeListenersFile, listenerAddress, isLoopback, normalizePrefix, serviceUrl, allowProfiles, denyProfiles, rotateListenerKey, setPublicUrl, canonicalProfileKeys, planProfileRemoval, parseIceUrl, iceLabel, rtcListeners, shareRtcListeners, defaultRtcListener, DEFAULT_RTC, DEFAULT_RTC_NOTE, LEGACY_RTC, type IceServer, type Listener, type ListenerConfig, type RtcListener } from "./listeners.ts";
+import { recordHoldMs } from "./record.ts";
 
 import { file } from "bun";
 import yargs from "yargs";
@@ -1961,7 +1962,8 @@ async function callServe(
     // dataDir is a client-local path; the daemon (possibly remote) only needs the session identity.
     // `secret` (fill-secret only) rides in its own field so it is never part of the logged args.
     body: JSON.stringify({ args, identity: { key: identity.key, label: identity.label, profile: identity.profile }, env, ...(upload ? { upload } : {}), ...(secret ? { secret } : {}) }),
-    signal: AbortSignal.timeout(70_000),
+    // A timed `record --seconds N` holds the request for N seconds before it answers.
+    signal: AbortSignal.timeout(70_000 + recordHoldMs(args)),
   }).catch(async (e) => {
     if (throwOnFailure) throw new Error("Cannot reach the rechrome daemon. Check that it is running.");
     console.error(`[rech] ${e.message}`);
@@ -4826,6 +4828,13 @@ const HELP_EPILOGUE = `Browser commands (sent to this project's Chrome session):
                      copy a cookie (incl. HttpOnly) into a pipe, never shown or logged
   rech read-storage <local|session> <key> [json-path] --allow-domain <host> [--goto <url>] | <command>
                      copy a localStorage/sessionStorage value into a pipe, never shown or logged
+  rech record start [--fps <n>] [--quality <1-100>] [--format mp4|webm|mjpeg] [--max-seconds <n>]
+  rech record stop [--filename <name>]
+                     record the active tab, streamed into ffmpeg on the host, until stop (or
+                     --max-seconds, default 600); stop hands you the video. No click, no new
+                     permission; mjpeg if the host has no ffmpeg
+  rech record [--seconds <n>] [...]
+                     the same in one call: record n seconds (max 60) and return the file
   rech pw <args>     forward verbatim to playwright-cli, e.g. \`rech pw --version\`
   rech --version     rechrome's version
 
