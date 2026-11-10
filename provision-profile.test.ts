@@ -2,7 +2,7 @@ import { afterEach, expect, test } from 'bun:test';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { CDPClient, provisionExtensionToken, seedExtensionToken } from './rechrome.ts';
+import { CDPClient, provisionExtensionToken, relayChromiumRevision, seedExtensionToken } from './rechrome.ts';
 
 const roots: string[] = [];
 const originalCache = process.env.PLAYWRIGHT_BROWSERS_PATH;
@@ -97,4 +97,16 @@ test('token seeding re-navigates an extension target stuck on its initial error 
     throw Error('Unexpected method: ' + method);
   } }, 'fixture-token');
   expect(methods).toContain('Page.navigate');
+});
+
+test('relayChromiumRevision reads the chromium revision pinned by the relay playwright-core', () => {
+  const root = mkdtempSync(join(tmpdir(), 'rech-relay-rev-')); roots.push(root);
+  const core = join(root, 'node_modules', 'playwright-core');
+  mkdirSync(join(core, 'lib', 'tools', 'cli-client'), { recursive: true });
+  writeFileSync(join(core, 'package.json'), JSON.stringify({ name: 'playwright-core', exports: { './lib/tools/cli-client/program': './lib/tools/cli-client/program.js' } }));
+  writeFileSync(join(core, 'lib', 'tools', 'cli-client', 'program.js'), '');
+  writeFileSync(join(core, 'browsers.json'), JSON.stringify({ browsers: [{ name: 'chromium-headless-shell', revision: '9' }, { name: 'chromium', revision: '1223' }] }));
+  writeFileSync(join(root, 'cli.js'), '');
+  expect(relayChromiumRevision(join(root, 'cli.js'))).toBe('1223');
+  expect(relayChromiumRevision(join(tmpdir(), 'no-such-dir', 'cli.js'))).toBeNull();
 });

@@ -4,6 +4,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { startSignalRelay } from "./signal-relay.ts";
 import type { InviteResult } from "./invite-page.ts";
+import { readShares } from "./shares.ts";
 
 // End to end, with the real CLI and daemon: a host shares a profile, a second "machine" (its own
 // HOME, no registry) redeems the invite and drives the browser over WebRTC and over a LAN
@@ -27,6 +28,8 @@ test("share new → connect → drive → session ls → reuse refused → appro
   const client3 = await mkdtemp(join(tmpdir(), "rech-rtc-client3-"));
   const client4 = await mkdtemp(join(tmpdir(), "rech-rtc-client4-"));
   const client5 = await mkdtemp(join(tmpdir(), "rech-rtc-client5-"));
+  const client6 = await mkdtemp(join(tmpdir(), "rech-rtc-client6-"));
+  const client7 = await mkdtemp(join(tmpdir(), "rech-rtc-client7-"));
   const mgmtPort = reserve(), lanPort = reserve();
   await mkdir(join(root, ".rechrome"));
   await mkdir(join(root, "secret-rules"));
@@ -63,7 +66,7 @@ test("share new → connect → drive → session ls → reuse refused → appro
   const clientEnv = (home: string) => ({ HOME: home, USERPROFILE: home, RECHROME_URL: undefined });
   cleanups.push(async () => {
     // Bridges are detached processes of the client machines: stop them.
-    for (const home of [client, client2, client3, client4, client5]) {
+    for (const home of [client, client2, client3, client4, client5, client6, client7]) {
       const dir = join(home, ".rechrome", "bridges");
       for (const f of await readdir(dir).catch(() => [] as string[]))
         if (f.endsWith(".json")) { try { process.kill(JSON.parse(await readFile(join(dir, f), "utf8")).pid); } catch {} }
@@ -161,6 +164,41 @@ test("share new → connect → drive → session ls → reuse refused → appro
   expect(after.stdout).not.toContain("Profile:");
   expect(after.stderr).toMatch(/revoked|offline|WebRTC/);
   expect((await pageView(inviteToken)).state).toBe("offline");   // the room is gone: the page says so
+
+  // --- A reusable invite: two machines redeem the same link, each gets its own credential ----
+  const team = await rech(["share", "new", "qa", "--name", "team", "--signal", signal, "--reusable", "--ttl", "12h"], hostEnv);
+  expect(team.code).toBe(0);
+  expect(team.stdout).toContain("Reusable invite: up to 100 devices");
+  const teamLink = team.stdout.match(/http:\/\/127\.0\.0\.1:\d+\/#rech1_\w{28}/)?.[0]!;
+  expect(teamLink).toBeTruthy();
+  await Bun.sleep(1500);
+  for (const home of [client6, client7]) {
+    const c = await rech(["connect", "--project", teamLink], clientEnv(home), home);
+    expect(c.stderr + c.stdout).toContain('Connected to share "team"');
+    expect(c.code).toBe(0);
+    expect((await rech(["tab-list"], clientEnv(home), home)).stdout).toContain("Profile: QA");
+  }
+  const own6 = await readFile(join(client6, ".rechrome", ".env.local"), "utf8");
+  const own7 = await readFile(join(client7, ".rechrome", ".env.local"), "utf8");
+  expect(own6).not.toBe(own7);
+  expect(own6 + own7).not.toContain(teamLink.split("#")[1]);
+  const teamLs = await rech(["share", "ls"], hostEnv);
+  expect(teamLs.stdout).toMatch(/team\s+qa\s+webrtc-127-0-0-1\s+2\/100\s+\S+\s+reusable, 2 redeemed, until /);
+  // One device dropped alone; the other keeps working.
+  const teamDevs = (await readShares(join(root, ".rechrome", "shares.json"))).shares.find(s => s.label === "team")!.devices;
+  expect(teamDevs.length).toBe(2);
+  expect((await rech(["share", "devices", "team", "--rm", teamDevs[0]!.id], hostEnv)).code).toBe(0);
+  await Bun.sleep(1500);
+  const after6 = await rech(["tab-list"], clientEnv(client6), client6), after7 = await rech(["tab-list"], clientEnv(client7), client7);
+  expect([after6.stdout.includes("Profile: QA"), after7.stdout.includes("Profile: QA")].sort()).toEqual([false, true]);
+  // Rotate kills the (leaked) link: a third machine is refused; nobody already in is affected.
+  expect((await rech(["share", "rotate", "team"], hostEnv)).code).toBe(0);
+  await Bun.sleep(1500);
+  const late = await rech(["connect", "--project", teamLink], clientEnv(client2), client2);
+  expect(late.code).toBe(1);
+  expect(late.stdout + late.stderr).not.toContain('Connected to share "team"');
+  expect([(await rech(["tab-list"], clientEnv(client6), client6)).stdout.includes("Profile: QA"), (await rech(["tab-list"], clientEnv(client7), client7)).stdout.includes("Profile: QA")].sort()).toEqual([false, true]);
+  expect((await rech(["share", "rm", "team"], hostEnv)).code).toBe(0);
 
   // --- One share on two WebRTC listeners (two signal servers) ------------------------------
   expect((await rech(["listener", "add", "second", "--webrtc", signal2], hostEnv)).code).toBe(0);

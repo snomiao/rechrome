@@ -745,7 +745,8 @@ export async function serve() {
         const { name } = await req.json().catch(() => ({})) as { name?: string };
         try {
           const device = await updateShares(config => redeemInvite(config, cred.share.id, String(name ?? "")));
-          shares = await readShares();
+          // Open the device's room now, not on the next 1 s reload: the client uses it right away.
+          await reloadShares().catch(error => log(`shares.json reload rejected; previous shares retained: ${error}`));
           log(`share ${cred.share.label}: invite redeemed by device ${device.id} (${device.name})${device.approved ? "" : ", waiting for approval"}`);
           return Response.json({ token: device.token, device: { id: device.id, name: device.name, approved: device.approved }, share: cred.share.label, profiles: cred.share.profiles });
         } catch (error) { return Response.json({ error: error instanceof Error ? error.message : String(error) }, { status: 403 }); }

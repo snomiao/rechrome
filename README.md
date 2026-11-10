@@ -56,6 +56,9 @@ rech tab-list
 rech eval "() => document.title"
 rech --profile work@example.com open https://example.com   # another registered profile
 rech --isolate open https://accounts.example.com           # throwaway session, e.g. for a login flow
+rech --isolate=login open https://accounts.example.com     # named isolated session: reused by later
+rech --isolate=login fill-secret e12 --from-env PASSWORD   #   --isolate=login commands (same tabs)
+rech session close login                                   #   until you close it (rech session ls lists it)
 ```
 
 Any [playwright-cli](https://github.com/snomiao/playwright-cli) command works after `rech`. When a
@@ -549,7 +552,11 @@ Each client gets its own browser session, keyed by the **git worktree root path*
 roll up to their parent), or the current directory outside git. So two worktrees of one repo
 get separate sessions, and `git checkout` keeps you in the same one. `RECH_IDENTITY=branch`
 restores the older `<remote>/tree/<branch>` keying and `RECH_IDENTITY=cwd` keys on the exact
-directory. Pass `-s=<name>` for a named sub-session, or `--isolate` for a throwaway one.
+directory. Pass `-s=<name>` for a named sub-session, `--isolate` for a throwaway one (a new session per
+command), or `--isolate=<name>` for a named isolated session (`-s=iso_<name>`) that later
+`--isolate=<name>` commands from the same worktree reuse until `rech session close <name>`.
+An isolated session is its own tab group in the same Chrome profile: it shares the profile's
+cookies, so profile-scoped listeners still refuse `eval`, `run-code` and other arbitrary code in it.
 A share device's sessions are additionally keyed by its share and device, so they never meet
 another device's or a listener link's; `rech session ls` lists the ones this link drove.
 

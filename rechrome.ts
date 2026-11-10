@@ -17,7 +17,7 @@ import { createRequire } from "node:module";
 import { spawn as cpSpawn } from "child_process";
 import { readFile, writeFile, rename, chmod, mkdir, stat } from "node:fs/promises";
 import { isDeprecatedPm2Fallback, listsProcess, oxmgrInstallCommand, pickDaemonManager, PM2_DEPRECATION, type DaemonManager } from "./daemon-manager.ts";
-import { DEFAULT_SIGNAL, WEBRTC, createShare, normalizeSignal, findDevice, findShare, inviteLink, inviteProblem, parseDuration, readShares, updateShares, type Share } from "./shares.ts";
+import { DEFAULT_SIGNAL, WEBRTC, createShare, normalizeSignal, findDevice, findShare, inviteLink, inviteProblem, parseDuration, REUSABLE_DEFAULT_TTL, REUSABLE_MAX_DEVICES, readShares, updateShares, type Share } from "./shares.ts";
 import { bearerOf, looksLikeToken, newToken, parseToken, redactSecrets } from "./secret.ts";
 import { WebrtcClient, loadRTC, runBridge, spawnBridge } from "./webrtc.ts";
 import { startSignalRelay } from "./signal-relay.ts";
@@ -2059,7 +2059,7 @@ export function withDefaultScheme(target: string): string {
 // `open --profile <dir>`, a user-data-dir path) and must pass through untouched. Throws on a
 // missing value; accepts multiple occurrences (last one wins).
 /**
- * `rech [--profile X] [--isolate] pw <args>` forwards <args> to playwright-cli verbatim, so
+ * `rech [--profile X] [--isolate[=<name>]] pw <args>` forwards <args> to playwright-cli verbatim, so
  * `rech pw --version` or `rech pw status` reach playwright instead of rech. `--` works the
  * same after a rech flag (`rech --profile X -- status`); a bare leading `--` cannot, because
  * Bun consumes the `--` right after the script path. The separator counts only when
@@ -2071,10 +2071,30 @@ export function rechSeparatorIndex(args: string[]): number {
     const a = args[i];
     if (a === "--" || a === "pw" || a === "playwright") return i;
     if (a === "--profile") { i++; continue; }
-    if (a.startsWith("--profile=") || a === "--isolate" || a === "--isolated") continue;
+    if (a.startsWith("--profile=") || a === "--isolate" || a === "--isolated" || /^--isolated?=/.test(a)) continue;
     return -1;
   }
   return -1;
+}
+
+/** Prefix of a named isolated session (`--isolate=<name>` -> `-s=iso_<name>`); `_` keeps it out of the iso-<hex> reaper. */
+export const NAMED_ISO_PREFIX = "iso_";
+
+/**
+ * Turn rech's `--isolate` / `--isolate=<name>` into a session flag. Bare `--isolate` is a
+ * throwaway `-s=iso-<random>` (reaped when idle); `--isolate=<name>` is the persistent
+ * `-s=iso_<name>`, reused by later commands with the same name until `rech session close <name>`.
+ */
+export function applyIsolateArg(args: string[]): string[] {
+  const idx = args.findIndex(a => a === "--isolate" || a === "--isolated" || /^--isolated?=/.test(a));
+  if (idx === -1) return args;
+  const flag = args[idx];
+  const rest = args.filter((_, i) => i !== idx);
+  if (!flag.includes("=")) return [...rest, `-s=iso-${randomBytes(8).toString("hex")}`];
+  const name = flag.slice(flag.indexOf("=") + 1);
+  if (!/^[a-zA-Z0-9_-]{1,60}$/.test(name)) throw new Error(`--isolate=<name> takes 1-60 letters, digits, '-' or '_' (got "${name}")`);
+  if (rest.some(a => a.startsWith("-s="))) throw new Error("Pass --isolate=<name> or -s=<session>, not both.");
+  return [...rest, `-s=${NAMED_ISO_PREFIX}${name}`];
 }
 
 /** rechrome's own version, from the package.json shipped next to this file. */
@@ -2313,7 +2333,12 @@ async function run(url: string, args: string[], overrideEnv?: Record<string, str
     }
     process.stderr.write(stderr);
   }
-  if (stdout) process.stdout.write(stdout);
+  // Wait for the write: process.exit() below would otherwise cut a pipe off at its buffer
+  // (128 KiB), e.g. a large run-code result read through `| jq`. A reader that stops early
+  // (`| head`) closes the pipe: that is EPIPE, not an error.
+  if (stdout) await new Promise<void>((done, fail) => process.stdout.write(stdout, e => {
+    if (!e || (e as NodeJS.ErrnoException).code === "EPIPE") done(); else fail(e);
+  }));
 
   if (files?.length) {
     // Saved files belong to the project: <project>/.rechrome/output. The folder also holds
@@ -3026,10 +3051,28 @@ async function trayCommand(sub?: string): Promise<void> {
   }
 }
 
+// The Chromium revision pinned by the playwright-core that the relay (playwright-cli) runs, read
+// from its browsers.json. Provisioning must seed with that same build: the relay later reopens the
+// profile with it, and a profile written by a newer Chromium (e.g. 156, whose localStorage moved to
+// SQLite) loses the seeded token, so the extension mints a new one and the bridge never connects.
+export function relayChromiumRevision(cli: string = resolvePlaywrightCli()): string | null {
+  try {
+    const entry = cli.split(" ").pop()!;
+    let dir = dirname(createRequire(entry).resolve("playwright-core/lib/tools/cli-client/program"));
+    for (let i = 0; i < 8 && dir !== dirname(dir); i++, dir = dirname(dir)) {
+      const browsers = join(dir, "browsers.json");
+      if (!existsSync(browsers)) continue;
+      const chromium = JSON.parse(readFileSync(browsers, "utf8")).browsers?.find((b: { name?: string }) => b.name === "chromium");
+      return chromium?.revision ? String(chromium.revision) : null;
+    }
+  } catch {}
+  return null;
+}
+
 // Resolve a Chromium / Chrome-for-Testing executable from the Playwright browsers cache.
 // Managed (provisioned) profiles must run on Chromium because branded Google Chrome 149+ rejects
 // --load-extension. Returns null if no Chromium is installed (`npx playwright install chromium`).
-function findChromiumForTesting(): string | null {
+function findChromiumForTesting(preferredRevision: string | null = relayChromiumRevision()): string | null {
   // Honor PLAYWRIGHT_BROWSERS_PATH (the user's convention) first, then the platform default —
   // `playwright install` doesn't always write to the env path, so check both.
   const bases = [
@@ -3042,6 +3085,8 @@ function findChromiumForTesting(): string | null {
     let revs: string[];
     try { revs = readdirSync(base).filter(d => /^chromium-\d+$/.test(d)).sort((a, b) => parseInt(b.slice(9)) - parseInt(a.slice(9))); }
     catch { continue; }
+    // The relay's own build first; the newest installed one only if it is missing.
+    if (preferredRevision) revs = revs.filter(r => r === `chromium-${preferredRevision}`).concat(revs.filter(r => r !== `chromium-${preferredRevision}`));
     for (const rev of revs) {
       const root = join(base, rev);
       const candidates = process.platform === "darwin"
@@ -4319,7 +4364,10 @@ async function shareLinks(share: Share): Promise<{ via: string; link: string; si
 function printInvite(share: Share, links: { via: string; link: string; signal?: string }[]): void {
   const expiry = share.inviteExpiresAt ? `unused, it expires ${fmtDate(share.inviteExpiresAt)}` : "it never expires unused";
   console.log(`Share "${share.label}": ${share.profiles.join(", ")}`);
-  console.log(`Invite for ${share.maxDevices === 1 ? "one device" : `${share.maxDevices} devices`} (${expiry}; secret: send it privately):\n`);
+  if (share.reusable) {
+    const until = share.inviteExpiresAt ? `until ${fmtDate(share.inviteExpiresAt)}` : "with no expiry";
+    console.log(`Reusable invite: up to ${share.maxDevices} devices may redeem it ${until}, each getting its own credential (secret: anyone with it can join; kill it with rech share rotate ${share.label}):\n`);
+  } else console.log(`Invite for ${share.maxDevices === 1 ? "one device" : `${share.maxDevices} devices`} (${expiry}; secret: send it privately):\n`);
   const width = Math.max(...links.map(l => l.via.length));
   for (const { via, link } of links) console.log(`  ${links.length > 1 ? `${via.padEnd(width)}  ` : ""}${link}`);
   if (links.some(l => l.signal === DEFAULT_SIGNAL)) {
@@ -4331,7 +4379,7 @@ function printInvite(share: Share, links: { via: string; link: string; signal?: 
   console.log(`Share expires: ${fmtDay(share.expiresAt)}${share.expiresAt ? ` (renew: rech share renew ${share.label})` : ""}`);
 }
 
-export type ShareNewOptions = { name?: string; via?: string[]; webrtc?: string[]; lan?: boolean; tailscale?: boolean; signal?: string; expires?: string; inviteTtl?: string; devices?: number; approve?: boolean };
+export type ShareNewOptions = { name?: string; via?: string[]; webrtc?: string[]; lan?: boolean; tailscale?: boolean; signal?: string; expires?: string; inviteTtl?: string; devices?: number; approve?: boolean; reusable?: boolean };
 
 /**
  * The transports named on the command line, in order: --via entries (comma-separated), then
@@ -4387,8 +4435,8 @@ async function shareNew(selectors: string[], opts: ShareNewOptions): Promise<voi
   const share = await updateShares(config => createShare(config, {
     label, profiles, via,
     expiresAt: expiresMs ? Date.now() + expiresMs : undefined,
-    inviteTtlMs: parseDuration(opts.inviteTtl ?? "24h"),
-    maxDevices: opts.devices ?? 1, approve: opts.approve,
+    inviteTtlMs: parseDuration(opts.inviteTtl ?? (opts.reusable ? REUSABLE_DEFAULT_TTL : "24h")),
+    maxDevices: opts.devices ?? (opts.reusable ? REUSABLE_MAX_DEVICES : 1), approve: opts.approve, reusable: opts.reusable,
   }));
   // The daemon answers WebRTC peers with node-datachannel: install it now, not on the first peer.
   if (rtc.length) await loadRTC().catch(error => console.error(`[rech] warning: ${error instanceof Error ? error.message : error}`));
@@ -4399,12 +4447,15 @@ async function shareList(): Promise<void> {
   const { shares } = await readShares();
   if (shares.length) {
     const now = Date.now();
-    const rows = [["SHARE", "PROFILES", "VIA", "DEVICES", "EXPIRES", "STATUS"]];
+    const rows = [["SHARE", "PROFILES", "VIA", "DEVICES", "EXPIRES", "INVITE", "STATUS"]];
     for (const s of shares) {
       const pending = s.devices.filter(d => !d.approved).length;
       const status = s.revokedAt ? "revoked" : s.expiresAt && now >= s.expiresAt ? "expired"
         : inviteProblem(s, now) ? (pending ? `${pending} waiting for approval` : "active") : `invite open${pending ? `, ${pending} waiting` : ""}`;
-      rows.push([s.label, s.profiles.join(", "), s.via.join(", "), `${s.devices.length}/${s.maxDevices}`, fmtDay(s.expiresAt), status]);
+      const invite = s.reusable
+        ? `reusable, ${s.redeemed ?? 0} redeemed, ${s.inviteExpiresAt && now >= s.inviteExpiresAt ? "expired" : `until ${s.inviteExpiresAt ? fmtDate(s.inviteExpiresAt) : "never"}`}`
+        : "single-use";
+      rows.push([s.label, s.profiles.join(", "), s.via.join(", "), `${s.devices.length}/${s.maxDevices}`, fmtDay(s.expiresAt), invite, status]);
     }
     printTable(rows);
     console.log(`\nDevices: rech share devices <share> · invite link again: rech share rotate <share> · stop: rech share revoke <share>\n`);
@@ -4451,7 +4502,8 @@ async function shareEdit(action: string, name: string, args: string[], opts: { e
       const s = findShare(config, name);
       s.invite = newToken();
       s.inviteExpiresAt = s.inviteTtlMs ? Date.now() + s.inviteTtlMs : undefined;
-      if (s.devices.length >= s.maxDevices) s.maxDevices = s.devices.length + 1;
+      if (!s.reusable && s.devices.length >= s.maxDevices) s.maxDevices = s.devices.length + 1;
+      if (s.reusable) s.redeemed = 0;
       return s;
     });
     console.log("New invite; the previous invite link no longer works (devices already connected keep working).\n");
@@ -4596,22 +4648,40 @@ async function bridgeCommand(): Promise<void> {
 
 // ---- sessions (client view) -----------------------------------------------------------------
 
+type SessionRow = { session: string; profile?: string; client?: string; owner?: string; lastUsed: number; live: boolean };
+
+async function fetchSessions(url: string): Promise<{ res: Response; body: { sessions?: SessionRow[]; stderr?: string } | null }> {
+  const res = await fetch(serviceUrl(url, "sessions"), { headers: { Authorization: `Bearer ${parseUrl(url).key}` }, signal: AbortSignal.timeout(10_000) });
+  return { res, body: await res.json().catch(() => null) as { sessions?: SessionRow[]; stderr?: string } | null };
+}
+
+/** `name` as given, unless only the named isolated session `iso_<name>` exists. */
+export function pickSessionName(name: string, known: string[]): string {
+  if (name.startsWith(NAMED_ISO_PREFIX) || known.includes(name)) return name;
+  return known.includes(NAMED_ISO_PREFIX + name) ? NAMED_ISO_PREFIX + name : name;
+}
+
+async function resolveSessionName(url: string, name: string): Promise<string> {
+  const known = await fetchSessions(url).then(({ body }) => (body?.sessions ?? []).map(s => s.session)).catch(() => [] as string[]);
+  return pickSessionName(name, known);
+}
+
 async function sessionCommand(action: string, name?: string): Promise<void> {
   const raw = process.env[ENV_KEY];
   if (!raw) throw new Error(notConnectedMessage());
   const url = await transportUrl(raw);
   if (action === "close") {
     if (!name) throw new Error("Which session? rech session close <name>   (see rech session ls)");
-    return run(url, ["close", `-s=${name}`]);
+    // A named isolated session closes by its --isolate name too (`login` for iso_login).
+    return run(url, ["close", `-s=${await resolveSessionName(url, name)}`]);
   }
-  const res = await fetch(serviceUrl(url, "sessions"), { headers: { Authorization: `Bearer ${parseUrl(url).key}` }, signal: AbortSignal.timeout(10_000) });
-  const body = await res.json().catch(() => null) as { sessions?: { session: string; profile?: string; client?: string; owner?: string; lastUsed: number; live: boolean }[]; stderr?: string } | null;
+  const { res, body } = await fetchSessions(url);
   if (!res.ok || !body?.sessions) throw new Error(body?.stderr?.trim() || `The host does not list sessions (HTTP ${res.status}); it may run an older rech.`);
   if (!body.sessions.length) { console.log("No sessions yet (since the host's daemon started)."); return; }
   const rows = [["SESSION", "PROFILE", "CLIENT", "LAST USED", "STATE"]];
   for (const s of body.sessions) rows.push([s.session, s.profile ?? "-", s.client ?? "-", fmtDate(s.lastUsed), s.live ? "open" : "closed"]);
   printTable(rows);
-  console.log(`\nUse one: rech -s=<session> open https://example.com · close it: rech session close <session>`);
+  console.log(`\nUse one: rech -s=<session> open https://example.com (an ${NAMED_ISO_PREFIX}<name> session: rech --isolate=<name> …) · close it: rech session close <session>`);
 }
 
 async function signalServe(opts: { host?: string; port?: number }): Promise<void> {
@@ -4742,10 +4812,12 @@ const HELP_USAGE = `rechrome (rech) — drive your real, logged-in Chrome from s
 Usage: rech <command> [options]   ·   rech <browser-command> [args]`;
 
 const HELP_EPILOGUE = `Browser commands (sent to this project's Chrome session):
-  rech [--profile <p>] [--isolate] <browser-command> [args]
+  rech [--profile <p>] [--isolate[=<name>]] <browser-command> [args]
       open, goto, click, fill, screenshot, eval, tab-list…  (\`rech pw --help\` lists all)
       --profile <p>  as another registered profile (email, name or folder); put it first
-      --isolate      in a throwaway session, e.g. for a login flow
+      --isolate      in a throwaway session (a new one per command)
+      --isolate=<n>  in the named isolated session <n>: made on first use, reused by later
+                     commands (same tabs, same page) until \`rech session close <n>\`
   rech fill-secret <ref> --from-env VAR | --totp-from-env VAR [--env-file f] [--allow-domain '*.example.com']
                      type a password / TOTP code without it reaching argv, logs or output
   rech read-secret <ref> --allow-domain <host> | <vault command>
@@ -4819,7 +4891,8 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
       .option("webrtc", { type: "string", describe: `Share over WebRTC: bare = ${DEFAULT_RTC} (${DEFAULT_SIGNAL}, best effort); --webrtc=<signal-url> = that server's listener (made if needed); repeatable` })
       .option("signal", { type: "string", requiresArg: true, describe: `Signal server for a bare --webrtc / --via webrtc (else RECH_SIGNAL, else ${DEFAULT_SIGNAL})` })
       .option("expires", { type: "string", requiresArg: true, describe: "With new/renew: 30d, 2w, 24h, never (new default: 30d over webrtc, else never)" })
-      .option("invite-ttl", { type: "string", requiresArg: true, describe: "With new: an unused invite stops working after this (default 24h)" })
+      .option("invite-ttl", { type: "string", requiresArg: true, alias: "ttl", describe: "With new: the invite stops working after this (default 24h; 7d with --reusable)" })
+      .option("reusable", { type: "boolean", describe: "With new: many devices may redeem the same invite link (each gets its own credential) until --ttl or rech share rotate" })
       .option("devices", { type: "number", requiresArg: true, describe: "With new: how many devices may redeem the invite (default 1)" })
       .option("approve", { type: "boolean", describe: "With new: each new device waits for `rech share approve`" })
       .option("rm", { type: "string", requiresArg: true, describe: "With devices: remove this device" })
@@ -4832,7 +4905,7 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
         const [action, target, ...rest] = profiles;
         const webrtc = a.webrtc === undefined ? undefined : ([a.webrtc].flat() as string[]).map(String);
         const transport = { via: a.via as string[] | undefined, webrtc, lan: a.lan, tailscale: a.tailscale, signal: a.signal };
-        const newOpts = { name: a.name, ...transport, expires: a.expires, inviteTtl: a.inviteTtl, devices: a.devices, approve: a.approve };
+        const newOpts = { name: a.name, ...transport, expires: a.expires, inviteTtl: a.inviteTtl, devices: a.devices, approve: a.approve, reusable: a.reusable };
         if (action === "new") return handlers.shareNew(profiles.slice(1), newOpts);
         // Transport flags make a share (an invite link) for the named profiles.
         if (transportTokens(transport).length && !(action && SHARE_ACTIONS.has(action)) && !(profiles.length === 1 && ["ls", "list"].includes(profiles[0]))) {
@@ -4905,7 +4978,7 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
       .command("remove <name>", "Remove a listener", y => y.positional("name", { type: "string", demandOption: true }),
         a => handlers.removeListener(a.name))
       .demandCommand(1).strict())
-    .command(["session [action] [name]", "sessions [action] [name]"], "This link's browser sessions on the host: ls (default) | close <name>", y => y
+    .command(["session [action] [name]", "sessions [action] [name]"], "This link's browser sessions on the host: ls (default) | close <name> (also an --isolate=<name> session)", y => y
       .positional("action", { type: "string", choices: ["ls", "list", "close"], default: "ls" })
       .positional("name", { type: "string", describe: "With close: the session (as `rech session ls` shows it)" }),
       a => handlers.session(a.action === "list" ? "ls" : a.action!, a.name))
@@ -5052,10 +5125,13 @@ if (import.meta.main) {
     // flows (OAuth/login) that must not share tabs with the worktree's default session. The `iso-`
     // marker lets the daemon reap these throwaway sessions on an idle TTL (see serve.ts), so an
     // OAuth drive can't leak an orphaned browser context.
-    const isolateIdx = args.findIndex((a) => a === "--isolate" || a === "--isolated");
-    if (isolateIdx !== -1) {
-      args.splice(isolateIdx, 1);
-      args.push(`-s=iso-${randomBytes(8).toString("hex")}`);
+    // --isolate=<name>: a named isolated session (-s=iso_<name>), kept across commands until
+    // `rech session close <name>`, for multi-step flows (email, password, TOTP).
+    try { args = applyIsolateArg(args); }
+    catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      envWatcher?.close();
+      process.exit(1);
     }
     args = [...forwarded, ...args];
     await run(url, args, overrideEnv, { verbatim: separator !== -1 });
