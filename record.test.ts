@@ -13,6 +13,7 @@ import {
   resolveFormat,
   resolveFfmpeg,
   freeName,
+  withFormatExt,
   recordHoldMs,
   RECORD_DEFAULT_SECONDS,
   RECORD_DEFAULT_MAX_SECONDS,
@@ -53,6 +54,14 @@ test("recordHoldMs: only a timed recording holds the request (the client waits t
   expect(recordHoldMs(["record", "stop"])).toBe(0);
   expect(recordHoldMs(["record", "--seconds", "9999"])).toBe(0); // refused by serve anyway
   expect(recordHoldMs(["open", "https://example.com"])).toBe(0);
+});
+
+test("withFormatExt: the saved name matches what was written", () => {
+  expect(withFormatExt("clip.mp4", "mp4")).toBe("clip.mp4");
+  expect(withFormatExt("clip.mp4", "mjpeg")).toBe("clip.mjpeg"); // no ffmpeg on the host
+  expect(withFormatExt("clip.WEBM", "mp4")).toBe("clip.mp4");
+  expect(withFormatExt("clip", "webm")).toBe("clip.webm");
+  expect(withFormatExt("notes.v2", "mp4")).toBe("notes.v2.mp4");
 });
 
 test("freeName: never an existing name", () => {

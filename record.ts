@@ -59,6 +59,13 @@ export function recordHoldMs(args: string[]): number {
   } catch { return 0; }
 }
 
+/** `name` with the extension of what was actually written: `clip.mp4` saved as mjpeg is `clip.mjpeg`. */
+export function withFormatExt(name: string, format: RecordFormat): string {
+  const m = /^(.+)\.(mp4|webm|mjpeg|mjpg|mkv|mov|avi)$/i.exec(name);
+  if (m && m[2]!.toLowerCase() === format) return name;
+  return `${m ? m[1] : name}.${format}`;
+}
+
 /** `name`, or `name-2`, `name-3`… before the extension: the first that is not taken. */
 export function freeName(name: string, taken: (name: string) => boolean): string {
   if (!taken(name)) return name;
