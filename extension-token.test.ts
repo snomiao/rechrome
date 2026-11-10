@@ -62,3 +62,23 @@ test('malformed table does not return a stale token from other files', () => fix
   writeFileSync(join(dir, '000011.ldb'), Buffer.from('broken'));
   expect(read()).toBeNull();
 }));
+test('reads the Chromium 156+ SQLite LocalStorage store; other origins never supply the token', () => {
+  const { Database } = require('bun:sqlite');
+  const root = mkdtempSync(join(tmpdir(), 'rech-token-'));
+  mkdirSync(join(root, 'Profile 2'), {recursive:true});
+  try {
+    const db = new Database(join(root, 'Profile 2', 'LocalStorage'));
+    db.run('CREATE TABLE maps(row_id INTEGER PRIMARY KEY AUTOINCREMENT,storage_key BLOB NOT NULL,last_accessed INTEGER,last_modified INTEGER,total_size INTEGER)');
+    db.run('CREATE TABLE map_entries(map_id INTEGER NOT NULL,value_compression_type INTEGER NOT NULL,key BLOB NOT NULL,value BLOB NOT NULL,PRIMARY KEY(map_id, key)) WITHOUT ROWID');
+    const k = Buffer.from('\x01auth-token', 'latin1');
+    db.run('INSERT INTO maps(row_id, storage_key) VALUES (1, ?), (2, ?)', [Buffer.from(`chrome-extension://${'d'.repeat(32)}/`), Buffer.from(`chrome-extension://${ext}/`)]);
+    db.run('INSERT INTO map_entries VALUES (1, 0, ?, ?)', [k, Buffer.from('\x01' + old, 'latin1')]);
+    db.close();
+    const read = () => readExtensionTokenFromProfile(root, 'Profile 2', ext);
+    expect(read()).toBeNull();
+    const db2 = new Database(join(root, 'Profile 2', 'LocalStorage'));
+    db2.run('INSERT INTO map_entries VALUES (2, 0, ?, ?)', [k, Buffer.from('\x01' + token, 'latin1')]);
+    db2.close();
+    expect(read()).toBe(token);
+  } finally { rmSync(root, {recursive:true, force:true}); }
+});
