@@ -83,3 +83,20 @@ test('reads the Chromium 156+ SQLite LocalStorage store; other origins never sup
     expect(read()).toBe(token);
   } finally { rmSync(root, {recursive:true, force:true}); }
 });
+test('reads a token still in the SQLite -wal file while Chrome has the store open', () => {
+  const { Database } = require('bun:sqlite');
+  const root = mkdtempSync(join(tmpdir(), 'rech-token-'));
+  mkdirSync(join(root, 'Default'), {recursive:true});
+  // Chrome's connection: WAL, nothing checkpointed into the main file yet.
+  const chrome = new Database(join(root, 'Default', 'LocalStorage'));
+  try {
+    chrome.run('PRAGMA journal_mode=WAL');
+    chrome.run('PRAGMA wal_autocheckpoint=0');
+    chrome.run('CREATE TABLE maps(row_id INTEGER PRIMARY KEY AUTOINCREMENT,storage_key BLOB NOT NULL,last_accessed INTEGER,last_modified INTEGER,total_size INTEGER)');
+    chrome.run('CREATE TABLE map_entries(map_id INTEGER NOT NULL,value_compression_type INTEGER NOT NULL,key BLOB NOT NULL,value BLOB NOT NULL,PRIMARY KEY(map_id, key)) WITHOUT ROWID');
+    chrome.run('PRAGMA wal_checkpoint(TRUNCATE)');
+    chrome.run('INSERT INTO maps(row_id, storage_key) VALUES (1, ?)', [Buffer.from(`chrome-extension://${ext}/`)]);
+    chrome.run('INSERT INTO map_entries VALUES (1, 0, ?, ?)', [Buffer.from('\x01auth-token', 'latin1'), Buffer.from('\x01' + token, 'latin1')]);
+    expect(readExtensionTokenFromProfile(root, 'Default', ext)).toBe(token);
+  } finally { chrome.close(); rmSync(root, {recursive:true, force:true}); }
+});
