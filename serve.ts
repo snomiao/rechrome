@@ -1013,8 +1013,8 @@ export async function serve() {
       // read-storage: a localStorage/sessionStorage value, page-level; secretOut only.
       if (filteredArgs[0] === "read-storage") {
         try {
-          const { area, key, path, allowDomains } = parseReadStorageWire(filteredArgs);
-          const { host, value } = await readStorageOnSession({ socketRoot: tmpSocketRoot(), session: namespacedSession, cwd: runWorkDir, area, key, path, allowDomains });
+          const { area, key, path, allowDomains, gotoUrl } = parseReadStorageWire(filteredArgs);
+          const { host, value } = await readStorageOnSession({ socketRoot: tmpSocketRoot(), session: namespacedSession, cwd: runWorkDir, area, key, path, allowDomains, gotoUrl });
           if (!value) throw new Error(`read-storage: ${area} ${key} on ${host} is empty`);
           secretMasker.add(value, Infinity);
           log(`exit: 0 | read-storage ${area} ${key}${path.length ? " " + path.join(".") : ""} on ${host} (${value.length} chars, value not logged)`);
