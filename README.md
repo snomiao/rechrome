@@ -10,7 +10,7 @@ Built on top of [playwright-multi-tab](https://github.com/snomiao/playwright-mul
 
 - **Your real Chrome, from anywhere** — drive a logged-in Chrome profile from scripts, agents, or other machines
 - **Session isolation** — each git worktree gets its own browser session (tab group) automatically
-- **Per-project files** — screenshots and downloads land in `<project>/.rechrome/output/`
+- **Per-project files** — screenshots, downloads and tab recordings land in `<project>/.rechrome/output/`
 - **Share through any proxy** — Tailscale Serve, Caddy, nginx, cloudflared; one command on the client to connect
 - **Security** — per-listener keys and profile allowlists, scoped remote commands, path traversal protection
 
@@ -427,6 +427,24 @@ rech listener set <listener> --keep-downloads    # --no-keep-downloads: back to 
 
 A download that finishes after its command has returned is reported, and handed over,
 by the next command on that tab.
+
+### Recording the tab
+
+`rech record` saves a video of the tab to `<project>/.rechrome/output/`. It needs no click
+and no new permission, and it works on a background tab. There is no audio.
+
+```bash
+rech open https://mdn.github.io/learning-area/javascript/oojs/bouncing-balls/index-finished.html
+rech record --seconds 4 --fps 10 --filename balls.mp4   # one call: record, then hand over the file
+rech record start                                     # or open-ended (stops by itself after --max-seconds, default 600)
+rech record stop --filename demo.mp4
+```
+
+![rech record --seconds 4 of MDN's bouncing balls example](https://raw.githubusercontent.com/snomiao/rechrome/main/docs/record-demo.gif)
+
+The frames are screenshots, so the rate tops out around 10 fps (`--fps`, default 8). The
+host encodes them with ffmpeg into mp4 or webm (`--format`). Without ffmpeg it saves raw
+MJPEG and says so.
 
 ### Uploading files
 
