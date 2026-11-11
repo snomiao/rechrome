@@ -42,8 +42,12 @@ Layers: a **listener** is a transport (an address); a **share** (`~/.rechrome/sh
 `shares.ts`) is a grant: profiles + transports (`via`: listener names and/or `webrtc`) + an
 invite + devices. Sessions stay playwright-cli `-s=` sessions, namespaced per share device.
 
-- **Every secret is a `rech1_` token** (`secret.ts`: 128-bit base58 + CRC32, scanner regex
-  `\brech1_[1-9A-HJ-NP-Za-km-z]{28}\b`). Everything else is HKDF-derived from it: room id, room
+- **Every secret is a `rech1_` token** (`token.ts`: a label `invite_`/`reusable_`/`device_`, then a
+  128-bit base58 secret + CRC32 over label and secret; scanner regex
+  `\brech1_(?:(?:invite|reusable|device)_)?[1-9A-HJ-NP-Za-km-z]{28}\b`, unlabeled = older tokens). The
+  label is informational and never in the HKDF input: the host's records decide what a token can do.
+  Invite links open the invite page at `<origin>/share/#…` (`INVITE_PATH`); only labeled invites
+  get that segment, so `shareLinkParts` strips it without guessing. Everything else is HKDF-derived from it: room id, room
   auth (what the signal server sees), HTTP bearer `rb_…`, AES keys. Never put the raw token in a
   header, a log line, argv or a URL query; `rech bridge` gets it via env, not argv.
 - **Invites are single-use** (`--devices N`): redeeming mints a per-device `rech1_` token, and

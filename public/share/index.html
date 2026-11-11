@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="referrer" content="no-referrer" />
+<title>Shared Chrome · rechrome</title>
+<meta name="description" content="Someone shared a Chrome browser with you through rechrome." />
+<style>
+  :root {
+    --bg: #0b0d10; --panel: #14181d; --panel2: #1b2027; --fg: #e6e9ee;
+    --muted: #97a0ad; --accent: #5ee0a0; --accent2: #58a6ff; --warn: #f0b45e; --border: #262c34;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: radial-gradient(1200px 600px at 50% -200px, #16202b 0%, var(--bg) 60%);
+    color: var(--fg); font: 16px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    min-height: 100vh;
+  }
+  .wrap { max-width: 720px; margin: 0 auto; padding: 64px 16px 80px; }
+  .logo { font-size: 13px; letter-spacing: .35em; text-transform: uppercase; color: var(--accent); text-decoration: none; }
+  h1 { font-size: clamp(28px, 5vw, 40px); margin: 12px 0 6px; line-height: 1.15; }
+  .kind { display: inline-block; font-size: 13px; border: 1px solid var(--border); border-radius: 999px; padding: 3px 12px; color: var(--accent2); margin: 6px 0 4px; }
+  .kind.bad { color: var(--warn); border-color: var(--warn); }
+  p { color: var(--muted); margin: 10px 0; }
+  p code, li code { color: var(--fg); font-family: ui-monospace, Menlo, monospace; font-size: 14px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .2em; color: var(--muted); margin: 32px 0 10px; }
+  .cmd {
+    display: flex; align-items: center; gap: 12px; background: var(--panel);
+    border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px;
+  }
+  .cmd code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 14px;
+    color: var(--fg); flex: 1; min-width: 0; overflow-x: auto; white-space: nowrap; padding: 2px 0;
+  }
+  .copy {
+    cursor: pointer; background: var(--panel2); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 7px 12px; font-size: 13px; flex-shrink: 0;
+  }
+  .copy:hover, .copy.done { border-color: var(--accent); color: var(--accent); }
+  .status { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; white-space: pre-wrap; font-size: 14.5px; }
+  .warn { color: var(--warn); }
+  footer { color: var(--muted); margin-top: 48px; font-size: 14px; }
+  footer a { color: var(--accent2); text-decoration: none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <a class="logo" href="/">rechrome</a>
+  <h1>Someone shared a Chrome with you</h1>
+  <span class="kind" id="kind">Invite</span>
+  <p id="about"></p>
+
+  <div id="steps" hidden>
+    <h2>Connect</h2>
+    <p>Run this inside the project folder that should use this browser:</p>
+    <div class="cmd">
+      <code id="cn"></code>
+      <button class="copy" type="button" data-target="cn">Copy</button>
+    </div>
+    <p>It needs <a href="https://bun.sh">Bun</a>. Opening this page doesn't use the invite up; the command does.</p>
+
+    <h2>The host</h2>
+    <div class="status" id="host-status" role="status">Checking the host…</div>
+  </div>
+
+  <footer>
+    <a href="/">What is rechrome?</a> · <a href="https://github.com/snomiao/rechrome">GitHub</a>
+  </footer>
+</div>
+
+<script>
+  // The token stays in the #fragment: browsers never send it, so it never reaches this server or a
+  // chat app's link preview, and the page only ever shows it masked. Its label (token.ts) says what
+  // it is before anything is contacted; the host's answer below is what counts.
+  (function () {
+    var m = /^#rech1_(?:(invite|reusable|device)_)?[1-9A-HJ-NP-Za-km-z]{28}$/.exec(location.hash);
+    var kind = document.getElementById('kind'), about = document.getElementById('about');
+    if (!m) {
+      kind.textContent = 'Incomplete link'; kind.classList.add('bad');
+      about.textContent = 'This link is missing its key, the part after #rech1_. It was probably cut off when it was copied. Ask for the full link again.';
+      return;
+    }
+    if (m[1] === 'device') {
+      kind.textContent = 'Device key, not an invite'; kind.classList.add('bad');
+      about.innerHTML = '<span class="warn">This is one machine’s own access key. It isn’t meant to be passed around.</span> If you received it, tell whoever shared it so they can remove that device and send you an invite instead.';
+      return;
+    }
+    if (m[1] === 'reusable') {
+      kind.textContent = 'Reusable invite';
+      about.textContent = 'Every machine that connects with it gets its own access, until it expires or reaches its device limit. Anyone holding this link can join, so pass it on only to people you would give this browser to.';
+    } else {
+      kind.textContent = 'One-time invite';
+      about.textContent = 'It registers the machine that connects with it, then stops working for anyone else. Keep it private until you have used it.';
+    }
+    var full = "bunx rechrome connect '" + location.href + "'";
+    var cn = document.getElementById('cn');
+    cn.textContent = full.replace(/(#rech1_(?:(?:invite|reusable|device)_)?[1-9A-HJ-NP-Za-km-z]{4})[1-9A-HJ-NP-Za-km-z]+/, '$1…');
+    cn.dataset.full = full;
+    document.getElementById('steps').hidden = false;
+    // Host status and share details: the same e2e client as the CLI, bundled from invite-page.ts.
+    var script = document.createElement('script');
+    script.src = '/invite.js';
+    script.onerror = function () { document.getElementById('host-status').textContent = "Couldn't check the host. You can still run the command."; };
+    document.head.appendChild(script);
+  })();
+  document.querySelectorAll('.copy').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var el = document.getElementById(btn.dataset.target);
+      navigator.clipboard.writeText(el.dataset.full || el.innerText).then(function () {
+        btn.textContent = 'Copied'; btn.classList.add('done');
+        setTimeout(function () { btn.textContent = 'Copy'; btn.classList.remove('done'); }, 1400);
+      });
+    });
+  });
+</script>
+</body>
+</html>

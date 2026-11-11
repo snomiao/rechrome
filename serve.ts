@@ -602,14 +602,14 @@ This link contains a secret key: anyone with it can use this browser profile, so
 (() => {
   let url = location.href;
   const key = (location.hash.match(/[#&]key=([^&]*)/) || [])[1];
-  const invite = /^#rech1_[1-9A-HJ-NP-Za-km-z]{28}$/.test(location.hash);
+  const invite = /^#rech1_(?:(?:invite|reusable|device)_)?[1-9A-HJ-NP-Za-km-z]{28}$/.test(location.hash);
   if (!/[#&?]key=/.test(location.hash) && !invite) document.getElementById("nokey").hidden = false;
   // One command for every shell: two lines (no && vs ; split), one double-quoted URL. Characters a
   // shell expands inside double quotes ($ \` " \\ !) are percent-encoded, which the URL reads the same;
   // %40 goes back to a readable @ (valid in a query, and one less % for cmd to try to expand).
   const quote = s => '"' + s.replace(/%40/g, "@").replace(/[$\`"\\\\!]/g, c => "%" + c.charCodeAt(0).toString(16).toUpperCase()) + '"';
   const build = u => "bun i -g rechrome\\nrechrome connect " + quote(u);
-  const mask = s => s.replace(/(key=)[^&"\\n]+/, "$1…").replace(/(#rech1_[1-9A-HJ-NP-Za-km-z]{4})[1-9A-HJ-NP-Za-km-z]+/, "$1…");
+  const mask = s => s.replace(/(key=)[^&"\\n]+/, "$1…").replace(/(#rech1_(?:(?:invite|reusable|device)_)?[1-9A-HJ-NP-Za-km-z]{4})[1-9A-HJ-NP-Za-km-z]+/, "$1…");
   const root = document.getElementById("cmds");
   const row = document.createElement("div"); row.className = "row";
   const line = document.createElement("div"); line.className = "cmd";
@@ -879,7 +879,8 @@ export async function serve() {
       }
       // A browser opening a shared URL gets copyable connect instructions. The key stays in the
       // #fragment, which browsers never send, so the page is static and the key never reaches here.
-      if (reqUrl.pathname === "/" && req.method === "GET" && (req.headers.get("accept") ?? "").includes("text/html"))
+      // Invite links open at /share/ (shares.ts INVITE_PATH); older links at the root.
+      if ((reqUrl.pathname === "/" || reqUrl.pathname === "/share/") && req.method === "GET" && (req.headers.get("accept") ?? "").includes("text/html"))
         return new Response(landingPage(), { headers: LANDING_HEADERS });
       // Unknown paths are a 404, not the banner: a stale link (its listener removed, the port
       // reused by another with a different prefix) must fail loudly, not look like a live daemon.
