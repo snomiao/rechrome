@@ -71,22 +71,61 @@ test("freeName: never an existing name", () => {
   expect(freeName("notes", n => taken.has(n))).toBe("notes-2");
 });
 
-test("buildCaptureChunkCode runs in run-code's sandbox (fresh vm context, no Buffer global)", async () => {
-  // run-code evaluates the snippet the way tools/backend/runCode.ts does: a new context holding only `page`.
-  let shots = 0;
-  const page = {
-    screenshot: async (o: { type: string; quality: number; scale?: string }) => { shots++; expect(o).toEqual({ type: "jpeg", quality: 55, scale: "css" }); return Buffer.from(`jpeg-${shots}`); },
+/** A fake page whose screenshots are numbered; `fail` makes the next one throw. */
+function fakePage() {
+  const p = {
+    shots: 0, fail: false,
+    screenshot: async (o: { type: string; quality: number; scale?: string }) => {
+      expect(o).toEqual({ type: "jpeg", quality: 55, scale: "css" });
+      if (p.fail) throw new Error("Target page, context or browser has been closed");
+      p.shots++; return Buffer.from(`jpeg-${p.shots}`);
+    },
     waitForTimeout: (ms: number) => new Promise(r => setTimeout(r, ms)),
   };
+  return p;
+}
+// run-code evaluates the snippet the way tools/backend/runCode.ts does: a new context per call
+// holding only `page` (no Buffer, no setTimeout).
+async function runCode(page: object, code: string): Promise<CaptureChunk> {
   const context: any = { page };
   vm.createContext(context);
-  const fn = vm.runInContext("(" + buildCaptureChunkCode({ fps: 20, quality: 55 }, 200) + ")", context);
-  const out = JSON.parse(await fn(page)) as CaptureChunk;
-  expect(out.frames.length).toBe(shots);
-  expect(out.frames.length).toBeGreaterThanOrEqual(2);
-  expect(Buffer.from(out.frames[0]!, "base64").toString()).toBe("jpeg-1");
-  expect(out.times.length).toBe(out.frames.length);
-  expect(out.times.every((t, i) => i === 0 || t >= out.times[i - 1]!)).toBe(true);
+  return JSON.parse(await vm.runInContext("(" + code + ")", context)(page));
+}
+
+test("capture code: the browser-side loop keeps shooting between run-code calls, and the final call ends it", async () => {
+  const page = fakePage();
+  const code = buildCaptureChunkCode({ fps: 20, quality: 55, id: "a" }, 200);
+  const first = await runCode(page, code);
+  expect(first.frames.length).toBeGreaterThanOrEqual(1);
+  expect(Buffer.from(first.frames[0]!, "base64").toString()).toBe("jpeg-1");
+  await Bun.sleep(300); // the cliDaemon's settle between calls: capture goes on meanwhile
+  const calledAt = Date.now();
+  const second = await runCode(page, code);
+  expect(second.times.filter(t => t < calledAt).length).toBeGreaterThanOrEqual(4); // shot during the gap
+  const all = [...first.frames, ...second.frames].map(f => Buffer.from(f, "base64").toString());
+  expect(all).toEqual(all.map((_, i) => `jpeg-${i + 1}`)); // nothing lost or repeated across calls
+  expect(second.times.every((t, i) => i === 0 || t >= second.times[i - 1]!)).toBe(true);
+  const last = await runCode(page, buildCaptureChunkCode({ fps: 20, quality: 55, id: "a", final: true }, 200));
+  expect(all.length + last.frames.length).toBe(page.shots); // the final drain hands over the rest
+  await Bun.sleep(150);
+  const stoppedAt = page.shots;
+  await Bun.sleep(150);
+  expect(page.shots).toBe(stoppedAt);
+});
+
+test("capture code: a new recording id replaces a leftover loop; a failed screenshot is reported", async () => {
+  const page = fakePage();
+  await runCode(page, buildCaptureChunkCode({ fps: 20, quality: 55, id: "old" }, 200));
+  const next = await runCode(page, buildCaptureChunkCode({ fps: 20, quality: 55, id: "new" }, 200));
+  expect(next.frames.length).toBeGreaterThanOrEqual(1);
+  // The old recording's final drain must not stop or steal the new one.
+  expect((await runCode(page, buildCaptureChunkCode({ fps: 20, quality: 55, id: "old", final: true }, 200))).frames).toEqual([]);
+  page.fail = true;
+  await Bun.sleep(100);
+  const code = buildCaptureChunkCode({ fps: 20, quality: 55, id: "new" }, 200);
+  // Frames shot before the failure may still come back first; then the error does.
+  await runCode(page, code).catch(() => {});
+  await expect(runCode(page, code)).rejects.toThrow(/has been closed/);
 });
 
 const jpeg = (n: number) => new Uint8Array([n]);

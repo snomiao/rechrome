@@ -1114,9 +1114,10 @@ export async function serve() {
           const ffmpegBin = resolveFfmpeg();
           const format = resolveFormat(a.format, ffmpegBin !== null);
           const out = join(runWorkDir, `.recording-${Date.now().toString(36)}-${randomBytes(3).toString("hex")}.${format}.part`);
-          const code = buildCaptureChunkCode(a);
-          const capture = async (): Promise<CaptureChunk> => {
-            const { isError, text } = await runCodeOnSession({ socketRoot: tmpSocketRoot(), session: namespacedSession, cwd: runWorkDir, code, json: true, timeoutMs: RECORD_CHUNK_MS + 30_000 });
+          const id = randomBytes(6).toString("hex");
+          const code = buildCaptureChunkCode({ ...a, id }), finalCode = buildCaptureChunkCode({ ...a, id, final: true });
+          const capture = async (final?: boolean): Promise<CaptureChunk> => {
+            const { isError, text } = await runCodeOnSession({ socketRoot: tmpSocketRoot(), session: namespacedSession, cwd: runWorkDir, code: final ? finalCode : code, json: true, timeoutMs: RECORD_CHUNK_MS + 30_000 });
             if (isError) throw new Error(text.trim().split("\n")[0] || "record: could not screenshot the tab");
             // The run-code return (a JSON string) comes back JSON-wrapped by the daemon; unwrap up to twice.
             let parsed: unknown; try { parsed = JSON.parse(text).result; } catch { parsed = text.match(/### Result\n([^\n]*)/)?.[1]; }
