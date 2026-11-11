@@ -6,9 +6,19 @@ const ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 const B58 = "[1-9A-HJ-NP-Za-km-z]";
 const BODY_LEN = 22, SUM_LEN = 6;
 export const SECRET_BYTES = 16;
-/** Matches a token anywhere in text (logs, files); for scanners and redaction. */
-export const TOKEN_PATTERN = new RegExp(`\\brech1_${B58}{${BODY_LEN + SUM_LEN}}\\b`, "g");
-const EXACT = new RegExp(`^rech1_(${B58}{${BODY_LEN}})(${B58}{${SUM_LEN}})$`);
+/** What a token is for, written into it so a person (and the invite page) can tell before
+ *  anything is contacted: `rech1_invite_…` is used up as devices redeem it, `rech1_reusable_…`
+ *  enrolls devices until it expires, `rech1_device_…` is one device's own credential. The label is
+ *  covered by the checksum but not by the derivations: it never changes the room or the bearer, and
+ *  the host's records, not the label, decide what a token may do. Tokens minted before labels
+ *  (`rech1_<28>`) stay valid. */
+export const TOKEN_KINDS = ["invite", "reusable", "device"] as const;
+export type TokenKind = (typeof TOKEN_KINDS)[number];
+const KIND = `(?:(?:${TOKEN_KINDS.join("|")})_)?`;
+/** Matches a token anywhere in text (logs, files); for scanners and redaction. The pages that
+ *  can't import it (public/*.html, serve.ts's link page) carry a copy, kept equal by a test. */
+export const TOKEN_PATTERN = new RegExp(`\\brech1_${KIND}${B58}{${BODY_LEN + SUM_LEN}}\\b`, "g");
+const EXACT = new RegExp(`^rech1_(?:(${TOKEN_KINDS.join("|")})_)?(${B58}{${BODY_LEN}})(${B58}{${SUM_LEN}})$`);
 
 export function base58(bytes: Uint8Array, width: number): string {
   let n = 0n;
@@ -46,26 +56,35 @@ export function crc32(bytes: Uint8Array): number {
   return (c ^ 0xffffffff) >>> 0;
 }
 const u32 = (n: number) => new Uint8Array([n >>> 24, (n >>> 16) & 255, (n >>> 8) & 255, n & 255]);
+// The checksum covers the label too, so editing it (invite → reusable) reads as a damaged link.
+const checksum = (secret: Uint8Array, kind?: TokenKind) =>
+  u32(crc32(kind ? new Uint8Array([...new TextEncoder().encode(`${kind}_`), ...secret]) : secret));
 
-export function formatToken(secret: Uint8Array): string {
+export function formatToken(secret: Uint8Array, kind?: TokenKind): string {
   if (secret.length !== SECRET_BYTES) throw new Error(`a share secret is ${SECRET_BYTES} bytes`);
-  return `${TOKEN_PREFIX}${base58(secret, BODY_LEN)}${base58(u32(crc32(secret)), SUM_LEN)}`;
+  return `${TOKEN_PREFIX}${kind ? `${kind}_` : ""}${base58(secret, BODY_LEN)}${base58(checksum(secret, kind), SUM_LEN)}`;
 }
 
-export type ParsedToken = { ok: true; secret: Uint8Array } | { ok: false; reason: "format" | "checksum" };
+export type ParsedToken = { ok: true; secret: Uint8Array; kind?: TokenKind } | { ok: false; reason: "format" | "checksum" };
 
 /** Parse a token, telling a non-token apart from a damaged one (a truncated paste, a typo). */
 export function parseToken(token: string): ParsedToken {
   const m = EXACT.exec(token.trim());
   if (!m) return { ok: false, reason: "format" };
-  const secret = unbase58(m[1], SECRET_BYTES), sum = unbase58(m[2], 4);
+  const kind = m[1] as TokenKind | undefined;
+  const secret = unbase58(m[2]!, SECRET_BYTES), sum = unbase58(m[3]!, 4);
   if (!secret || !sum) return { ok: false, reason: "format" };
-  const expected = u32(crc32(secret));
-  return sum.every((b, i) => b === expected[i]) ? { ok: true, secret } : { ok: false, reason: "checksum" };
+  const expected = checksum(secret, kind);
+  return sum.every((b, i) => b === expected[i]) ? { ok: true, secret, ...(kind ? { kind } : {}) } : { ok: false, reason: "checksum" };
 }
 
 export function isToken(text: string): boolean {
   return parseToken(text).ok;
+}
+
+/** Hide a token's secret part, keeping the prefix, the label and 4 characters to tell tokens apart. */
+export function maskToken(token: string): string {
+  return token.replace(new RegExp(`^(rech1_${KIND}${B58}{4})${B58}+`), "$1…");
 }
 
 /** Looks like a token (prefix and shape) whether or not its checksum holds. */

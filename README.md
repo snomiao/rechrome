@@ -162,14 +162,20 @@ name them:
 rech share you@example.com --webrtc --name alice
 # Share "alice": you@example.com
 # Invite for one device (unused, it expires …; secret: send it privately):
-#   https://rechrome.pages.dev/#rech1_7fQxC9tZp2mVb8wLrN4hdK3kT9aQ
-#   or in a terminal:  rech connect rech1_7fQxC9tZp2mVb8wLrN4hdK3kT9aQ
+#   https://rechrome.pages.dev/share/#rech1_invite_7fQxC9tZp2mVb8wLrN4hdK3kT9aQ
+#   or in a terminal:  rech connect rech1_invite_7fQxC9tZp2mVb8wLrN4hdK3kT9aQ
 ```
+
+Opening the link in a browser shows what it gives and whether the host is online, without
+using it up. The token after `#` says what it is: `rech1_invite_…` is used up as devices
+connect (`--devices N`, default one), `rech1_reusable_…` (`--reusable`) lets devices join
+until it expires, and `rech1_device_…` is a connected machine's own credential, never meant
+to be passed on. The part after `#` never reaches a server or a chat app's link preview.
 
 On the other machine, inside the project that should use it:
 
 ```bash
-rech connect 'https://rechrome.pages.dev/#rech1_…'
+rech connect 'https://rechrome.pages.dev/share/#rech1_invite_…'
 rech open https://example.com
 ```
 
@@ -221,7 +227,8 @@ free tier is 1,000 GB/month) in the daemon's environment, or share `--tailscale`
 **Keep links out of git.** `rech status`, `rech connect` and `rech share --save` warn when the file
 holding `RECHROME_URL` is committed, staged, not git-ignored, or readable by other users. Links
 use a `rech1_` prefix and a checksum, so secret scanners can match them:
-`\brech1_[1-9A-HJ-NP-Za-km-z]{28}\b`.
+`\brech1_(?:(?:invite|reusable|device)_)?[1-9A-HJ-NP-Za-km-z]{28}\b` (links made before the
+labels have none).
 
 #### Listener links (reverse proxies)
 

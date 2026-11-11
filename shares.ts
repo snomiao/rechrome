@@ -9,7 +9,7 @@ import { randomBytes } from "crypto";
 import { homedir } from "os";
 import { join } from "path";
 import { mkdir, readFile, rename, rm, stat, writeFile } from "fs/promises";
-import { bearerOf, credentialIdOf, newToken, safeEqual } from "./secret.ts";
+import { bearerOf, credentialIdOf, newToken, parseToken, safeEqual } from "./secret.ts";
 
 export const WEBRTC = "webrtc";
 export const DEFAULT_SIGNAL = "https://rechrome.pages.dev/";
@@ -131,7 +131,7 @@ export function createShare(config: ShareConfig, opts: NewShareOptions): Share {
   const share: Share = {
     id: randomBytes(4).toString("hex"),
     label: opts.label,
-    invite: newToken(),
+    invite: newToken(opts.reusable ? "reusable" : "invite"),
     inviteExpiresAt: opts.inviteTtlMs ? now + opts.inviteTtlMs : undefined,
     inviteTtlMs: opts.inviteTtlMs,
     profiles: [...new Set(opts.profiles)],
@@ -159,10 +159,16 @@ export function normalizeSignal(value: string): string {
   return url.toString();
 }
 
-/** The link to send: the transport's origin plus the invite in the #fragment. */
+/** Where an invite opens in a browser, under the transport's origin: …/share/#rech1_invite_… */
+export const INVITE_PATH = "share/";
+
+/** The link to send: the transport's origin, the invite page's path, and the invite in the
+ *  #fragment (browsers never send it, so neither the server nor a chat app's link preview sees it).
+ *  Invites minted before token labels keep their old link, the bare origin. */
 export function inviteLink(share: Share, origin: string): string {
   const base = origin.endsWith("/") ? origin : `${origin}/`;
-  return `${base}#${share.invite}`;
+  const kind = parseToken(share.invite);
+  return `${base}${kind.ok && kind.kind ? INVITE_PATH : ""}#${share.invite}`;
 }
 
 export type Credential = { share: Share; kind: "invite"; token: string } | { share: Share; kind: "device"; token: string; device: Device };
@@ -252,7 +258,7 @@ export function redeemInvite(config: ShareConfig, shareId: string, name: string,
   if (!share) throw new Error("This share no longer exists.");
   const problem = shareProblem(share, now) ?? inviteProblem(share, now);
   if (problem) throw new Error(problem);
-  const token = newToken();
+  const token = newToken("device");
   const device: Device = {
     id: credentialIdOf(token),
     name: (name || "device").replace(/[^\w .@-]/g, "").slice(0, 40) || "device",

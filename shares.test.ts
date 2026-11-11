@@ -3,7 +3,7 @@ import { mkdtempSync, statSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { REUSABLE_MAX_DEVICES, authorizeCredential, createShare, credentialForBearer, inviteLink, inviteState, shareSessions, parseDuration, readShares, redeemInvite, updateShares, webrtcCredentials, type ShareConfig } from "./shares.ts";
-import { bearerOf, newToken } from "./secret.ts";
+import { bearerOf, formatToken, newToken, parseToken } from "./secret.ts";
 
 const empty = (): ShareConfig => ({ version: 1, shares: [] });
 const NOW = 1_800_000_000_000;
@@ -12,7 +12,10 @@ test("a share starts as an invite that may only ping and redeem", () => {
   const config = empty();
   const share = createShare(config, { label: "alice", profiles: ["work@x.com"], via: ["webrtc"], now: NOW });
   expect(share.signal).toBe("https://rechrome.pages.dev/");
-  expect(inviteLink(share, share.signal!)).toBe(`https://rechrome.pages.dev/#${share.invite}`);
+  expect(share.invite.startsWith("rech1_invite_")).toBe(true);
+  expect(inviteLink(share, share.signal!)).toBe(`https://rechrome.pages.dev/share/#${share.invite}`);
+  // An invite minted before token labels keeps its old link.
+  expect(inviteLink({ ...share, invite: formatToken(new Uint8Array(16).fill(3)) }, "http://h:1/p")).toBe(`http://h:1/p/#${formatToken(new Uint8Array(16).fill(3))}`);
   const cred = credentialForBearer(config, bearerOf(share.invite))!;
   expect(cred.kind).toBe("invite");
   expect(authorizeCredential(cred, "webrtc", "ping", NOW)).toBeNull();
@@ -162,4 +165,15 @@ test("shareSessions lists this share's live sessions by name and device, and no 
   const live = new Set(["s1", "s3", "s4", "s5"]);
   expect(shareSessions(a, owners, live)).toEqual([{ name: "default", device: "laptop" }]);
   expect(shareSessions(b, owners, live)).toEqual([{ name: "theirs", device: "other" }]);
+});
+
+test("tokens say what they are: invite, reusable, and each device's own credential", () => {
+  const config = empty();
+  const once = createShare(config, { label: "one", profiles: ["p"], via: ["webrtc"], now: NOW });
+  const many = createShare(config, { label: "many", profiles: ["p"], via: ["webrtc"], reusable: true, now: NOW });
+  expect(parseToken(once.invite)).toMatchObject({ ok: true, kind: "invite" });
+  expect(parseToken(many.invite)).toMatchObject({ ok: true, kind: "reusable" });
+  expect(inviteLink(many, "https://sig.example/")).toBe(`https://sig.example/share/#${many.invite}`);
+  const device = redeemInvite(config, once.id, "mbp", NOW);
+  expect(parseToken(device.token)).toMatchObject({ ok: true, kind: "device" });
 });

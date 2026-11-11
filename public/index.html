@@ -5,6 +5,11 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>rechrome — Remote Chrome, one command</title>
 <meta name="description" content="Drive a shared remote Chrome with Playwright commands. Install with one line." />
+<script>
+  // Invite links open at /share/ now; one sent before that (/#rech1_…) still arrives here. The
+  // #fragment never reaches the server, so the forward happens in the page.
+  if (/^#rech1_/.test(location.hash)) location.replace('/share/' + location.hash);
+</script>
 <style>
   :root {
     --bg: #0b0d10; --panel: #14181d; --panel2: #1b2027; --fg: #e6e9ee;
@@ -77,19 +82,6 @@
     </div>
   </header>
 
-  <section class="install" id="invite" hidden>
-    <h2>Someone shared a Chrome with you</h2>
-    <div class="cmd">
-      <span class="os">Any shell</span>
-      <code id="cn"></code>
-      <button class="copy" data-target="cn">Copy</button>
-    </div>
-    <div class="what" id="host-status" role="status">Checking the host…</div>
-    <p class="what">Run it inside the project folder that should use this browser (it needs <a href="https://bun.sh">Bun</a>).
-      The link is a one-time invite: it registers this machine, then stops working for anyone else. Keep it private until then.
-      Anyone holding it can see what's shown here. Opening this page doesn't use it up.</p>
-  </section>
-
   <section class="install">
     <h2>Install</h2>
 
@@ -144,21 +136,6 @@
 </div>
 
 <script>
-  // A rech1_ invite link lands here (this site is the default signal server's origin). The
-  // secret stays in the #fragment: it never reaches the server, and the page only shows it masked.
-  (function () {
-    if (!/^#rech1_[1-9A-HJ-NP-Za-km-z]{28}$/.test(location.hash)) return;
-    var full = "bunx rechrome connect '" + location.href + "'";
-    var el = document.getElementById('cn');
-    el.textContent = full.replace(/(#rech1_[1-9A-HJ-NP-Za-km-z]{4})[1-9A-HJ-NP-Za-km-z]+/, '$1…');
-    el.dataset.full = full;
-    document.getElementById('invite').hidden = false;
-    // Host status and share details: the same e2e client as the CLI, bundled from invite-page.ts.
-    var script = document.createElement('script');
-    script.src = '/invite.js';
-    script.onerror = function () { document.getElementById('host-status').textContent = "Couldn't check the host. You can still try the command."; };
-    document.head.appendChild(script);
-  })();
   document.querySelectorAll('.copy').forEach(function (btn) {
     btn.addEventListener('click', function () {
       var el = document.getElementById(btn.dataset.target);

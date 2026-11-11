@@ -125,7 +125,7 @@ as a WebRTC listener, optionally with STUN/TURN servers, then share over it:
 rech listener add home --webrtc=https://signal.example.com/ --turn-env TEAM_TURN
 #   TEAM_TURN=turns://user:pass@turn.example.com:5349   (user and password percent-encoded)
 rech share you@example.com --via home
-# → https://signal.example.com/#rech1_…
+# → https://signal.example.com/share/#rech1_invite_…
 
 rech share you@example.com --webrtc=https://signal.example.com/   # same, making the listener if needed
 rech share you@example.com --via home,webrtc-default             # one link per signal server

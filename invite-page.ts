@@ -1,4 +1,4 @@
-// The invite page (rechrome.pages.dev/#rech1_…): what this link gives, before anyone reaches the
+// The invite page (rechrome.pages.dev/share/#rech1_invite_…): what this link gives, before anyone reaches the
 // CLI. It connects like `rech connect` does (same room, same sealed channel), asks for /ping and
 // shows the answer; it never redeems the invite. Bundled to public/invite.js, which is committed
 // since Pages has no build step: `bun run build-invite-page`.
@@ -121,7 +121,7 @@ const when = (ms: number) => new Date(ms).toISOString().slice(0, 16).replace("T"
 /** What to show for a result, line by line. Host data, so it only ever becomes text. */
 export function inviteLines(r: InviteResult): { text: string; list?: boolean }[] {
   if (r.state === "offline") return [{ text: "○ Host offline: nobody is answering this link. Its rech daemon may be down, or the link expired or was revoked. Ask the host to check." }];
-  if (r.state === "no-path") return [{ text: "● Host online, but no direct path from this browser, so no details here. The command below may still connect from your machine." }];
+  if (r.state === "no-path") return [{ text: "● Host online, but no direct path from this browser, so no details here. The connect command may still work from your machine." }];
   if (r.state === "unknown") return [{ text: "Couldn't check the host. You can still try the command." }];
   if (r.state === "failed") return [{ text: `Couldn't read this link's details: ${r.reason}` }];
   const { info } = r;
@@ -162,7 +162,7 @@ export function renderInvite(el: any, r: InviteResult, doc: any): void {
 }
 
 if (typeof document !== "undefined") {
-  const match = /^#(rech1_[1-9A-HJ-NP-Za-km-z]{28})$/.exec(location.hash);
+  const match = /^#(rech1_(?:(?:invite|reusable)_)?[1-9A-HJ-NP-Za-km-z]{28})$/.exec(location.hash);
   const el = document.getElementById("host-status");
   if (match && el) {
     void fetchInviteInfo(match[1]!, { signal: `${location.origin}/`, onHost: () => { el.textContent = "● Host online, getting details…"; } })

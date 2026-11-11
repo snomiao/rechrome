@@ -2,7 +2,8 @@ import { describe, test, expect } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { rechCli, listenerNextSteps, unknownCommandHint, notConnectedMessage, chooseShareListener, matchProfileLoosely, preferManagementListener, promptChoice, type RechHandlers } from "./rechrome.ts";
+import { formatToken, newToken } from "./secret.ts";
+import { rechCli, shareLinkParts, listenerNextSteps, unknownCommandHint, notConnectedMessage, chooseShareListener, matchProfileLoosely, preferManagementListener, promptChoice, type RechHandlers } from "./rechrome.ts";
 import { applyIsolateArg, pickSessionName, rechSeparatorIndex as rechSep } from "./rechrome.ts";
 import { isIsoSession } from "./serve.ts";
 
@@ -524,4 +525,17 @@ describe("--isolate=<name>", () => {
     expect(pickSessionName("login", ["login", "iso_login"])).toBe("login");
     expect(pickSessionName("other", ["iso_login"])).toBe("other");
   });
+});
+
+test("shareLinkParts: an invite's /share/ page is not part of the transport's address", () => {
+  const invite = newToken("invite"), reusable = newToken("reusable"), device = newToken("device");
+  const legacy = formatToken(new Uint8Array(16).fill(5));
+  expect(shareLinkParts(`https://rechrome.pages.dev/share/#${invite}`)).toMatchObject({ token: invite, origin: "https://rechrome.pages.dev/" });
+  expect(shareLinkParts(`http://100.64.0.1:13775/rechrome/x/share/#${reusable}`)?.origin).toBe("http://100.64.0.1:13775/rechrome/x/");
+  // A listener whose own prefix ends in /share/: its new invite links carry a second share/.
+  expect(shareLinkParts(`https://h.example/rechrome/share/share/#${invite}`)?.origin).toBe("https://h.example/rechrome/share/");
+  // Links that never had the page segment keep their path: older invites and saved device links.
+  expect(shareLinkParts(`https://h.example/rechrome/share/#${legacy}`)?.origin).toBe("https://h.example/rechrome/share/");
+  expect(shareLinkParts(`https://h.example/rechrome/share/#${device}&via=webrtc`)).toMatchObject({ origin: "https://h.example/rechrome/share/", webrtc: true });
+  expect(shareLinkParts(`https://rechrome.pages.dev/#${legacy}`)?.origin).toBe("https://rechrome.pages.dev/");
 });

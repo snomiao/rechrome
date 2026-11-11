@@ -86,7 +86,7 @@ test("share new → connect → drive → session ls → reuse refused → appro
   expect(made.stderr).toBe("");
   expect(made.code).toBe(0);
   expect(made.stdout).toContain('Added WebRTC listener "webrtc-127-0-0-1"');
-  const link = made.stdout.match(/http:\/\/127\.0\.0\.1:\d+\/#rech1_\w{28}/)?.[0]!;
+  const link = made.stdout.match(/http:\/\/127\.0\.0\.1:\d+\/share\/#rech1_(?:invite|reusable)_[1-9A-HJ-NP-Za-km-z]{28}/)?.[0]!;
   expect(link).toBeTruthy();
   expect(made.stdout).toContain("Share expires:");             // webrtc shares default to 30 days
 
@@ -169,7 +169,7 @@ test("share new → connect → drive → session ls → reuse refused → appro
   const team = await rech(["share", "new", "qa", "--name", "team", "--signal", signal, "--reusable", "--ttl", "12h"], hostEnv);
   expect(team.code).toBe(0);
   expect(team.stdout).toContain("Reusable invite: up to 100 devices");
-  const teamLink = team.stdout.match(/http:\/\/127\.0\.0\.1:\d+\/#rech1_\w{28}/)?.[0]!;
+  const teamLink = team.stdout.match(/http:\/\/127\.0\.0\.1:\d+\/share\/#rech1_(?:invite|reusable)_[1-9A-HJ-NP-Za-km-z]{28}/)?.[0]!;
   expect(teamLink).toBeTruthy();
   await Bun.sleep(1500);
   for (const home of [client6, client7]) {
@@ -216,7 +216,7 @@ test("share new → connect → drive → session ls → reuse refused → appro
   expect((await rech(["listener", "remove", "relayed"], hostEnv)).code).toBe(0);
   const two = await rech(["share", "new", "qa", "--name", "dave", "--devices", "2", "--via", "webrtc-127-0-0-1,second"], hostEnv);
   expect(two.code).toBe(0);
-  const links = [...two.stdout.matchAll(/http:\/\/127\.0\.0\.1:(\d+)\/#rech1_\w{28}/g)];
+  const links = [...two.stdout.matchAll(/http:\/\/127\.0\.0\.1:(\d+)\/share\/#rech1_(?:invite|reusable)_[1-9A-HJ-NP-Za-km-z]{28}/g)];
   expect(links.map(m => Number(m[1]))).toEqual([relay.port, relay2.port]);   // one invite link per signal server
   await Bun.sleep(1500);
   // The daemon is in the share's room on each signal server: a device can join through either.
@@ -235,7 +235,7 @@ test("share new → connect → drive → session ls → reuse refused → appro
   // --- LAN share with approval --------------------------------------------------------------
   const lanMade = await rech(["share", "new", "personal", "--name", "bob", "--via", "lan1", "--approve"], hostEnv);
   expect(lanMade.code).toBe(0);
-  const lanLink = lanMade.stdout.match(/http:\/\/127\.0\.0\.1:\d+\/#rech1_\w{28}/)?.[0]!;
+  const lanLink = lanMade.stdout.match(/http:\/\/127\.0\.0\.1:\d+\/share\/#rech1_(?:invite|reusable)_[1-9A-HJ-NP-Za-km-z]{28}/)?.[0]!;
   expect(lanLink).toContain(`:${lanPort}/`);
   await Bun.sleep(1200);
   const lanConnected = await rech(["connect", "--project", lanLink], clientEnv(client2), client2);
@@ -253,7 +253,7 @@ test("share new → connect → drive → session ls → reuse refused → appro
   expect(downloaded).toBeTruthy();
   expect(await readFile(downloaded!, "utf8")).toStartWith("png-of-");
   const carol = await rech(["share", "new", "personal", "--name", "carol", "--via", "lan1"], hostEnv);
-  const carolLink = carol.stdout.match(/http:\/\/127\.0\.0\.1:\d+\/#rech1_\w{28}/)?.[0]!;
+  const carolLink = carol.stdout.match(/http:\/\/127\.0\.0\.1:\d+\/share\/#rech1_(?:invite|reusable)_[1-9A-HJ-NP-Za-km-z]{28}/)?.[0]!;
   await Bun.sleep(1200);
   expect((await rech(["connect", "--project", carolLink], clientEnv(client3), client3)).code).toBe(0);
   const carolUrl = (await readFile(join(client3, ".rechrome", ".env.local"), "utf8")).match(/RECHROME_URL="([^"]+)"/)![1];

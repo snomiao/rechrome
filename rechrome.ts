@@ -18,7 +18,7 @@ import { createRequire } from "node:module";
 import { spawn as cpSpawn } from "child_process";
 import { readFile, writeFile, rename, chmod, mkdir, stat } from "node:fs/promises";
 import { isDeprecatedPm2Fallback, listsProcess, oxmgrInstallCommand, pickDaemonManager, PM2_DEPRECATION, type DaemonManager } from "./daemon-manager.ts";
-import { DEFAULT_SIGNAL, WEBRTC, createShare, normalizeSignal, findDevice, findShare, inviteLink, inviteProblem, parseDuration, REUSABLE_DEFAULT_TTL, REUSABLE_MAX_DEVICES, readShares, updateShares, type Share } from "./shares.ts";
+import { DEFAULT_SIGNAL, INVITE_PATH, WEBRTC, createShare, normalizeSignal, findDevice, findShare, inviteLink, inviteProblem, parseDuration, REUSABLE_DEFAULT_TTL, REUSABLE_MAX_DEVICES, readShares, updateShares, type Share } from "./shares.ts";
 import { bearerOf, looksLikeToken, newToken, parseToken, redactSecrets } from "./secret.ts";
 import { WebrtcClient, loadRTC, runBridge, spawnBridge } from "./webrtc.ts";
 import { startSignalRelay } from "./signal-relay.ts";
@@ -4520,7 +4520,7 @@ async function shareEdit(action: string, name: string, args: string[], opts: { e
   } else if (action === "rotate") {
     const share = await updateShares(config => {
       const s = findShare(config, name);
-      s.invite = newToken();
+      s.invite = newToken(s.reusable ? "reusable" : "invite");
       s.inviteExpiresAt = s.inviteTtlMs ? Date.now() + s.inviteTtlMs : undefined;
       if (!s.reusable && s.devices.length >= s.maxDevices) s.maxDevices = s.devices.length + 1;
       if (s.reusable) s.redeemed = 0;
@@ -4563,7 +4563,13 @@ export function shareLinkParts(url: string): { token: string; origin: string; we
   const [token, ...rest] = u.hash.slice(1).split("&");
   if (!looksLikeToken(token)) return null;
   const params = new URLSearchParams(rest.join("&"));
-  return { token, origin: `${u.protocol}//${u.host}${normalizePrefix(u.pathname)}`, webrtc: params.get("via") === WEBRTC, profile: u.searchParams.get("profile") ?? undefined };
+  // An invite link opens the invite page at <origin>/share/; the transport is the origin. Only
+  // labeled invites are linked that way, so a listener whose own prefix ends in /share/ is never
+  // mistaken for it (unlabeled tokens and saved device links have no page segment).
+  const kind = parseToken(token);
+  const invitePage = kind.ok && (kind.kind === "invite" || kind.kind === "reusable") && u.pathname.endsWith(`/${INVITE_PATH}`);
+  const path = invitePage ? u.pathname.slice(0, -INVITE_PATH.length) : u.pathname;
+  return { token, origin: `${u.protocol}//${u.host}${normalizePrefix(path)}`, webrtc: params.get("via") === WEBRTC, profile: u.searchParams.get("profile") ?? undefined };
 }
 
 /** Call a share's HTTP API over whichever transport its link uses (one-shot, for connect). */
@@ -4961,7 +4967,7 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
       .option("global", { type: "boolean", describe: "Save it for every project on this machine without its own link (~/.rechrome/.env.local)" })
       .conflicts("project", "global")
       .example("rech connect 'https://host.example.ts.net/rechrome/?profile=you%40example.com#key=…'", "")
-      .example("rech connect 'https://rechrome.pages.dev/#rech1_…'", "An invite: registers this device, then saves its own link")
+      .example("rech connect 'https://rechrome.pages.dev/share/#rech1_invite_…'", "An invite: registers this device, then saves its own link")
       .example("rech connect --global '<url>'", "An agent machine: one link for every folder, /tmp included"),
       a => a.global || a.project ? handlers.connect(a.url, { global: a.global, project: a.project }) : handlers.connect(a.url))
     .command(["listener", "listeners"], "Control who can connect: listeners, allowed profiles, keys, public URLs", y => y

@@ -1,4 +1,5 @@
-// Share secrets: `rech1_` + 22 base58 chars (128 random bits) + 6 base58 chars (CRC32).
+// Share secrets: `rech1_` + a label (`invite_`, `reusable_`, `device_`; see token.ts) + 22 base58
+// chars (128 random bits) + 6 base58 chars (CRC32 over the label and the secret).
 //
 // The unique prefix lets secret scanners match with few false positives (`sk-` would be
 // mistaken for OpenAI-style keys), base58 drops look-alike characters (0 O I l) and keeps the
@@ -6,12 +7,12 @@
 // Everything a party needs is derived one-way from the secret with HKDF, so a signal server or
 // HTTP proxy never holds anything that would let it derive another value or the secret itself.
 import { hkdfSync, randomBytes, timingSafeEqual } from "crypto";
-import { SECRET_BYTES, TOKEN_PATTERN, TOKEN_PREFIX, base58, formatToken, parseToken } from "./token.ts";
+import { SECRET_BYTES, TOKEN_PATTERN, base58, formatToken, maskToken, parseToken, type TokenKind } from "./token.ts";
 
 export * from "./token.ts";
 
-export function newToken(): string {
-  return formatToken(new Uint8Array(randomBytes(SECRET_BYTES)));
+export function newToken(kind: TokenKind = "invite"): string {
+  return formatToken(new Uint8Array(randomBytes(SECRET_BYTES)), kind);
 }
 
 function secretOf(token: string): Uint8Array {
@@ -41,5 +42,5 @@ export function safeEqual(a: string, b: string): boolean {
 
 /** Hide every token (and legacy #key=…) in text meant for a terminal or a log. */
 export function redactSecrets(text: string): string {
-  return text.replace(TOKEN_PATTERN, t => `${t.slice(0, TOKEN_PREFIX.length + 4)}…`).replace(/([#&?]key=)[^&\s"]*/g, "$1…");
+  return text.replace(TOKEN_PATTERN, maskToken).replace(/([#&?]key=)[^&\s"]*/g, "$1…");
 }
