@@ -26,6 +26,9 @@ export const RECORD_DEFAULT_QUALITY = 70;
 export const RECORD_CHUNK_MS = 1000;
 // Per chunk: bounds one run-code reply even if screenshots are very fast.
 export const RECORD_MAX_CHUNK_FRAMES = 60;
+// Frames the browser-side loop holds for the next drain, and how long it runs undrained.
+export const RECORD_MAX_BUFFER_FRAMES = 4 * RECORD_MAX_CHUNK_FRAMES;
+export const RECORD_ORPHAN_MS = 15_000;
 export const RECORD_FORMATS = ["mp4", "webm", "mjpeg"] as const;
 export type RecordFormat = (typeof RECORD_FORMATS)[number];
 
@@ -106,24 +109,49 @@ export function parseRecordArgs(args: string[]): RecordArgs {
   return { mode, seconds, fps, quality, format, filename };
 }
 
-/** run-code the cliDaemon executes: screenshot the tab for ~chunkMs, return base64 JPEGs + capture times. */
-export function buildCaptureChunkCode(a: { fps: number; quality: number }, chunkMs = RECORD_CHUNK_MS): string {
+/** run-code the cliDaemon executes. The first call for a recording `id` starts a screenshot loop
+ *  that keeps running in the browser-side process between calls (stashed on the Page object, the
+ *  one thing that survives run-code's fresh vm contexts); every call drains the frames shot since
+ *  the last one, waiting up to chunkMs for at least one. That way the cliDaemon's per-call settle
+ *  (waitForCompletion: ~1 s fixed, up to 6 s while the page keeps fetching, e.g. a playing video)
+ *  no longer leaves holes in the capture. `final` drains the rest and ends the loop. With nobody
+ *  draining for RECORD_ORPHAN_MS (serve went away), the loop ends by itself. */
+export function buildCaptureChunkCode(a: { fps: number; quality: number; id?: string; final?: boolean }, chunkMs = RECORD_CHUNK_MS): string {
   return `async page => {
-  const endAt = Date.now() + ${chunkMs};
-  const interval = Math.max(1, Math.round(1000 / ${a.fps}));
-  const frames = [], times = [];
-  while (frames.length < ${RECORD_MAX_CHUNK_FRAMES}) {
-    const shotAt = Date.now();
-    // The sandbox has no Buffer global, but page.screenshot() returns a Buffer whose own
-    // .toString("base64") works without it.
-    // CSS pixels, not device pixels: a retina tab would otherwise be a 2x-sized video.
-    const b = await page.screenshot({ type: "jpeg", quality: ${a.quality}, scale: "css" });
-    frames.push(b.toString("base64"));
-    times.push(shotAt);
-    if (Date.now() >= endAt) break;
-    const rest = interval - (Date.now() - shotAt);
-    if (rest > 0) await page.waitForTimeout(rest);
+  const id = ${JSON.stringify(a.id ?? "")}, final = ${a.final === true};
+  let r = page.__rechRecord;
+  if (final) {
+    if (r && r.id === id) { r.done = true; await r.loop; }
+  } else if (!r || r.id !== id || (r.done && !r.error)) {
+    if (r) r.done = true;
+    r = page.__rechRecord = { id, frames: [], times: [], done: false, error: "", seen: Date.now() };
+    const rec = r, interval = Math.max(1, Math.round(1000 / ${a.fps}));
+    rec.loop = (async () => {
+      while (!rec.done) {
+        if (Date.now() - rec.seen > ${RECORD_ORPHAN_MS}) break;
+        const shotAt = Date.now();
+        try {
+          // The sandbox has no Buffer global, but page.screenshot() returns a Buffer whose own
+          // .toString("base64") works without it.
+          // CSS pixels, not device pixels: a retina tab would otherwise be a 2x-sized video.
+          const b = await page.screenshot({ type: "jpeg", quality: ${a.quality}, scale: "css" });
+          rec.frames.push(b.toString("base64"));
+          rec.times.push(shotAt);
+          // A stalled reader: keep the newest frames only.
+          if (rec.frames.length > ${RECORD_MAX_BUFFER_FRAMES}) { rec.frames.shift(); rec.times.shift(); }
+        } catch (e) { rec.error = String((e && e.message) || e); break; }
+        const rest = interval - (Date.now() - shotAt);
+        if (rest > 0 && !rec.done) await page.waitForTimeout(rest);
+      }
+      rec.done = true;
+    })();
   }
+  if (!r || r.id !== id) return JSON.stringify({ frames: [], times: [] });
+  r.seen = Date.now();
+  const endAt = Date.now() + ${chunkMs};
+  while (!final && !r.done && !r.frames.length && Date.now() < endAt) await page.waitForTimeout(25);
+  if (r.error && !r.frames.length) throw new Error(r.error);
+  const frames = r.frames.splice(0, ${RECORD_MAX_CHUNK_FRAMES}), times = r.times.splice(0, ${RECORD_MAX_CHUNK_FRAMES});
   return JSON.stringify({ frames, times });
 }`;
 }
@@ -193,9 +221,10 @@ export class Recording {
   private readonly pending: Promise<unknown>[] = [];
   private readonly loop: Promise<void>;
   private summary: Promise<RecordingSummary> | undefined;
+  private stopAt = Infinity;
   constructor(private readonly opts: {
     fps: number; format: RecordFormat; out: string; maxMs: number;
-    capture: () => Promise<CaptureChunk>; sink: FrameSink; now?: () => number;
+    capture: (final?: boolean) => Promise<CaptureChunk>; sink: FrameSink; now?: () => number;
     onAutoStop?: (s: RecordingSummary) => void;
   }) {
     const now = opts.now ?? Date.now;
@@ -204,16 +233,19 @@ export class Recording {
     this.loop = (async () => {
       // A failed screenshot (tab closed, session gone) or a dead encoder ends the capture; stop()
       // still closes the file and reports why.
-      try {
-        while (!this.stopping && now() - startAt < opts.maxMs) {
-          const chunk = await opts.capture();
-          for (let i = 0; i < chunk.frames.length; i++) {
-            if (chunk.times[i]! - startAt > opts.maxMs) break;
-            retimer.push(Buffer.from(chunk.frames[i]!, "base64"), chunk.times[i]!);
-            this.captured++;
-          }
-          if (this.pending.length) await Promise.all(this.pending.splice(0)); // backpressure from ffmpeg
+      const take = async (chunk: CaptureChunk) => {
+        const until = Math.min(startAt + opts.maxMs, this.stopAt);
+        for (let i = 0; i < chunk.frames.length; i++) {
+          if (chunk.times[i]! >= until) break; // shot at or after the end: not part of the clip
+          retimer.push(Buffer.from(chunk.frames[i]!, "base64"), chunk.times[i]!);
+          this.captured++;
         }
+        if (this.pending.length) await Promise.all(this.pending.splice(0)); // backpressure from ffmpeg
+      };
+      try {
+        while (!this.stopping && now() - startAt < opts.maxMs) await take(await opts.capture());
+        // The frames shot since the last drain; this also ends the browser-side loop.
+        await take(await opts.capture(true));
       } catch (e) { this.error = e instanceof Error ? e.message : String(e); }
     })();
     // Hit --max-seconds or the tab went away: finish the file on our own; stop() then just reports it.
@@ -226,7 +258,7 @@ export class Recording {
   stop(): Promise<RecordingSummary> {
     if (this.summary) return this.summary;
     this.stopping = true;
-    const end = (this.opts.now ?? Date.now)();
+    const end = this.stopAt = (this.opts.now ?? Date.now)();
     this.summary = (async () => {
       await this.loop;
       let frames = 0, encodeError: string | undefined;
