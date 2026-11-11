@@ -41,6 +41,7 @@
   .copy:hover, .copy.done { border-color: var(--accent); color: var(--accent); }
   .status { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; white-space: pre-wrap; font-size: 14.5px; }
   .warn { color: var(--warn); }
+  a { color: var(--accent2); }
   footer { color: var(--muted); margin-top: 48px; font-size: 14px; }
   footer a { color: var(--accent2); text-decoration: none; }
 </style>
@@ -105,6 +106,8 @@
     script.onerror = function () { document.getElementById('host-status').textContent = "Couldn't check the host. You can still run the command."; };
     document.head.appendChild(script);
   })();
+  // Another link pasted into this tab changes only the #fragment: start over for it.
+  window.addEventListener('hashchange', function () { location.reload(); });
   document.querySelectorAll('.copy').forEach(function (btn) {
     btn.addEventListener('click', function () {
       var el = document.getElementById(btn.dataset.target);
