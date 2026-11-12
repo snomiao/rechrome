@@ -152,3 +152,29 @@ test("profile rm plans every alias, listener edits (dropping emptied ones), and 
   expect(planProfileRemoval("me@x.com", reg, ls, "/home/u/.rechrome/profiles").dataDir).toBeUndefined(); // real Chrome profile
   expect(() => planProfileRemoval("nope", reg, ls, "/x")).toThrow(/not a registered profile/);
 });
+
+test("page eval is opt-in and preserves all scoped escape-route checks", () => {
+  const enabled: Listener = { ...listener, eval: true };
+  for (const mode of [listener, { ...listener, eval: false }])
+    expect(() => authorizeProfileRequest(mode, request(["eval", "() => document.title"]))).toThrow(/Command is unavailable/);
+  expect(authorizeProfileRequest(enabled, request(["eval", "() => document.title"]))).toBe("qa");
+  expect(authorizeProfileRequest(enabled, request(["eval", "element => element.textContent", "e1"]))).toBe("qa");
+  for (const args of [
+    ["run-code", "async page => {}"], ["cdp", "Emulation.setEmulatedMedia"], ["kill-all"],
+    ["open", "--profile", "/other"], ["open", "file:///review-only"], ["open", "chrome://settings"],
+    ["eval", "() => 1", "--filename=/tmp/review-only"],
+    ["screenshot", "--filename", "/tmp/review-only"], ["tab-list", "--session=other"],
+    ["-s=one", "-s=two", "eval", "() => 1"], ["upload", "/review-only"],
+  ]) expect(() => authorizeProfileRequest(enabled, request(args))).toThrow();
+  expect(() => authorizeProfileRequest(enabled, { ...request(["eval", "() => 1"]), identity: { key: "/worktree", profile: "other" } })).toThrow(/Profile is not allowed/);
+  expect(() => authorizeProfileRequest(enabled, { ...request(["eval", "() => 1"]), env: { PLAYWRIGHT_MCP_PROFILE_DIRECTORY: "other" } })).toThrow(/Profile override/);
+  expect(() => authorizeProfileRequest(enabled, { ...request(["eval", "() => 1"]), upload: {} })).toThrow(/Unexpected upload/);
+  for (const cmd of ["read-secret", "read-cookie", "read-storage", "read-headers"])
+    expect(() => authorizeProfileRequest(enabled, request([cmd]))).toThrow(/off on listener/);
+  expect(() => authorizeProfileRequest({ ...enabled, uploads: false }, { ...request(["upload"]), upload: {} })).toThrow(/Uploads are off/);
+});
+
+test("eval grant must be a boolean", () => {
+  for (const value of ["true", 1, null])
+    expect(() => validateListeners({ version: 1, listeners: [{ ...listener, eval: value }] })).toThrow(/eval must be true or false/);
+});

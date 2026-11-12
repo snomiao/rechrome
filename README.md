@@ -545,12 +545,20 @@ browser sessions; removed listeners reject further requests. An occupied or unav
 address causes reload to retain the old configuration, so verify reachability after editing.
 
 Remote listeners permit navigation, tabs, snapshots, screenshots, and basic page interactions.
-They reject arbitrary `run-code`/`eval`, filesystem commands, global session commands, and
-browser/config overrides. Those commands remain available on the unrestricted **loopback
+By default they reject `eval`; they always reject `run-code`, raw CDP, filesystem
+commands, global session commands, and browser/config overrides. Those commands remain available on the unrestricted **loopback
 management listener**. Scoped sessions and output directories are separate from management
 sessions; a listener cannot download another profile's output. This is an application access
 policy, not an OS sandbox for the browser. Never publish the management listener through a
 proxy or tunnel to clients that should have restricted access.
+
+For trusted clients, `rech listener set <name> --eval` enables JavaScript evaluated
+inside browser pages (`rech pw eval`). This can read page data and act as signed-in
+accounts, bypassing page-level redaction; only grant it to clients you trust with those
+accounts. It does not enable host-process `run-code`, raw CDP, output-path options,
+profile overrides, or non-HTTP navigation commands. Other permission checks remain
+active. `--no-eval` revokes the grant; `rech listener ls` shows it as `page-eval` in
+GRANTS. This is not a sandbox for arbitrary browser code or a way to grant full CDP.
 
 LAN traffic is plain HTTP unless TLS is configured. Tailscale provides its private transport;
 binding an address does not configure Tailscale ACLs, port forwarding, or public tunnels.

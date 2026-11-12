@@ -539,3 +539,13 @@ test("shareLinkParts: an invite's /share/ page is not part of the transport's ad
   expect(shareLinkParts(`https://h.example/rechrome/share/#${device}&via=webrtc`)).toMatchObject({ origin: "https://h.example/rechrome/share/", webrtc: true });
   expect(shareLinkParts(`https://rechrome.pages.dev/#${legacy}`)?.origin).toBe("https://rechrome.pages.dev/");
 });
+
+test("listener page eval can be enabled and disabled explicitly", async () => {
+  for (const [flag, enabled] of [["--eval", true], ["--no-eval", false]] as const) {
+    const calls = await run(["listener", "set", "qa", flag]);
+    expect(calls).toHaveLength(1);
+    expect(calls[0][0]).toBe("setListener");
+    expect(calls[0][1]).toBe("qa");
+    expect(calls[0][2]).toMatchObject({ evalCode: enabled });
+  }
+});
