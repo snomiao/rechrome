@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test';
 import { stat, readFile } from 'node:fs/promises';
 import { dirname, basename, join } from 'node:path';
 import { createHash } from 'node:crypto';
-import { prepareUpload, prepareStdinUpload, uploadScript, receiveUpload, readHostFile, validateUploadPolicy, currentPageOrigin, readRequestJson, MAX_UPLOAD_BYTES, MAX_REQUEST_BYTES, type UploadAudit } from './scoped-upload.ts';
+import { prepareUpload, prepareStdinUpload, uploadScript, receiveUpload, readHostFile, validateUploadPolicy, resolveUploadTypes, currentPageOrigin, readRequestJson, MAX_UPLOAD_BYTES, MAX_UPLOAD_CEILING, MAX_REQUEST_BYTES, UPLOAD_TYPES, type UploadAudit } from './scoped-upload.ts';
 import { authorizeProfileRequest, type Listener } from './listeners.ts';
 const svg = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><path d="M0 0"/></svg>');
 const payload = { name: 'app.svg', contentType: 'image/svg+xml', data: svg.toString('base64') };
@@ -55,8 +55,25 @@ test('uploads default on, false turns them off; uploads never enable eval or hos
   for (const l of [listener, enabled]) for (const args of [['eval', '() => 1'], ['upload', '/etc/passwd'], ['upload', '../secret'], ['upload', '--filename=/etc/passwd'], ['upload', '--config=evil']])
     expect(() => authorizeProfileRequest(l, body(args))).toThrow();
   expect(() => authorizeProfileRequest(enabled, body(['upload'], null))).toThrow();
-  for (const p of [true, null, { directory: '/tmp' }, { maxBytes: 0 }, { maxBytes: MAX_UPLOAD_BYTES + 1 }, { contentTypes: ['text/html'] }])
+  for (const p of [true, null, { directory: '/tmp' }, { maxBytes: 0 }, { maxBytes: MAX_UPLOAD_CEILING + 1 }, { contentTypes: ['text/html'] }])
     expect(() => validateUploadPolicy(p)).toThrow();
+  // A listener may now raise the cap above the 10 MiB client default (up to the 100 MiB ceiling)
+  // and opt into document types; images and the ceiling itself stay valid.
+  for (const p of [{ maxBytes: MAX_UPLOAD_BYTES + 1 }, { maxBytes: MAX_UPLOAD_CEILING }, { contentTypes: ['text/csv', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'] }])
+    expect(() => validateUploadPolicy(p)).not.toThrow();
+});
+
+test('resolveUploadTypes: images resets to default, documents/mix keep images alongside', () => {
+  expect(resolveUploadTypes(['images'])).toBeUndefined();
+  expect(resolveUploadTypes(['documents'])).toContain('text/csv');
+  expect(resolveUploadTypes(['documents'])).toContain('image/png');
+  const mix = resolveUploadTypes(['xlsx', 'csv'])!;
+  expect(mix).toContain('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  expect(mix).toContain('text/csv');
+  for (const img of UPLOAD_TYPES) expect(mix).toContain(img); // images never dropped
+  expect(resolveUploadTypes(['application/pdf'])).toContain('application/pdf');
+  expect(() => resolveUploadTypes([])).toThrow();
+  expect(() => resolveUploadTypes(['nonsense'])).toThrow('Unknown upload type');
 });
 
 for (const failure of [false, true]) test(`private byte staging, origin audit and cleanup (${failure ? 'timeout/error' : 'success'})`, async () => {
@@ -130,6 +147,29 @@ test('untrusted payloads cannot become host paths, types, or unbounded allocatio
     const result = await receiveUpload({ policy, payload, args: ['upload'], audit: () => {}, run: async () => { throw Error('must not run'); } });
     expect(result.status).toBe(1);
   }
+});
+
+test('document uploads: allowed only when the listener opts in, and the bytes must match the type', async () => {
+  const xlsx = Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), Buffer.alloc(40)]); // ZIP container
+  const csv = Buffer.from('a,b,c\n1,2,3\n');
+  const xlsxType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+  const xlsxPayload = { name: 'data.xlsx', contentType: xlsxType, data: xlsx.toString('base64') };
+  const csvPayload = { name: 'data.csv', contentType: 'text/csv', data: csv.toString('base64') };
+  const run = async (args: string[]) => args[0] === 'tab-list' ? tabs : { status: 0, stdout: `uploaded ${args[1]}`, stderr: '' };
+  // Default policy ({}) is images only → a document is refused before any command runs.
+  for (const p of [xlsxPayload, csvPayload]) {
+    let ran = false;
+    expect((await receiveUpload({ policy: {}, payload: p, args: ['upload'], audit: () => {}, run: async () => { ran = true; return tabs; } })).status).toBe(1);
+    expect(ran).toBe(false);
+  }
+  // Opted in → accepted, staged under the original name, the larger cap honoured.
+  const big = { maxBytes: 50 * 1024 * 1024, contentTypes: [...UPLOAD_TYPES, xlsxType, 'text/csv'] };
+  expect((await receiveUpload({ policy: big, payload: xlsxPayload, args: ['upload'], audit: () => {}, run })).status).toBe(0);
+  expect((await receiveUpload({ policy: big, payload: csvPayload, args: ['upload'], audit: () => {}, run })).status).toBe(0);
+  // Type is opted in but the bytes lie (xlsx claimed over non-ZIP bytes) → refused.
+  expect((await receiveUpload({ policy: big, payload: { ...xlsxPayload, data: csv.toString('base64') }, args: ['upload'], audit: () => {}, run: async () => { throw Error('must not run'); } })).status).toBe(1);
+  // A NUL byte disqualifies a text/csv upload.
+  expect((await receiveUpload({ policy: big, payload: { ...csvPayload, data: Buffer.from('a,b\0c').toString('base64') }, args: ['upload'], audit: () => {}, run: async () => { throw Error('must not run'); } })).status).toBe(1);
 });
 
 test('origin requires exactly one selected HTTP(S) tab; credentials/query never enter audit', () => {

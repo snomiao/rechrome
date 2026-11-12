@@ -5,10 +5,46 @@ import { basename, join, isAbsolute, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 
 export const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+// A listener may raise maxBytes up to this ceiling. Only the host-path route (rech upload --host)
+// can actually use the headroom: the client base64 route still rides the JSON body, bounded below
+// by MAX_REQUEST_BYTES, so a large client-side file must be staged on the host and sent with --host.
+export const MAX_UPLOAD_CEILING = 100 * 1024 * 1024;
 // Base64 (4/3) plus metadata. Bound JSON input before parsing, not just decoded bytes.
 export const MAX_REQUEST_BYTES = 14 * 1024 * 1024;
+// Images are the default allowed set (every listener with uploads on). matchesType sniffs each.
 export const UPLOAD_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/svg+xml'] as const;
-const EXTENSION_TYPES: Record<string, string> = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml' };
+// Documents are opt-in per listener (rech listener set <name> --upload-types …). They are never
+// parsed or executed on the host — the bytes are written to a private temp file and handed to the
+// page's file input as a File, so the sniffs below only confirm the declared type, not host safety.
+export const DOCUMENT_TYPES = [
+  'application/pdf',
+  'application/zip',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', // xlsx
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document', // docx
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation', // pptx
+  'text/csv',
+  'text/tab-separated-values',
+  'text/plain',
+  'application/json',
+] as const;
+export const ALL_UPLOAD_TYPES = [...UPLOAD_TYPES, ...DOCUMENT_TYPES] as const;
+const EXTENSION_TYPES: Record<string, string> = {
+  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml',
+  pdf: 'application/pdf', zip: 'application/zip',
+  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  csv: 'text/csv', tsv: 'text/tab-separated-values', txt: 'text/plain', json: 'application/json',
+};
+// The ZIP container shared by xlsx/docx/pptx (and a bare .zip). Empty/spanned markers included.
+const ZIP_TYPES = new Set([
+  'application/zip',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+]);
+// Text-ish types with no magic number: accept any valid UTF-8 without a NUL byte.
+const TEXT_TYPES = new Set(['text/csv', 'text/tab-separated-values', 'text/plain', 'application/json']);
 /**
  * How the file reaches the page. auto: the open file chooser, else the page's only file input.
  * chooser: the file chooser a previous `rech click` opened. into: a file input (hidden ones too),
@@ -27,10 +63,31 @@ export type UploadAudit = { name: string | null; size: number | null; sha256: st
 export function validateUploadPolicy(value: unknown): asserts value is UploadPolicy {
   const p = value as UploadPolicy;
   if (!p || typeof p !== 'object' || Array.isArray(p) || Object.keys(p).some(k => !['maxBytes', 'contentTypes', 'hostDirs'].includes(k))
-    || (p.maxBytes !== undefined && (!Number.isSafeInteger(p.maxBytes) || p.maxBytes < 1 || p.maxBytes > MAX_UPLOAD_BYTES))
-    || (p.contentTypes !== undefined && (!Array.isArray(p.contentTypes) || !p.contentTypes.length || p.contentTypes.some(t => !UPLOAD_TYPES.includes(t as any))))
+    || (p.maxBytes !== undefined && (!Number.isSafeInteger(p.maxBytes) || p.maxBytes < 1 || p.maxBytes > MAX_UPLOAD_CEILING))
+    || (p.contentTypes !== undefined && (!Array.isArray(p.contentTypes) || !p.contentTypes.length || p.contentTypes.some(t => !ALL_UPLOAD_TYPES.includes(t as any))))
     || (p.hostDirs !== undefined && (!Array.isArray(p.hostDirs) || !p.hostDirs.length || p.hostDirs.some(d => typeof d !== 'string' || !isAbsolute(d) || d.includes('\0') || d === sep))))
-    throw new Error(`uploads must be an object with optional maxBytes (1..${MAX_UPLOAD_BYTES}), contentTypes (${UPLOAD_TYPES.join(', ')}) and hostDirs (absolute directories, not /)`);
+    throw new Error(`uploads must be an object with optional maxBytes (1..${MAX_UPLOAD_CEILING}), contentTypes (${ALL_UPLOAD_TYPES.join(', ')}) and hostDirs (absolute directories, not /)`);
+}
+
+/**
+ * Resolve `rech listener set --upload-types <token…>` into the content-type list to store on the
+ * policy. Tokens: "images" (reset to the image-only default — returns undefined), "documents"/"docs"
+ * /"all" (images plus every document type), or any mix of extensions (xlsx, csv) and MIME types.
+ * An explicit list always keeps the images allowed, so turning on documents never silently drops them.
+ */
+export function resolveUploadTypes(tokens: string[]): string[] | undefined {
+  const lower = tokens.map(t => t.trim().toLowerCase()).filter(Boolean);
+  if (!lower.length) throw new Error('--upload-types needs at least one of: images, documents, or specific types (xlsx, csv, application/pdf, …)');
+  if (lower.length === 1 && lower[0] === 'images') return undefined; // back to the image-only default
+  if (lower.some(t => t === 'documents' || t === 'docs' || t === 'all')) return [...ALL_UPLOAD_TYPES];
+  const picked = new Set<string>(UPLOAD_TYPES); // images stay allowed alongside any documents chosen
+  for (const t of lower) {
+    if (t === 'images') { for (const i of UPLOAD_TYPES) picked.add(i); continue; }
+    const mime = ALL_UPLOAD_TYPES.includes(t as any) ? t : EXTENSION_TYPES[t.replace(/^\./, '')];
+    if (!mime) throw new Error(`Unknown upload type "${t}". Use images, documents, an extension (${Object.keys(EXTENSION_TYPES).join(', ')}) or a MIME type.`);
+    picked.add(mime);
+  }
+  return [...picked];
 }
 
 function validName(name: unknown): name is string {
@@ -57,6 +114,17 @@ function matchesType(bytes: Buffer, type: string): boolean {
     text = text.trim().replace(/^<\?xml\s[^?]*\?>\s*/, '').replace(/^(?:<!--[\s\S]*?-->\s*)+/, '');
     return /^<svg(?:\s|\/?>)/.test(text) && /(?:<\/svg\s*>|\/>)\s*$/.test(text);
   }
+  if (type === 'application/pdf') return bytes.length >= 5 && bytes.toString('ascii', 0, 5) === '%PDF-';
+  if (ZIP_TYPES.has(type)) {
+    // Any ZIP local-file (PK\x03\x04), empty-archive (PK\x05\x06) or spanned (PK\x07\x08) header.
+    // xlsx/docx/pptx are ZIPs; we confirm the container, not the OOXML part names.
+    if (bytes.length < 4 || bytes[0] !== 0x50 || bytes[1] !== 0x4b) return false;
+    return (bytes[2] === 0x03 && bytes[3] === 0x04) || (bytes[2] === 0x05 && bytes[3] === 0x06) || (bytes[2] === 0x07 && bytes[3] === 0x08);
+  }
+  if (TEXT_TYPES.has(type)) {
+    try { new TextDecoder('utf-8', { fatal: true }).decode(bytes); } catch { return false; }
+    return !bytes.includes(0); // valid UTF-8, no NUL byte
+  }
   return false;
 }
 
@@ -67,7 +135,9 @@ export const UPLOAD_USAGE = `Usage: rech upload <file> [how]   (the file is read
   --paste [ref|selector] an editor that takes pasted images (default: the focused element)
   --name <file>          read the bytes from stdin instead:  rech upload --name shot.png < shot.png
   --host <path>          a file already on the host (only where its listener allows that directory)
-Types: ${UPLOAD_TYPES.join(', ')}, up to ${MAX_UPLOAD_BYTES / 1024 / 1024} MiB. Get refs from rech snapshot.`;
+Images (${UPLOAD_TYPES.join(', ')}) are always allowed, up to ${MAX_UPLOAD_BYTES / 1024 / 1024} MiB.
+A listener may also allow documents (xlsx, csv, pdf, zip, …) and raise the size cap (up to ${MAX_UPLOAD_CEILING / 1024 / 1024} MiB).
+Client-side bytes ride the request body (~${MAX_REQUEST_BYTES / 1024 / 1024} MiB cap); for a large file, stage it on the host and send it with --host. Get refs from rech snapshot.`;
 
 /**
  * Client side of `rech upload`: read the file here (a path argument, or stdin with --name) and
@@ -106,7 +176,7 @@ export async function prepareUpload(args: string[], stdin: AsyncIterable<Uint8Ar
     const hostName = basename(fields.host);
     if (!validName(hostName)) throw new Error('The host file name must be a plain name');
     const hostType = fields['content-type'] ?? EXTENSION_TYPES[hostName.toLowerCase().split('.').pop() ?? ''] ?? '';
-    if (!UPLOAD_TYPES.includes(hostType as any)) throw new Error(`Upload content type must be one of ${UPLOAD_TYPES.join(', ')} (from the file extension, or --content-type)`);
+    if (!ALL_UPLOAD_TYPES.includes(hostType as any)) throw new Error(`Upload content type must be one of ${ALL_UPLOAD_TYPES.join(', ')} (from the file extension, or --content-type)`);
     const upload: UploadPayload = { name: hostName, contentType: hostType, hostPath: fields.host };
     if (mode !== 'auto') upload.mode = mode;
     if (target !== undefined) upload.target = target;
@@ -116,7 +186,7 @@ export async function prepareUpload(args: string[], stdin: AsyncIterable<Uint8Ar
   const name = fields.name ?? (path !== undefined ? basename(path) : undefined);
   if (!validName(name)) throw new Error(path !== undefined ? 'The file name must be a plain name; rename the file or pass --name' : 'Reading stdin needs --name with a plain filename (no path)');
   const contentType = fields['content-type'] ?? EXTENSION_TYPES[name.toLowerCase().split('.').pop() ?? ''] ?? '';
-  if (!UPLOAD_TYPES.includes(contentType as any)) throw new Error(`Upload content type must be one of ${UPLOAD_TYPES.join(', ')} (from the file extension, or --content-type)`);
+  if (!ALL_UPLOAD_TYPES.includes(contentType as any)) throw new Error(`Upload content type must be one of ${ALL_UPLOAD_TYPES.join(', ')} (from the file extension, or --content-type)`);
   let bytes: Buffer;
   if (path !== undefined) {
     bytes = Buffer.from(await readLocal(path).catch((e: any) => { throw new Error(`Cannot read ${path}: ${e?.code === 'ENOENT' ? 'no such file' : e?.message ?? e}`); }));

@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { prepareUpload, UPLOAD_USAGE, MAX_UPLOAD_BYTES, type UploadPayload } from "./scoped-upload.ts";
+import { prepareUpload, UPLOAD_USAGE, MAX_UPLOAD_BYTES, MAX_UPLOAD_CEILING, resolveUploadTypes, type UploadPayload } from "./scoped-upload.ts";
 import { readListeners, writeListeners as writeListenersFile, listenerAddress, isLoopback, normalizePrefix, serviceUrl, allowProfiles, denyProfiles, rotateListenerKey, setPublicUrl, canonicalProfileKeys, planProfileRemoval, parseIceUrl, iceLabel, rtcListeners, shareRtcListeners, defaultRtcListener, DEFAULT_RTC, DEFAULT_RTC_NOTE, LEGACY_RTC, type IceServer, type Listener, type ListenerConfig, type RtcListener } from "./listeners.ts";
 import { recordHoldMs } from "./record.ts";
 
@@ -3551,7 +3551,7 @@ async function rotateKey(name: string): Promise<void> {
   console.log(`New key for ${name}; URLs carrying the old key stop working now. Print new ones with: rech share <profile> --listener ${name}`);
 }
 
-async function setListener(name: string, opts: { publicUrl?: string; clearPublicUrl?: boolean; uploads?: boolean; hostUploadDirs?: string[]; noHostUploads?: boolean; readSecrets?: boolean; readCookies?: boolean; readHeaders?: boolean; keepDownloads?: boolean; evalCode?: boolean }): Promise<void> {
+async function setListener(name: string, opts: { publicUrl?: string; clearPublicUrl?: boolean; uploads?: boolean; hostUploadDirs?: string[]; noHostUploads?: boolean; uploadMaxMb?: number; uploadTypes?: string[]; readSecrets?: boolean; readCookies?: boolean; readHeaders?: boolean; keepDownloads?: boolean; evalCode?: boolean }): Promise<void> {
   const config = await requireListeners();
   let listener = config.listeners.find(l => l.name === name);
   if (!listener) throw new Error(`Unknown listener "${name}". See rech listener ls.`);
@@ -3567,6 +3567,21 @@ async function setListener(name: string, opts: { publicUrl?: string; clearPublic
     const policy = listener.uploads ?? {};
     if (opts.noHostUploads) delete policy.hostDirs;
     else policy.hostDirs = [...new Set([...(policy.hostDirs ?? []), ...opts.hostUploadDirs!.map(d => realpathSync(resolve(d)))])];
+    listener.uploads = policy;
+  }
+  if (opts.uploadMaxMb !== undefined || opts.uploadTypes !== undefined) {
+    if (listener.profiles === "*") throw new Error(`"${name}" is the local management listener; upload limits are set on shared listeners.`);
+    if (listener.uploads === false) throw new Error(`Uploads are off on "${name}"; turn them on first: rech listener set ${name} --uploads`);
+    const policy = listener.uploads ?? {};
+    if (opts.uploadMaxMb !== undefined) {
+      const bytes = Math.round(opts.uploadMaxMb * 1024 * 1024);
+      if (!Number.isSafeInteger(bytes) || bytes < 1 || bytes > MAX_UPLOAD_CEILING) throw new Error(`--upload-max-mb must be between 1 and ${MAX_UPLOAD_CEILING / 1024 / 1024}`);
+      policy.maxBytes = bytes;
+    }
+    if (opts.uploadTypes !== undefined) {
+      const types = resolveUploadTypes(opts.uploadTypes);
+      if (types) policy.contentTypes = types; else delete policy.contentTypes;
+    }
     listener.uploads = policy;
   }
   if (opts.readSecrets !== undefined) {
@@ -3597,7 +3612,13 @@ async function setListener(name: string, opts: { publicUrl?: string; clearPublic
     const dirs = (listener.uploads || {}).hostDirs;
     console.log(dirs?.length ? `${name}: host-path uploads allowed from ${dirs.join(", ")} (rech upload --host <path>; each is logged)` : `${name}: host-path uploads off`);
   }
-  if (opts.uploads !== undefined) console.log(opts.uploads ? `${name}: uploads on (rech upload <file>; images up to ${((listener.uploads || {}).maxBytes ?? MAX_UPLOAD_BYTES) / 1024 / 1024} MiB)` : `${name}: uploads off`);
+  if (opts.uploadMaxMb !== undefined || opts.uploadTypes !== undefined) {
+    const policy = listener.uploads || {};
+    const cap = (policy.maxBytes ?? MAX_UPLOAD_BYTES) / 1024 / 1024;
+    const types = policy.contentTypes ? policy.contentTypes.join(", ") : "images only (default)";
+    console.log(`${name}: uploads accept ${types}, up to ${cap} MiB. A file over ~${Math.floor(14)} MiB must be staged on the host and sent with rech upload --host <path> (set --host-upload-dir first).`);
+  }
+  if (opts.uploads !== undefined) console.log(opts.uploads ? `${name}: uploads on (rech upload <file>; images up to ${((listener.uploads || {}).maxBytes ?? MAX_UPLOAD_BYTES) / 1024 / 1024} MiB. Documents and a larger cap: --upload-types / --upload-max-mb)` : `${name}: uploads off`);
 }
 
 const hideKey = (url: string) => url.replace(/([#&?]key=)[^&]*/, "$1…");
@@ -4818,7 +4839,7 @@ export type RechHandlers = {
   allowListener(name: string, profiles: string[]): Promise<void>;
   denyListener(name: string, profiles: string[]): Promise<void>;
   rotateKey(name: string): Promise<void>;
-  setListener(name: string, opts: { publicUrl?: string; clearPublicUrl?: boolean; uploads?: boolean; hostUploadDirs?: string[]; noHostUploads?: boolean; readSecrets?: boolean; readCookies?: boolean; readHeaders?: boolean; keepDownloads?: boolean; evalCode?: boolean }): Promise<void>;
+  setListener(name: string, opts: { publicUrl?: string; clearPublicUrl?: boolean; uploads?: boolean; hostUploadDirs?: string[]; noHostUploads?: boolean; uploadMaxMb?: number; uploadTypes?: string[]; readSecrets?: boolean; readCookies?: boolean; readHeaders?: boolean; keepDownloads?: boolean; evalCode?: boolean }): Promise<void>;
   setup(opts: SetupOptions): Promise<void>;
   tray(action?: string): Promise<void>;
   provisionProfile(name: string, opts: { headed: boolean; experimental: boolean }): Promise<void>;
@@ -5014,8 +5035,10 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
         .option("eval", { type: "boolean", describe: "Off by default. Allow JavaScript in browser pages: clients can read page data and act as signed-in accounts. Does not grant host-process run-code, raw CDP or CLI overrides. --no-eval turns it off" })
         .option("keep-downloads", { type: "boolean", describe: "Off by default: browser downloads go to the client, then are deleted here. --keep-downloads also keeps them on this host" })
         .option("host-uploads", { type: "boolean", describe: "--no-host-uploads turns host-path uploads off again" })
-        .check(a => a.publicUrl !== undefined || a.clearPublicUrl || a.uploads !== undefined || a.hostUploadDir?.length || a.hostUploads === false || a.readSecrets !== undefined || a.readCookies !== undefined || a.readHeaders !== undefined || a.keepDownloads !== undefined || a.eval !== undefined ? true : "Pass --public-url <url>, --clear-public-url, --uploads/--no-uploads, --host-upload-dir/--no-host-uploads, --read-secrets/--read-cookies/--read-headers, --eval/--no-eval, or --keep-downloads"),
-        a => handlers.setListener(a.name, { publicUrl: a.publicUrl, clearPublicUrl: a.clearPublicUrl, ...(a.uploads !== undefined ? { uploads: a.uploads } : {}), ...(a.hostUploadDir?.length ? { hostUploadDirs: a.hostUploadDir as string[] } : {}), ...(a.hostUploads === false ? { noHostUploads: true } : {}), ...(a.readSecrets !== undefined ? { readSecrets: a.readSecrets } : {}), ...(a.readCookies !== undefined ? { readCookies: a.readCookies } : {}), ...(a.readHeaders !== undefined ? { readHeaders: a.readHeaders } : {}), ...(a.keepDownloads !== undefined ? { keepDownloads: a.keepDownloads } : {}), ...(a.eval !== undefined ? { evalCode: a.eval } : {}) }))
+        .option("upload-types", { type: "string", array: true, requiresArg: true, describe: "Which upload types this listener accepts (default images only). Pass images | documents | a mix of extensions/MIME types (xlsx csv application/pdf …); documents stay alongside images" })
+        .option("upload-max-mb", { type: "number", requiresArg: true, describe: "Raise the per-upload size cap in MiB (default 10, max 100). A file over one request is sent in chunks automatically" })
+        .check(a => a.publicUrl !== undefined || a.clearPublicUrl || a.uploads !== undefined || a.hostUploadDir?.length || a.hostUploads === false || a.uploadTypes?.length || a.uploadMaxMb !== undefined || a.readSecrets !== undefined || a.readCookies !== undefined || a.readHeaders !== undefined || a.keepDownloads !== undefined || a.eval !== undefined ? true : "Pass --public-url <url>, --clear-public-url, --uploads/--no-uploads, --host-upload-dir/--no-host-uploads, --upload-types, --upload-max-mb, --read-secrets/--read-cookies/--read-headers, --eval/--no-eval, or --keep-downloads"),
+        a => handlers.setListener(a.name, { publicUrl: a.publicUrl, clearPublicUrl: a.clearPublicUrl, ...(a.uploads !== undefined ? { uploads: a.uploads } : {}), ...(a.hostUploadDir?.length ? { hostUploadDirs: a.hostUploadDir as string[] } : {}), ...(a.hostUploads === false ? { noHostUploads: true } : {}), ...(a.uploadTypes?.length ? { uploadTypes: a.uploadTypes as string[] } : {}), ...(a.uploadMaxMb !== undefined ? { uploadMaxMb: a.uploadMaxMb } : {}), ...(a.readSecrets !== undefined ? { readSecrets: a.readSecrets } : {}), ...(a.readCookies !== undefined ? { readCookies: a.readCookies } : {}), ...(a.readHeaders !== undefined ? { readHeaders: a.readHeaders } : {}), ...(a.keepDownloads !== undefined ? { keepDownloads: a.keepDownloads } : {}), ...(a.eval !== undefined ? { evalCode: a.eval } : {}) }))
       .command("port [name]", "Print a listener's port (for a proxy command)", y => y.positional("name", { type: "string" }),
         a => handlers.listenerPort(a.name))
       .command("rotate-key <name>", "Give a listener a new key (old URLs stop working)", y => y.positional("name", { type: "string", demandOption: true }),
