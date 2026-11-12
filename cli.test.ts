@@ -2,7 +2,10 @@ import { describe, test, expect } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { rechCli, listenerNextSteps, unknownCommandHint, notConnectedMessage, chooseShareListener, matchProfileLoosely, preferManagementListener, promptChoice, type RechHandlers } from "./rechrome.ts";
+import { formatToken, newToken } from "./secret.ts";
+import { rechCli, shareLinkParts, listenerNextSteps, unknownCommandHint, notConnectedMessage, chooseShareListener, matchProfileLoosely, preferManagementListener, promptChoice, type RechHandlers } from "./rechrome.ts";
+import { applyIsolateArg, pickSessionName, rechSeparatorIndex as rechSep } from "./rechrome.ts";
+import { isIsoSession } from "./serve.ts";
 
 async function run(argv: string[]) {
   const calls: [string, ...unknown[]][] = [];
@@ -72,9 +75,9 @@ test("share prints, saves, or lists connection URLs; connect takes a shared URL"
 
 test("share new/devices/approve/allow/deny/rotate/renew/revoke/rm route to share handlers", async () => {
   expect(await run(["share", "new", "a@x.com", "Profile 5", "--name", "alice", "--via", "webrtc", "--via", "lan", "--expires", "7d", "--devices", "2", "--approve", "--invite-ttl", "1h"]))
-    .toEqual([["shareNew", ["a@x.com", "Profile 5"], { name: "alice", via: ["webrtc", "lan"], signal: undefined, expires: "7d", inviteTtl: "1h", devices: 2, approve: true }]]);
+    .toEqual([["shareNew", ["a@x.com", "Profile 5"], { name: "alice", via: ["webrtc", "lan"], signal: undefined, expires: "7d", inviteTtl: "1h", devices: 2, approve: true, reusable: undefined }]]);
   expect(await run(["share", "new", "qa", "--signal", "https://sig.example/"]))
-    .toEqual([["shareNew", ["qa"], { name: undefined, via: undefined, signal: "https://sig.example/", expires: undefined, inviteTtl: undefined, devices: undefined, approve: undefined }]]);
+    .toEqual([["shareNew", ["qa"], { name: undefined, via: undefined, signal: "https://sig.example/", expires: undefined, inviteTtl: undefined, devices: undefined, approve: undefined, reusable: undefined }]]);
   expect(await run(["share", "devices", "alice"])).toEqual([["shareDevices", "alice", undefined]]);
   expect(await run(["share", "devices", "alice", "--rm", "abc"])).toEqual([["shareDevices", "alice", "abc"]]);
   expect(await run(["share", "approve", "alice"])).toEqual([["shareEdit", "approve", "alice", [], { expires: undefined }]]);
@@ -154,6 +157,40 @@ test("rech pw --version reaches playwright-cli, not rech", async () => {
     const [code, stdout] = await Promise.all([proc.exited, new Response(proc.stdout).text()]);
     expect(code).toBe(0);
     expect(JSON.parse(stdout.trim())).toEqual(["--version"]);
+  } finally { server.stop(true); }
+});
+
+test("a large reply reaches a pipe whole (the client waits for stdout before exiting)", async () => {
+  const big = "x".repeat(2 * 1024 * 1024) + "\nend\n"; // far past a pipe's 64-128 KiB buffer
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch(req) {
+    if (new URL(req.url).pathname === "/run") return Response.json({ status: 0, stdout: big, stderr: "" });
+    return new Response("rech server\n");
+  } });
+  try {
+    const proc = Bun.spawn([process.execPath, `${import.meta.dir}/rechrome.ts`, "pw", "--version"], {
+      env: { ...process.env, RECHROME_URL: `http://127.0.0.1:${server.port}/#key=stub-key-0123456789` }, stdout: "pipe", stderr: "pipe",
+    });
+    // Read slowly, like a consumer that is busy, so the pipe fills before the client is done.
+    await Bun.sleep(500);
+    const [code, stdout] = await Promise.all([proc.exited, new Response(proc.stdout).text()]);
+    expect(code).toBe(0);
+    expect(stdout.length).toBe(big.length);
+  } finally { server.stop(true); }
+});
+
+test("a reader that stops early (| head) is not an error", async () => {
+  const big = "x".repeat(2 * 1024 * 1024);
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch(req) {
+    if (new URL(req.url).pathname === "/run") return Response.json({ status: 0, stdout: big, stderr: "" });
+    return new Response("rech server\n");
+  } });
+  try {
+    const proc = Bun.spawn(["sh", "-c", `"$0" "$1" pw --version | head -c 5`, process.execPath, `${import.meta.dir}/rechrome.ts`], {
+      env: { ...process.env, RECHROME_URL: `http://127.0.0.1:${server.port}/#key=stub-key-0123456789` }, stdout: "pipe", stderr: "pipe",
+    });
+    const [, stdout, stderr] = await Promise.all([proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+    expect(stdout).toBe("xxxxx");
+    expect(stderr).not.toContain("EPIPE");
   } finally { server.stop(true); }
 });
 
@@ -461,4 +498,54 @@ test("a URL for this machine's own scoped listener goes through the loopback man
   for (const url of ["http://other-key-0123456@100.64.0.9:13775/", "http://scoped-key-0123456@tak.ts.net/", "https://scoped-key-0123456@100.64.0.7:13775/"])
     expect(preferManagementListener(url, config)).toBe(url);
   expect(preferManagementListener("http://scoped-key-0123456@100.64.0.7:13775/", null)).toBe("http://scoped-key-0123456@100.64.0.7:13775/");
+});
+
+describe("--isolate=<name>", () => {
+  test("named: a persistent iso_<name> session, the same on every command", () => {
+    expect(applyIsolateArg(["--isolate=login", "open", "about:blank"])).toEqual(["open", "about:blank", "-s=iso_login"]);
+    expect(applyIsolateArg(["--isolated=login", "click", "e3"])).toEqual(["click", "e3", "-s=iso_login"]);
+    expect(isIsoSession("a1b2c3d4-iso_login")).toBe(false); // not reaped on the idle TTL
+    expect(isIsoSession("a1b2c3d4-iso_deadbeef")).toBe(false);
+  });
+  test("bare --isolate stays throwaway", () => {
+    const a = applyIsolateArg(["--isolate", "open"]), b = applyIsolateArg(["--isolate", "open"]);
+    expect(a[1]).toMatch(/^-s=iso-[0-9a-f]{16}$/);
+    expect(a[1]).not.toBe(b[1]);
+  });
+  test("refuses bad names and a second -s", () => {
+    expect(() => applyIsolateArg(["--isolate=", "open"])).toThrow("--isolate=<name>");
+    expect(() => applyIsolateArg(["--isolate=a/b", "open"])).toThrow("--isolate=<name>");
+    expect(() => applyIsolateArg(["--isolate=x", "-s=y", "open"])).toThrow("not both");
+  });
+  test("is a rech flag before pw", () => {
+    expect(rechSep(["--isolate=login", "pw", "open"])).toBe(1);
+  });
+  test("session close takes the --isolate name", () => {
+    expect(pickSessionName("login", ["iso_login"])).toBe("iso_login");
+    expect(pickSessionName("login", ["login", "iso_login"])).toBe("login");
+    expect(pickSessionName("other", ["iso_login"])).toBe("other");
+  });
+});
+
+test("shareLinkParts: an invite's /share/ page is not part of the transport's address", () => {
+  const invite = newToken("invite"), reusable = newToken("reusable"), device = newToken("device");
+  const legacy = formatToken(new Uint8Array(16).fill(5));
+  expect(shareLinkParts(`https://rechrome.pages.dev/share/#${invite}`)).toMatchObject({ token: invite, origin: "https://rechrome.pages.dev/" });
+  expect(shareLinkParts(`http://100.64.0.1:13775/rechrome/x/share/#${reusable}`)?.origin).toBe("http://100.64.0.1:13775/rechrome/x/");
+  // A listener whose own prefix ends in /share/: its new invite links carry a second share/.
+  expect(shareLinkParts(`https://h.example/rechrome/share/share/#${invite}`)?.origin).toBe("https://h.example/rechrome/share/");
+  // Links that never had the page segment keep their path: older invites and saved device links.
+  expect(shareLinkParts(`https://h.example/rechrome/share/#${legacy}`)?.origin).toBe("https://h.example/rechrome/share/");
+  expect(shareLinkParts(`https://h.example/rechrome/share/#${device}&via=webrtc`)).toMatchObject({ origin: "https://h.example/rechrome/share/", webrtc: true });
+  expect(shareLinkParts(`https://rechrome.pages.dev/#${legacy}`)?.origin).toBe("https://rechrome.pages.dev/");
+});
+
+test("listener page eval can be enabled and disabled explicitly", async () => {
+  for (const [flag, enabled] of [["--eval", true], ["--no-eval", false]] as const) {
+    const calls = await run(["listener", "set", "qa", flag]);
+    expect(calls).toHaveLength(1);
+    expect(calls[0][0]).toBe("setListener");
+    expect(calls[0][1]).toBe("qa");
+    expect(calls[0][2]).toMatchObject({ evalCode: enabled });
+  }
 });

@@ -1,4 +1,6 @@
-import { readFileSync, readdirSync } from "fs";
+import { Database } from "bun:sqlite";
+import { copyFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "fs";
+import { tmpdir } from "os";
 import { join } from "path";
 
 function varint(b: Buffer, cursor: { p: number }): number {
@@ -87,7 +89,41 @@ function* logRecords(b: Buffer): Generator<Buffer> {
 // Read files without opening the database or taking Chrome's LevelDB lock. Internal
 // sequence numbers, not filenames/byte order, determine the latest value. Decode
 // SST prefix compression and Snappy, and scope the key to the exact extension origin.
+// Chromium 156+ keeps localStorage in a SQLite file `<profile>/LocalStorage` (maps + map_entries)
+// instead of `Local Storage/leveldb`; keys and values keep the same 0x01-prefixed Latin-1 encoding.
+function readExtensionTokenFromSqlite(userDataDir: string, profileDir: string, extensionId: string): string | null {
+  const path = join(userDataDir, profileDir, "LocalStorage");
+  if (!existsSync(path)) return null;
+  const query = (file: string, readonly: boolean): string | null => {
+    const db = new Database(file, readonly ? { readonly: true } : undefined);
+    try {
+      const row = db.query(
+        "SELECT e.value AS value, e.value_compression_type AS compression FROM map_entries e JOIN maps m ON m.row_id = e.map_id WHERE m.storage_key = ? AND e.key = ?",
+      ).get(Buffer.from(`chrome-extension://${extensionId}/`, "latin1"), Buffer.from("\x01auth-token", "latin1")) as { value: Uint8Array; compression: number } | null;
+      if (!row || row.compression !== 0) return null;
+      const value = Buffer.from(row.value).toString("latin1");
+      return /^\x01[A-Za-z0-9_-]{43}$/.test(value) ? value.slice(1) : null;
+    } finally { db.close(); }
+  };
+  // Chrome keeps the file in WAL mode. While Chrome runs, a recent write (a freshly minted token)
+  // can sit in the -wal file only, and a read-only open sees it. Once Chrome has exited and
+  // removed the -shm file, a read-only open fails (SQLITE_CANTOPEN): then read a private copy of
+  // the file and its -wal, which never touches Chrome's own files. (No `file:` URIs: Bun's SQLite
+  // on Linux does not take them.)
+  try { return query(path, true); } catch {}
+  const tmp = mkdtempSync(join(tmpdir(), "rech-ls-"));
+  try {
+    copyFileSync(path, join(tmp, "LocalStorage"));
+    if (existsSync(`${path}-wal`)) copyFileSync(`${path}-wal`, join(tmp, "LocalStorage-wal"));
+    return query(join(tmp, "LocalStorage"), false);
+  } catch { return null; } finally { rmSync(tmp, { recursive: true, force: true }); }
+}
+
 export function readExtensionTokenFromProfile(userDataDir: string, profileDir: string, extensionId: string): string | null {
+  return readExtensionTokenFromSqlite(userDataDir, profileDir, extensionId) ?? readExtensionTokenFromLeveldb(userDataDir, profileDir, extensionId);
+}
+
+function readExtensionTokenFromLeveldb(userDataDir: string, profileDir: string, extensionId: string): string | null {
   const dir = join(userDataDir, profileDir, "Local Storage", "leveldb");
   const wanted = Buffer.from(`_chrome-extension://${extensionId}\0\x01auth-token`, "latin1");
   let newest = -1n, token: string | null = null;

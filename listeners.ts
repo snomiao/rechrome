@@ -6,11 +6,9 @@ import { join } from "path";
 import { mkdir, readFile, rename, writeFile } from "fs/promises";
 import { DEFAULT_RTC, DEFAULT_SIGNAL, normalizeSignal } from "./shares.ts";
 
+// eval grants page-context JavaScript only; never host-process run-code or raw CDP.
 // publicUrl: where a reverse proxy (Tailscale Serve, Caddy, nginx, ...) exposes this listener.
-// eval: the host has shared the whole browser profile with this listener's links — arbitrary code
-// (eval/run-code) and full CDP are allowed for its profiles, the same capability as the local
-// management listener. Off by default; only set it on a listener you trust with those accounts.
-export type Listener = { name: string; host: string; port: number; key: string; profiles: string[] | "*"; prefix?: string; publicUrl?: string; uploads?: UploadPolicy | false; readSecrets?: boolean; readCookies?: boolean; keepDownloads?: boolean; eval?: boolean };
+export type Listener = { name: string; host: string; port: number; key: string; profiles: string[] | "*"; prefix?: string; publicUrl?: string; uploads?: UploadPolicy | false; readSecrets?: boolean; readCookies?: boolean; readHeaders?: boolean; keepDownloads?: boolean; eval?: boolean };
 // retiredPorts: ports of removed listeners, newest last. New listeners skip them so a link
 // saved for a removed listener gets "connection refused", not some other listener's answer.
 // rtcListeners: WebRTC transports (a signal server, plus optional STUN/TURN). They live under
@@ -143,6 +141,8 @@ export function validateListeners(value: unknown): ListenerConfig {
     if (l.uploads !== undefined && l.uploads !== false) validateUploadPolicy(l.uploads);
     if (l.readSecrets !== undefined && typeof l.readSecrets !== "boolean") throw new Error("readSecrets must be true or false");
     if (l.readCookies !== undefined && typeof l.readCookies !== "boolean") throw new Error("readCookies must be true or false");
+    if (l.readHeaders !== undefined && typeof l.readHeaders !== "boolean") throw new Error("readHeaders must be true or false");
+    if (l.eval !== undefined && typeof l.eval !== "boolean") throw new Error("eval must be true or false");
     if (l.keepDownloads !== undefined && typeof l.keepDownloads !== "boolean") throw new Error("keepDownloads must be true or false");
     const address = listenerAddress(l);
     if (names.has(l.name) || addresses.has(address) || keys.has(l.key)) throw new Error("Listener names, addresses, and credentials must be unique");
@@ -182,22 +182,16 @@ export async function writeListeners(config: ListenerConfig): Promise<void> {
 
 // Restricted listeners deliberately exclude arbitrary code, host filesystem access,
 // attachment/config overrides, and commands that manage all browser sessions.
-const SCOPED_COMMANDS = new Set(["open", "goto", "tab-new", "tab-list", "tab-select", "tab-close", "snapshot", "screenshot", "click", "dblclick", "fill", "type", "press", "hover", "select", "check", "uncheck", "go-back", "go-forward", "reload", "resize", "close", "fill-secret", "console", "dialog-accept", "dialog-dismiss"]);
+const SCOPED_COMMANDS = new Set(["open", "goto", "tab-new", "tab-list", "tab-select", "tab-close", "snapshot", "screenshot", "click", "dblclick", "fill", "type", "press", "hover", "select", "check", "uncheck", "go-back", "go-forward", "reload", "resize", "close", "fill-secret", "console", "dialog-accept", "dialog-dismiss", "record"]);
+// The CLI options each scoped command may carry (everything else is refused). record uses a
+// start/stop subcommand (a positional) plus these capture/output knobs (record.ts RECORD_OPTIONS).
+const RECORD_SCOPED_OPTS = ["--seconds", "--max-seconds", "--fps", "--quality", "--filename", "--format"];
 export function authorizeProfileRequest(listener: Listener, body: any): string {
   if (!body || Array.isArray(body) || !body.identity || typeof body.identity.key !== "string" || !body.identity.key || !Array.isArray(body.args) || body.args.some((a: unknown) => typeof a !== "string")) throw new Error("Scoped requests require identity.key, identity.profile and string args");
   const profile = body.identity.profile;
   if (typeof profile !== "string" || listener.profiles === "*" || !listener.profiles.includes(profile)) throw new Error("Profile is not allowed on this listener");
   if (body.env?.PLAYWRIGHT_MCP_PROFILE_DIRECTORY && body.env.PLAYWRIGHT_MCP_PROFILE_DIRECTORY !== profile) throw new Error("Profile override does not match request identity");
   const args = body.args.filter((a: string) => /^-s=[a-zA-Z0-9_-]{1,64}$/.test(a) === false);
-  // Host filesystem stays closed on every network listener, full access included: the upload
-  // receiver takes stdin bytes only, so a caller can never name a host path. Checked before any
-  // mode branch so --eval can't widen it.
-  if (args[0] === "upload" && (args.length !== 1 || !body.upload)) throw new Error("Upload requires stdin bytes; host paths are unavailable");
-  if (args[0] !== "upload" && body.upload !== undefined) throw new Error("Unexpected upload payload");
-  // --eval: the host has shared the whole browser profile with this listener's links, so arbitrary
-  // code (eval/run-code) and full CDP are allowed for its allowlisted profiles — the same capability
-  // as the local management listener. Off by default; set with `rech listener set <name> --eval`.
-  if (listener.eval === true) return profile;
   if (args[0] === "upload" && listener.uploads === false)
     throw new Error(`Uploads are off on listener "${listener.name}". The host can turn them on: rech listener set ${listener.name} --uploads`);
   if (args[0] === "read-secret" && listener.readSecrets !== true)
@@ -206,9 +200,14 @@ export function authorizeProfileRequest(listener: Listener, body: any): string {
     throw new Error(`read-storage is off on listener "${listener.name}". The host can turn it on: rech listener set ${listener.name} --read-secrets`);
   if (args[0] === "read-cookie" && listener.readCookies !== true)
     throw new Error(`read-cookie is off on listener "${listener.name}". The host can turn it on: rech listener set ${listener.name} --read-cookies`);
-  if (args[0] !== "upload" && args[0] !== "read-secret" && args[0] !== "read-cookie" && args[0] !== "read-storage" && !SCOPED_COMMANDS.has(args[0])) throw new Error("Command is unavailable on profile-scoped listeners; use the local management listener for arbitrary code or host access");
-  if (body.args.filter((a: string) => a.startsWith("-s=")).length > 1 || args.slice(1).some((a: string) => a.startsWith("-") && !(args[0] === "screenshot" && a === "--full-page") && !(args[0] === "console" && a === "--clear") && !(args[0] === "fill-secret" && (a === "--submit" || a === "--totp" || a.startsWith("--allow-domain="))) && !(args[0] === "read-secret" && a.startsWith("--allow-domain=")) && !(args[0] === "read-cookie" && a.startsWith("--allow-domain=")) && !(args[0] === "read-storage" && a.startsWith("--allow-domain=")))) throw new Error("CLI option overrides are unavailable on profile-scoped listeners");
+  if (args[0] === "read-headers" && listener.readHeaders !== true)
+    throw new Error(`read-headers is off on listener "${listener.name}". The host can turn it on: rech listener set ${listener.name} --read-headers`);
+  if (args[0] !== "upload" && args[0] !== "read-secret" && args[0] !== "read-cookie" && args[0] !== "read-storage" && args[0] !== "read-headers" && !(args[0] === "eval" && listener.eval === true) && !SCOPED_COMMANDS.has(args[0])) throw new Error("Command is unavailable on profile-scoped listeners; use the local management listener for arbitrary code or host access");
+  if (body.args.filter((a: string) => a.startsWith("-s=")).length > 1 || args.slice(1).some((a: string) => a.startsWith("-") && !(args[0] === "screenshot" && a === "--full-page") && !(args[0] === "console" && a === "--clear") && !(args[0] === "fill-secret" && (a === "--submit" || a === "--totp" || a.startsWith("--allow-domain="))) && !(args[0] === "read-secret" && a.startsWith("--allow-domain=")) && !(args[0] === "read-cookie" && a.startsWith("--allow-domain=")) && !(args[0] === "read-storage" && (a.startsWith("--allow-domain=") || a.startsWith("--goto="))) && !(args[0] === "read-headers" && (a.startsWith("--allow-domain=") || a.startsWith("--seconds=") || a.startsWith("--goto="))) && !(args[0] === "record" && RECORD_SCOPED_OPTS.some(o => a === o || a.startsWith(o + "="))))) throw new Error("CLI option overrides are unavailable on profile-scoped listeners");
   if (["open", "goto", "tab-new"].includes(args[0]) && args[1] && !/^https?:\/\//i.test(args[1]) && args[1] !== "about:blank") throw new Error("Scoped navigation accepts only HTTP(S) or about:blank");
+  // Upload is handled by the byte-only receiver; the caller cannot supply host paths.
+  if (args[0] === "upload" && (args.length !== 1 || !body.upload)) throw new Error("Upload requires stdin bytes; host paths are unavailable");
+  if (args[0] !== "upload" && body.upload !== undefined) throw new Error("Unexpected upload payload");
   return profile;
 }
 

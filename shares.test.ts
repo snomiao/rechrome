@@ -2,8 +2,8 @@ import { expect, test } from "bun:test";
 import { mkdtempSync, statSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { authorizeCredential, createShare, credentialForBearer, inviteLink, parseDuration, readShares, redeemInvite, updateShares, webrtcCredentials, type ShareConfig } from "./shares.ts";
-import { bearerOf } from "./secret.ts";
+import { REUSABLE_MAX_DEVICES, authorizeCredential, createShare, credentialForBearer, inviteLink, inviteState, shareSessions, parseDuration, readShares, redeemInvite, updateShares, webrtcCredentials, type ShareConfig } from "./shares.ts";
+import { bearerOf, formatToken, newToken, parseToken } from "./secret.ts";
 
 const empty = (): ShareConfig => ({ version: 1, shares: [] });
 const NOW = 1_800_000_000_000;
@@ -12,7 +12,10 @@ test("a share starts as an invite that may only ping and redeem", () => {
   const config = empty();
   const share = createShare(config, { label: "alice", profiles: ["work@x.com"], via: ["webrtc"], now: NOW });
   expect(share.signal).toBe("https://rechrome.pages.dev/");
-  expect(inviteLink(share, share.signal!)).toBe(`https://rechrome.pages.dev/#${share.invite}`);
+  expect(share.invite.startsWith("rech1_invite_")).toBe(true);
+  expect(inviteLink(share, share.signal!)).toBe(`https://rechrome.pages.dev/share/#${share.invite}`);
+  // An invite minted before token labels keeps its old link.
+  expect(inviteLink({ ...share, invite: formatToken(new Uint8Array(16).fill(3)) }, "http://h:1/p")).toBe(`http://h:1/p/#${formatToken(new Uint8Array(16).fill(3))}`);
   const cred = credentialForBearer(config, bearerOf(share.invite))!;
   expect(cred.kind).toBe("invite");
   expect(authorizeCredential(cred, "webrtc", "ping", NOW)).toBeNull();
@@ -50,6 +53,33 @@ test("--devices N allows N redemptions; --approve holds each device until approv
   expect(authorizeCredential(cred, "lan", "run", NOW)).toBeNull();
 });
 
+test("a reusable invite is redeemed by many devices, each with its own credential, until rotated or expired", () => {
+  const config = empty();
+  const share = createShare(config, { label: "team", profiles: ["p"], via: ["webrtc"], reusable: true, inviteTtlMs: 1000, now: NOW });
+  expect(share.maxDevices).toBe(REUSABLE_MAX_DEVICES);
+  const a = redeemInvite(config, share.id, "a", NOW);
+  const b = redeemInvite(config, share.id, "b", NOW);
+  expect(a.token).not.toBe(b.token);
+  expect(share.redeemed).toBe(2);
+  const inv = credentialForBearer(config, bearerOf(share.invite))!;
+  expect(authorizeCredential(inv, "webrtc", "redeem", NOW)).toBeNull();
+  expect(authorizeCredential(inv, "webrtc", "redeem", NOW + 1000)?.message).toMatch(/invite expired\./);
+  // dropping one device leaves the other working
+  share.devices = share.devices.filter(d => d !== a);
+  expect(credentialForBearer(config, bearerOf(a.token))).toBeNull();
+  expect(authorizeCredential(credentialForBearer(config, bearerOf(b.token))!, "webrtc", "run", NOW)).toBeNull();
+  // rotating kills the leaked link
+  const old = share.invite; share.invite = newToken();
+  expect(credentialForBearer(config, bearerOf(old))).toBeNull();
+});
+
+test("a reusable invite stops at its device cap", () => {
+  const config = empty();
+  const share = createShare(config, { label: "cap", profiles: ["p"], via: ["lan"], reusable: true, maxDevices: 2, now: NOW });
+  redeemInvite(config, share.id, "a", NOW); redeemInvite(config, share.id, "b", NOW);
+  expect(() => redeemInvite(config, share.id, "c", NOW)).toThrow(/limit of 2 devices/);
+});
+
 test("expiry, invite TTL and revocation", () => {
   const config = empty();
   const share = createShare(config, { label: "x", profiles: ["p"], via: ["webrtc"], expiresAt: NOW + 1000, inviteTtlMs: 500, now: NOW });
@@ -63,7 +93,7 @@ test("expiry, invite TTL and revocation", () => {
   expect(authorizeCredential(dev, "webrtc", "ping", NOW)?.message).toMatch(/revoked/);
 });
 
-test("the WebRTC host listens for unused invites and every device of live shares only", () => {
+test("the WebRTC host listens for the invite and every device of live shares only", () => {
   const config = empty();
   const a = createShare(config, { label: "a", profiles: ["p"], via: ["webrtc"], now: NOW });
   createShare(config, { label: "lan-only", profiles: ["p"], via: ["lan"], now: NOW });
@@ -72,8 +102,16 @@ test("the WebRTC host listens for unused invites and every device of live shares
   expect(webrtcCredentials(config, NOW).map(c => c.kind)).toEqual(["invite"]);
   redeemInvite(config, a.id, "d", NOW);
   expect(webrtcCredentials(config, NOW).map(c => c.kind)).toEqual(["invite", "device"]);
+  // An expired invite keeps its room, so the taker hears "expired", not "host offline"…
   a.inviteExpiresAt = NOW;
-  expect(webrtcCredentials(config, NOW).map(c => c.kind)).toEqual(["device"]);
+  const creds = webrtcCredentials(config, NOW);
+  expect(creds.map(c => c.kind)).toEqual(["invite", "device"]);
+  // …and that room can only say so: it can't redeem or run anything.
+  const invite = creds[0]!;
+  expect(authorizeCredential(invite, "webrtc", "ping", NOW)).toBeNull();
+  expect(authorizeCredential(invite, "webrtc", "redeem", NOW)?.message).toContain("expired");
+  expect(authorizeCredential(invite, "webrtc", "run", NOW)?.status).toBe(403);
+  expect(() => redeemInvite(config, a.id, "e", NOW)).toThrow(/expired/);
 });
 
 test("names, profiles and transports are validated", () => {
@@ -100,4 +138,42 @@ test("updateShares persists owner-only and serializes concurrent writers", async
     updateShares(c => { createShare(c, { label, profiles: ["p"], via: ["lan"] }); }, path)));
   expect((await readShares(path)).shares.map(s => s.label).sort()).toEqual(["a", "b", "c", "d"]);
   if (process.platform !== "win32") expect(statSync(path).mode & 0o777).toBe(0o600);
+});
+
+test("inviteState: open, then used; expired only while it can still be used", () => {
+  const config = empty();
+  const s = createShare(config, { label: "s", profiles: ["p"], via: ["webrtc"], now: NOW, inviteTtlMs: 1000 });
+  expect(inviteState(s, NOW)).toEqual({ state: "open", maxDevices: 1, used: 0, expiresAt: NOW + 1000 });
+  expect(inviteState(s, NOW + 1000).state).toBe("expired");
+  redeemInvite(config, s.id, "d", NOW);
+  expect(inviteState(s, NOW).state).toBe("used");
+  expect(inviteState(s, NOW + 1000).state).toBe("used");
+});
+
+test("shareSessions lists this share's live sessions by name and device, and no one else's", () => {
+  const config = empty();
+  const a = createShare(config, { label: "a", profiles: ["p"], via: ["webrtc"], now: NOW });
+  const b = createShare(config, { label: "b", profiles: ["p"], via: ["webrtc"], now: NOW });
+  const da = redeemInvite(config, a.id, "laptop", NOW), db = redeemInvite(config, b.id, "other", NOW);
+  const owners: [string, { owner: string; name: string; profile: string }][] = [
+    ["s1", { owner: `share:${a.id}:${da.id}`, name: "default", profile: "secret-profile" }],
+    ["s2", { owner: `share:${a.id}:${da.id}`, name: "closed", profile: "p" }],
+    ["s3", { owner: `share:${b.id}:${db.id}`, name: "theirs", profile: "p" }],
+    ["s4", { owner: "listener:local", name: "mine", profile: "p" }],
+    ["s5", { owner: `share:${a.id}:gone`, name: "removed-device", profile: "p" }],
+  ];
+  const live = new Set(["s1", "s3", "s4", "s5"]);
+  expect(shareSessions(a, owners, live)).toEqual([{ name: "default", device: "laptop" }]);
+  expect(shareSessions(b, owners, live)).toEqual([{ name: "theirs", device: "other" }]);
+});
+
+test("tokens say what they are: invite, reusable, and each device's own credential", () => {
+  const config = empty();
+  const once = createShare(config, { label: "one", profiles: ["p"], via: ["webrtc"], now: NOW });
+  const many = createShare(config, { label: "many", profiles: ["p"], via: ["webrtc"], reusable: true, now: NOW });
+  expect(parseToken(once.invite)).toMatchObject({ ok: true, kind: "invite" });
+  expect(parseToken(many.invite)).toMatchObject({ ok: true, kind: "reusable" });
+  expect(inviteLink(many, "https://sig.example/")).toBe(`https://sig.example/share/#${many.invite}`);
+  const device = redeemInvite(config, once.id, "mbp", NOW);
+  expect(parseToken(device.token)).toMatchObject({ ok: true, kind: "device" });
 });

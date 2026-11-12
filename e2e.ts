@@ -7,7 +7,7 @@
 // The AES keys are HKDF(secret, transcriptHash) where the transcript binds both DTLS
 // fingerprints: a relay that swaps in its own fingerprints derives different keys, and the
 // mandatory key-confirmation round fails closed.
-import { parseToken } from "./secret.ts";
+import { parseToken } from "./token.ts";
 
 export const PROTO = "rech-e2e-1";
 export const MAX_CHUNK = 12_000;          // plaintext bytes per sealed frame, well under SCTP limits
@@ -102,5 +102,5 @@ export async function open(key: CryptoKey, frame: ArrayBuffer | Uint8Array, th: 
 export const pack = (obj: unknown) => enc.encode(JSON.stringify(obj));
 export const unpack = (bytes: Uint8Array) => JSON.parse(dec.decode(bytes));
 export function randomHex(n: number): string {
-  return Buffer.from(globalThis.crypto.getRandomValues(new Uint8Array(n))).toString("hex");
+  return Array.from(globalThis.crypto.getRandomValues(new Uint8Array(n)), b => b.toString(16).padStart(2, "0")).join("");
 }

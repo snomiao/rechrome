@@ -26,3 +26,6 @@ signal-relay.js
 # A symlinked node_modules or vendor (from a worktree) must not be committed either.
 /node_modules
 /vendor
+
+# Claude Code session lock (per machine, rewritten every session)
+.claude/scheduled_tasks.lock

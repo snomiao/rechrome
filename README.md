@@ -10,7 +10,7 @@ Built on top of [playwright-multi-tab](https://github.com/snomiao/playwright-mul
 
 - **Your real Chrome, from anywhere** — drive a logged-in Chrome profile from scripts, agents, or other machines
 - **Session isolation** — each git worktree gets its own browser session (tab group) automatically
-- **Per-project files** — screenshots and downloads land in `<project>/.rechrome/output/`
+- **Per-project files** — screenshots, downloads and tab recordings land in `<project>/.rechrome/output/`
 - **Share through any proxy** — Tailscale Serve, Caddy, nginx, cloudflared; one command on the client to connect
 - **Security** — per-listener keys and profile allowlists, scoped remote commands, path traversal protection
 
@@ -56,6 +56,9 @@ rech tab-list
 rech eval "() => document.title"
 rech --profile work@example.com open https://example.com   # another registered profile
 rech --isolate open https://accounts.example.com           # throwaway session, e.g. for a login flow
+rech --isolate=login open https://accounts.example.com     # named isolated session: reused by later
+rech --isolate=login fill-secret e12 --from-env PASSWORD   #   --isolate=login commands (same tabs)
+rech session close login                                   #   until you close it (rech session ls lists it)
 ```
 
 Any [playwright-cli](https://github.com/snomiao/playwright-cli) command works after `rech`. When a
@@ -159,20 +162,30 @@ name them:
 rech share you@example.com --webrtc --name alice
 # Share "alice": you@example.com
 # Invite for one device (unused, it expires …; secret: send it privately):
-#   https://rechrome.pages.dev/#rech1_7fQxC9tZp2mVb8wLrN4hdK3kT9aQ
-#   or in a terminal:  rech connect rech1_7fQxC9tZp2mVb8wLrN4hdK3kT9aQ
+#   https://rechrome.pages.dev/share/#rech1_invite_7fQxC9tZp2mVb8wLrN4hdK3kT9aQ
+#   or in a terminal:  rech connect rech1_invite_7fQxC9tZp2mVb8wLrN4hdK3kT9aQ
 ```
+
+Opening the link in a browser shows what it gives and whether the host is online, without
+using it up. The token after `#` says what it is: `rech1_invite_…` is used up as devices
+connect (`--devices N`, default one), `rech1_reusable_…` (`--reusable`) lets devices join
+until it expires, and `rech1_device_…` is a connected machine's own credential, never meant
+to be passed on. The part after `#` never reaches a server or a chat app's link preview.
 
 On the other machine, inside the project that should use it:
 
 ```bash
-rech connect 'https://rechrome.pages.dev/#rech1_…'
+rech connect 'https://rechrome.pages.dev/share/#rech1_invite_…'
 rech open https://example.com
 ```
 
 Over **WebRTC** the two machines need no open port, VPN or domain. A small signal server introduces them, and then traffic flows peer to peer, end-to-end
 encrypted with keys the signal server never sees. The first `rech` command after connecting starts
 a small local bridge that keeps the connection open between commands.
+
+**Opening the link in a browser shows what it gives**, without redeeming it: whether the host is
+online, the share and when it ends, whether the invite is still open, its profiles, and its open
+sessions. Anyone holding the link can see that. `rech connect` lists the open sessions too.
 
 **The link is an invite, not a key.** `rech connect` redeems it once: this machine gets its own
 device credential (saved to `.rechrome/.env.local`) and the invite stops working, so a link that
@@ -214,7 +227,8 @@ free tier is 1,000 GB/month) in the daemon's environment, or share `--tailscale`
 **Keep links out of git.** `rech status`, `rech connect` and `rech share --save` warn when the file
 holding `RECHROME_URL` is committed, staged, not git-ignored, or readable by other users. Links
 use a `rech1_` prefix and a checksum, so secret scanners can match them:
-`\brech1_[1-9A-HJ-NP-Za-km-z]{28}\b`.
+`\brech1_(?:(?:invite|reusable|device)_)?[1-9A-HJ-NP-Za-km-z]{28}\b` (links made before the
+labels have none).
 
 #### Listener links (reverse proxies)
 
@@ -421,6 +435,24 @@ rech listener set <listener> --keep-downloads    # --no-keep-downloads: back to 
 A download that finishes after its command has returned is reported, and handed over,
 by the next command on that tab.
 
+### Recording the tab
+
+`rech record` saves a video of the tab to `<project>/.rechrome/output/`. It needs no click
+and no new permission, and it works on a background tab. There is no audio.
+
+```bash
+rech open https://mdn.github.io/learning-area/javascript/oojs/bouncing-balls/index-finished.html
+rech record --seconds 4 --fps 10 --filename balls.mp4   # one call: record, then hand over the file
+rech record start                                     # or open-ended (stops by itself after --max-seconds, default 600)
+rech record stop --filename demo.mp4
+```
+
+![rech record --seconds 4 of MDN's bouncing balls example](https://raw.githubusercontent.com/snomiao/rechrome/main/docs/record-demo.gif)
+
+The frames are screenshots, so the rate tops out around 10 fps (`--fps`, default 8). The
+host encodes them with ffmpeg into mp4 or webm (`--format`). Without ffmpeg it saves raw
+MJPEG and says so.
+
 ### Uploading files
 
 `rech upload <file>` puts a local image into the page: a file picker, an
@@ -513,12 +545,20 @@ browser sessions; removed listeners reject further requests. An occupied or unav
 address causes reload to retain the old configuration, so verify reachability after editing.
 
 Remote listeners permit navigation, tabs, snapshots, screenshots, and basic page interactions.
-They reject arbitrary `run-code`/`eval`, filesystem commands, global session commands, and
-browser/config overrides. Those commands remain available on the unrestricted **loopback
+By default they reject `eval`; they always reject `run-code`, raw CDP, filesystem
+commands, global session commands, and browser/config overrides. Those commands remain available on the unrestricted **loopback
 management listener**. Scoped sessions and output directories are separate from management
 sessions; a listener cannot download another profile's output. This is an application access
 policy, not an OS sandbox for the browser. Never publish the management listener through a
 proxy or tunnel to clients that should have restricted access.
+
+For trusted clients, `rech listener set <name> --eval` enables JavaScript evaluated
+inside browser pages (`rech pw eval`). This can read page data and act as signed-in
+accounts, bypassing page-level redaction; only grant it to clients you trust with those
+accounts. It does not enable host-process `run-code`, raw CDP, output-path options,
+profile overrides, or non-HTTP navigation commands. Other permission checks remain
+active. `--no-eval` revokes the grant; `rech listener ls` shows it as `page-eval` in
+GRANTS. This is not a sandbox for arbitrary browser code or a way to grant full CDP.
 
 LAN traffic is plain HTTP unless TLS is configured. Tailscale provides its private transport;
 binding an address does not configure Tailscale ACLs, port forwarding, or public tunnels.
@@ -545,7 +585,11 @@ Each client gets its own browser session, keyed by the **git worktree root path*
 roll up to their parent), or the current directory outside git. So two worktrees of one repo
 get separate sessions, and `git checkout` keeps you in the same one. `RECH_IDENTITY=branch`
 restores the older `<remote>/tree/<branch>` keying and `RECH_IDENTITY=cwd` keys on the exact
-directory. Pass `-s=<name>` for a named sub-session, or `--isolate` for a throwaway one.
+directory. Pass `-s=<name>` for a named sub-session, `--isolate` for a throwaway one (a new session per
+command), or `--isolate=<name>` for a named isolated session (`-s=iso_<name>`) that later
+`--isolate=<name>` commands from the same worktree reuse until `rech session close <name>`.
+An isolated session is its own tab group in the same Chrome profile: it shares the profile's
+cookies, so profile-scoped listeners still refuse `eval`, `run-code` and other arbitrary code in it.
 A share device's sessions are additionally keyed by its share and device, so they never meet
 another device's or a listener link's; `rech session ls` lists the ones this link drove.
 

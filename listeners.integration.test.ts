@@ -12,7 +12,7 @@ test("multiple sockets enforce profile/file policies and reload without browser 
   a.stop(true); b.stop(true);
   await mkdir(join(root, ".rechrome"));
   await mkdir(join(root, "secret-rules"));
-  for (const name of ["rechrome.ts", "serve.ts", "listeners.ts", "extension-token.ts", "daemon-manager.ts", "fill-secret.ts", "scoped-upload.ts", "shares.ts", "secret.ts", "e2e.ts", "webrtc.ts", "signal-relay.ts", "redact.ts", "secret-rules/gitleaks.toml"])
+  for (const name of ["rechrome.ts", "serve.ts", "listeners.ts", "extension-token.ts", "daemon-manager.ts", "fill-secret.ts", "record.ts", "scoped-upload.ts", "shares.ts", "secret.ts", "token.ts", "rtc-channel.ts", "e2e.ts", "webrtc.ts", "signal-relay.ts", "redact.ts", "secret-rules/gitleaks.toml"])
     await copyFile(join(import.meta.dir, name), join(root, name));
   // The copied sources import packages (e.g. yargs); resolve them from the repo's node_modules.
   await symlink(join(import.meta.dir, "node_modules"), join(root, "node_modules"), "junction");
@@ -79,6 +79,31 @@ test("multiple sockets enforce profile/file policies and reload without browser 
     expect((await run(personal, "personal", ["upload"], {}, upload)).status).toBe(403);
     expect((await run(qa, "qa", ["upload", "/etc/passwd"], {}, upload)).status).toBe(403);
     expect((await run(qa, "qa", ["eval", "() => 1"])).status).toBe(403);
+    // Exercise the real configuration CLI and daemon reload, with a fake browser CLI.
+    const configureEval = async (flag: string) => {
+      const cli = Bun.spawn([process.execPath, join(root, "rechrome.ts"), "listener", "set", "qa", flag], {
+        cwd: root, env: { ...process.env, HOME: root, USERPROFILE: root }, stdout: "pipe", stderr: "pipe",
+      });
+      const [code, out, err] = await Promise.all([cli.exited, new Response(cli.stdout).text(), new Response(cli.stderr).text()]);
+      expect(code, err).toBe(0);
+      return out;
+    };
+    expect(await configureEval("--eval")).toContain("page eval on");
+    await waitFor(async () => (await run(qa, "qa", ["eval", "() => 1"])).ok);
+    expect((await (await run(qa, "qa", ["eval", "() => 1"])).json()).stdout).toContain("Profile: QA");
+    for (const args of [["run-code", "async page => {}"], ["kill-all"], ["cdp", "Browser.close"],
+      ["open", "--profile", "/other"], ["open", "file:///review-only"], ["eval", "() => 1", "--filename=/tmp/review-only"]])
+      expect((await run(qa, "qa", args)).status).toBe(403);
+    expect((await run(qa, "personal", ["eval", "() => 1"])).status).toBe(403);
+    const list = Bun.spawn([process.execPath, join(root, "rechrome.ts"), "listener", "ls"], {
+      cwd: root, env: { ...process.env, HOME: root, USERPROFILE: root }, stdout: "pipe", stderr: "pipe",
+    });
+    const listing = await new Response(list.stdout).text();
+    expect(await list.exited).toBe(0);
+    expect(listing).toContain("GRANTS");
+    expect(listing).toContain("page-eval");
+    expect(await configureEval("--no-eval")).toContain("page eval off");
+    await waitFor(async () => (await run(qa, "qa", ["eval", "() => 1"])).status === 403);
     const uploaded = await (await run(qa, "qa", ["upload"], {}, upload)).json();
     expect(uploaded.status).toBe(0);
     expect(uploaded.stdout).toContain('uploaded:' + Buffer.from(svg).toString('hex'));

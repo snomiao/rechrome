@@ -1,11 +1,11 @@
 import { receiveUpload, readRequestJson } from "./scoped-upload.ts";
 import { readListeners, listenerAddress, authorizeProfileRequest, canReadProfileFile, profileOutputPrefix, normalizePrefix, resolveAllowedProfile, shareRtcListeners, rtcListeners, type Listener } from "./listeners.ts";
-import { WEBRTC, authorizeCredential, credentialForBearer, readShares, redeemInvite, shareProblem, updateShares, webrtcCredentials, type Credential, type ShareConfig } from "./shares.ts";
+import { WEBRTC, authorizeCredential, credentialForBearer, inviteState, readShares, redeemInvite, shareProblem, shareSessions, updateShares, webrtcCredentials, type Credential, type ShareConfig } from "./shares.ts";
 import { bearerOf, safeEqual } from "./secret.ts";
 import { WebrtcHost } from "./webrtc.ts";
 import { file } from "bun";
 import { createHash, randomBytes, X509Certificate } from "crypto";
-import { mkdirSync, lstatSync, statSync, chmodSync, unlinkSync, accessSync, readdirSync, realpathSync, existsSync, readFileSync, constants as fsConstants } from "fs";
+import { mkdirSync, lstatSync, statSync, chmodSync, unlinkSync, accessSync, readdirSync, realpathSync, existsSync, readFileSync, renameSync, constants as fsConstants } from "fs";
 import { join, resolve, relative, isAbsolute, sep } from "path";
 import { tmpdir } from "os";
 import {
@@ -24,7 +24,8 @@ import {
   checkTailscaleServe,
   chromeDataAccessHint,
 } from "./rechrome.ts";
-import { SecretMasker, parseReadCookieWire, readCookieOnSession, parseReadStorageWire, readStorageOnSession, parseReadSecretWire, readSecretOnSession, parseFillSecretWire, fillSecretOnSession, passwordValuesOnSession, hasSnapshot, maskPasswordLines, withholdSnapshots } from "./fill-secret.ts";
+import { SecretMasker, runCodeOnSession, parseReadCookieWire, readCookieOnSession, parseReadStorageWire, readStorageOnSession, parseReadSecretWire, readSecretOnSession, parseReadHeadersWire, readHeadersOnSession, readHeadersEvidence, parseFillSecretWire, fillSecretOnSession, passwordValuesOnSession, hasSnapshot, maskPasswordLines, withholdSnapshots } from "./fill-secret.ts";
+import { parseRecordArgs, buildCaptureChunkCode, resolveFfmpeg, resolveFormat, recordSink, Recording, freeName, withFormatExt, RECORD_CHUNK_MS, RECORD_MAX_SECONDS, type CaptureChunk, type RecordingSummary } from "./record.ts";
 
 const TAILSCALE_BIN = process.env.TAILSCALE_BIN || "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
 const CERT_RENEW_THRESHOLD_DAYS = 7;
@@ -105,6 +106,37 @@ const deniedFiles = new Set<string>();
 // keeps them on the host instead (opt-in).
 const pendingDownloads = new Map<string, ReturnType<typeof setTimeout>>();
 const DOWNLOAD_PICKUP_MS = 10 * 60_000;
+// Per-request idle limit for POSTs (Bun's default is 10 s): past the client's 70 s plus the longest timed recording.
+export const RUN_IDLE_SECONDS = 70 + RECORD_MAX_SECONDS + 20;
+// rech record start/stop: the recording in progress (or finished by --max-seconds and not yet
+// collected) per namespaced session. serve owns the capture loop; see record.ts.
+type RecordingEntry = { rec: Recording; dir: string; outputPrefix: string; listener: string; keep: boolean; done?: RecordingSummary; expire?: ReturnType<typeof setTimeout> };
+const recordings = new Map<string, RecordingEntry>();
+
+/** Rename a finished recording to its final name and hand it to the client like a download. */
+function deliverRecording(entry: RecordingEntry, s: RecordingSummary, filename: string | undefined): { stdout: string; files: string[] } {
+  // Nothing captured is the real story (no tab, session gone); ffmpeg's "no stream" only follows from it.
+  if (!s.frames || !existsSync(s.out)) {
+    try { unlinkSync(s.out); } catch {}
+    const why = s.error?.split("\n")[0];
+    throw new Error(`record: nothing was captured${why ? ` (${why})` : ""}${why?.includes("rech open") ? "" : "; is a tab open? run \`rech open <url>\` first"}`);
+  }
+  if (s.encodeError) { try { unlinkSync(s.out); } catch {} throw new Error(s.encodeError); }
+  // Never over an existing file: `--filename clip.mp4` twice keeps both (clip.mp4, clip-2.mp4).
+  // The name says what the file is: no ffmpeg on the host means mjpeg, whatever --filename asked for.
+  const wanted = filename ? withFormatExt(filename, s.format) : undefined;
+  const out = wanted ? join(entry.dir, freeName(wanted, n => existsSync(join(entry.dir, n)))) : s.out.replace(/\/\.(recording-[^/]+)\.part$/, "/$1");
+  if (out !== s.out) renameSync(s.out, out);
+  log(`record: ${JSON.stringify({ listener: entry.listener, name: relative(entry.dir, out), frames: s.frames, captured: s.captured, fps: s.fps, format: s.format, size: statSync(out).size, kept: entry.keep, ...(s.error ? { ended: s.error.split("\n")[0] } : {}) })}`);
+  if (!entry.keep) {
+    const real = realpathSync(out);
+    clearTimeout(pendingDownloads.get(real));
+    pendingDownloads.set(real, setTimeout(() => { pendingDownloads.delete(real); try { unlinkSync(real); } catch {} }, DOWNLOAD_PICKUP_MS));
+  }
+  const note = (filename && wanted !== filename ? ` — saved as ${s.format}, not ${filename}${s.format === "mjpeg" ? " (no ffmpeg on the host)" : ""}` : "")
+    + (s.error ? ` — capture ended early: ${s.error.split("\n")[0]}` : "");
+  return { stdout: `record: saved ${relative(entry.dir, out)} (${s.format}, ${s.seconds.toFixed(1)} s at ${s.fps} fps, ${s.captured} screenshots)${note}\n`, files: [(entry.outputPrefix + relative(entry.dir, out)).replaceAll("\\", "/")] };
+}
 // playwright-cli's line for a finished download (tools/backend/response.ts).
 const DOWNLOADED_LINE = /^- Downloaded file (.+?) to "(.+)"$/gm;
 // Where the CLI saves downloads: its output dir under the session's cwd (context.ts outputDir).
@@ -570,14 +602,14 @@ This link contains a secret key: anyone with it can use this browser profile, so
 (() => {
   let url = location.href;
   const key = (location.hash.match(/[#&]key=([^&]*)/) || [])[1];
-  const invite = /^#rech1_[1-9A-HJ-NP-Za-km-z]{28}$/.test(location.hash);
+  const invite = /^#rech1_(?:(?:invite|reusable|device)_)?[1-9A-HJ-NP-Za-km-z]{28}$/.test(location.hash);
   if (!/[#&?]key=/.test(location.hash) && !invite) document.getElementById("nokey").hidden = false;
   // One command for every shell: two lines (no && vs ; split), one double-quoted URL. Characters a
   // shell expands inside double quotes ($ \` " \\ !) are percent-encoded, which the URL reads the same;
   // %40 goes back to a readable @ (valid in a query, and one less % for cmd to try to expand).
   const quote = s => '"' + s.replace(/%40/g, "@").replace(/[$\`"\\\\!]/g, c => "%" + c.charCodeAt(0).toString(16).toUpperCase()) + '"';
   const build = u => "bun i -g rechrome\\nrechrome connect " + quote(u);
-  const mask = s => s.replace(/(key=)[^&"\\n]+/, "$1…").replace(/(#rech1_[1-9A-HJ-NP-Za-km-z]{4})[1-9A-HJ-NP-Za-km-z]+/, "$1…");
+  const mask = s => s.replace(/(key=)[^&"\\n]+/, "$1…").replace(/(#rech1_(?:(?:invite|reusable|device)_)?[1-9A-HJ-NP-Za-km-z]{4})[1-9A-HJ-NP-Za-km-z]+/, "$1…");
   const root = document.getElementById("cmds");
   const row = document.createElement("div"); row.className = "row";
   const line = document.createElement("div"); line.className = "cmd";
@@ -701,6 +733,16 @@ export async function serve() {
     }).catch(error => log(`could not record device use: ${error}`));
   };
 
+  const profileInfo = async (profiles: string[] | "*") => {
+    const registry = await readTokenRegistry().catch(() => ({} as Awaited<ReturnType<typeof readTokenRegistry>>));
+    const cache = await readChromeProfileCache().catch(() => null) ?? {};
+    const keys = profiles === "*" ? Object.keys(registry) : profiles;
+    return keys.map(k => ({ key: k, name: cache[registry[k]?.profileDir ?? ""]?.name ?? "", registered: !!registry[k] }));
+  };
+  const liveSessions = () => {
+    try { return new Set(readdirSync(tmpSocketRoot()).filter(f => f.endsWith(".sock")).map(f => f.slice(0, -5))); } catch { return new Set<string>(); }
+  };
+
   const handle = async (req: Request, initialListener: Listener, remoteAddr: () => string): Promise<Response> => {
       let listener = initialListener;
       const reqUrl = new URL(req.url);
@@ -735,7 +777,8 @@ export async function serve() {
         const { name } = await req.json().catch(() => ({})) as { name?: string };
         try {
           const device = await updateShares(config => redeemInvite(config, cred.share.id, String(name ?? "")));
-          shares = await readShares();
+          // Open the device's room now, not on the next 1 s reload: the client uses it right away.
+          await reloadShares().catch(error => log(`shares.json reload rejected; previous shares retained: ${error}`));
           log(`share ${cred.share.label}: invite redeemed by device ${device.id} (${device.name})${device.approved ? "" : ", waiting for approval"}`);
           return Response.json({ token: device.token, device: { id: device.id, name: device.name, approved: device.approved }, share: cred.share.label, profiles: cred.share.profiles });
         } catch (error) { return Response.json({ error: error instanceof Error ? error.message : String(error) }, { status: 403 }); }
@@ -744,17 +787,13 @@ export async function serve() {
       if (reqUrl.pathname === "/profiles") {
         const denied = authCheck(req, key);
         if (denied) return denied;
-        const registry = await readTokenRegistry().catch(() => ({} as Awaited<ReturnType<typeof readTokenRegistry>>));
-        const cache = await readChromeProfileCache().catch(() => null) ?? {};
-        const keys = listener.profiles === "*" ? Object.keys(registry) : listener.profiles;
-        return Response.json({ share: cred?.share.label, profiles: keys.map(k => ({ key: k, name: cache[registry[k]?.profileDir ?? ""]?.name ?? "", registered: !!registry[k] })) });
+        return Response.json({ share: cred?.share.label, profiles: await profileInfo(listener.profiles) });
       }
 
       if (reqUrl.pathname === "/sessions") {
         const denied = authCheck(req, key);
         if (denied) return denied;
-        let live = new Set<string>();
-        try { live = new Set(readdirSync(tmpSocketRoot()).filter(f => f.endsWith(".sock")).map(f => f.slice(0, -5))); } catch {}
+        const live = liveSessions();
         const all = listener.profiles === "*" && !cred;
         const rows = [...sessionOwners.entries()]
           .filter(([, o]) => all || o.owner === owner)
@@ -812,7 +851,10 @@ export async function serve() {
         if (scoped || !reqUrl.searchParams.get("deep"))
           return Response.json({
             ok: true, bind: listenHost, listener: listener.name, profiles: listener.profiles, multiListener: true, consecutiveTimeouts, degraded, chromeAccessProblem,
-            ...(cred ? { share: cred.share.label, kind: cred.kind, ...(cred.kind === "device" ? { device: { id: cred.device.id, name: cred.device.name, approved: cred.device.approved } } : {}), expiresAt: cred.share.expiresAt } : {}),
+            ...(cred ? {
+              share: cred.share.label, kind: cred.kind, ...(cred.kind === "device" ? { device: { id: cred.device.id, name: cred.device.name, approved: cred.device.approved } } : { invite: inviteState(cred.share) }), expiresAt: cred.share.expiresAt,
+              profileInfo: await profileInfo(cred.share.profiles), sessions: shareSessions(cred.share, sessionOwners, liveSessions()),
+            } : {}),
           });
         // Deep probe: exercise the relay read-only via `tab-list` (opens nothing) against the
         // most-recently-used session — never a fresh one, which could spawn a browser window.
@@ -837,7 +879,8 @@ export async function serve() {
       }
       // A browser opening a shared URL gets copyable connect instructions. The key stays in the
       // #fragment, which browsers never send, so the page is static and the key never reaches here.
-      if (reqUrl.pathname === "/" && req.method === "GET" && (req.headers.get("accept") ?? "").includes("text/html"))
+      // Invite links open at /share/ (shares.ts INVITE_PATH); older links at the root.
+      if ((reqUrl.pathname === "/" || reqUrl.pathname === "/share/") && req.method === "GET" && (req.headers.get("accept") ?? "").includes("text/html"))
         return new Response(landingPage(), { headers: LANDING_HEADERS });
       // Unknown paths are a 404, not the banner: a stale link (its listener removed, the port
       // reused by another with a different prefix) must fail loudly, not look like a live daemon.
@@ -1003,8 +1046,8 @@ export async function serve() {
       // read-storage: a localStorage/sessionStorage value, page-level; secretOut only.
       if (filteredArgs[0] === "read-storage") {
         try {
-          const { area, key, path, allowDomains } = parseReadStorageWire(filteredArgs);
-          const { host, value } = await readStorageOnSession({ socketRoot: tmpSocketRoot(), session: namespacedSession, cwd: runWorkDir, area, key, path, allowDomains });
+          const { area, key, path, allowDomains, gotoUrl } = parseReadStorageWire(filteredArgs);
+          const { host, value } = await readStorageOnSession({ socketRoot: tmpSocketRoot(), session: namespacedSession, cwd: runWorkDir, area, key, path, allowDomains, gotoUrl });
           if (!value) throw new Error(`read-storage: ${area} ${key} on ${host} is empty`);
           secretMasker.add(value, Infinity);
           log(`exit: 0 | read-storage ${area} ${key}${path.length ? " " + path.join(".") : ""} on ${host} (${value.length} chars, value not logged)`);
@@ -1029,6 +1072,88 @@ export async function serve() {
           const message = secretMasker.mask(error instanceof Error ? error.message : String(error));
           log(`exit: 1 | read-cookie: ${message.split("\n")[0]}`);
           return Response.json({ status: 1, stdout: "", stderr: `[rech] ${message}\n`, files: [] });
+        }
+      }
+
+      // read-headers: response status + headers (no bodies) for an --allow-domain host over a
+      // window, credential header values and URL query values redacted. Written as a JSON evidence file in
+      // the output dir and returned in `files`; header values never reach stdout or a log line.
+      if (filteredArgs[0] === "read-headers") {
+        try {
+          const { allowDomains, seconds, gotoUrl } = parseReadHeadersWire(filteredArgs);
+          const { host, captured } = await readHeadersOnSession({ socketRoot: tmpSocketRoot(), session: namespacedSession, cwd: runWorkDir, allowDomains, seconds, gotoUrl });
+          const name = `read-headers-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
+          await Bun.write(join(runWorkDir, name), readHeadersEvidence(captured, t => secretMasker.mask(t)));
+          log(`exit: 0 | read-headers ${allowDomains.join(",")} (${captured.length} responses, ${seconds}s window, header values redacted)`);
+          return Response.json({ status: 0, stdout: `[rech] read-headers: captured ${captured.length} responses on ${host} to ${name}\n`, stderr: "", files: [(outputPrefix + name).replaceAll("\\", "/")] });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          log(`exit: 1 | read-headers: ${message.split("\n")[0]}`);
+          return Response.json({ status: 1, stdout: "", stderr: `[rech] ${message}\n`, files: [] });
+        }
+      }
+
+      // record: serve runs the capture loop (short run-code screenshot chunks, back to back) and
+      // streams every frame into ffmpeg as it arrives. `record start` / `record stop` bracket an
+      // open-ended recording; plain `record --seconds N` does both in one call. See record.ts.
+      if (filteredArgs[0] === "record") {
+        const fail = (message: string) => {
+          log(`exit: 1 | ${message.split("\n")[0]}`);
+          return Response.json({ status: 1, stdout: "", stderr: `[rech] ${message}\n`, files: [] });
+        };
+        try {
+          const a = parseRecordArgs(filteredArgs);
+          const existing = recordings.get(namespacedSession);
+          if (a.mode === "stop") {
+            if (!existing) return fail("record: no recording in progress; run `rech record start` first");
+            recordings.delete(namespacedSession);
+            clearTimeout(existing.expire);
+            const s = existing.done ?? await existing.rec.stop();
+            return Response.json({ status: 0, stderr: "", ...deliverRecording(existing, s, a.filename) });
+          }
+          if (existing) return fail(existing.done ? "record: a finished recording is waiting; run `rech record stop` to collect it first" : `record: already recording (since ${new Date(existing.rec.startAt).toISOString()}); run \`rech record stop\``);
+          const ffmpegBin = resolveFfmpeg();
+          const format = resolveFormat(a.format, ffmpegBin !== null);
+          const out = join(runWorkDir, `.recording-${Date.now().toString(36)}-${randomBytes(3).toString("hex")}.${format}.part`);
+          const id = randomBytes(6).toString("hex");
+          const code = buildCaptureChunkCode({ ...a, id }), finalCode = buildCaptureChunkCode({ ...a, id, final: true });
+          const capture = async (final?: boolean): Promise<CaptureChunk> => {
+            const { isError, text } = await runCodeOnSession({ socketRoot: tmpSocketRoot(), session: namespacedSession, cwd: runWorkDir, code: final ? finalCode : code, json: true, timeoutMs: RECORD_CHUNK_MS + 30_000 });
+            if (isError) throw new Error(text.trim().split("\n")[0] || "record: could not screenshot the tab");
+            // The run-code return (a JSON string) comes back JSON-wrapped by the daemon; unwrap up to twice.
+            let parsed: unknown; try { parsed = JSON.parse(text).result; } catch { parsed = text.match(/### Result\n([^\n]*)/)?.[1]; }
+            for (let i = 0; i < 2 && typeof parsed === "string"; i++) { try { parsed = JSON.parse(parsed); } catch { parsed = undefined; } }
+            const chunk = parsed as CaptureChunk | undefined;
+            if (!Array.isArray(chunk?.frames) || !Array.isArray(chunk?.times)) throw new Error("record: the browser returned no frames");
+            return chunk;
+          };
+          const entry: RecordingEntry = {
+            dir: runWorkDir, outputPrefix, listener: listener.name, keep: listener.keepDownloads === true,
+            rec: new Recording({
+              fps: a.fps, format, out, maxMs: (a.mode === "timed" ? a.seconds : a.maxSeconds) * 1000,
+              capture, sink: recordSink(format, ffmpegBin, a.fps, out),
+              onAutoStop: s => {
+                entry.done = s;
+                // Nobody came for it: drop it like an uncollected download.
+                entry.expire = setTimeout(() => { if (recordings.get(namespacedSession) === entry) recordings.delete(namespacedSession); try { unlinkSync(s.out); } catch {} }, DOWNLOAD_PICKUP_MS);
+                log(`record: ${namespacedSession} stopped by itself after ${s.seconds.toFixed(1)} s${s.error ? ` (${s.error.split("\n")[0]})` : ""}`);
+              },
+            }),
+          };
+          recordings.set(namespacedSession, entry);
+          if (a.mode === "start") {
+            const note = format !== a.format ? ` (no ffmpeg on the host, so ${format})` : "";
+            log(`exit: 0 | record start (${a.fps} fps, ${format}, max ${a.maxSeconds} s)`);
+            return Response.json({ status: 0, stdout: `record: recording at ${a.fps} fps to ${format}${note}; run \`rech record stop\` to save (stops by itself after ${a.maxSeconds} s)\n`, stderr: "", files: [] });
+          }
+          // Answer early if the capture ends on its own (the tab went away).
+          await Promise.race([Bun.sleep(a.seconds * 1000), entry.rec.ended]);
+          recordings.delete(namespacedSession);
+          clearTimeout(entry.expire);
+          const s = await entry.rec.stop();
+          return Response.json({ status: 0, stderr: "", ...deliverRecording(entry, s, a.filename) });
+        } catch (error) {
+          return fail(error instanceof Error ? error.message : String(error));
         }
       }
 
@@ -1377,6 +1502,10 @@ export async function serve() {
       return Response.json({ status: 1, stdout: "", stderr: err.message }, { status: 500 });
     },
     async fetch(req, server) {
+      // Bun's default idle limit is 10 s. Bun 1.4 does not apply it to a POST with a body, but don't
+      // rely on that: a /run can take longer (`record --seconds 60`, a slow page). Allow it longer
+      // than the client waits (70 s + a recording's length).
+      if (req.method === "POST") server.timeout(req, RUN_IDLE_SECONDS);
       const listener = policies.get(listenerAddress(initial));
       if (!listener) return new Response("Listener removed", { status: 403 });
       return handle(req, listener, () => `${req.headers.get("x-forwarded-for") || server.requestIP(req)?.address || "unknown"}`);

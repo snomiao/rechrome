@@ -30,24 +30,6 @@ test("denies profile switching and CLI escape routes", () => {
   expect(authorizeProfileRequest(listener, request(["-s=qa1", "open", "https://example.com"]))).toBe("qa");
 });
 
-test("the eval flag grants full code/CDP access for the listener's profiles, host filesystem still closed", () => {
-  const full: Listener = { ...listener, eval: true };
-  // off by default: arbitrary code, raw CDP and option overrides are refused
-  expect(() => authorizeProfileRequest(listener, request(["eval", "() => 1"]))).toThrow(/Command is unavailable/);
-  expect(() => authorizeProfileRequest(listener, request(["run-code", "async page => {}"]))).toThrow(/Command is unavailable/);
-  // on: the same commands and arbitrary options now pass (eval, run-code, raw CDP, any flags)
-  expect(authorizeProfileRequest(full, request(["eval", "() => 1"]))).toBe("qa");
-  expect(authorizeProfileRequest(full, request(["run-code", "async page => { await page.emulateMedia({ colorScheme: 'dark' }); }"]))).toBe("qa");
-  expect(authorizeProfileRequest(full, request(["cdp", "Emulation.setEmulatedMedia"]))).toBe("qa");
-  expect(authorizeProfileRequest(full, request(["screenshot", "--filename", "shot.png"]))).toBe("qa");
-  expect(authorizeProfileRequest(full, request(["open", "file:///etc/hosts"]))).toBe("qa");
-  // the profile allowlist and profile-override checks still apply even with full access
-  expect(() => authorizeProfileRequest(full, { ...request(["eval", "() => 1"]), identity: { key: "/worktree", profile: "personal" } })).toThrow(/Profile is not allowed/);
-  expect(() => authorizeProfileRequest(full, { ...request(["eval", "() => 1"]), env: { PLAYWRIGHT_MCP_PROFILE_DIRECTORY: "personal" } })).toThrow(/Profile override/);
-  // host filesystem stays closed: upload still takes stdin bytes only, never a host path
-  expect(() => authorizeProfileRequest(full, request(["upload", "/etc/passwd"]))).toThrow(/stdin bytes; host paths are unavailable/);
-});
-
 test("reading or clearing the page's console is as page-scoped as a snapshot", () => {
   expect(authorizeProfileRequest(listener, request(["console"]))).toBe("qa");
   expect(authorizeProfileRequest(listener, request(["console", "error"]))).toBe("qa");
@@ -169,4 +151,30 @@ test("profile rm plans every alias, listener edits (dropping emptied ones), and 
   expect(planProfileRemoval("odd", reg, ls, "/home/u/.rechrome/profiles").dataDir).toBeUndefined();   // outside rech's folder: never deleted
   expect(planProfileRemoval("me@x.com", reg, ls, "/home/u/.rechrome/profiles").dataDir).toBeUndefined(); // real Chrome profile
   expect(() => planProfileRemoval("nope", reg, ls, "/x")).toThrow(/not a registered profile/);
+});
+
+test("page eval is opt-in and preserves all scoped escape-route checks", () => {
+  const enabled: Listener = { ...listener, eval: true };
+  for (const mode of [listener, { ...listener, eval: false }])
+    expect(() => authorizeProfileRequest(mode, request(["eval", "() => document.title"]))).toThrow(/Command is unavailable/);
+  expect(authorizeProfileRequest(enabled, request(["eval", "() => document.title"]))).toBe("qa");
+  expect(authorizeProfileRequest(enabled, request(["eval", "element => element.textContent", "e1"]))).toBe("qa");
+  for (const args of [
+    ["run-code", "async page => {}"], ["cdp", "Emulation.setEmulatedMedia"], ["kill-all"],
+    ["open", "--profile", "/other"], ["open", "file:///review-only"], ["open", "chrome://settings"],
+    ["eval", "() => 1", "--filename=/tmp/review-only"],
+    ["screenshot", "--filename", "/tmp/review-only"], ["tab-list", "--session=other"],
+    ["-s=one", "-s=two", "eval", "() => 1"], ["upload", "/review-only"],
+  ]) expect(() => authorizeProfileRequest(enabled, request(args))).toThrow();
+  expect(() => authorizeProfileRequest(enabled, { ...request(["eval", "() => 1"]), identity: { key: "/worktree", profile: "other" } })).toThrow(/Profile is not allowed/);
+  expect(() => authorizeProfileRequest(enabled, { ...request(["eval", "() => 1"]), env: { PLAYWRIGHT_MCP_PROFILE_DIRECTORY: "other" } })).toThrow(/Profile override/);
+  expect(() => authorizeProfileRequest(enabled, { ...request(["eval", "() => 1"]), upload: {} })).toThrow(/Unexpected upload/);
+  for (const cmd of ["read-secret", "read-cookie", "read-storage", "read-headers"])
+    expect(() => authorizeProfileRequest(enabled, request([cmd]))).toThrow(/off on listener/);
+  expect(() => authorizeProfileRequest({ ...enabled, uploads: false }, { ...request(["upload"]), upload: {} })).toThrow(/Uploads are off/);
+});
+
+test("eval grant must be a boolean", () => {
+  for (const value of ["true", 1, null])
+    expect(() => validateListeners({ version: 1, listeners: [{ ...listener, eval: value }] })).toThrow(/eval must be true or false/);
 });

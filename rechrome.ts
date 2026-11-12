@@ -1,12 +1,13 @@
 #!/usr/bin/env bun
 import { prepareUpload, UPLOAD_USAGE, MAX_UPLOAD_BYTES, type UploadPayload } from "./scoped-upload.ts";
 import { readListeners, writeListeners as writeListenersFile, listenerAddress, isLoopback, normalizePrefix, serviceUrl, allowProfiles, denyProfiles, rotateListenerKey, setPublicUrl, canonicalProfileKeys, planProfileRemoval, parseIceUrl, iceLabel, rtcListeners, shareRtcListeners, defaultRtcListener, DEFAULT_RTC, DEFAULT_RTC_NOTE, LEGACY_RTC, type IceServer, type Listener, type ListenerConfig, type RtcListener } from "./listeners.ts";
+import { recordHoldMs } from "./record.ts";
 
 import { file } from "bun";
 import yargs from "yargs";
 import { readExtensionTokenFromProfile } from "./extension-token.ts";
 import { redact } from "./redact.ts";
-import { READ_COOKIE_USAGE, parseReadCookieArgs, readCookieWireArgs, READ_STORAGE_USAGE, parseReadStorageArgs, readStorageWireArgs, READ_SECRET_USAGE, parseReadSecretArgs, readSecretWireArgs, FILL_SECRET_USAGE, SECRET_MASK, parseFillSecretArgs, fillSecretWireArgs, readSecretSource, totpCode, totpWaitMs } from "./fill-secret.ts";
+import { READ_COOKIE_USAGE, parseReadCookieArgs, readCookieWireArgs, READ_STORAGE_USAGE, parseReadStorageArgs, readStorageWireArgs, READ_SECRET_USAGE, parseReadSecretArgs, readSecretWireArgs, READ_HEADERS_USAGE, parseReadHeadersArgs, readHeadersWireArgs, FILL_SECRET_USAGE, SECRET_MASK, parseFillSecretArgs, fillSecretWireArgs, readSecretSource, totpCode, totpWaitMs } from "./fill-secret.ts";
 import { createHash, randomBytes } from "crypto";
 import { mkdirSync, fstatSync, appendFileSync, existsSync, realpathSync, accessSync, cpSync, unlinkSync, readFileSync, readdirSync, renameSync, readlinkSync, rmdirSync, constants as fsConstants } from "fs";
 import { hostname, homedir, networkInterfaces } from "os";
@@ -17,7 +18,7 @@ import { createRequire } from "node:module";
 import { spawn as cpSpawn } from "child_process";
 import { readFile, writeFile, rename, chmod, mkdir, stat } from "node:fs/promises";
 import { isDeprecatedPm2Fallback, listsProcess, oxmgrInstallCommand, pickDaemonManager, PM2_DEPRECATION, type DaemonManager } from "./daemon-manager.ts";
-import { DEFAULT_SIGNAL, WEBRTC, createShare, normalizeSignal, findDevice, findShare, inviteLink, inviteProblem, parseDuration, readShares, updateShares, type Share } from "./shares.ts";
+import { DEFAULT_SIGNAL, INVITE_PATH, WEBRTC, createShare, normalizeSignal, findDevice, findShare, inviteLink, inviteProblem, parseDuration, REUSABLE_DEFAULT_TTL, REUSABLE_MAX_DEVICES, readShares, updateShares, type Share } from "./shares.ts";
 import { bearerOf, looksLikeToken, newToken, parseToken, redactSecrets } from "./secret.ts";
 import { WebrtcClient, loadRTC, runBridge, spawnBridge } from "./webrtc.ts";
 import { startSignalRelay } from "./signal-relay.ts";
@@ -1961,7 +1962,8 @@ async function callServe(
     // dataDir is a client-local path; the daemon (possibly remote) only needs the session identity.
     // `secret` (fill-secret only) rides in its own field so it is never part of the logged args.
     body: JSON.stringify({ args, identity: { key: identity.key, label: identity.label, profile: identity.profile }, env, ...(upload ? { upload } : {}), ...(secret ? { secret } : {}) }),
-    signal: AbortSignal.timeout(70_000),
+    // A timed `record --seconds N` holds the request for N seconds before it answers.
+    signal: AbortSignal.timeout(70_000 + recordHoldMs(args)),
   }).catch(async (e) => {
     if (throwOnFailure) throw new Error("Cannot reach the rechrome daemon. Check that it is running.");
     console.error(`[rech] ${e.message}`);
@@ -2059,7 +2061,7 @@ export function withDefaultScheme(target: string): string {
 // `open --profile <dir>`, a user-data-dir path) and must pass through untouched. Throws on a
 // missing value; accepts multiple occurrences (last one wins).
 /**
- * `rech [--profile X] [--isolate] pw <args>` forwards <args> to playwright-cli verbatim, so
+ * `rech [--profile X] [--isolate[=<name>]] pw <args>` forwards <args> to playwright-cli verbatim, so
  * `rech pw --version` or `rech pw status` reach playwright instead of rech. `--` works the
  * same after a rech flag (`rech --profile X -- status`); a bare leading `--` cannot, because
  * Bun consumes the `--` right after the script path. The separator counts only when
@@ -2071,10 +2073,30 @@ export function rechSeparatorIndex(args: string[]): number {
     const a = args[i];
     if (a === "--" || a === "pw" || a === "playwright") return i;
     if (a === "--profile") { i++; continue; }
-    if (a.startsWith("--profile=") || a === "--isolate" || a === "--isolated") continue;
+    if (a.startsWith("--profile=") || a === "--isolate" || a === "--isolated" || /^--isolated?=/.test(a)) continue;
     return -1;
   }
   return -1;
+}
+
+/** Prefix of a named isolated session (`--isolate=<name>` -> `-s=iso_<name>`); `_` keeps it out of the iso-<hex> reaper. */
+export const NAMED_ISO_PREFIX = "iso_";
+
+/**
+ * Turn rech's `--isolate` / `--isolate=<name>` into a session flag. Bare `--isolate` is a
+ * throwaway `-s=iso-<random>` (reaped when idle); `--isolate=<name>` is the persistent
+ * `-s=iso_<name>`, reused by later commands with the same name until `rech session close <name>`.
+ */
+export function applyIsolateArg(args: string[]): string[] {
+  const idx = args.findIndex(a => a === "--isolate" || a === "--isolated" || /^--isolated?=/.test(a));
+  if (idx === -1) return args;
+  const flag = args[idx];
+  const rest = args.filter((_, i) => i !== idx);
+  if (!flag.includes("=")) return [...rest, `-s=iso-${randomBytes(8).toString("hex")}`];
+  const name = flag.slice(flag.indexOf("=") + 1);
+  if (!/^[a-zA-Z0-9_-]{1,60}$/.test(name)) throw new Error(`--isolate=<name> takes 1-60 letters, digits, '-' or '_' (got "${name}")`);
+  if (rest.some(a => a.startsWith("-s="))) throw new Error("Pass --isolate=<name> or -s=<session>, not both.");
+  return [...rest, `-s=${NAMED_ISO_PREFIX}${name}`];
 }
 
 /** rechrome's own version, from the package.json shipped next to this file. */
@@ -2241,6 +2263,19 @@ async function run(url: string, args: string[], overrideEnv?: Record<string, str
     console.error(`[rech] read-secret: wrote ${res.secretOut.length} characters to stdout`);
     process.exit(0);
   }
+  if (args[cmdIdx] === "read-headers") {
+    // read-headers writes a JSON evidence file (no bodies, credential header values redacted), so it
+    // goes through the normal file-download path below, not the secretOut pipe. Validate and
+    // normalize the args here for an early error and help text, then fall through.
+    if (args.some(a => a === "--help" || a === "-h")) { console.log(READ_HEADERS_USAGE); process.exit(0); }
+    try {
+      const hwire = readHeadersWireArgs(parseReadHeadersArgs(args.slice(cmdIdx)));
+      args = [...args.filter(a => a.startsWith("-s=")), ...hwire];
+    } catch (err) {
+      console.error(`[rech] ${err instanceof Error ? err.message : String(err)}\n${READ_HEADERS_USAGE}`);
+      process.exit(2);
+    }
+  }
   if (args[cmdIdx] === "fill-secret") {
     if (args.some(a => a === "--help" || a === "-h")) { console.log(FILL_SECRET_USAGE); process.exit(0); }
     try {
@@ -2313,7 +2348,12 @@ async function run(url: string, args: string[], overrideEnv?: Record<string, str
     }
     process.stderr.write(stderr);
   }
-  if (stdout) process.stdout.write(stdout);
+  // Wait for the write: process.exit() below would otherwise cut a pipe off at its buffer
+  // (128 KiB), e.g. a large run-code result read through `| jq`. A reader that stops early
+  // (`| head`) closes the pipe: that is EPIPE, not an error.
+  if (stdout) await new Promise<void>((done, fail) => process.stdout.write(stdout, e => {
+    if (!e || (e as NodeJS.ErrnoException).code === "EPIPE") done(); else fail(e);
+  }));
 
   if (files?.length) {
     // Saved files belong to the project: <project>/.rechrome/output. The folder also holds
@@ -3026,10 +3066,28 @@ async function trayCommand(sub?: string): Promise<void> {
   }
 }
 
+// The Chromium revision pinned by the playwright-core that the relay (playwright-cli) runs, read
+// from its browsers.json. Provisioning must seed with that same build: the relay later reopens the
+// profile with it, and a profile written by a newer Chromium (e.g. 156, whose localStorage moved to
+// SQLite) loses the seeded token, so the extension mints a new one and the bridge never connects.
+export function relayChromiumRevision(cli: string = resolvePlaywrightCli()): string | null {
+  try {
+    const entry = cli.split(" ").pop()!;
+    let dir = dirname(createRequire(entry).resolve("playwright-core/lib/tools/cli-client/program"));
+    for (let i = 0; i < 8 && dir !== dirname(dir); i++, dir = dirname(dir)) {
+      const browsers = join(dir, "browsers.json");
+      if (!existsSync(browsers)) continue;
+      const chromium = JSON.parse(readFileSync(browsers, "utf8")).browsers?.find((b: { name?: string }) => b.name === "chromium");
+      return chromium?.revision ? String(chromium.revision) : null;
+    }
+  } catch {}
+  return null;
+}
+
 // Resolve a Chromium / Chrome-for-Testing executable from the Playwright browsers cache.
 // Managed (provisioned) profiles must run on Chromium because branded Google Chrome 149+ rejects
 // --load-extension. Returns null if no Chromium is installed (`npx playwright install chromium`).
-function findChromiumForTesting(): string | null {
+function findChromiumForTesting(preferredRevision: string | null = relayChromiumRevision()): string | null {
   // Honor PLAYWRIGHT_BROWSERS_PATH (the user's convention) first, then the platform default —
   // `playwright install` doesn't always write to the env path, so check both.
   const bases = [
@@ -3042,6 +3100,8 @@ function findChromiumForTesting(): string | null {
     let revs: string[];
     try { revs = readdirSync(base).filter(d => /^chromium-\d+$/.test(d)).sort((a, b) => parseInt(b.slice(9)) - parseInt(a.slice(9))); }
     catch { continue; }
+    // The relay's own build first; the newest installed one only if it is missing.
+    if (preferredRevision) revs = revs.filter(r => r === `chromium-${preferredRevision}`).concat(revs.filter(r => r !== `chromium-${preferredRevision}`));
     for (const rev of revs) {
       const root = join(base, rev);
       const candidates = process.platform === "darwin"
@@ -3332,9 +3392,7 @@ async function listListeners(): Promise<void> {
   const config = await requireListeners();
   const rows = [["NAME", "ADDRESS", "PROFILES", "GRANTS", "PUBLIC URL"]];
   for (const l of config.listeners) {
-    const grants = l.profiles === "*"
-      ? "full (local)"
-      : [l.eval && "eval", l.readSecrets && "read-secrets", l.readCookies && "read-cookies", l.uploads === false && "no-uploads", l.keepDownloads && "keep-downloads"].filter(Boolean).join(", ") || "-";
+    const grants = l.profiles === "*" ? "full (local)" : [l.eval && "page-eval", l.readSecrets && "read-secrets", l.readCookies && "read-cookies", l.readHeaders && "read-headers", l.uploads === false && "no-uploads", l.keepDownloads && "keep-downloads"].filter(Boolean).join(", ") || "-";
     rows.push([l.name, `${listenerAddress(l)}${normalizePrefix(l.prefix)}`, l.profiles === "*" ? "(all — local management)" : l.profiles.join(", "), grants, l.publicUrl ?? "-"]);
   }
   printTable(rows);
@@ -3493,7 +3551,7 @@ async function rotateKey(name: string): Promise<void> {
   console.log(`New key for ${name}; URLs carrying the old key stop working now. Print new ones with: rech share <profile> --listener ${name}`);
 }
 
-async function setListener(name: string, opts: { publicUrl?: string; clearPublicUrl?: boolean; uploads?: boolean; hostUploadDirs?: string[]; noHostUploads?: boolean; readSecrets?: boolean; readCookies?: boolean; keepDownloads?: boolean; evalCode?: boolean }): Promise<void> {
+async function setListener(name: string, opts: { publicUrl?: string; clearPublicUrl?: boolean; uploads?: boolean; hostUploadDirs?: string[]; noHostUploads?: boolean; readSecrets?: boolean; readCookies?: boolean; readHeaders?: boolean; keepDownloads?: boolean; evalCode?: boolean }): Promise<void> {
   const config = await requireListeners();
   let listener = config.listeners.find(l => l.name === name);
   if (!listener) throw new Error(`Unknown listener "${name}". See rech listener ls.`);
@@ -3519,16 +3577,21 @@ async function setListener(name: string, opts: { publicUrl?: string; clearPublic
     if (listener.profiles === "*") throw new Error(`"${name}" is the local management listener: read-cookie is always available there.`);
     if (opts.readCookies) listener.readCookies = true; else delete listener.readCookies;
   }
+  if (opts.readHeaders !== undefined) {
+    if (listener.profiles === "*") throw new Error(`"${name}" is the local management listener: read-headers is always available there.`);
+    if (opts.readHeaders) listener.readHeaders = true; else delete listener.readHeaders;
+  }
   if (opts.evalCode !== undefined) {
-    if (listener.profiles === "*") throw new Error(`"${name}" is the local management listener: eval and full CDP are always available there.`);
+    if (listener.profiles === "*") throw new Error(`"${name}" is the local management listener: eval is always available there.`);
     if (opts.evalCode) listener.eval = true; else delete listener.eval;
   }
   if (opts.keepDownloads !== undefined) { if (opts.keepDownloads) listener.keepDownloads = true; else delete listener.keepDownloads; }
   await writeListeners(config);
-  if (opts.evalCode !== undefined) console.log(opts.evalCode ? `${name}: eval on. Anyone with this link can run arbitrary JavaScript (rech pw eval / run-code) and drive full CDP in this listener's profiles — the whole signed-in browser profile, enough to read any page, cookie or token and act as the user. Only for links you trust with those accounts` : `${name}: eval off`);
+  if (opts.evalCode !== undefined) console.log(opts.evalCode ? `${name}: page eval on. Links can execute JavaScript in pages in these profiles, read page data and act as signed-in accounts. Use only with trusted clients. Host-process run-code, raw CDP and CLI overrides remain unavailable` : `${name}: page eval off`);
   if (opts.keepDownloads !== undefined) console.log(opts.keepDownloads ? `${name}: browser downloads are also kept on this host (each is logged)` : `${name}: browser downloads go to the client only, then are deleted here`);
   if (opts.readCookies !== undefined) console.log(opts.readCookies ? `${name}: read-cookie on. Anyone with this link can copy any cookie (HttpOnly session cookies included) of any site its profiles are signed in to, which is enough to take over those sessions; --allow-domain only checks the domain the caller names. Each read is logged without the value` : `${name}: read-cookie off`);
   if (opts.readSecrets !== undefined) console.log(opts.readSecrets ? `${name}: read-secret on. Anyone with this link can copy the value of any field (saved passwords included) on any site its profiles have open; --allow-domain only checks the site the caller names. Each read is logged without the value` : `${name}: read-secret off`);
+  if (opts.readHeaders !== undefined) console.log(opts.readHeaders ? `${name}: read-headers on. Anyone with this link can capture response status + headers for any site its profiles reach; credential header values (cookie, authorization, tokens) and URL query values are redacted. Each capture is logged without those values` : `${name}: read-headers off`);
   if (opts.publicUrl !== undefined || opts.clearPublicUrl) console.log(listener.publicUrl ? `${name} is reachable at ${listener.publicUrl}` : `${name}: public URL cleared`);
   if (opts.hostUploadDirs?.length || opts.noHostUploads) {
     const dirs = (listener.uploads || {}).hostDirs;
@@ -3703,14 +3766,20 @@ export function nearerUrlSource(cwd: string, inherited: boolean, globalFile = GL
   }
 }
 
-type ConnectedShare = { share?: string; device?: { id: string; name: string; approved: boolean }; profiles: string[]; webrtc: boolean };
+type ConnectedShare = { share?: string; device?: { id: string; name: string; approved: boolean }; profiles: string[]; webrtc: boolean; sessions?: { name: string; device: string }[] };
 
 async function connect(url: string, opts: { global?: boolean; project?: boolean } = {}, shared?: ConnectedShare): Promise<void> {
   if (opts.global && opts.project) throw new Error("Pass --global or --project, not both.");
   // A bare rech1_ token means the default signal server.
   if (looksLikeToken(url)) url = `${DEFAULT_SIGNAL}#${url.trim()}`;
   const share = shareLinkParts(url);
-  if (share && !shared) return connectShare(url, share, opts);
+  if (share && !shared) {
+    // node-datachannel's native threads can keep the process alive after every connection is
+    // closed, so the command leaves explicitly: done, it must not hang on.
+    try { await connectShare(url, share, opts); }
+    catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exit(1); }
+    process.exit(0);
+  }
   if (share && shared) return saveConnection(url, opts, shared);
   const parsed = parseUrl(url);
   if (!parsed.key) throw new Error("That URL has no key (#key=…). Ask the host for the full URL from: rech share <profile>");
@@ -3771,6 +3840,10 @@ async function saveConnection(url: string, opts: { global?: boolean; project?: b
     for (const p of shared.profiles) console.log(`  ${p}`);
     console.log(`Pick one per command: rech --profile <name> open https://example.com   (see them again with rech profile)`);
   } else if (shared.profiles.length === 1) console.log(`Profile: ${shared.profiles[0]}. Try: rech open https://example.com`);
+  if (shared.sessions?.length) {
+    console.log(`\nOpen sessions on this share:`);
+    for (const x of shared.sessions) console.log(`  ${x.name}  (device ${x.device})`);
+  }
 }
 
 export function detectSetupAgent(env: Record<string, string | undefined> = process.env): "Codex" | "Claude Code" | null {
@@ -4318,7 +4391,10 @@ async function shareLinks(share: Share): Promise<{ via: string; link: string; si
 function printInvite(share: Share, links: { via: string; link: string; signal?: string }[]): void {
   const expiry = share.inviteExpiresAt ? `unused, it expires ${fmtDate(share.inviteExpiresAt)}` : "it never expires unused";
   console.log(`Share "${share.label}": ${share.profiles.join(", ")}`);
-  console.log(`Invite for ${share.maxDevices === 1 ? "one device" : `${share.maxDevices} devices`} (${expiry}; secret: send it privately):\n`);
+  if (share.reusable) {
+    const until = share.inviteExpiresAt ? `until ${fmtDate(share.inviteExpiresAt)}` : "with no expiry";
+    console.log(`Reusable invite: up to ${share.maxDevices} devices may redeem it ${until}, each getting its own credential (secret: anyone with it can join; kill it with rech share rotate ${share.label}):\n`);
+  } else console.log(`Invite for ${share.maxDevices === 1 ? "one device" : `${share.maxDevices} devices`} (${expiry}; secret: send it privately):\n`);
   const width = Math.max(...links.map(l => l.via.length));
   for (const { via, link } of links) console.log(`  ${links.length > 1 ? `${via.padEnd(width)}  ` : ""}${link}`);
   if (links.some(l => l.signal === DEFAULT_SIGNAL)) {
@@ -4330,7 +4406,7 @@ function printInvite(share: Share, links: { via: string; link: string; signal?: 
   console.log(`Share expires: ${fmtDay(share.expiresAt)}${share.expiresAt ? ` (renew: rech share renew ${share.label})` : ""}`);
 }
 
-export type ShareNewOptions = { name?: string; via?: string[]; webrtc?: string[]; lan?: boolean; tailscale?: boolean; signal?: string; expires?: string; inviteTtl?: string; devices?: number; approve?: boolean };
+export type ShareNewOptions = { name?: string; via?: string[]; webrtc?: string[]; lan?: boolean; tailscale?: boolean; signal?: string; expires?: string; inviteTtl?: string; devices?: number; approve?: boolean; reusable?: boolean };
 
 /**
  * The transports named on the command line, in order: --via entries (comma-separated), then
@@ -4386,8 +4462,8 @@ async function shareNew(selectors: string[], opts: ShareNewOptions): Promise<voi
   const share = await updateShares(config => createShare(config, {
     label, profiles, via,
     expiresAt: expiresMs ? Date.now() + expiresMs : undefined,
-    inviteTtlMs: parseDuration(opts.inviteTtl ?? "24h"),
-    maxDevices: opts.devices ?? 1, approve: opts.approve,
+    inviteTtlMs: parseDuration(opts.inviteTtl ?? (opts.reusable ? REUSABLE_DEFAULT_TTL : "24h")),
+    maxDevices: opts.devices ?? (opts.reusable ? REUSABLE_MAX_DEVICES : 1), approve: opts.approve, reusable: opts.reusable,
   }));
   // The daemon answers WebRTC peers with node-datachannel: install it now, not on the first peer.
   if (rtc.length) await loadRTC().catch(error => console.error(`[rech] warning: ${error instanceof Error ? error.message : error}`));
@@ -4398,12 +4474,15 @@ async function shareList(): Promise<void> {
   const { shares } = await readShares();
   if (shares.length) {
     const now = Date.now();
-    const rows = [["SHARE", "PROFILES", "VIA", "DEVICES", "EXPIRES", "STATUS"]];
+    const rows = [["SHARE", "PROFILES", "VIA", "DEVICES", "EXPIRES", "INVITE", "STATUS"]];
     for (const s of shares) {
       const pending = s.devices.filter(d => !d.approved).length;
       const status = s.revokedAt ? "revoked" : s.expiresAt && now >= s.expiresAt ? "expired"
         : inviteProblem(s, now) ? (pending ? `${pending} waiting for approval` : "active") : `invite open${pending ? `, ${pending} waiting` : ""}`;
-      rows.push([s.label, s.profiles.join(", "), s.via.join(", "), `${s.devices.length}/${s.maxDevices}`, fmtDay(s.expiresAt), status]);
+      const invite = s.reusable
+        ? `reusable, ${s.redeemed ?? 0} redeemed, ${s.inviteExpiresAt && now >= s.inviteExpiresAt ? "expired" : `until ${s.inviteExpiresAt ? fmtDate(s.inviteExpiresAt) : "never"}`}`
+        : "single-use";
+      rows.push([s.label, s.profiles.join(", "), s.via.join(", "), `${s.devices.length}/${s.maxDevices}`, fmtDay(s.expiresAt), invite, status]);
     }
     printTable(rows);
     console.log(`\nDevices: rech share devices <share> · invite link again: rech share rotate <share> · stop: rech share revoke <share>\n`);
@@ -4448,9 +4527,10 @@ async function shareEdit(action: string, name: string, args: string[], opts: { e
   } else if (action === "rotate") {
     const share = await updateShares(config => {
       const s = findShare(config, name);
-      s.invite = newToken();
+      s.invite = newToken(s.reusable ? "reusable" : "invite");
       s.inviteExpiresAt = s.inviteTtlMs ? Date.now() + s.inviteTtlMs : undefined;
-      if (s.devices.length >= s.maxDevices) s.maxDevices = s.devices.length + 1;
+      if (!s.reusable && s.devices.length >= s.maxDevices) s.maxDevices = s.devices.length + 1;
+      if (s.reusable) s.redeemed = 0;
       return s;
     });
     console.log("New invite; the previous invite link no longer works (devices already connected keep working).\n");
@@ -4490,7 +4570,13 @@ export function shareLinkParts(url: string): { token: string; origin: string; we
   const [token, ...rest] = u.hash.slice(1).split("&");
   if (!looksLikeToken(token)) return null;
   const params = new URLSearchParams(rest.join("&"));
-  return { token, origin: `${u.protocol}//${u.host}${normalizePrefix(u.pathname)}`, webrtc: params.get("via") === WEBRTC, profile: u.searchParams.get("profile") ?? undefined };
+  // An invite link opens the invite page at <origin>/share/; the transport is the origin. Only
+  // labeled invites are linked that way, so a listener whose own prefix ends in /share/ is never
+  // mistaken for it (unlabeled tokens and saved device links have no page segment).
+  const kind = parseToken(token);
+  const invitePage = kind.ok && (kind.kind === "invite" || kind.kind === "reusable") && u.pathname.endsWith(`/${INVITE_PATH}`);
+  const path = invitePage ? u.pathname.slice(0, -INVITE_PATH.length) : u.pathname;
+  return { token, origin: `${u.protocol}//${u.host}${normalizePrefix(path)}`, webrtc: params.get("via") === WEBRTC, profile: u.searchParams.get("profile") ?? undefined };
 }
 
 /** Call a share's HTTP API over whichever transport its link uses (one-shot, for connect). */
@@ -4539,7 +4625,8 @@ async function connectShare(url: string, parts: { token: string; origin: string 
   const saved = new URL(parts.origin);
   if (profiles.length === 1) saved.searchParams.set("profile", profiles[0]);
   saved.hash = `${token}${webrtc ? `&via=${WEBRTC}` : ""}`;
-  await connect(saved.toString(), opts, { share, device, profiles, webrtc });
+  const sessions = Array.isArray(ping?.sessions) ? ping.sessions as { name: string; device: string }[] : [];
+  await connect(saved.toString(), opts, { share, device, profiles, webrtc, sessions });
 }
 
 // ---- WebRTC client bridge -------------------------------------------------------------------
@@ -4594,22 +4681,40 @@ async function bridgeCommand(): Promise<void> {
 
 // ---- sessions (client view) -----------------------------------------------------------------
 
+type SessionRow = { session: string; profile?: string; client?: string; owner?: string; lastUsed: number; live: boolean };
+
+async function fetchSessions(url: string): Promise<{ res: Response; body: { sessions?: SessionRow[]; stderr?: string } | null }> {
+  const res = await fetch(serviceUrl(url, "sessions"), { headers: { Authorization: `Bearer ${parseUrl(url).key}` }, signal: AbortSignal.timeout(10_000) });
+  return { res, body: await res.json().catch(() => null) as { sessions?: SessionRow[]; stderr?: string } | null };
+}
+
+/** `name` as given, unless only the named isolated session `iso_<name>` exists. */
+export function pickSessionName(name: string, known: string[]): string {
+  if (name.startsWith(NAMED_ISO_PREFIX) || known.includes(name)) return name;
+  return known.includes(NAMED_ISO_PREFIX + name) ? NAMED_ISO_PREFIX + name : name;
+}
+
+async function resolveSessionName(url: string, name: string): Promise<string> {
+  const known = await fetchSessions(url).then(({ body }) => (body?.sessions ?? []).map(s => s.session)).catch(() => [] as string[]);
+  return pickSessionName(name, known);
+}
+
 async function sessionCommand(action: string, name?: string): Promise<void> {
   const raw = process.env[ENV_KEY];
   if (!raw) throw new Error(notConnectedMessage());
   const url = await transportUrl(raw);
   if (action === "close") {
     if (!name) throw new Error("Which session? rech session close <name>   (see rech session ls)");
-    return run(url, ["close", `-s=${name}`]);
+    // A named isolated session closes by its --isolate name too (`login` for iso_login).
+    return run(url, ["close", `-s=${await resolveSessionName(url, name)}`]);
   }
-  const res = await fetch(serviceUrl(url, "sessions"), { headers: { Authorization: `Bearer ${parseUrl(url).key}` }, signal: AbortSignal.timeout(10_000) });
-  const body = await res.json().catch(() => null) as { sessions?: { session: string; profile?: string; client?: string; owner?: string; lastUsed: number; live: boolean }[]; stderr?: string } | null;
+  const { res, body } = await fetchSessions(url);
   if (!res.ok || !body?.sessions) throw new Error(body?.stderr?.trim() || `The host does not list sessions (HTTP ${res.status}); it may run an older rech.`);
   if (!body.sessions.length) { console.log("No sessions yet (since the host's daemon started)."); return; }
   const rows = [["SESSION", "PROFILE", "CLIENT", "LAST USED", "STATE"]];
   for (const s of body.sessions) rows.push([s.session, s.profile ?? "-", s.client ?? "-", fmtDate(s.lastUsed), s.live ? "open" : "closed"]);
   printTable(rows);
-  console.log(`\nUse one: rech -s=<session> open https://example.com · close it: rech session close <session>`);
+  console.log(`\nUse one: rech -s=<session> open https://example.com (an ${NAMED_ISO_PREFIX}<name> session: rech --isolate=<name> …) · close it: rech session close <session>`);
 }
 
 async function signalServe(opts: { host?: string; port?: number }): Promise<void> {
@@ -4713,7 +4818,7 @@ export type RechHandlers = {
   allowListener(name: string, profiles: string[]): Promise<void>;
   denyListener(name: string, profiles: string[]): Promise<void>;
   rotateKey(name: string): Promise<void>;
-  setListener(name: string, opts: { publicUrl?: string; clearPublicUrl?: boolean; uploads?: boolean; hostUploadDirs?: string[]; noHostUploads?: boolean; readSecrets?: boolean; readCookies?: boolean; keepDownloads?: boolean; evalCode?: boolean }): Promise<void>;
+  setListener(name: string, opts: { publicUrl?: string; clearPublicUrl?: boolean; uploads?: boolean; hostUploadDirs?: string[]; noHostUploads?: boolean; readSecrets?: boolean; readCookies?: boolean; readHeaders?: boolean; keepDownloads?: boolean; evalCode?: boolean }): Promise<void>;
   setup(opts: SetupOptions): Promise<void>;
   tray(action?: string): Promise<void>;
   provisionProfile(name: string, opts: { headed: boolean; experimental: boolean }): Promise<void>;
@@ -4740,18 +4845,30 @@ const HELP_USAGE = `rechrome (rech) — drive your real, logged-in Chrome from s
 Usage: rech <command> [options]   ·   rech <browser-command> [args]`;
 
 const HELP_EPILOGUE = `Browser commands (sent to this project's Chrome session):
-  rech [--profile <p>] [--isolate] <browser-command> [args]
+  rech [--profile <p>] [--isolate[=<name>]] <browser-command> [args]
       open, goto, click, fill, screenshot, eval, tab-list…  (\`rech pw --help\` lists all)
       --profile <p>  as another registered profile (email, name or folder); put it first
-      --isolate      in a throwaway session, e.g. for a login flow
+      --isolate      in a throwaway session (a new one per command)
+      --isolate=<n>  in the named isolated session <n>: made on first use, reused by later
+                     commands (same tabs, same page) until \`rech session close <n>\`
   rech fill-secret <ref> --from-env VAR | --totp-from-env VAR [--env-file f] [--allow-domain '*.example.com']
                      type a password / TOTP code without it reaching argv, logs or output
   rech read-secret <ref> --allow-domain <host> | <vault command>
                      copy a field's value (e.g. an API secret) into a pipe, never shown or logged
   rech read-cookie <name> <domain> --allow-domain <domain> | <command>
                      copy a cookie (incl. HttpOnly) into a pipe, never shown or logged
-  rech read-storage <local|session> <key> [json-path] --allow-domain <host> | <command>
+  rech read-storage <local|session> <key> [json-path] --allow-domain <host> [--goto <url>] | <command>
                      copy a localStorage/sessionStorage value into a pipe, never shown or logged
+  rech read-headers --allow-domain <host> [--seconds N] [--goto <url>]
+                     capture response status + headers (no bodies) to a JSON evidence file;
+                     credential header values and URL query values are redacted
+  rech record start [--fps <n>] [--quality <1-100>] [--format mp4|webm|mjpeg] [--max-seconds <n>]
+  rech record stop [--filename <name>]
+                     record the active tab, streamed into ffmpeg on the host, until stop (or
+                     --max-seconds, default 600); stop hands you the video. No click, no new
+                     permission; mjpeg if the host has no ffmpeg
+  rech record [--seconds <n>] [...]
+                     the same in one call: record n seconds (max 60) and return the file
   rech pw <args>     forward verbatim to playwright-cli, e.g. \`rech pw --version\`
   rech --version     rechrome's version
 
@@ -4817,7 +4934,8 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
       .option("webrtc", { type: "string", describe: `Share over WebRTC: bare = ${DEFAULT_RTC} (${DEFAULT_SIGNAL}, best effort); --webrtc=<signal-url> = that server's listener (made if needed); repeatable` })
       .option("signal", { type: "string", requiresArg: true, describe: `Signal server for a bare --webrtc / --via webrtc (else RECH_SIGNAL, else ${DEFAULT_SIGNAL})` })
       .option("expires", { type: "string", requiresArg: true, describe: "With new/renew: 30d, 2w, 24h, never (new default: 30d over webrtc, else never)" })
-      .option("invite-ttl", { type: "string", requiresArg: true, describe: "With new: an unused invite stops working after this (default 24h)" })
+      .option("invite-ttl", { type: "string", requiresArg: true, alias: "ttl", describe: "With new: the invite stops working after this (default 24h; 7d with --reusable)" })
+      .option("reusable", { type: "boolean", describe: "With new: many devices may redeem the same invite link (each gets its own credential) until --ttl or rech share rotate" })
       .option("devices", { type: "number", requiresArg: true, describe: "With new: how many devices may redeem the invite (default 1)" })
       .option("approve", { type: "boolean", describe: "With new: each new device waits for `rech share approve`" })
       .option("rm", { type: "string", requiresArg: true, describe: "With devices: remove this device" })
@@ -4830,7 +4948,7 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
         const [action, target, ...rest] = profiles;
         const webrtc = a.webrtc === undefined ? undefined : ([a.webrtc].flat() as string[]).map(String);
         const transport = { via: a.via as string[] | undefined, webrtc, lan: a.lan, tailscale: a.tailscale, signal: a.signal };
-        const newOpts = { name: a.name, ...transport, expires: a.expires, inviteTtl: a.inviteTtl, devices: a.devices, approve: a.approve };
+        const newOpts = { name: a.name, ...transport, expires: a.expires, inviteTtl: a.inviteTtl, devices: a.devices, approve: a.approve, reusable: a.reusable };
         if (action === "new") return handlers.shareNew(profiles.slice(1), newOpts);
         // Transport flags make a share (an invite link) for the named profiles.
         if (transportTokens(transport).length && !(action && SHARE_ACTIONS.has(action)) && !(profiles.length === 1 && ["ls", "list"].includes(profiles[0]))) {
@@ -4856,7 +4974,7 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
       .option("global", { type: "boolean", describe: "Save it for every project on this machine without its own link (~/.rechrome/.env.local)" })
       .conflicts("project", "global")
       .example("rech connect 'https://host.example.ts.net/rechrome/?profile=you%40example.com#key=…'", "")
-      .example("rech connect 'https://rechrome.pages.dev/#rech1_…'", "An invite: registers this device, then saves its own link")
+      .example("rech connect 'https://rechrome.pages.dev/share/#rech1_invite_…'", "An invite: registers this device, then saves its own link")
       .example("rech connect --global '<url>'", "An agent machine: one link for every folder, /tmp included"),
       a => a.global || a.project ? handlers.connect(a.url, { global: a.global, project: a.project }) : handlers.connect(a.url))
     .command(["listener", "listeners"], "Control who can connect: listeners, allowed profiles, keys, public URLs", y => y
@@ -4892,11 +5010,12 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
         .option("host-upload-dir", { type: "string", array: true, requiresArg: true, describe: "Off by default. Also let links upload files already on this host, from inside this directory (rech upload --host <path>); repeatable" })
         .option("read-secrets", { type: "boolean", describe: "Off by default. Let this listener's links copy any field's value (saved passwords too) or localStorage/sessionStorage value (app tokens) into a pipe (rech read-secret, read-storage): only for links you trust with those accounts. --no-read-secrets turns it off" })
         .option("read-cookies", { type: "boolean", describe: "Off by default. Let this listener's links copy any cookie, HttpOnly session cookies too (rech read-cookie): enough to take over the profiles' signed-in sessions, so only for links you trust with those accounts. --no-read-cookies turns it off" })
+        .option("read-headers", { type: "boolean", describe: "Off by default. Let this listener's links capture response status + headers (no bodies) for an allowed host (rech read-headers); credential header values and URL query values are redacted. --no-read-headers turns it off" })
+        .option("eval", { type: "boolean", describe: "Off by default. Allow JavaScript in browser pages: clients can read page data and act as signed-in accounts. Does not grant host-process run-code, raw CDP or CLI overrides. --no-eval turns it off" })
         .option("keep-downloads", { type: "boolean", describe: "Off by default: browser downloads go to the client, then are deleted here. --keep-downloads also keeps them on this host" })
         .option("host-uploads", { type: "boolean", describe: "--no-host-uploads turns host-path uploads off again" })
-        .option("eval", { type: "boolean", describe: "Off by default. Let this listener's links run arbitrary JavaScript (rech pw eval / run-code) and drive full CDP in its profiles — the whole signed-in browser profile, enough to read any page, cookie or token and act as the user: only for links you trust with those accounts. --no-eval turns it off" })
-        .check(a => a.publicUrl !== undefined || a.clearPublicUrl || a.uploads !== undefined || a.hostUploadDir?.length || a.hostUploads === false || a.readSecrets !== undefined || a.readCookies !== undefined || a.keepDownloads !== undefined || a.eval !== undefined ? true : "Pass --public-url <url>, --clear-public-url, --uploads/--no-uploads, --host-upload-dir/--no-host-uploads, --read-secrets/--read-cookies, --eval/--no-eval, or --keep-downloads"),
-        a => handlers.setListener(a.name, { publicUrl: a.publicUrl, clearPublicUrl: a.clearPublicUrl, ...(a.uploads !== undefined ? { uploads: a.uploads } : {}), ...(a.hostUploadDir?.length ? { hostUploadDirs: a.hostUploadDir as string[] } : {}), ...(a.hostUploads === false ? { noHostUploads: true } : {}), ...(a.readSecrets !== undefined ? { readSecrets: a.readSecrets } : {}), ...(a.readCookies !== undefined ? { readCookies: a.readCookies } : {}), ...(a.keepDownloads !== undefined ? { keepDownloads: a.keepDownloads } : {}), ...(a.eval !== undefined ? { evalCode: a.eval } : {}) }))
+        .check(a => a.publicUrl !== undefined || a.clearPublicUrl || a.uploads !== undefined || a.hostUploadDir?.length || a.hostUploads === false || a.readSecrets !== undefined || a.readCookies !== undefined || a.readHeaders !== undefined || a.keepDownloads !== undefined || a.eval !== undefined ? true : "Pass --public-url <url>, --clear-public-url, --uploads/--no-uploads, --host-upload-dir/--no-host-uploads, --read-secrets/--read-cookies/--read-headers, --eval/--no-eval, or --keep-downloads"),
+        a => handlers.setListener(a.name, { publicUrl: a.publicUrl, clearPublicUrl: a.clearPublicUrl, ...(a.uploads !== undefined ? { uploads: a.uploads } : {}), ...(a.hostUploadDir?.length ? { hostUploadDirs: a.hostUploadDir as string[] } : {}), ...(a.hostUploads === false ? { noHostUploads: true } : {}), ...(a.readSecrets !== undefined ? { readSecrets: a.readSecrets } : {}), ...(a.readCookies !== undefined ? { readCookies: a.readCookies } : {}), ...(a.readHeaders !== undefined ? { readHeaders: a.readHeaders } : {}), ...(a.keepDownloads !== undefined ? { keepDownloads: a.keepDownloads } : {}), ...(a.eval !== undefined ? { evalCode: a.eval } : {}) }))
       .command("port [name]", "Print a listener's port (for a proxy command)", y => y.positional("name", { type: "string" }),
         a => handlers.listenerPort(a.name))
       .command("rotate-key <name>", "Give a listener a new key (old URLs stop working)", y => y.positional("name", { type: "string", demandOption: true }),
@@ -4904,7 +5023,7 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
       .command("remove <name>", "Remove a listener", y => y.positional("name", { type: "string", demandOption: true }),
         a => handlers.removeListener(a.name))
       .demandCommand(1).strict())
-    .command(["session [action] [name]", "sessions [action] [name]"], "This link's browser sessions on the host: ls (default) | close <name>", y => y
+    .command(["session [action] [name]", "sessions [action] [name]"], "This link's browser sessions on the host: ls (default) | close <name> (also an --isolate=<name> session)", y => y
       .positional("action", { type: "string", choices: ["ls", "list", "close"], default: "ls" })
       .positional("name", { type: "string", describe: "With close: the session (as `rech session ls` shows it)" }),
       a => handlers.session(a.action === "list" ? "ls" : a.action!, a.name))
@@ -5051,10 +5170,13 @@ if (import.meta.main) {
     // flows (OAuth/login) that must not share tabs with the worktree's default session. The `iso-`
     // marker lets the daemon reap these throwaway sessions on an idle TTL (see serve.ts), so an
     // OAuth drive can't leak an orphaned browser context.
-    const isolateIdx = args.findIndex((a) => a === "--isolate" || a === "--isolated");
-    if (isolateIdx !== -1) {
-      args.splice(isolateIdx, 1);
-      args.push(`-s=iso-${randomBytes(8).toString("hex")}`);
+    // --isolate=<name>: a named isolated session (-s=iso_<name>), kept across commands until
+    // `rech session close <name>`, for multi-step flows (email, password, TOTP).
+    try { args = applyIsolateArg(args); }
+    catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      envWatcher?.close();
+      process.exit(1);
     }
     args = [...forwarded, ...args];
     await run(url, args, overrideEnv, { verbatim: separator !== -1 });

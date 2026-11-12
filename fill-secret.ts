@@ -16,6 +16,7 @@ import { connect } from "net";
 import { readdirSync, readFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
+import { redact } from "./redact.ts";
 
 export const SECRET_MASK = "***";
 export const SECRET_MASK_TTL_MS = 15 * 60_000;
@@ -321,14 +322,14 @@ export function socketRequest(path: string, method: string, params: unknown, tim
 }
 
 /** Run a run-code function on the session's live browser over its cliDaemon socket (no child argv). */
-export async function runCodeOnSession(opts: { socketRoot: string; session: string; cwd: string; code: string; json?: boolean }): Promise<{ isError: boolean; text: string }> {
+export async function runCodeOnSession(opts: { socketRoot: string; session: string; cwd: string; code: string; json?: boolean; timeoutMs?: number }): Promise<{ isError: boolean; text: string }> {
   const candidates = [...new Set([...sessionSocketCandidates(opts.socketRoot, opts.session), ...daemonSessionSockets(opts.session)])];
   if (!candidates.length) throw new Error("no browser is open in this session; run `rech open <url>` first");
   const errors: string[] = [];
   for (const path of candidates) {
     let reply: { result?: any; error?: string };
     try {
-      reply = await socketRequest(path, "run", { args: { _: ["run-code", opts.code] }, cwd: opts.cwd, ...(opts.json ? { json: true } : {}) });
+      reply = await socketRequest(path, "run", { args: { _: ["run-code", opts.code] }, cwd: opts.cwd, ...(opts.json ? { json: true } : {}) }, opts.timeoutMs);
     } catch (e) {
       errors.push(e instanceof Error ? e.message : String(e)); // stale socket: try the next one
       continue;
@@ -338,6 +339,20 @@ export async function runCodeOnSession(opts: { socketRoot: string; session: stri
     return { isError: !!r?.isError, text: typeof r === "string" ? r : typeof r?.text === "string" ? r.text : "" };
   }
   throw new Error(`could not reach this session's browser (${errors.join("; ")}); run \`rech open <url>\` first`);
+}
+
+/** Run a plain CLI command (e.g. tab-list, tab-select) on the session's browser over its socket. */
+export async function runCliOnSession(opts: { socketRoot: string; session: string; cwd: string }, cliArgs: string[]): Promise<{ isError: boolean; text: string }> {
+  const candidates = [...new Set([...sessionSocketCandidates(opts.socketRoot, opts.session), ...daemonSessionSockets(opts.session)])];
+  for (const path of candidates) {
+    let reply: { result?: any; error?: string };
+    try { reply = await socketRequest(path, "run", { args: { _: cliArgs }, cwd: opts.cwd }); }
+    catch { continue; }
+    if (reply.error) throw new Error(reply.error);
+    const r = reply.result;
+    return { isError: !!r?.isError, text: typeof r === "string" ? r : typeof r?.text === "string" ? r.text : "" };
+  }
+  throw new Error("no browser is open in this session");
 }
 
 /**
@@ -450,30 +465,44 @@ export async function readSecretOnSession(opts: { socketRoot: string; session: s
 // via page-level evaluate, so it works over the extension bridge. localStorage is per-origin, so
 // the session's page must be on the allowed host.
 
-export const READ_STORAGE_USAGE = `Usage: rech read-storage <local|session> <key> [json-path] --allow-domain <glob> | <command>
+export const READ_STORAGE_USAGE = `Usage: rech read-storage <local|session> <key> [json-path] --allow-domain <glob> [--goto <url>] | <command>
   Writes the storage value, raw and without a newline, to stdout, which must be a pipe into the
   program that stores it (never a terminal or a file). Never logged; masked in later outputs.
   <local|session>       localStorage or sessionStorage
   <key>                 the storage key, e.g. localConfig_v2
   [json-path]           optional: a path into the JSON value, e.g. teams.T0123.token or teams[T0123].token
-  --allow-domain GLOB   required: the page's host must match, e.g. app.slack.com`;
+  --allow-domain GLOB   required: the page's host must match, e.g. app.slack.com
+  --goto URL            first navigate the attached tab to URL (host must match --allow-domain),
+                        so the value is read from it, e.g. --goto https://app.slack.com/client/T0`;
+
+/** --goto must be http(s) on an --allow-domain host (checked by the client and again by serve). */
+export function checkGotoUrl(gotoUrl: string, allowDomains: string[]): void {
+  let u: URL;
+  try { u = new URL(gotoUrl); } catch { throw new Error("--goto must be an http(s) URL"); }
+  if (!/^https?:$/.test(u.protocol)) throw new Error("--goto must be an http(s) URL");
+  if (!allowDomains.some(d => domainGlobToRegExp(d).test(u.hostname.toLowerCase()))) throw new Error("--goto URL host must match --allow-domain");
+}
 
 /** Split "teams[T0123].token" / "teams.T0123.token" into ["teams","T0123","token"]. */
 export function parseStoragePath(path: string): string[] {
   return path.match(/[^.[\]]+/g) ?? [];
 }
 
-export function parseReadStorageArgs(args: string[]): { area: "local" | "session"; key: string; path: string[]; allowDomains: string[] } {
+export function parseReadStorageArgs(args: string[]): { area: "local" | "session"; key: string; path: string[]; allowDomains: string[]; gotoUrl?: string } {
   const [cmd, ...rest] = args;
   if (cmd !== "read-storage") throw new Error("Expected read-storage");
   const pos: string[] = [];
   const allowDomains: string[] = [];
+  let gotoUrl: string | undefined;
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i]!;
     if (a === "--allow-domain" || a.startsWith("--allow-domain=")) {
       const v = a === "--allow-domain" ? rest[++i] : a.slice("--allow-domain=".length);
       if (!v) throw new Error("--allow-domain got an empty host");
       for (const d of v.split(",")) { domainGlobToRegExp(d.trim()); allowDomains.push(d.trim()); }
+    } else if (a === "--goto" || a.startsWith("--goto=")) {
+      gotoUrl = a === "--goto" ? rest[++i] : a.slice("--goto=".length);
+      if (!gotoUrl) throw new Error("--goto got an empty URL");
     } else if (a.startsWith("-")) throw new Error(`read-storage: unknown option ${a}`);
     else pos.push(a);
   }
@@ -482,25 +511,29 @@ export function parseReadStorageArgs(args: string[]): { area: "local" | "session
   if (area !== "local" && area !== "session") throw new Error("read-storage: first argument must be 'local' or 'session'");
   if (!key) throw new Error("read-storage: a storage key is required");
   if (!allowDomains.length) throw new Error("read-storage needs --allow-domain: name the site the value must come from");
-  return { area, key, path: rawPath ? parseStoragePath(rawPath) : [], allowDomains };
+  if (gotoUrl) checkGotoUrl(gotoUrl, allowDomains);
+  return { area, key, path: rawPath ? parseStoragePath(rawPath) : [], allowDomains, gotoUrl };
 }
 
-export function readStorageWireArgs(req: { area: string; key: string; path: string[]; allowDomains: string[] }): string[] {
-  return ["read-storage", req.area, req.key, ...(req.path.length ? [req.path.join(".")] : []), ...req.allowDomains.map(d => `--allow-domain=${d}`)];
+export function readStorageWireArgs(req: { area: string; key: string; path: string[]; allowDomains: string[]; gotoUrl?: string }): string[] {
+  return ["read-storage", req.area, req.key, ...(req.path.length ? [req.path.join(".")] : []), ...req.allowDomains.map(d => `--allow-domain=${d}`), ...(req.gotoUrl ? [`--goto=${req.gotoUrl}`] : [])];
 }
 
-export function parseReadStorageWire(args: string[]): { area: "local" | "session"; key: string; path: string[]; allowDomains: string[] } {
+export function parseReadStorageWire(args: string[]): { area: "local" | "session"; key: string; path: string[]; allowDomains: string[]; gotoUrl?: string } {
   const [cmd, area, key, ...rest] = args;
   if (cmd !== "read-storage" || (area !== "local" && area !== "session") || !key || key.startsWith("-")) throw new Error("read-storage needs <local|session> <key>");
   const allowDomains: string[] = [];
   let path: string[] = [];
+  let gotoUrl: string | undefined;
   for (const a of rest) {
     if (a.startsWith("--allow-domain=")) { const d = a.slice("--allow-domain=".length); domainGlobToRegExp(d); allowDomains.push(d); }
+    else if (a.startsWith("--goto=")) { gotoUrl = a.slice("--goto=".length); }
     else if (!a.startsWith("-") && !path.length) path = parseStoragePath(a);
     else throw new Error(`read-storage: unexpected argument ${a.startsWith("-") ? a : "(positional)"}`);
   }
   if (!allowDomains.length) throw new Error("read-storage needs --allow-domain");
-  return { area, key, path, allowDomains };
+  if (gotoUrl !== undefined) checkGotoUrl(gotoUrl, allowDomains);
+  return { area, key, path, allowDomains, gotoUrl };
 }
 
 /** run-code reading storage[key], optionally walking a JSON path; returns {host,value} JSON. */
@@ -508,25 +541,34 @@ export function buildReadStorageCode(area: "local" | "session", key: string, pat
   const patterns = allowDomains.map(d => domainGlobToRegExp(d).source);
   const store = area === "local" ? "localStorage" : "sessionStorage";
   return `async page => {
-  // One evaluate: the host checked is the origin read, with no navigation in between.
-  const out = await page.evaluate(({ key, path }) => {
-    const host = String(location.hostname).toLowerCase();
+  const allowed = ${JSON.stringify(patterns)};
+  const hostOf = (u) => { const m = /^[a-z][a-z0-9+.-]*:\\/\\/([^/?#]+)/i.exec(String(u || "")); return m ? m[1].replace(/^[^@]*@/, "").replace(/:\\d+$/, "").toLowerCase() : ""; };
+  const ok = (h) => h && allowed.some(p => new RegExp(p, "i").test(h));
+  // The caller has foregrounded the --allow-domain tab; read from whichever of this tab's frames
+  // is on the allowed host (the top frame can be a blank wrapper over the bridge).
+  const frame = page.frames().find(f => ok(hostOf(f.url())));
+  const host = frame ? hostOf(frame.url()) : "";
+  if (!frame)
+    throw new Error("read-storage refused: the foreground tab is not on an --allow-domain host (host " + JSON.stringify(hostOf(page.url())) + ")");
+  // Re-check the host inside the same evaluate that reads, so a navigation between the frame
+  // pick and the read can't hand over another origin's storage.
+  const out = await frame.evaluate(({ key, path, allowed }) => {
+    const m = /^[a-z][a-z0-9+.-]*:\\/\\/([^/?#]+)/i.exec(String(document.URL || ""));
+    const h = m ? m[1].replace(/^[^@]*@/, "").replace(/:\\d+$/, "").toLowerCase() : "";
+    if (!h || !allowed.some(p => new RegExp(p, "i").test(h))) return { moved: true };
     const raw = window.${store}.getItem(key);
-    if (raw === null) return { host, missing: true };
-    if (!path.length) return { host, value: raw };
+    if (raw === null) return { missing: true };
+    if (!path.length) return { value: raw };
     let v;
-    try { v = JSON.parse(raw); } catch { return { host, notjson: true }; }
+    try { v = JSON.parse(raw); } catch { return { notjson: true }; }
     for (const seg of path) {
-      if (v == null || typeof v !== "object") return { host, nopath: true };
+      if (v == null || typeof v !== "object") return { nopath: true };
       v = v[seg];
     }
-    if (v === undefined) return { host, nopath: true };
-    return { host, value: typeof v === "string" ? v : JSON.stringify(v) };
-  }, { key: ${JSON.stringify(key)}, path: ${JSON.stringify(path)} });
-  const host = out.host;
-  const allowed = ${JSON.stringify(patterns)};
-  if (!allowed.some(p => new RegExp(p, "i").test(host)))
-    throw new Error("read-storage refused: the page host " + JSON.stringify(host) + " is not allowed by --allow-domain");
+    if (v === undefined) return { nopath: true };
+    return { value: typeof v === "string" ? v : JSON.stringify(v) };
+  }, { key: ${JSON.stringify(key)}, path: ${JSON.stringify(path)}, allowed });
+  if (out.moved) throw new Error("read-storage refused: the foreground tab is not on an --allow-domain host (it navigated away)");
   if (out.missing) throw new Error("read-storage: no ${store} key " + JSON.stringify(${JSON.stringify(key)}) + " on " + host);
   if (out.notjson) throw new Error("read-storage: the value is not JSON, so the path can't apply");
   if (out.nopath) throw new Error("read-storage: the json-path is not present in the value");
@@ -534,15 +576,33 @@ export function buildReadStorageCode(area: "local" | "session", key: string, pat
 }`;
 }
 
-export async function readStorageOnSession(opts: { socketRoot: string; session: string; cwd: string; area: "local" | "session"; key: string; path: string[]; allowDomains: string[] }): Promise<{ host: string; value: string }> {
-  const { isError, text } = await runCodeOnSession({ ...opts, code: buildReadStorageCode(opts.area, opts.key, opts.path, opts.allowDomains), json: true });
-  if (isError) throw new Error(text.match(/read-storage(?: refused)?: [^\n]*/)?.[0] ?? (/no browser is open|could not reach/.test(text) ? text.trim().split("\n")[0]! : "read-storage: could not read the value"));
-  let raw: unknown;
-  try { raw = JSON.parse(text).result; } catch { raw = text.match(/### Result\n([^\n]*)/)?.[1]; }
-  let o: any = raw;
-  for (let i = 0; i < 2 && typeof o === "string"; i++) { try { o = JSON.parse(o); } catch { o = undefined; } }
-  if (!o || typeof o.host !== "string" || typeof o.value !== "string") throw new Error("read-storage: the page returned no value");
-  return o;
+export async function readStorageOnSession(opts: { socketRoot: string; session: string; cwd: string; area: "local" | "session"; key: string; path: string[]; allowDomains: string[]; gotoUrl?: string }): Promise<{ host: string; value: string }> {
+  // Over the extension bridge Playwright reaches only the attached tab, and localStorage is
+  // per-origin. With --goto, navigate that tab to the allowed URL in THIS same invocation (so the
+  // attachment can't change between navigate and read), then read it.
+  if (opts.gotoUrl) {
+    await runCliOnSession(opts, ["goto", opts.gotoUrl]).catch(() => {});
+    await new Promise(r => setTimeout(r, 2500));
+  }
+  let last = "";
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const { isError, text } = await runCodeOnSession({ socketRoot: opts.socketRoot, session: opts.session, cwd: opts.cwd, code: buildReadStorageCode(opts.area, opts.key, opts.path, opts.allowDomains), json: true });
+    if (!isError) {
+      let raw: unknown;
+      try { raw = JSON.parse(text).result; } catch { raw = text.match(/### Result\n([^\n]*)/)?.[1]; }
+      let o: any = raw;
+      for (let i = 0; i < 2 && typeof o === "string"; i++) { try { o = JSON.parse(o); } catch { o = undefined; } }
+      if (o && typeof o.host === "string" && typeof o.value === "string") return o;
+      throw new Error("read-storage: the page returned no value");
+    }
+    last = text.match(/read-storage(?: refused)?: [^\n]*/)?.[0] ?? (/no browser is open|could not reach/.test(text) ? text.trim().split("\n")[0]! : "read-storage: could not read the value");
+    if (!/foreground tab is not on/.test(last)) break;
+    await new Promise(r => setTimeout(r, 1000));
+  }
+  // A clearer hint for the common case: the allowed site isn't the attached tab.
+  if (/foreground tab is not on/.test(last))
+    last += ". Put the site on the active tab first: rech goto <url on that host>, then rerun read-storage.";
+  throw new Error(last || "read-storage: could not read the value");
 }
 
 // ---------- read-cookie: a cookie value (incl. HttpOnly) to a pipe ----------
@@ -635,6 +695,206 @@ export async function readCookieOnSession(opts: { socketRoot: string; session: s
   for (let i = 0; i < 2 && typeof out === "string"; i++) { try { out = JSON.parse(out); } catch { out = undefined; } }
   if (!out || typeof out.domain !== "string" || typeof out.value !== "string") throw new Error("read-cookie: the browser returned no value");
   return out;
+}
+
+// ---------- read-headers: response status + headers (no bodies) to an evidence file ----------
+//
+// Captures the status code and response headers of every request on an --allow-domain host over a
+// capture window, with an optional --goto that navigates the attached tab first. Headers are not
+// secrets in general, but some carry credentials, so their VALUES are redacted (the name is kept), as
+// are URL query values, fragments and userinfo; the file then goes through the secret scanner.
+// Unlike read-secret/read-storage/read-cookie this writes a JSON evidence FILE (an array of
+// {url, status, headers}) to the run's output dir and returns its path; nothing is piped. On a
+// profile-scoped listener it is refused unless the host turned it on (listener.readHeaders).
+
+/** Header names whose VALUES carry credentials: keep the name, replace the value. */
+export const REDACTED_HEADERS = [
+  "set-cookie", "cookie", "authorization", "proxy-authorization", "www-authenticate", "proxy-authenticate",
+  "x-api-key", "x-csrf-token", "x-xsrf-token",
+];
+/** …and any header named like one: `*-token`, `*-secret`, `*-api-key` (also with `_`). */
+export const REDACTED_HEADER_PATTERN = "[-_](?:token|secret|api[-_]?key)$";
+/** Headers whose value is a URL: its query values, fragment and userinfo are redacted. */
+export const URL_HEADERS = ["location", "content-location"];
+export const HEADER_REDACTION = "<redacted>";
+export const READ_HEADERS_DEFAULT_SECONDS = 5;
+// The whole capture (a --goto included) runs inside one /run, and the client gives up at 70 s.
+export const READ_HEADERS_MAX_SECONDS = 50;
+
+export const READ_HEADERS_USAGE = `Usage: rech read-headers --allow-domain <host> [--allow-domain <host>]... [--seconds N] [--goto <url>]
+  Captures the status code and response headers (NO bodies) of every request on an --allow-domain
+  host over a capture window, and writes them as a JSON evidence file in the output dir (an array of
+  {url, status, headers}). Credential header values (cookie, set-cookie, authorization,
+  *-authenticate, x-api-key, *-token, *-secret, ...) are redacted, as are URL query values,
+  fragments and userinfo; then the file goes through the secret scanner.
+  --allow-domain GLOB   required: capture only responses whose host matches, e.g. app.example.com
+  --seconds N           capture window in seconds (default ${READ_HEADERS_DEFAULT_SECONDS}, max ${READ_HEADERS_MAX_SECONDS})
+  --goto URL            first navigate the attached tab to URL (host must match --allow-domain),
+                        then capture, so a page load's requests are captured (within the window)`;
+
+/** The host of a URL string, lowercased, without userinfo or port ("" when it has none). */
+export function hostFromUrl(u: string): string {
+  const m = /^[a-z][a-z0-9+.-]*:\/\/([^/?#]+)/i.exec(String(u || ""));
+  return m ? m[1]!.replace(/^[^@]*@/, "").replace(/:\d+$/, "").toLowerCase() : "";
+}
+
+export type CapturedResponse = { url: string; status: number; headers: Record<string, string> };
+
+/**
+ * One captured response with its credentials taken out: credential header values, and in the URL
+ * and URL-valued headers the query values, fragment and userinfo. Self-contained (only its
+ * arguments and builtins), because the browser runs it too via toString(), so raw values never
+ * leave the browser; serve runs it again on what comes back.
+ */
+export function redactResponse(e: { url?: unknown; status?: unknown; headers?: unknown }, names: readonly string[], pattern: string, urlHeaders: readonly string[], mask: string): CapturedResponse {
+  const maskUrl = (u: string): string => {
+    u = u.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/?#]*@/i, `$1${mask}@`);
+    const hash = u.indexOf("#");
+    const frag = hash >= 0 ? `#${mask}` : "";
+    if (hash >= 0) u = u.slice(0, hash);
+    const q = u.indexOf("?");
+    if (q < 0) return u + frag;
+    const query = u.slice(q + 1).split("&").map(p => (p.includes("=") ? `${p.slice(0, p.indexOf("="))}=${mask}` : p ? mask : p)).join("&");
+    return `${u.slice(0, q)}?${query}${frag}`;
+  };
+  const credential = new RegExp(pattern, "i");
+  const raw = e.headers && typeof e.headers === "object" ? (e.headers as Record<string, unknown>) : {};
+  const headers: Record<string, string> = {};
+  for (const k of Object.keys(raw)) {
+    const n = k.toLowerCase();
+    headers[k] = names.includes(n) || credential.test(n) ? mask : urlHeaders.includes(n) ? maskUrl(String(raw[k])) : String(raw[k]);
+  }
+  const status = Number(e.status);
+  return { url: maskUrl(String(e.url ?? "")), status: Number.isFinite(status) ? status : 0, headers };
+}
+
+/**
+ * The evidence file's text: the (already redacted) responses, then anything `mask` knows (filled
+ * passwords, TOTPs) and anything the secret scanner recognizes, e.g. a token in an unusual header.
+ */
+export function readHeadersEvidence(captured: CapturedResponse[], mask: (text: string) => string): string {
+  return redact(mask(JSON.stringify(captured.map(redactCaptured), null, 2))).text + "\n";
+}
+
+/** redactResponse with this module's lists. */
+export function redactCaptured(e: { url?: unknown; status?: unknown; headers?: unknown }): CapturedResponse {
+  return redactResponse(e, REDACTED_HEADERS, REDACTED_HEADER_PATTERN, URL_HEADERS, HEADER_REDACTION);
+}
+
+/** Keep every header name; replace the value of a credential-bearing header with <redacted>. */
+export function redactHeaders(headers: Record<string, unknown>): Record<string, string> {
+  return redactCaptured({ headers }).headers;
+}
+
+function validateSeconds(seconds: number): number {
+  if (!Number.isInteger(seconds) || seconds < 1 || seconds > READ_HEADERS_MAX_SECONDS)
+    throw new Error(`read-headers: --seconds must be an integer between 1 and ${READ_HEADERS_MAX_SECONDS}`);
+  return seconds;
+}
+
+
+export function parseReadHeadersArgs(args: string[]): { allowDomains: string[]; seconds: number; gotoUrl?: string } {
+  const [cmd, ...rest] = args;
+  if (cmd !== "read-headers") throw new Error("Expected read-headers");
+  const allowDomains: string[] = [];
+  let seconds = READ_HEADERS_DEFAULT_SECONDS;
+  let gotoUrl: string | undefined;
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i]!;
+    if (a === "--allow-domain" || a.startsWith("--allow-domain=")) {
+      const v = a === "--allow-domain" ? rest[++i] : a.slice("--allow-domain=".length);
+      if (!v) throw new Error("--allow-domain got an empty host");
+      for (const d of v.split(",")) { domainGlobToRegExp(d.trim()); allowDomains.push(d.trim()); }
+    } else if (a === "--seconds" || a.startsWith("--seconds=")) {
+      const v = a === "--seconds" ? rest[++i] : a.slice("--seconds=".length);
+      if (!v) throw new Error("--seconds needs a value");
+      seconds = validateSeconds(Number(v));
+    } else if (a === "--goto" || a.startsWith("--goto=")) {
+      gotoUrl = a === "--goto" ? rest[++i] : a.slice("--goto=".length);
+      if (!gotoUrl) throw new Error("--goto got an empty URL");
+    } else if (a.startsWith("-")) throw new Error(`read-headers: unknown option ${a}`);
+    else throw new Error(`read-headers: unexpected argument ${a}`);
+  }
+  if (!allowDomains.length) throw new Error("read-headers needs --allow-domain: name the host to capture responses from");
+  if (gotoUrl) checkGotoUrl(gotoUrl, allowDomains);
+  return { allowDomains, seconds, gotoUrl };
+}
+
+export function readHeadersWireArgs(req: { allowDomains: string[]; seconds: number; gotoUrl?: string }): string[] {
+  return ["read-headers", ...req.allowDomains.map(d => `--allow-domain=${d}`), `--seconds=${req.seconds}`, ...(req.gotoUrl ? [`--goto=${req.gotoUrl}`] : [])];
+}
+
+/** Parse what the daemon received; exactly the shape readHeadersWireArgs sends. */
+export function parseReadHeadersWire(args: string[]): { allowDomains: string[]; seconds: number; gotoUrl?: string } {
+  const [cmd, ...rest] = args;
+  if (cmd !== "read-headers") throw new Error("read-headers expected");
+  const allowDomains: string[] = [];
+  let seconds = READ_HEADERS_DEFAULT_SECONDS;
+  let gotoUrl: string | undefined;
+  for (const a of rest) {
+    if (a.startsWith("--allow-domain=")) { const d = a.slice("--allow-domain=".length); domainGlobToRegExp(d); allowDomains.push(d); }
+    else if (a.startsWith("--seconds=")) { seconds = validateSeconds(Number(a.slice("--seconds=".length))); }
+    else if (a.startsWith("--goto=")) { gotoUrl = a.slice("--goto=".length); }
+    else throw new Error(`read-headers: unexpected argument ${a.startsWith("-") ? a : "(positional)"}`);
+  }
+  if (!allowDomains.length) throw new Error("read-headers needs --allow-domain");
+  if (gotoUrl) checkGotoUrl(gotoUrl, allowDomains);
+  return { allowDomains, seconds, gotoUrl };
+}
+
+/**
+ * run-code that captures responses on the attached page, optionally navigates to gotoUrl first, waits
+ * the window, and returns {host, count, captured} JSON. Only responses whose host matches an
+ * --allow-domain glob are kept, and credential-bearing header values are redacted IN the browser so
+ * their raw values never leave it. Uses page.on("response") (Playwright's view of the CDP Network
+ * domain), so it works over the extension bridge the same way read-cookie's run-code does.
+ */
+export function buildReadHeadersCode(allowDomains: string[], seconds: number, gotoUrl?: string): string {
+  const patterns = allowDomains.map(d => domainGlobToRegExp(d).source);
+  return `async page => {
+  const allowed = ${JSON.stringify(patterns)};
+  const redact = ${redactResponse.toString()};
+  const hostOf = (u) => { const m = /^[a-z][a-z0-9+.-]*:\\/\\/([^/?#]+)/i.exec(String(u || "")); return m ? m[1].replace(/^[^@]*@/, "").replace(/:\\d+$/, "").toLowerCase() : ""; };
+  const ok = (h) => h && allowed.some(p => new RegExp(p, "i").test(h));
+  const captured = [];
+  const onResponse = async (response) => {
+    try {
+      const url = String(response.url());
+      const host = hostOf(url);
+      if (!ok(host)) return;
+      let headers = {};
+      try { headers = await response.allHeaders(); } catch { try { headers = response.headers(); } catch { headers = {}; } }
+      captured.push(redact({ url, status: response.status(), headers }, ${JSON.stringify(REDACTED_HEADERS)}, ${JSON.stringify(REDACTED_HEADER_PATTERN)}, ${JSON.stringify(URL_HEADERS)}, ${JSON.stringify(HEADER_REDACTION)}));
+    } catch {}
+  };
+  page.on("response", onResponse);
+  // The window includes the --goto: the whole capture fits in the one request.
+  const endAt = Date.now() + ${seconds} * 1000;
+  try {
+    ${gotoUrl ? `try { await page.goto(${JSON.stringify(gotoUrl)}, { waitUntil: "load", timeout: ${seconds * 1000} }); } catch {}` : ""}
+    await page.waitForTimeout(Math.max(0, endAt - Date.now()));
+  } finally {
+    try { page.off("response", onResponse); } catch {}
+  }
+  return JSON.stringify({ host: ${JSON.stringify(allowDomains[0] ?? "")}, count: captured.length, captured });
+}`;
+}
+
+/**
+ * Capture response status + headers on the session's live browser over the window. Returns the
+ * captured array (re-redacted daemon-side as defence in depth); the caller writes the evidence file.
+ */
+export async function readHeadersOnSession(opts: { socketRoot: string; session: string; cwd: string; allowDomains: string[]; seconds: number; gotoUrl?: string }): Promise<{ host: string; captured: CapturedResponse[] }> {
+  const timeoutMs = opts.seconds * 1000 + 15_000;
+  const { isError, text } = await runCodeOnSession({ socketRoot: opts.socketRoot, session: opts.session, cwd: opts.cwd, code: buildReadHeadersCode(opts.allowDomains, opts.seconds, opts.gotoUrl), json: true, timeoutMs });
+  if (isError) throw new Error(text.match(/read-headers(?: refused)?: [^\n]*/)?.[0] ?? (/no browser is open|could not reach/.test(text) ? text.trim().split("\n")[0]! : "read-headers: could not capture responses"));
+  let raw: unknown;
+  try { raw = JSON.parse(text).result; } catch { raw = text.match(/### Result\n([^\n]*)/)?.[1]; }
+  let out: any = raw;
+  for (let i = 0; i < 2 && typeof out === "string"; i++) { try { out = JSON.parse(out); } catch { out = undefined; } }
+  if (!out || !Array.isArray(out.captured)) throw new Error("read-headers: the browser returned no capture");
+  const captured = out.captured.map((e: any) => redactCaptured(e && typeof e === "object" ? e : {}));
+  return { host: typeof out.host === "string" ? out.host : (opts.allowDomains[0] ?? ""), captured };
 }
 
 // ---------- password fields in snapshots ----------
