@@ -135,6 +135,15 @@ test("a share carries an optional per-share eval level that round-trips and is v
   expect(() => validateShares({ version: 1, shares: [{ ...dev, eval: "yes" as any }] })).toThrow(/malformed/);
 });
 
+test("a share can carry the dangerous debug level, which round-trips and is validated", () => {
+  const config = empty();
+  const dbg = createShare(config, { label: "dbg", profiles: ["p"], via: ["webrtc"], debug: true });
+  expect(dbg.debug).toBe(true);
+  expect(createShare(config, { label: "plain", profiles: ["p"], via: ["webrtc"] }).debug).toBeUndefined();
+  expect(validateShares(JSON.parse(JSON.stringify(config))).shares.find(s => s.label === "dbg")?.debug).toBe(true);
+  expect(() => validateShares({ version: 1, shares: [{ ...dbg, debug: 1 as any }] })).toThrow(/malformed/);
+});
+
 test("durations", () => {
   expect(parseDuration("30d")).toBe(30 * 86_400_000);
   expect(parseDuration("24h")).toBe(86_400_000);

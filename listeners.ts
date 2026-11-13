@@ -186,11 +186,16 @@ const SCOPED_COMMANDS = new Set(["open", "goto", "tab-new", "tab-list", "tab-sel
 // The CLI options each scoped command may carry (everything else is refused). record uses a
 // start/stop subcommand (a positional) plus these capture/output knobs (record.ts RECORD_OPTIONS).
 const RECORD_SCOPED_OPTS = ["--seconds", "--max-seconds", "--fps", "--quality", "--filename", "--format"];
-export function authorizeProfileRequest(listener: Listener, body: any, caps: { eval?: boolean } = {}): string {
+export function authorizeProfileRequest(listener: Listener, body: any, caps: { eval?: boolean; full?: boolean } = {}): string {
   if (!body || Array.isArray(body) || !body.identity || typeof body.identity.key !== "string" || !body.identity.key || !Array.isArray(body.args) || body.args.some((a: unknown) => typeof a !== "string")) throw new Error("Scoped requests require identity.key, identity.profile and string args");
   const profile = body.identity.profile;
   if (typeof profile !== "string" || listener.profiles === "*" || !listener.profiles.includes(profile)) throw new Error("Profile is not allowed on this listener");
   if (body.env?.PLAYWRIGHT_MCP_PROFILE_DIRECTORY && body.env.PLAYWRIGHT_MCP_PROFILE_DIRECTORY !== profile) throw new Error("Profile override does not match request identity");
+  // caps.full (a --dangerously-allow-debug share) lifts every command/option restriction below:
+  // this credential gets the local management listener's power — run-code, raw CDP, CLI overrides,
+  // host access — but ONLY on this listener's profiles (the two checks above still pin the profile
+  // and reject a mismatched override, so a full share can never reach a profile it was not granted).
+  if (caps.full) return profile;
   const args = body.args.filter((a: string) => /^-s=[a-zA-Z0-9_-]{1,64}$/.test(a) === false);
   if (args[0] === "upload" && listener.uploads === false)
     throw new Error(`Uploads are off on listener "${listener.name}". The host can turn them on: rech listener set ${listener.name} --uploads`);

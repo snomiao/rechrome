@@ -4403,11 +4403,18 @@ function printInvite(share: Share, links: { via: string; link: string; signal?: 
   }
   console.log(`\nThe other machine runs: rech connect '<link>'${links.length > 1 ? " (any one of them)" : ""}`);
   if (share.approve) console.log(`Each new device waits for you: rech share approve ${share.label}`);
-  if (share.eval) console.log(`Level: eval — this share's devices may run eval (page JavaScript) on its profiles.`);
+  if (share.debug) {
+    console.log(`\n⚠  DANGER — level debug (--dangerously-allow-debug)`);
+    console.log(`   Anyone who holds this link can, on ${share.profiles.join(", ")}:`);
+    console.log(`     • run code on this host machine, and use raw CDP`);
+    console.log(`     • act as every signed-in session in that profile (cookies, tokens)`);
+    console.log(`     • read and modify files this user can reach`);
+    console.log(`   Treat the link like a password. Stop it any time: rech share revoke ${share.label}`);
+  } else if (share.eval) console.log(`Level: eval — this share's devices may run eval (page JavaScript) on its profiles.`);
   console.log(`Share expires: ${fmtDay(share.expiresAt)}${share.expiresAt ? ` (renew: rech share renew ${share.label})` : ""}`);
 }
 
-export type ShareNewOptions = { name?: string; via?: string[]; webrtc?: string[]; lan?: boolean; tailscale?: boolean; signal?: string; expires?: string; inviteTtl?: string; devices?: number; approve?: boolean; reusable?: boolean; eval?: boolean };
+export type ShareNewOptions = { name?: string; via?: string[]; webrtc?: string[]; lan?: boolean; tailscale?: boolean; signal?: string; expires?: string; inviteTtl?: string; devices?: number; approve?: boolean; reusable?: boolean; eval?: boolean; debug?: boolean };
 
 /**
  * The transports named on the command line, in order: --via entries (comma-separated), then
@@ -4464,7 +4471,7 @@ async function shareNew(selectors: string[], opts: ShareNewOptions): Promise<voi
     label, profiles, via,
     expiresAt: expiresMs ? Date.now() + expiresMs : undefined,
     inviteTtlMs: parseDuration(opts.inviteTtl ?? (opts.reusable ? REUSABLE_DEFAULT_TTL : "24h")),
-    maxDevices: opts.devices ?? (opts.reusable ? REUSABLE_MAX_DEVICES : 1), approve: opts.approve, reusable: opts.reusable, eval: opts.eval,
+    maxDevices: opts.devices ?? (opts.reusable ? REUSABLE_MAX_DEVICES : 1), approve: opts.approve, reusable: opts.reusable, eval: opts.eval, debug: opts.debug,
   }));
   // The daemon answers WebRTC peers with node-datachannel: install it now, not on the first peer.
   if (rtc.length) await loadRTC().catch(error => console.error(`[rech] warning: ${error instanceof Error ? error.message : error}`));
@@ -4483,7 +4490,7 @@ async function shareList(): Promise<void> {
       const invite = s.reusable
         ? `reusable, ${s.redeemed ?? 0} redeemed, ${s.inviteExpiresAt && now >= s.inviteExpiresAt ? "expired" : `until ${s.inviteExpiresAt ? fmtDate(s.inviteExpiresAt) : "never"}`}`
         : "single-use";
-      rows.push([s.label, s.profiles.join(", "), s.via.join(", "), s.eval ? "eval" : "scoped", `${s.devices.length}/${s.maxDevices}`, fmtDay(s.expiresAt), invite, status]);
+      rows.push([s.label, s.profiles.join(", "), s.via.join(", "), s.debug ? "debug(!)" : s.eval ? "eval" : "scoped", `${s.devices.length}/${s.maxDevices}`, fmtDay(s.expiresAt), invite, status]);
     }
     printTable(rows);
     console.log(`\nDevices: rech share devices <share> · invite link again: rech share rotate <share> · stop: rech share revoke <share>\n`);
@@ -4940,6 +4947,7 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
       .option("devices", { type: "number", requiresArg: true, describe: "With new: how many devices may redeem the invite (default 1)" })
       .option("approve", { type: "boolean", describe: "With new: each new device waits for `rech share approve`" })
       .option("allow-eval", { type: "boolean", describe: "With new: this share's devices may run `eval` (page JavaScript) on its profiles, even if the listener itself doesn't allow eval" })
+      .option("dangerously-allow-debug", { type: "boolean", describe: "With new: DANGEROUS — this share's devices get full debug access on its profiles: run code on the host machine, raw CDP, every signed-in session in that profile (cookies, tokens), and reading/writing files. Anyone who holds the link can do all of that — treat the link like a password" })
       .option("rm", { type: "string", requiresArg: true, describe: "With devices: remove this device" })
       .option("listener", { type: "string", requiresArg: true, describe: "Listener to share through (default: the one that allows the profile)" })
       .option("local", { type: "boolean", describe: "Print the direct listener address even when a public URL is set" })
@@ -4950,7 +4958,7 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
         const [action, target, ...rest] = profiles;
         const webrtc = a.webrtc === undefined ? undefined : ([a.webrtc].flat() as string[]).map(String);
         const transport = { via: a.via as string[] | undefined, webrtc, lan: a.lan, tailscale: a.tailscale, signal: a.signal };
-        const newOpts = { name: a.name, ...transport, expires: a.expires, inviteTtl: a.inviteTtl, devices: a.devices, approve: a.approve, reusable: a.reusable, eval: a.allowEval };
+        const newOpts = { name: a.name, ...transport, expires: a.expires, inviteTtl: a.inviteTtl, devices: a.devices, approve: a.approve, reusable: a.reusable, eval: a.allowEval, debug: a.dangerouslyAllowDebug };
         if (action === "new") return handlers.shareNew(profiles.slice(1), newOpts);
         // Transport flags make a share (an invite link) for the named profiles.
         if (transportTokens(transport).length && !(action && SHARE_ACTIONS.has(action)) && !(profiles.length === 1 && ["ls", "list"].includes(profiles[0]))) {

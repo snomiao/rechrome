@@ -913,8 +913,11 @@ export async function serve() {
               body.env.PLAYWRIGHT_MCP_PROFILE_DIRECTORY = resolveAllowedProfile(body.env.PLAYWRIGHT_MCP_PROFILE_DIRECTORY, allowed, registry, chromeNames);
           }
           // eval is granted by the listener (every scoped listener on it) or per-share (just this
-          // share's approved devices, even when the listener itself does not allow eval).
-          scopedProfile = authorizeProfileRequest(listener, body, { eval: listener.eval === true || (cred?.kind === "device" && cred.share.eval === true) });
+          // share's approved devices, even when the listener itself does not allow eval). A
+          // --dangerously-allow-debug share's device gets full management power on the share's
+          // profiles (still pinned to them by authorizeProfileRequest's profile checks).
+          const full = cred?.kind === "device" && cred.share.debug === true;
+          scopedProfile = authorizeProfileRequest(listener, body, { eval: listener.eval === true || (cred?.kind === "device" && cred.share.eval === true), full });
           const entry = registry[scopedProfile];
           if (!entry?.token || !entry?.extensionId || !entry?.profileDir) throw new Error("Profile is not registered on this server");
           profileEnv = {

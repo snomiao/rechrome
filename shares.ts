@@ -36,6 +36,7 @@ export type Share = {
   devices: Device[];
   revokedAt?: number;
   eval?: boolean;            // this share's devices may run `eval` (page JS) on its profiles, even if the listener doesn't allow eval
+  debug?: boolean;           // DANGEROUS (--dangerously-allow-debug): this share's devices get full local-management power (run-code, raw CDP, CLI overrides, host access) on its profiles
 };
 export type ShareConfig = { version: 1; shares: Share[] };
 
@@ -48,7 +49,7 @@ export function validateShares(value: unknown): ShareConfig {
   for (const s of config.shares) {
     if (!s || typeof s.id !== "string" || !LABEL.test(s.label) || typeof s.invite !== "string" || !Array.isArray(s.profiles)
       || !Array.isArray(s.via) || !s.via.length || !Array.isArray(s.devices) || !Number.isInteger(s.maxDevices) || s.maxDevices < 1
-      || (s.eval !== undefined && typeof s.eval !== "boolean"))
+      || (s.eval !== undefined && typeof s.eval !== "boolean") || (s.debug !== undefined && typeof s.debug !== "boolean"))
       throw new Error(`shares.json: malformed share ${JSON.stringify(s?.label ?? s?.id ?? "?")}`);
     if (labels.has(s.label)) throw new Error(`shares.json: duplicate share name "${s.label}"`);
     labels.add(s.label);
@@ -116,7 +117,7 @@ export function findShare(config: ShareConfig, name: string): Share {
 
 export type NewShareOptions = {
   label: string; profiles: string[]; via: string[]; signal?: string;
-  expiresAt?: number; inviteTtlMs?: number; maxDevices?: number; approve?: boolean; reusable?: boolean; eval?: boolean; now?: number;
+  expiresAt?: number; inviteTtlMs?: number; maxDevices?: number; approve?: boolean; reusable?: boolean; eval?: boolean; debug?: boolean; now?: number;
 };
 
 /** Device cap of a reusable invite when --devices isn't given: bounds what a leaked link can enroll. */
@@ -149,6 +150,7 @@ export function createShare(config: ShareConfig, opts: NewShareOptions): Share {
   };
   if (opts.reusable) { share.reusable = true; share.redeemed = 0; }
   if (opts.eval) share.eval = true;
+  if (opts.debug) share.debug = true;
   config.shares.push(share);
   return share;
 }

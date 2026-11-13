@@ -188,6 +188,22 @@ test("a per-share eval grant allows eval without opening the listener, and nothi
   expect(() => authorizeProfileRequest(listener, { ...request(["eval", "() => 1"]), identity: { key: "/worktree", profile: "other" } }, { eval: true })).toThrow(/Profile is not allowed/);
 });
 
+test("a full (dangerously-allow-debug) grant lifts every command restriction but stays pinned to the profile", () => {
+  // caps.full models a --dangerously-allow-debug share: everything the management listener allows.
+  for (const args of [
+    ["run-code", "async page => require('fs').readFileSync('/etc/passwd')"],
+    ["cdp", "Emulation.setEmulatedMedia"], ["kill-all"],
+    ["eval", "() => 1"], ["upload", "/host/path/file.bin"],
+    ["open", "file:///etc/hosts"], ["screenshot", "--filename", "/anywhere.png"],
+    ["tab-list", "--session=other"],
+  ]) expect(authorizeProfileRequest(listener, request(args), { full: true })).toBe("qa");
+  // But it can never reach a profile it was not granted, and a mismatched override is still refused.
+  expect(() => authorizeProfileRequest(listener, { ...request(["run-code", "x"]), identity: { key: "/worktree", profile: "other" } }, { full: true })).toThrow(/Profile is not allowed/);
+  expect(() => authorizeProfileRequest(listener, { ...request(["run-code", "x"]), env: { PLAYWRIGHT_MCP_PROFILE_DIRECTORY: "other" } }, { full: true })).toThrow(/Profile override/);
+  // Malformed requests are still rejected before the lift.
+  expect(() => authorizeProfileRequest(listener, { args: ["run-code"], identity: { key: "/worktree" } } as any, { full: true })).toThrow();
+});
+
 test("eval grant must be a boolean", () => {
   for (const value of ["true", 1, null])
     expect(() => validateListeners({ version: 1, listeners: [{ ...listener, eval: value }] })).toThrow(/eval must be true or false/);
