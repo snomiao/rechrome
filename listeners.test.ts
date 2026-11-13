@@ -43,6 +43,22 @@ test("a dialog (alert, prompt, beforeunload) can be answered, or it blocks the t
   expect(authorizeProfileRequest(listener, request(["dialog-dismiss"]))).toBe("qa");
 });
 
+test("mouse input (move, down/up, wheel, drag) is as page-scoped as click/hover", () => {
+  for (const args of [
+    ["mousemove", "100", "200"],
+    ["mousedown"], ["mousedown", "left"], ["mousedown", "right"],
+    ["mouseup"], ["mouseup", "middle"],
+    ["mousewheel", "0", "100"],
+    ["drag", "e1", "e2"],
+    // negative wheel deltas (scroll up/left) and coordinates must not read as options
+    ["mousewheel", "0", "-100"], ["mousewheel", "-50", "0"], ["mousemove", "10", "-5"],
+    ["mousewheel", "0", "-12.5"],
+  ]) expect(authorizeProfileRequest(listener, request(args))).toBe("qa");
+  // real option overrides stay refused, even on the number-exempt commands
+  for (const args of [["mousewheel", "--dy=-100"], ["mousewheel", "0", "--evil"], ["mousemove", "--x=10"], ["drag", "e1", "--foo"]])
+    expect(() => authorizeProfileRequest(listener, request(args))).toThrow(/option overrides/);
+});
+
 test("file paths must belong to a permitted profile", () => {
   expect(canReadProfileFile(listener, profileOutputPrefix("qa") + "screenshot.png")).toBe(true);
   expect(canReadProfileFile(listener, profileOutputPrefix("personal") + "screenshot.png")).toBe(false);
