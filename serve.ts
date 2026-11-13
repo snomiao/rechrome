@@ -1253,6 +1253,8 @@ export async function serve() {
         const result = await receiveUpload({
           // The management key can already run any code, so uploads need no extra opt-in there.
           policy: listener.uploads === false ? undefined : listener.uploads ?? {}, payload: body.upload, args: filteredArgs,
+          // Chunks of one upload are staged per session, so one credential can't touch another's.
+          stagingKey: namespacedSession,
           audit: event => log(`upload: ${JSON.stringify({ listener: listener.name, profile: scopedProfile ?? body.identity?.profile ?? null, ...event })}`),
           run: async uploadArgs => {
             const child = Bun.spawn([bin, ...binArgs, ...uploadArgs, `-s=${namespacedSession}`], {

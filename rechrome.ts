@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { prepareUpload, UPLOAD_USAGE, MAX_UPLOAD_BYTES, MAX_UPLOAD_CEILING, resolveUploadTypes, type UploadPayload } from "./scoped-upload.ts";
+import { prepareUpload, chunkUploadPayloads, UPLOAD_USAGE, resolveUploadTypes, type UploadPayload } from "./scoped-upload.ts";
 import { readListeners, writeListeners as writeListenersFile, listenerAddress, isLoopback, normalizePrefix, serviceUrl, allowProfiles, denyProfiles, rotateListenerKey, setPublicUrl, canonicalProfileKeys, planProfileRemoval, parseIceUrl, iceLabel, rtcListeners, shareRtcListeners, defaultRtcListener, DEFAULT_RTC, DEFAULT_RTC_NOTE, LEGACY_RTC, type IceServer, type Listener, type ListenerConfig, type RtcListener } from "./listeners.ts";
 import { recordHoldMs } from "./record.ts";
 
@@ -2294,7 +2294,12 @@ async function run(url: string, args: string[], overrideEnv?: Record<string, str
       process.exit(2);
     }
   }
-  const served = await callServe(url, args, overrideEnv, identity, false, upload, secret);
+  // A large client file is sent in chunks so no single request body nears MAX_REQUEST_BYTES; the
+  // host stages them and the final chunk delivers. A small or --host upload is one request as before.
+  const uploadParts = upload ? chunkUploadPayloads(upload) : [undefined];
+  let served = await callServe(url, args, overrideEnv, identity, false, uploadParts[0], secret);
+  for (let i = 1; i < uploadParts.length && served.status === 0; i++)
+    served = await callServe(url, args, overrideEnv, identity, false, uploadParts[i], secret);
   // The daemon already masks the value; this is a second line of defence for an older daemon.
   // Then any secret-shaped string (API keys, tokens) in page text, unless RECH_REDACT=0.
   const scrub = (s: string) => {
@@ -3574,9 +3579,13 @@ async function setListener(name: string, opts: { publicUrl?: string; clearPublic
     if (listener.uploads === false) throw new Error(`Uploads are off on "${name}"; turn them on first: rech listener set ${name} --uploads`);
     const policy = listener.uploads ?? {};
     if (opts.uploadMaxMb !== undefined) {
-      const bytes = Math.round(opts.uploadMaxMb * 1024 * 1024);
-      if (!Number.isSafeInteger(bytes) || bytes < 1 || bytes > MAX_UPLOAD_CEILING) throw new Error(`--upload-max-mb must be between 1 and ${MAX_UPLOAD_CEILING / 1024 / 1024}`);
-      policy.maxBytes = bytes;
+      // 0 (or less) removes the cap — the default is no cap, bounded only by free disk on the host.
+      if (opts.uploadMaxMb <= 0) delete policy.maxBytes;
+      else {
+        const bytes = Math.round(opts.uploadMaxMb * 1024 * 1024);
+        if (!Number.isSafeInteger(bytes) || bytes < 1) throw new Error(`--upload-max-mb must be a positive number of MiB (or 0 to remove the cap)`);
+        policy.maxBytes = bytes;
+      }
     }
     if (opts.uploadTypes !== undefined) {
       const types = resolveUploadTypes(opts.uploadTypes);
@@ -3614,11 +3623,11 @@ async function setListener(name: string, opts: { publicUrl?: string; clearPublic
   }
   if (opts.uploadMaxMb !== undefined || opts.uploadTypes !== undefined) {
     const policy = listener.uploads || {};
-    const cap = (policy.maxBytes ?? MAX_UPLOAD_BYTES) / 1024 / 1024;
+    const cap = policy.maxBytes !== undefined ? `${policy.maxBytes / 1024 / 1024} MiB` : "no size cap (bounded by free disk)";
     const types = policy.contentTypes ? policy.contentTypes.join(", ") : "images only (default)";
-    console.log(`${name}: uploads accept ${types}, up to ${cap} MiB. A file over ~${Math.floor(14)} MiB must be staged on the host and sent with rech upload --host <path> (set --host-upload-dir first).`);
+    console.log(`${name}: uploads accept ${types}, ${cap}. A file larger than one request is sent in chunks automatically.`);
   }
-  if (opts.uploads !== undefined) console.log(opts.uploads ? `${name}: uploads on (rech upload <file>; images up to ${((listener.uploads || {}).maxBytes ?? MAX_UPLOAD_BYTES) / 1024 / 1024} MiB. Documents and a larger cap: --upload-types / --upload-max-mb)` : `${name}: uploads off`);
+  if (opts.uploads !== undefined) console.log(opts.uploads ? `${name}: uploads on (rech upload <file>; images only, no size cap by default — larger files are chunked. Documents and an optional cap: --upload-types / --upload-max-mb)` : `${name}: uploads off`);
 }
 
 const hideKey = (url: string) => url.replace(/([#&?]key=)[^&]*/, "$1…");
@@ -5036,9 +5045,9 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
         .option("keep-downloads", { type: "boolean", describe: "Off by default: browser downloads go to the client, then are deleted here. --keep-downloads also keeps them on this host" })
         .option("host-uploads", { type: "boolean", describe: "--no-host-uploads turns host-path uploads off again" })
         .option("upload-types", { type: "string", array: true, requiresArg: true, describe: "Which upload types this listener accepts (default images only). Pass images | documents | a mix of extensions/MIME types (xlsx csv application/pdf …); documents stay alongside images" })
-        .option("upload-max-mb", { type: "number", requiresArg: true, describe: "Raise the per-upload size cap in MiB (default 10, max 100). A file over one request is sent in chunks automatically" })
-        .check(a => a.publicUrl !== undefined || a.clearPublicUrl || a.uploads !== undefined || a.hostUploadDir?.length || a.hostUploads === false || a.uploadTypes?.length || a.uploadMaxMb !== undefined || a.readSecrets !== undefined || a.readCookies !== undefined || a.readHeaders !== undefined || a.keepDownloads !== undefined || a.eval !== undefined ? true : "Pass --public-url <url>, --clear-public-url, --uploads/--no-uploads, --host-upload-dir/--no-host-uploads, --upload-types, --upload-max-mb, --read-secrets/--read-cookies/--read-headers, --eval/--no-eval, or --keep-downloads"),
-        a => handlers.setListener(a.name, { publicUrl: a.publicUrl, clearPublicUrl: a.clearPublicUrl, ...(a.uploads !== undefined ? { uploads: a.uploads } : {}), ...(a.hostUploadDir?.length ? { hostUploadDirs: a.hostUploadDir as string[] } : {}), ...(a.hostUploads === false ? { noHostUploads: true } : {}), ...(a.uploadTypes?.length ? { uploadTypes: a.uploadTypes as string[] } : {}), ...(a.uploadMaxMb !== undefined ? { uploadMaxMb: a.uploadMaxMb } : {}), ...(a.readSecrets !== undefined ? { readSecrets: a.readSecrets } : {}), ...(a.readCookies !== undefined ? { readCookies: a.readCookies } : {}), ...(a.readHeaders !== undefined ? { readHeaders: a.readHeaders } : {}), ...(a.keepDownloads !== undefined ? { keepDownloads: a.keepDownloads } : {}), ...(a.eval !== undefined ? { evalCode: a.eval } : {}) }))
+        .option("upload-max-mb", { type: "number", requiresArg: true, describe: "Optional per-upload size cap in MiB for this listener (for links shared with outsiders). Default: no cap (bounded by host disk); 0 removes the cap. Large files stream in chunks regardless" })
+        .check(a => a.publicUrl !== undefined || a.clearPublicUrl || a.uploads !== undefined || (Array.isArray(a.hostUploadDir) && a.hostUploadDir.length) || a.hostUploads === false || (Array.isArray(a.uploadTypes) && a.uploadTypes.length) || a.uploadMaxMb !== undefined || a.readSecrets !== undefined || a.readCookies !== undefined || a.readHeaders !== undefined || a.keepDownloads !== undefined || a.eval !== undefined ? true : "Pass --public-url <url>, --clear-public-url, --uploads/--no-uploads, --host-upload-dir/--no-host-uploads, --upload-types, --upload-max-mb, --read-secrets/--read-cookies/--read-headers, --eval/--no-eval, or --keep-downloads"),
+        a => handlers.setListener(a.name, { publicUrl: a.publicUrl, clearPublicUrl: a.clearPublicUrl, ...(a.uploads !== undefined ? { uploads: a.uploads } : {}), ...((Array.isArray(a.hostUploadDir) && a.hostUploadDir.length) ? { hostUploadDirs: a.hostUploadDir as string[] } : {}), ...(a.hostUploads === false ? { noHostUploads: true } : {}), ...((Array.isArray(a.uploadTypes) && a.uploadTypes.length) ? { uploadTypes: a.uploadTypes as string[] } : {}), ...(a.uploadMaxMb !== undefined ? { uploadMaxMb: a.uploadMaxMb } : {}), ...(a.readSecrets !== undefined ? { readSecrets: a.readSecrets } : {}), ...(a.readCookies !== undefined ? { readCookies: a.readCookies } : {}), ...(a.readHeaders !== undefined ? { readHeaders: a.readHeaders } : {}), ...(a.keepDownloads !== undefined ? { keepDownloads: a.keepDownloads } : {}), ...(a.eval !== undefined ? { evalCode: a.eval } : {}) }))
       .command("port [name]", "Print a listener's port (for a proxy command)", y => y.positional("name", { type: "string" }),
         a => handlers.listenerPort(a.name))
       .command("rotate-key <name>", "Give a listener a new key (old URLs stop working)", y => y.positional("name", { type: "string", demandOption: true }),
