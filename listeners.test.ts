@@ -174,6 +174,20 @@ test("page eval is opt-in and preserves all scoped escape-route checks", () => {
   expect(() => authorizeProfileRequest({ ...enabled, uploads: false }, { ...request(["upload"]), upload: {} })).toThrow(/Uploads are off/);
 });
 
+test("a per-share eval grant allows eval without opening the listener, and nothing beyond eval", () => {
+  // caps.eval models a share whose devices are granted eval, on a listener that itself has no eval.
+  expect(authorizeProfileRequest(listener, request(["eval", "() => document.title"]), { eval: true })).toBe("qa");
+  expect(authorizeProfileRequest(listener, request(["eval", "element => element.textContent", "e1"]), { eval: true })).toBe("qa");
+  // Without the grant (default caps) the same non-eval listener still refuses eval.
+  expect(() => authorizeProfileRequest(listener, request(["eval", "() => 1"]))).toThrow(/Command is unavailable/);
+  // The grant is eval-only: it opens no host access, raw CDP or arbitrary code.
+  for (const args of [["run-code", "async page => {}"], ["cdp", "Emulation.setEmulatedMedia"], ["kill-all"], ["open", "file:///secret"]])
+    expect(() => authorizeProfileRequest(listener, request(args), { eval: true })).toThrow();
+  // Every scoped escape-route check still holds under the grant.
+  expect(() => authorizeProfileRequest(listener, request(["eval", "() => 1", "--filename=/tmp/x"]), { eval: true })).toThrow(/option overrides/);
+  expect(() => authorizeProfileRequest(listener, { ...request(["eval", "() => 1"]), identity: { key: "/worktree", profile: "other" } }, { eval: true })).toThrow(/Profile is not allowed/);
+});
+
 test("eval grant must be a boolean", () => {
   for (const value of ["true", 1, null])
     expect(() => validateListeners({ version: 1, listeners: [{ ...listener, eval: value }] })).toThrow(/eval must be true or false/);
