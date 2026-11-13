@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test';
 import { stat, readFile } from 'node:fs/promises';
 import { dirname, basename, join } from 'node:path';
 import { createHash } from 'node:crypto';
-import { prepareUpload, prepareStdinUpload, uploadScript, receiveUpload, readHostFile, validateUploadPolicy, currentPageOrigin, readRequestJson, MAX_UPLOAD_BYTES, MAX_REQUEST_BYTES, type UploadAudit } from './scoped-upload.ts';
+import { prepareUpload, prepareStdinUpload, chunkUploadPayloads, uploadScript, receiveUpload, readHostFile, validateUploadPolicy, resolveUploadTypes, currentPageOrigin, readRequestJson, MAX_UPLOAD_BYTES, MAX_REQUEST_BYTES, CHUNK_RAW_BYTES, DROP_PASTE_MAX_BYTES, UPLOAD_TYPES, type UploadAudit, type UploadPayload } from './scoped-upload.ts';
 import { authorizeProfileRequest, type Listener } from './listeners.ts';
 const svg = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><path d="M0 0"/></svg>');
 const payload = { name: 'app.svg', contentType: 'image/svg+xml', data: svg.toString('base64') };
@@ -16,7 +16,11 @@ test('stdin client accepts metadata, never a caller path', async () => {
   for (const args of [['upload', '/etc/passwd'], ['upload', '--name', '../app.svg'], ['upload', '--name', 'app.svg', '--name', 'again.svg'], ['upload', '--name', 'app.svg', '--filename=/etc/passwd']])
     await expect(prepareStdinUpload(args, input())).rejects.toThrow();
   await expect(prepareStdinUpload(['upload', '--name', 'app.png'], input())).rejects.toThrow('are not image/png');
-  await expect(prepareStdinUpload(['upload', '--name', 'app.svg'], input(Buffer.alloc(MAX_UPLOAD_BYTES + 1)))).rejects.toThrow('10 MiB');
+  // No client-side size cap any more: a file above the old 10 MiB limit still builds a payload (it is
+  // chunked at send time and bounded on the host by free disk / the listener's optional maxBytes).
+  const big = Buffer.alloc(MAX_UPLOAD_BYTES + 4096, 0x61); // valid text, over the old cap
+  const r = await prepareStdinUpload(['upload', '--name', 'big.txt'], input(big));
+  expect(Buffer.from(r.upload.data!, 'base64').length).toBe(big.length);
 });
 
 test('a file path is read on the client: only its bytes, name and delivery mode are sent', async () => {
@@ -55,8 +59,25 @@ test('uploads default on, false turns them off; uploads never enable eval or hos
   for (const l of [listener, enabled]) for (const args of [['eval', '() => 1'], ['upload', '/etc/passwd'], ['upload', '../secret'], ['upload', '--filename=/etc/passwd'], ['upload', '--config=evil']])
     expect(() => authorizeProfileRequest(l, body(args))).toThrow();
   expect(() => authorizeProfileRequest(enabled, body(['upload'], null))).toThrow();
-  for (const p of [true, null, { directory: '/tmp' }, { maxBytes: 0 }, { maxBytes: MAX_UPLOAD_BYTES + 1 }, { contentTypes: ['text/html'] }])
+  for (const p of [true, null, { directory: '/tmp' }, { maxBytes: 0 }, { maxBytes: -5 }, { maxBytes: 1.5 }, { contentTypes: ['text/html'] }])
     expect(() => validateUploadPolicy(p)).toThrow();
+  // maxBytes is an optional opt-in cap with no fixed ceiling (any positive byte count); document
+  // types opt in too; images stay valid. The default (no maxBytes) means no size cap.
+  for (const p of [{}, { maxBytes: MAX_UPLOAD_BYTES + 1 }, { maxBytes: 5 * 1024 * 1024 * 1024 }, { contentTypes: ['text/csv', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'] }])
+    expect(() => validateUploadPolicy(p)).not.toThrow();
+});
+
+test('resolveUploadTypes: images resets to default, documents/mix keep images alongside', () => {
+  expect(resolveUploadTypes(['images'])).toBeUndefined();
+  expect(resolveUploadTypes(['documents'])).toContain('text/csv');
+  expect(resolveUploadTypes(['documents'])).toContain('image/png');
+  const mix = resolveUploadTypes(['xlsx', 'csv'])!;
+  expect(mix).toContain('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  expect(mix).toContain('text/csv');
+  for (const img of UPLOAD_TYPES) expect(mix).toContain(img); // images never dropped
+  expect(resolveUploadTypes(['application/pdf'])).toContain('application/pdf');
+  expect(() => resolveUploadTypes([])).toThrow();
+  expect(() => resolveUploadTypes(['nonsense'])).toThrow('Unknown upload type');
 });
 
 for (const failure of [false, true]) test(`private byte staging, origin audit and cleanup (${failure ? 'timeout/error' : 'success'})`, async () => {
@@ -132,6 +153,29 @@ test('untrusted payloads cannot become host paths, types, or unbounded allocatio
   }
 });
 
+test('document uploads: allowed only when the listener opts in, and the bytes must match the type', async () => {
+  const xlsx = Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), Buffer.alloc(40)]); // ZIP container
+  const csv = Buffer.from('a,b,c\n1,2,3\n');
+  const xlsxType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+  const xlsxPayload = { name: 'data.xlsx', contentType: xlsxType, data: xlsx.toString('base64') };
+  const csvPayload = { name: 'data.csv', contentType: 'text/csv', data: csv.toString('base64') };
+  const run = async (args: string[]) => args[0] === 'tab-list' ? tabs : { status: 0, stdout: `uploaded ${args[1]}`, stderr: '' };
+  // Default policy ({}) is images only → a document is refused before any command runs.
+  for (const p of [xlsxPayload, csvPayload]) {
+    let ran = false;
+    expect((await receiveUpload({ policy: {}, payload: p, args: ['upload'], audit: () => {}, run: async () => { ran = true; return tabs; } })).status).toBe(1);
+    expect(ran).toBe(false);
+  }
+  // Opted in → accepted, staged under the original name, the larger cap honoured.
+  const big = { maxBytes: 50 * 1024 * 1024, contentTypes: [...UPLOAD_TYPES, xlsxType, 'text/csv'] };
+  expect((await receiveUpload({ policy: big, payload: xlsxPayload, args: ['upload'], audit: () => {}, run })).status).toBe(0);
+  expect((await receiveUpload({ policy: big, payload: csvPayload, args: ['upload'], audit: () => {}, run })).status).toBe(0);
+  // Type is opted in but the bytes lie (xlsx claimed over non-ZIP bytes) → refused.
+  expect((await receiveUpload({ policy: big, payload: { ...xlsxPayload, data: csv.toString('base64') }, args: ['upload'], audit: () => {}, run: async () => { throw Error('must not run'); } })).status).toBe(1);
+  // A NUL byte disqualifies a text/csv upload.
+  expect((await receiveUpload({ policy: big, payload: { ...csvPayload, data: Buffer.from('a,b\0c').toString('base64') }, args: ['upload'], audit: () => {}, run: async () => { throw Error('must not run'); } })).status).toBe(1);
+});
+
 test('origin requires exactly one selected HTTP(S) tab; credentials/query never enter audit', () => {
   expect(currentPageOrigin('- 0: (current) [x](https://user:secret@example.com:444/path?q=secret#hash)')).toBe('https://example.com:444');
   for (const text of ['No tabs', '- 0: (current) [x](file:///secret)', tabs.stdout + '\n' + tabs.stdout]) expect(() => currentPageOrigin(text)).toThrow();
@@ -198,4 +242,67 @@ test('the client sends only the host path for --host, never bytes', async () => 
   const { upload } = await prepareUpload(['upload', '--host', '/srv/shots/a.png'], null, () => Promise.reject(new Error('must not read locally')));
   expect(upload).toEqual({ name: 'a.png', contentType: 'image/png', hostPath: '/srv/shots/a.png' });
   await expect(prepareUpload(['upload', 'local.png', '--host', '/srv/a.png'], null)).rejects.toThrow();
+});
+
+test('chunkUploadPayloads: small stays single, large splits with one shared id, host untouched', () => {
+  const small: UploadPayload = { name: 'a.txt', contentType: 'text/plain', data: Buffer.from('hi').toString('base64') };
+  expect(chunkUploadPayloads(small)).toEqual([small]);          // below the single-request threshold
+  const host: UploadPayload = { name: 'h.txt', contentType: 'text/plain', hostPath: '/srv/h.txt' };
+  expect(chunkUploadPayloads(host)).toEqual([host]);            // --host sends no bytes to chunk
+  const data = Buffer.from('0123456789abcdefghij');             // 20 bytes
+  const parts = chunkUploadPayloads({ name: 'b.txt', contentType: 'text/plain', data: data.toString('base64') }, 8);
+  expect(parts.length).toBe(3);                                 // 8 + 8 + 4
+  expect(parts.every((p, i) => p.chunk?.id === parts[0].chunk!.id && p.chunk?.seq === i && p.chunk?.total === 3)).toBe(true);
+  expect(Buffer.concat(parts.map(p => Buffer.from(p.data!, 'base64')))).toEqual(data);  // reassembles exactly
+});
+
+test('chunked upload stages ordered chunks and delivers once on the final chunk', async () => {
+  const csv = Buffer.from('col1,col2\n' + Array.from({ length: 6 }, (_, i) => `${i},${i * 2}`).join('\n') + '\n');
+  const parts = chunkUploadPayloads({ name: 'big.csv', contentType: 'text/csv', data: csv.toString('base64') }, 8);
+  expect(parts.length).toBeGreaterThan(1);
+  const policy = { contentTypes: [...UPLOAD_TYPES, 'text/csv'] };
+  const calls: string[][] = [];
+  const audits: UploadAudit[] = [];
+  const run = async (args: string[]) => { calls.push(args); return args[0] === 'tab-list' ? tabs : { status: 0, stdout: `uploaded ${args[1]}`, stderr: '' }; };
+  let final: any;
+  for (let i = 0; i < parts.length; i++) {
+    final = await receiveUpload({ policy, payload: parts[i], args: ['upload'], stagingKey: 'sess1', audit: a => audits.push(a), run });
+    if (i < parts.length - 1) { expect(final.status).toBe(0); expect(final.stdout).toContain('staged chunk'); }
+  }
+  expect(final.status).toBe(0);
+  expect(calls.some(c => c[0] === 'tab-list')).toBe(true);      // delivery ran only at the end
+  expect(audits).toHaveLength(1);                               // one audit for the whole upload
+  expect(audits[0].size).toBe(csv.length);
+  expect(audits[0].result).toBe('completed');
+});
+
+test('chunked upload rejects out-of-order, unknown, mutated, or bad-id chunks', async () => {
+  const data = Buffer.from('hello world, a small payload for chunk tests!!');
+  const parts = chunkUploadPayloads({ name: 'x.txt', contentType: 'text/plain', data: data.toString('base64') }, 8);
+  const policy = { contentTypes: [...UPLOAD_TYPES, 'text/plain'] };
+  const run = async () => { throw new Error('must not run'); };          // no delivery on any of these
+  const recv = (payload: any, key = 'k') => receiveUpload({ policy, payload, args: ['upload'], stagingKey: key, audit: () => {}, run });
+  expect((await recv(parts[1])).status).toBe(1);                         // seq>0 with no seq 0 → unknown
+  expect((await recv(parts[0])).status).toBe(0);                         // start
+  expect((await recv(parts[2])).status).toBe(1);                         // skipped seq 1 → out of order (drops staging)
+  expect((await recv(parts[1])).status).toBe(1);                         // staging gone → unknown
+  expect((await recv(parts[0], 'k2')).status).toBe(0);                   // fresh session
+  expect((await recv({ ...parts[1], name: 'other.txt' }, 'k2')).status).toBe(1);  // metadata changed mid-stream
+  expect((await recv({ ...parts[0], chunk: { id: 'has space!', seq: 0, total: parts.length } }, 'k3')).status).toBe(1);  // bad id
+});
+
+test('no size cap for into/auto; drop/paste are bounded with a clear message', async () => {
+  // A file over the drop/paste practical limit (so also over any old fixed cap).
+  const big = Buffer.alloc(DROP_PASTE_MAX_BYTES + 1, 0x61); // 'a' bytes: valid text, no NUL
+  const data = big.toString('base64');
+  const policy = { contentTypes: [...UPLOAD_TYPES, 'text/plain'] }; // no maxBytes → no size cap
+  const run = async (args: string[]) => args[0] === 'tab-list' ? tabs : { status: 0, stdout: `uploaded ${args[1]}`, stderr: '' };
+  // into: Chrome gets the host path (setInputFiles), so a huge file is accepted.
+  const into = await receiveUpload({ policy, payload: { name: 'big.txt', contentType: 'text/plain', data, mode: 'into', target: 'e1' }, args: ['upload'], audit: () => {}, run });
+  expect(into.status).toBe(0);
+  // drop: must embed base64 through the page, so it is refused with a clear, actionable message.
+  const dropped = await receiveUpload({ policy, payload: { name: 'big.txt', contentType: 'text/plain', data, mode: 'drop', target: '.zone' }, args: ['upload'], audit: () => {}, run });
+  expect(dropped.status).toBe(1);
+  expect(dropped.stderr).toMatch(/too large for --drop/);
+  expect(dropped.stderr).toMatch(/--into/);
 });
