@@ -14,7 +14,7 @@ Obtain authorization for the target profile, extension and task. Existing task a
 ## Preflight and locking
 
 - Windows SSH gives a non-interactive session, often session 0. It is suitable for diagnostics and CLI calls, not launching GUI automation directly. winrpc must already run on the interactive desktop; use `POST /ahk-eval?gui=1` through the executor.
-- Read the installed winrpc README and implementation when its behavior is uncertain. The observed installation was `C:\tmp\winrpc`; the source is [symval/winrpc](https://github.com/symval/winrpc).
+- Read the installed package's README and source when behavior is uncertain.
 - Check `GET /health` and `GET /lock`. Normal `/ahk-eval` requests acquire the cross-process `C:\tmp\im-ui.lock` automatically. The AHK lock was observed to be held per request; keep scripts short. The README's 60-second timeout applies to `/shell`, not a documented AHK lock TTL. Never force-unlock or use `readonly=1` to bypass locking for UI actions.
 - The observed API has no acquire/hold endpoint across requests. Use per-action locks, passive screenshots between actions, and coordinator-confirmed exclusive desktop access. If someone requires a continuous lock, explain this limitation before proceeding. Do not silently claim the lock is held between calls. Passive screenshots do not acquire it.
 - Take a screenshot **before** any action. After each small action, capture another screenshot and inspect it before sending the next action. Send scripts as exact UTF-8 files: semicolons in AHK start comments, so do not flatten scripts into semicolon-separated chat prose.
