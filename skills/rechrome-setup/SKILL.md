@@ -18,7 +18,7 @@ Use this workflow when the user requests rechrome setup for an existing Chrome p
 
 ## Start and retain the setup process
 
-Run `rech setup --profile "<selector>"` in a retained terminal session, preferably with a TTY. A bare positional selector such as `rech setup work-2` is not supported by the current CLI.
+Run `rech setup --profile "<selector>"` in a retained terminal session, preferably with a TTY. A bare positional selector such as `rech setup work-2` is not supported by the current CLI. To set up a profile that doesn't exist yet, add `--new-profile` (or `--yes`): setup creates it in the running Chrome without restarting it.
 
 - The listen choice applies to the selected profile. Local is the default and removes that profile from remote allowlists; choose LAN or Tailscale when requested. Other profiles keep their exposure. The menu shows Tailscale only when detected. Use `rech listener ls` and `rech profile ls` to review configured bindings. Listener changes reload in one daemon without restarting Chrome; first migration may restart only the daemon.
 - Keep the terminal session handle and poll it while working in Chrome. Non-TTY mode also works, but input is read until EOF before setup starts: provide all prompt answers and close stdin. EOF does not stop the guide server.
