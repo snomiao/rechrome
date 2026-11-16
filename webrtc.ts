@@ -83,6 +83,52 @@ export async function hostIceServers(log: Log, env = process.env, extra: IceServ
   }
 }
 
+// Signal servers may publish discovery at their base URL (GET, Accept: application/json):
+// {"signaling": "wss://…", "ice": "https://…/ice", "version": 1}. `ice` hands a live room's host short-lived TURN
+// credentials (POST {room, auth}), so shares work through strict NAT with no setup on either side.
+export type SignalDiscovery = { signaling?: string; ice?: string; version?: number };
+const discoveryCache = new Map<string, Promise<SignalDiscovery>>();
+export function discoverSignal(signal: string): Promise<SignalDiscovery> {
+  let p = discoveryCache.get(signal);
+  if (!p) {
+    const u = new URL(signal); if (u.protocol === "wss:") u.protocol = "https:"; if (u.protocol === "ws:") u.protocol = "http:";
+    p = fetch(u, { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(5000) })
+      .then(r => r.ok && (r.headers.get("content-type") ?? "").includes("json") ? r.json() as Promise<SignalDiscovery> : {}, () => ({}))
+      .then(d => (d && typeof d === "object" ? d : {}), () => ({}));
+    discoveryCache.set(signal, p);
+    // A failed lookup is retried later (a signal server that was down).
+    void p.then(d => { if (!d.ice && !d.signaling) setTimeout(() => discoveryCache.delete(signal), 5 * 60_000).unref?.(); });
+  }
+  return p;
+}
+
+const signalTurnCache = new Map<string, { servers: IceServer[]; exp: number }>();
+/** TURN credentials from the signal server's `ice` endpoint for this room's host; [] when it has none. */
+export async function signalIceServers(signal: string, token: string, log: Log): Promise<IceServer[]> {
+  const key = `${signal}\0${roomOf(token)}`;
+  const hit = signalTurnCache.get(key);
+  if (hit && hit.exp > Date.now()) return hit.servers;
+  const { ice } = await discoverSignal(signal);
+  if (!ice) return [];
+  try {
+    const r = await fetch(ice, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ room: roomOf(token), auth: roomAuthOf(token) }), signal: AbortSignal.timeout(5000),
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const body = await r.json() as { iceServers: IceServer | IceServer[]; ttl?: number };
+    const servers = [body.iceServers].flat().filter(Boolean);
+    signalTurnCache.set(key, { servers, exp: Date.now() + Math.max(60, (body.ttl ?? 3600) - 600) * 1000 });
+    return servers;
+  } catch (error) {
+    log(`TURN credentials from the signal server unavailable, using STUN only: ${error}`);
+    return [];
+  }
+}
+
+/** RECH_ICE_POLICY=relay forces TURN-only connections (testing that TURN works). */
+export const iceTransportPolicy = (env = process.env): "relay" | "all" => env.RECH_ICE_POLICY === "relay" ? "relay" : "all";
+
 // ---- host ------------------------------------------------------------------------------
 // listener: the WebRTC listener this room belongs to (a share's `via` entry); ice: its STUN/TURN.
 export type HostCredential = { token: string; signal: string; label: string; listener?: string; ice?: IceServer[] };
@@ -171,8 +217,11 @@ export class WebrtcHost {
 
   private async startPeer(room: any, peerId: string): Promise<void> {
     const { RTCPeerConnection } = await loadRTC(this.log);
-    const ice = await hostIceServers(this.log, process.env, room.cred.ice ?? []);
-    const pc = new RTCPeerConnection({ iceServers: ice });
+    let ice = await hostIceServers(this.log, process.env, room.cred.ice ?? []);
+    // No TURN of our own (CF_TURN_* / RECH_ICE_SERVERS / the listener's): ask the signal server for some.
+    if (!process.env.RECH_ICE_SERVERS && !ice.some(s => [s.urls].flat().some(u => /^turns?:/.test(u))))
+      ice = [...ice, ...await signalIceServers(room.cred.signal, room.cred.token, this.log)];
+    const pc = new RTCPeerConnection({ iceServers: ice, iceTransportPolicy: iceTransportPolicy() });
     let keysReady!: (th: Uint8Array) => void;
     const keys = new Promise<Uint8Array>(r => (keysReady = r));
     const peer: any = { pc, keysReady };
@@ -253,7 +302,7 @@ export class WebrtcClient {
           if (m.type === "welcome" && m.hostPresent === false) fail("nobody is answering this link: the host's rech daemon may be down, or the link was revoked. Ask the host to check, or for a fresh link");
           else if (m.type === "host-leave" && !this.connected) fail("the host left before the connection finished");
           else if (m.type === "offer" && typeof m.sdp === "string" && !this.pc) {
-            const pc = new RTCPeerConnection({ iceServers: Array.isArray(m.ice) ? m.ice : iceServersFromEnv() });
+            const pc = new RTCPeerConnection({ iceServers: Array.isArray(m.ice) ? m.ice : iceServersFromEnv(), iceTransportPolicy: iceTransportPolicy() });
             this.pc = pc;
             pc.onicecandidate = (e: any) => { if (e.candidate) sock!.send({ type: "candidate", candidate: { candidate: e.candidate.candidate, sdpMid: e.candidate.sdpMid } }); };
             pc.onconnectionstatechange = () => { if (["failed", "closed"].includes(pc.connectionState)) this.close(); };
