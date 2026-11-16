@@ -35,6 +35,7 @@ export type Share = {
   redeemed?: number;         // how many times the invite was redeemed (devices removed since still count)
   devices: Device[];
   revokedAt?: number;
+  eval?: boolean;            // this share's devices may run `eval` (page JS) on its profiles, even if the listener doesn't allow eval
 };
 export type ShareConfig = { version: 1; shares: Share[] };
 
@@ -46,7 +47,8 @@ export function validateShares(value: unknown): ShareConfig {
   const labels = new Set<string>();
   for (const s of config.shares) {
     if (!s || typeof s.id !== "string" || !LABEL.test(s.label) || typeof s.invite !== "string" || !Array.isArray(s.profiles)
-      || !Array.isArray(s.via) || !s.via.length || !Array.isArray(s.devices) || !Number.isInteger(s.maxDevices) || s.maxDevices < 1)
+      || !Array.isArray(s.via) || !s.via.length || !Array.isArray(s.devices) || !Number.isInteger(s.maxDevices) || s.maxDevices < 1
+      || (s.eval !== undefined && typeof s.eval !== "boolean"))
       throw new Error(`shares.json: malformed share ${JSON.stringify(s?.label ?? s?.id ?? "?")}`);
     if (labels.has(s.label)) throw new Error(`shares.json: duplicate share name "${s.label}"`);
     labels.add(s.label);
@@ -114,7 +116,7 @@ export function findShare(config: ShareConfig, name: string): Share {
 
 export type NewShareOptions = {
   label: string; profiles: string[]; via: string[]; signal?: string;
-  expiresAt?: number; inviteTtlMs?: number; maxDevices?: number; approve?: boolean; reusable?: boolean; now?: number;
+  expiresAt?: number; inviteTtlMs?: number; maxDevices?: number; approve?: boolean; reusable?: boolean; eval?: boolean; now?: number;
 };
 
 /** Device cap of a reusable invite when --devices isn't given: bounds what a leaked link can enroll. */
@@ -146,6 +148,7 @@ export function createShare(config: ShareConfig, opts: NewShareOptions): Share {
     devices: [],
   };
   if (opts.reusable) { share.reusable = true; share.redeemed = 0; }
+  if (opts.eval) share.eval = true;
   config.shares.push(share);
   return share;
 }
