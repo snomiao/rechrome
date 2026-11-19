@@ -453,6 +453,65 @@ The frames are screenshots, so the rate tops out around 10 fps (`--fps`, default
 host encodes them with ffmpeg into mp4 or webm (`--format`). Without ffmpeg it saves raw
 MJPEG and says so.
 
+### Virtual microphone and silent audio capture
+
+`rech audio` supplies a page with a virtual microphone and saves its newly
+connected audio output locally. Install it **before** starting the page's call.
+It is available only through a trusted management connection; scoped and shared
+listeners remain denied, even when page `eval` is enabled. Audio commands never
+upgrade a restricted connection to management access.
+
+```bash
+rech open about:blank
+rech audio install https://aistudio.google.com/live
+# Select the service's project/key and start its call in the page when ready.
+rech audio capture start
+rech audio feed ./fixture.wav
+rech audio drain --dir ./captured-audio
+rech audio stop --dir ./captured-audio
+```
+
+Use the same worktree, profile, session and output directory throughout. A named
+`--isolate=audio-test` works; bare `--isolate` creates a different session on
+every command and is refused for this workflow. `install` navigates the selected
+tab and pins its origin and bridge generation. Navigation or a new installation
+cannot silently redirect a later feed. `install --capture` also starts capture.
+
+Input is a regular PCM WAV file: 16-bit integer or 32-bit float, mono/stereo,
+8–96 kHz, at most 2 MiB and 30 seconds. Queued input is bounded to 30 seconds.
+The virtual stream never falls back to the physical microphone. Newly connected
+Web Audio output and explicitly played HTML audio are routed to silent capture
+sinks. Already-connected graphs and parser-native autoplay cannot be claimed as
+fully covered; `status` reports these limits. Protected/EME media is refused.
+
+Capture is explicit, lasts at most 60 seconds (`--max-seconds` can lower it),
+and buffers at most 2 MiB. Drain regularly. `stop` waits for final recorder
+events, saves remaining fragments, and leaves the microphone/output guards
+closed. To start again, stop and drain first, then install a new generation.
+This is a bounded diagnostic bridge, not an indefinite call recorder.
+
+WAV bytes travel in the request body and on the local session socket, not in
+command arguments or daemon logs. Capture bytes return in a separate response
+field; the CLI prints only status and local paths. Each bridge has a private
+output folder containing ordered `s-N.webm` files and a manifest. Fragments of
+one stream are concatenated, not presented as independently decodable clips.
+Saving is retryable: the daemon retains a drained batch until a durable local
+write is acknowledged. Keep the same `--dir` when retrying. Files are created
+with mode 0600 on platforms supporting POSIX permissions.
+
+Both the CLI and daemon need this version. Updating the daemon requires its
+normal service reload; it does not require restarting Chrome or reloading the
+extension. The bridge does not create API keys, change service billing, or
+start a paid model call automatically.
+
+The isolated browser check uses only generated tones and muted throwaway Chrome:
+
+```bash
+RECH_AUDIO_PLAYWRIGHT=/path/to/playwright-core/index.mjs \
+RECH_AUDIO_CHROME=/path/to/chromium \
+RECH_AUDIO_SMOKE_HTML=1 bun scripts/audio-bridge-smoke.ts
+```
+
 ### Uploading files
 
 `rech upload <file>` puts a local image into the page: a file picker, an

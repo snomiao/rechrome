@@ -12,7 +12,7 @@ test("multiple sockets enforce profile/file policies and reload without browser 
   a.stop(true); b.stop(true);
   await mkdir(join(root, ".rechrome"));
   await mkdir(join(root, "secret-rules"));
-  for (const name of ["rechrome.ts", "serve.ts", "listeners.ts", "extension-token.ts", "daemon-manager.ts", "fill-secret.ts", "record.ts", "scoped-upload.ts", "shares.ts", "secret.ts", "token.ts", "rtc-channel.ts", "e2e.ts", "webrtc.ts", "signal-relay.ts", "redact.ts", "secret-rules/gitleaks.toml"])
+  for (const name of ["rechrome.ts", "serve.ts", "audio-bridge.ts", "audio-bridge-browser.ts", "audio-bridge-server.ts", "audio-bridge-client.ts", "audio-bridge-files.ts", "listeners.ts", "extension-token.ts", "daemon-manager.ts", "fill-secret.ts", "record.ts", "scoped-upload.ts", "shares.ts", "secret.ts", "token.ts", "rtc-channel.ts", "e2e.ts", "webrtc.ts", "signal-relay.ts", "redact.ts", "secret-rules/gitleaks.toml"])
     await copyFile(join(import.meta.dir, name), join(root, name));
   // The copied sources import packages (e.g. yargs); resolve them from the repo's node_modules.
   await symlink(join(import.meta.dir, "node_modules"), join(root, "node_modules"), "junction");
@@ -72,6 +72,7 @@ test("multiple sockets enforce profile/file policies and reload without browser 
     expect((await get({ ...qa, key: personal.key })).status).toBe(401);
     expect((await run(qa, "personal", ["tab-list"])).status).toBe(403);
     expect((await run(qa, "qa", ["run-code", "async page => {}"])).status).toBe(403);
+    expect((await run(qa, "qa", ["audio", "install", "https://example.test/live"])).status).toBe(403);
     const result = await (await run(qa, "qa", ["tab-list"], { PLAYWRIGHT_MCP_USER_DATA_DIR: "/personal", PLAYWRIGHT_MCP_EXTENSION_TOKEN: "attacker" })).json();
     expect(result.stdout).toContain("Profile: QA");
     const svg = '<svg xmlns="http://www.w3.org/2000/svg"><path d="M0 0"/></svg>';
@@ -91,7 +92,7 @@ test("multiple sockets enforce profile/file policies and reload without browser 
     expect(await configureEval("--eval")).toContain("page eval on");
     await waitFor(async () => (await run(qa, "qa", ["eval", "() => 1"])).ok);
     expect((await (await run(qa, "qa", ["eval", "() => 1"])).json()).stdout).toContain("Profile: QA");
-    for (const args of [["run-code", "async page => {}"], ["kill-all"], ["cdp", "Browser.close"],
+    for (const args of [["run-code", "async page => {}"], ["audio", "status"], ["audio", "feed"], ["kill-all"], ["cdp", "Browser.close"],
       ["open", "--profile", "/other"], ["open", "file:///review-only"], ["eval", "() => 1", "--filename=/tmp/review-only"]])
       expect((await run(qa, "qa", args)).status).toBe(403);
     expect((await run(qa, "personal", ["eval", "() => 1"])).status).toBe(403);
