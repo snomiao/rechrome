@@ -1,4 +1,5 @@
 import { receiveUpload, readRequestJson } from "./scoped-upload.ts";
+import { createAudioHandler } from "./audio-bridge-server.ts";
 import { readListeners, listenerAddress, authorizeProfileRequest, canReadProfileFile, profileOutputPrefix, normalizePrefix, resolveAllowedProfile, shareRtcListeners, rtcListeners, type Listener } from "./listeners.ts";
 import { WEBRTC, authorizeCredential, credentialForBearer, inviteState, readShares, redeemInvite, shareProblem, shareSessions, updateShares, webrtcCredentials, type Credential, type ShareConfig } from "./shares.ts";
 import { bearerOf, safeEqual } from "./secret.ts";
@@ -112,6 +113,7 @@ export const RUN_IDLE_SECONDS = 70 + RECORD_MAX_SECONDS + 20;
 // collected) per namespaced session. serve owns the capture loop; see record.ts.
 type RecordingEntry = { rec: Recording; dir: string; outputPrefix: string; listener: string; keep: boolean; done?: RecordingSummary; expire?: ReturnType<typeof setTimeout> };
 const recordings = new Map<string, RecordingEntry>();
+const audioHandler = createAudioHandler();
 
 /** Rename a finished recording to its final name and hand it to the client like a download. */
 function deliverRecording(entry: RecordingEntry, s: RecordingSummary, filename: string | undefined): { stdout: string; files: string[] } {
@@ -1003,6 +1005,15 @@ export async function serve() {
         filteredArgs.push("--help");
       }
 
+      if (filteredArgs[0] === "audio") {
+        // Auth/profile/session resolution above is shared with every command.
+        // Scoped listeners reject audio before here. Never log input paths,
+        // page URLs, WAV bytes, generated code, or captured output.
+        log(`run: rech audio (session=${namespacedSession})`);
+        const reply = await audioHandler({ args: filteredArgs, upload: Array.isArray(body) ? undefined : body.upload, socketRoot: tmpSocketRoot(), session: namespacedSession, cwd: runWorkDir });
+        log(`exit: ${reply.status} | audio`);
+        return Response.json(reply);
+      }
       log(`run: rech ${filteredArgs.join(" ")} (session=${namespacedSession})`);
 
       // fill-secret: the value arrives in body.secret, never in args; it is handed to the live

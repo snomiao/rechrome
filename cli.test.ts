@@ -4,8 +4,18 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { formatToken, newToken } from "./secret.ts";
 import { rechCli, shareLinkParts, listenerNextSteps, unknownCommandHint, notConnectedMessage, chooseShareListener, matchProfileLoosely, preferManagementListener, promptChoice, type RechHandlers } from "./rechrome.ts";
-import { applyIsolateArg, pickSessionName, rechSeparatorIndex as rechSep } from "./rechrome.ts";
+import { applyIsolateArg, pickSessionName, rechSeparatorIndex as rechSep, isAudioInvocation, transportUrl } from "./rechrome.ts";
 import { isIsoSession } from "./serve.ts";
+
+test("audio preserves explicit scoped transports and recognizes leading profile/session flags", async () => {
+  expect(isAudioInvocation(["audio","status"])).toBe(true);
+  expect(isAudioInvocation(["--profile","qa","--isolate=media","audio","status"])).toBe(true);
+  expect(isAudioInvocation(["-s=media","audio","drain","--dir","./output"])).toBe(true);
+  expect(isAudioInvocation(["--profile","audio","open","https://example.test"])).toBe(false);
+  expect(isAudioInvocation(["pw","audio","status"])).toBe(false);
+  const link="http://fixture-scoped-key@127.0.0.1:12345/";
+  expect(await transportUrl(link,{preserveListener:true})).toBe(link);
+});
 
 async function run(argv: string[]) {
   const calls: [string, ...unknown[]][] = [];

@@ -161,6 +161,7 @@ test("page eval is opt-in and preserves all scoped escape-route checks", () => {
   expect(authorizeProfileRequest(enabled, request(["eval", "element => element.textContent", "e1"]))).toBe("qa");
   for (const args of [
     ["run-code", "async page => {}"], ["cdp", "Emulation.setEmulatedMedia"], ["kill-all"],
+    ["audio", "install", "https://example.test/live"], ["audio", "status"], ["audio", "feed"],
     ["open", "--profile", "/other"], ["open", "file:///review-only"], ["open", "chrome://settings"],
     ["eval", "() => 1", "--filename=/tmp/review-only"],
     ["screenshot", "--filename", "/tmp/review-only"], ["tab-list", "--session=other"],
