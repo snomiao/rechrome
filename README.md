@@ -453,6 +453,30 @@ The frames are screenshots, so the rate tops out around 10 fps (`--fps`, default
 host encodes them with ffmpeg into mp4 or webm (`--format`). Without ffmpeg it saves raw
 MJPEG and says so.
 
+### Full-duplex PCM pipes and audio routing
+
+`rech audio stream` sends and receives continuous raw PCM concurrently after
+`rech audio install <url>`. There is no WAV-file feed or manual drain in the streaming
+path. Use explicit source and destination IDs, for example:
+
+```sh
+ffmpeg -i fixture.wav -f s16le -ar 16000 -ac 1 pipe:1 | \
+  rech audio stream --source ffmpeg --destination browser-live --rate 16000 --channels 1 \
+  | ffmpeg -f s16le -ar 16000 -ac 1 -i pipe:0 response.wav
+```
+
+stdout is PCM only; metadata and errors go to stderr. Input EOF half-closes input
+while output stays active. Cancel with Ctrl-C or `rech audio stream stop`. This is
+bounded duplex (60 seconds by default, configurable up to 300), not an unlimited
+live session. Slow consumers and navigation fail closed. Browser output is routed
+to silent capture sinks; use browser-level mute independently for unsupported graphs.
+
+For same-machine web routing, `rech audio stream ticket` writes a private one-use,
+30-second, Origin-bound ticket for explicit local file import. It never gives the
+frontend the reusable management key. Remote/mobile connections require a separate
+trusted WSS gateway; one is not provisioned here. See [the versioned protocol,
+backpressure and mix-minus contract](docs/audio-duplex.md) for the full interface.
+
 ### Virtual microphone and silent audio capture
 
 `rech audio` supplies a page with a virtual microphone and saves its newly

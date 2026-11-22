@@ -1,3 +1,5 @@
+import { createPcmGateway, buildPcmRelayCode } from "./audio-stream-server.ts";
+import { streamOptions } from "./audio-stream.ts";
 // Audio bytes travel in a body field and on the existing local session socket,
 // never in CLI argv, daemon log messages, or ordinary command output.
 import { randomUUID } from "node:crypto";
@@ -18,6 +20,7 @@ type Reply = {
   stderr: string;
   files: string[];
   audioOut?: unknown;
+  audioStream?: unknown;
 };
 type Session = {
   id: string;
@@ -26,6 +29,7 @@ type Session = {
   stopConfirmed: boolean;
   drained: boolean;
   pending?: any;
+  stream?: ReturnType<typeof createPcmGateway>;
 };
 type RunCode = typeof runCodeOnSession;
 type Request = {
@@ -60,7 +64,7 @@ export function createAudioHandler(runCode: RunCode = runCodeOnSession) {
     (state.phase === "stopped" || state.phase === "failed") &&
     state.stopConfirmed &&
     state.drained &&
-    !state.pending;
+    !state.pending && !state.stream;
   async function execute(request: Request): Promise<Reply> {
     const ok = (value: unknown, audioOut?: unknown): Reply => ({
       status: 0,
@@ -89,6 +93,35 @@ export function createAudioHandler(runCode: RunCode = runCodeOnSession) {
         state.pending = undefined;
         return ok({ acknowledged: true });
       }
+      if (request.args[1] === "stream") {
+        if (!state || request.upload !== undefined) return fail();
+        if (request.args[2] === "stop" && request.args.length === 3) {
+          state.stream?.stop("cancelled");
+          return ok({ id: state.id, phase: state.phase });
+        }
+        if (state.stream || state.phase !== "ready" || state.pending) return fail();
+        const options = streamOptions(request.args);
+        let running = false;
+        const stream = createPcmGateway(options, async (url, key) => {
+          running = true;
+          try {
+            const reply = await runCode({
+              socketRoot: request.socketRoot, session: request.session, cwd: request.cwd,
+              code: buildPcmRelayCode(url, key, state.id, state.origin, options),
+              json: true, timeoutMs: (options.maxSeconds + 45) * 1000,
+            });
+            if (reply.isError) throw Error("stream renderer failed");
+          } finally {
+            state.stream = undefined;
+            state.phase = "stopped";
+            state.stopConfirmed = true;
+            state.drained = true;
+          }
+        }, () => { if (!running) state.stream = undefined; });
+        state.stream = stream;
+        return { ...ok({ id: state.id, phase: state.phase }), audioStream: stream.ticket };
+      }
+      if (state?.stream) return fail();
       const command = parseAudioWire(request.args);
       if (command.action !== "feed" && request.upload !== undefined) return fail();
       const evaluate = async (code: string) => {
