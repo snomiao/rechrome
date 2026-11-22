@@ -2207,6 +2207,18 @@ async function run(url: string, args: string[], overrideEnv?: Record<string, str
     if (args.some(a => a === "--help" || a === "-h")) { console.log(AUDIO_USAGE); return; }
     try {
       await ensureProjectDir(identity.dataDir);
+      if (args.filter(a => !a.startsWith('-s='))[1] === 'approvals') {
+        if (args.filter(a => !a.startsWith('-s=')).length !== 2) throw Error('invalid approval command');
+        const prepare = await callServe(url, ['audio', 'approvals', 'prepare'], overrideEnv, identity, true);
+        if (prepare.status) throw Error('local approval unavailable');
+        const session = '-s=iso_rech_audio_approvals';
+        const opened = await callServe(url, ['open', 'about:blank', session], overrideEnv, identity, true);
+        if (opened.status) throw Error('operator browser unavailable');
+        const ready = await callServe(url, [session, 'audio', 'approvals'], overrideEnv, identity, true);
+        if (ready.status) throw Error('local approval unavailable');
+        console.error('Local Rechrome audio approval panel opened. Choose a chat there when a website requests Connect.');
+        return;
+      }
       if(args.filter(a=>!a.startsWith('-s='))[1]==='stream') {
         await runAudioStreamCommand(args,(wire)=>callServe(url,wire,overrideEnv,identity,true));
         return;

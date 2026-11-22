@@ -1,3 +1,5 @@
+import { readPairResult, type PairTarget } from "./audio-pairing.ts";
+import { createHash } from "node:crypto";
 import { createPcmGateway, buildPcmRelayCode, pcmStopConfirmed } from "./audio-stream-server.ts";
 import { streamOptions } from "./audio-stream.ts";
 // Audio bytes travel in a body field and on the existing local session socket,
@@ -30,6 +32,7 @@ type Session = {
   drained: boolean;
   pending?: any;
   stream?: ReturnType<typeof createPcmGateway>;
+  request?: Request;
 };
 type RunCode = typeof runCodeOnSession;
 type Request = {
@@ -38,6 +41,7 @@ type Request = {
   socketRoot: string;
   session: string;
   cwd: string;
+  expectedGeneration?: string;
 };
 const MAX_SESSIONS = 8;
 function summary(value: any) {
@@ -82,6 +86,7 @@ export function createAudioHandler(runCode: RunCode = runCodeOnSession) {
     });
     try {
       const state = sessions.get(request.session);
+      if (request.expectedGeneration && state?.id !== request.expectedGeneration) return fail();
       if (request.args[1] === "ack") {
         if (
           request.args.length !== 3 ||
@@ -158,6 +163,7 @@ export function createAudioHandler(runCode: RunCode = runCodeOnSession) {
             phase: value.phase,
             stopConfirmed: false,
             drained: false,
+            request,
           });
           return ok(value);
         } finally {
@@ -222,7 +228,7 @@ export function createAudioHandler(runCode: RunCode = runCodeOnSession) {
       return fail();
     }
   }
-  return async function handle(request: Request): Promise<Reply> {
+  const handle = async function handle(request: Request): Promise<Reply> {
     // All generation changes, destructive drains and acknowledgements share
     // the same queue. A drain receipt remains stable until its serialized ack.
     const previous = queues.get(request.session) ?? Promise.resolve();
@@ -239,4 +245,31 @@ export function createAudioHandler(runCode: RunCode = runCodeOnSession) {
       if (queues.get(request.session) === next) queues.delete(request.session);
     }
   };
+  const targetId = (session: string, state: Session) => createHash("sha256").update(`${session}\0${state.id}\0${state.origin}`).digest("hex").slice(0, 16);
+  const pairTargets = async (): Promise<PairTarget[]> => {
+    const entries = await Promise.all([...sessions].map(async ([session, state]) => {
+      if (state.phase !== "ready" || state.stream || state.pending || !state.request) return null;
+      try {
+        const reply = await runCode({ ...state.request, code: `async page => JSON.stringify(await page.evaluate(({id,origin})=>{if(location.origin!==origin||window.__rechAudioBridge?.status().id!==id)throw new Error('chat changed');return{title:document.title}},${JSON.stringify({ id: state.id, origin: state.origin })}))`, json: true, timeoutMs: 3000 });
+        if (reply.isError) return null;
+        const value = readPairResult(reply.text);
+        if (typeof value?.title !== "string" || !value.title.trim()) return null;
+        return { id: targetId(session, state), title: value.title.trim().slice(0, 160), origin: state.origin };
+      } catch { return null; }
+    }));
+    return entries.filter((entry): entry is PairTarget => entry !== null);
+  };
+  return Object.assign(handle, {
+    pairTargets,
+    async pairGrant(id: string, options: { sourceId: string; origin: string; pcm: { sampleRate: number; channels: number } }) {
+      const entry = [...sessions].find(([session, state]) => targetId(session, state) === id);
+      if (!entry?.[1].request) throw Error("chat unavailable");
+      const [session, state] = entry;
+      const request = state.request!;
+      const reply = await handle({ ...request, session, expectedGeneration: state.id, args: ["audio", "stream", "open", "--source", options.sourceId, "--destination", `chat-${id}`, "--client-origin", options.origin, "--rate", String(options.pcm.sampleRate), "--channels", String(options.pcm.channels)] });
+      if (reply.status !== 0 || !reply.audioStream) throw Error("chat unavailable");
+      const stream = state.stream!;
+      return { ticket: reply.audioStream as import("./audio-stream.ts").StreamTicket, isActive: () => stream.authenticated, revoke: () => stream.stop("pairing-cancelled") };
+    },
+  });
 }

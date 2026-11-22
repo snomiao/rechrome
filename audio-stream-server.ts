@@ -229,7 +229,7 @@ export function createPcmGateway(options: StreamOptions, renderer: (url: string,
     }, 30000);
     later(() => stop('duration-limit'), options.maxSeconds * 1000 + 30000);
     const ticket: StreamTicket = { version: 1, url: `ws://127.0.0.1:${server.port}/stream`, capability, clientOrigin: options.clientOrigin, expiresAt, sourceId: options.sourceId, destinationId: options.destinationId, input: options.pcm, output: options.pcm, frameMs: 20, maxFrameBytes: bytes, inputWindowBytes: windowBytes };
-    return { ticket, stop, get closed() { return stopped; } };
+    return { ticket, stop, get closed() { return stopped; }, get authenticated() { return consumed && !stopped; } };
 }
 /** Only an explicit terminal same-generation stop result can retire a renderer. */
 export function pcmStopConfirmed(text: string): boolean {
