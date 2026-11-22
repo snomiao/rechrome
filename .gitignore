@@ -34,3 +34,7 @@ signal-relay.js
 
 # Claude Code session lock (per machine, rewritten every session)
 .claude/scheduled_tasks.lock
+
+audio-stream.js
+audio-stream-client.js
+audio-stream-server.js

@@ -3,6 +3,7 @@ import { prepareUpload, UPLOAD_USAGE, MAX_UPLOAD_BYTES, type UploadPayload } fro
 import { readListeners, writeListeners as writeListenersFile, listenerAddress, isLoopback, normalizePrefix, serviceUrl, allowProfiles, denyProfiles, rotateListenerKey, setPublicUrl, canonicalProfileKeys, planProfileRemoval, parseIceUrl, iceLabel, rtcListeners, shareRtcListeners, defaultRtcListener, DEFAULT_RTC, DEFAULT_RTC_NOTE, LEGACY_RTC, type IceServer, type Listener, type ListenerConfig, type RtcListener } from "./listeners.ts";
 import { recordHoldMs } from "./record.ts";
 import { AUDIO_USAGE } from "./audio-bridge.ts";
+import { runAudioStreamCommand } from "./audio-stream-client.ts";
 import { runAudioCommand } from "./audio-bridge-client.ts";
 
 import { file } from "bun";
@@ -1944,7 +1945,7 @@ async function callServe(
   throwOnFailure = false,
   upload?: UploadPayload,
   secret?: string,
-): Promise<{ status: number; stdout: string; stderr: string; files?: string[]; existingSession?: boolean; secretOut?: string; audioOut?: unknown }> {
+): Promise<{ status: number; stdout: string; stderr: string; files?: string[]; existingSession?: boolean; secretOut?: string; audioOut?: unknown; audioStream?: unknown }> {
   const { key, host, port, protocol, extensionId, extensionToken, profileDirectory, userDataDir, loadExtension } = parseUrl(url);
   // Reuse the caller's identity when provided — computing it shells out to `git` several times,
   // and run() has already done so for its log line. Recomputing here would double those git
@@ -2206,6 +2207,10 @@ async function run(url: string, args: string[], overrideEnv?: Record<string, str
     if (args.some(a => a === "--help" || a === "-h")) { console.log(AUDIO_USAGE); return; }
     try {
       await ensureProjectDir(identity.dataDir);
+      if(args.filter(a=>!a.startsWith('-s='))[1]==='stream') {
+        await runAudioStreamCommand(args,(wire)=>callServe(url,wire,overrideEnv,identity,true));
+        return;
+      }
       const result = await runAudioCommand(args,
         (wire, data) => callServe(url, wire, overrideEnv, identity, true, data),
         join(identity.dataDir, "audio"));
@@ -4679,6 +4684,8 @@ export function preferManagementListener(url: string, config: { listeners: Liste
 
 /** Audio must never turn a restricted link into management access. */
 export function isAudioInvocation(args: string[]): boolean {
+  const separator = rechSeparatorIndex(args);
+  if (separator !== -1) return args[separator + 1] === "audio";
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]!;
     if (arg === "--profile") { i++; continue; }

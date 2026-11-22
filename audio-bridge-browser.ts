@@ -22,6 +22,10 @@ export interface AudioBridge {
   startCapture(): Promise<AudioBridgeStatus>;
   drain(): Promise<AudioBridgeDrain>;
   stop(): Promise<AudioBridgeStatus>;
+  startPcm(options: {sampleRate:number;channels:number;maxSeconds:number}): Promise<AudioBridgeStatus>;
+  feedPcm(input:string): Promise<AudioBridgeStatus>;
+  endPcmInput(): AudioBridgeStatus;
+  readPcm(): {id:string;phase:string;frames:string[]};
 }
 
 /** Everything executable deliberately lives inside this function: the CLI serializes toString(). */
@@ -170,6 +174,12 @@ export async function installAudioBridge(config: AudioBridgeConfig): Promise<Aud
     };
   }
   let state = fresh(initial);
+  let pcm: { context:AudioContext; node:AudioWorkletNode; sink:MediaStreamAudioDestinationNode; sources:MediaStreamAudioSourceNode[]; queue:string[]; bytes:number; ended:boolean; stopped:boolean; rate:number; channels:number; frameBytes:number } | null = null;
+  function attachPcm(output:Output) {
+    if(!pcm||pcm.stopped)return;
+    const source=pcm.context.createMediaStreamSource(output.destination.stream);
+    Reflect.apply(nativeConnect!,source,[pcm.node]);pcm.sources.push(source);
+  }
   function actualMute(element: HTMLMediaElement, value: boolean) {
     if (muted?.set) Reflect.apply(muted.set, element, [value]);
     else element.muted = value;
@@ -314,7 +324,7 @@ export async function installAudioBridge(config: AudioBridgeConfig): Promise<Aud
     return true;
   }
   function record(s: State, output: Output) {
-    if (output.recording || s.phase !== "capturing" || s.stopping) return;
+    if (pcm || output.recording || s.phase !== "capturing" || s.stopping) return;
     if (typeof MediaRecorder === "undefined" || s.recordings.length >= MAX_STREAMS) {
       fail(s, "media-recorder");
       throw error("unsupported");
@@ -412,6 +422,7 @@ export async function installAudioBridge(config: AudioBridgeConfig): Promise<Aud
       result = { context, destination: context.createMediaStreamDestination(), recording: null };
       for (const track of result.destination.stream.getTracks()) s.tracks.add(track);
       s.outputs.set(context, result);
+      attachPcm(result);
     }
     record(s, result);
     return result;
@@ -604,6 +615,13 @@ export async function installAudioBridge(config: AudioBridgeConfig): Promise<Aud
   async function stopState(s: State): Promise<AudioBridgeStatus> {
     if (s.stopped) return s.stopped;
     s.stopping = true;
+    if(pcm&&!pcm.stopped) {
+      pcm.stopped=true;pcm.node.port.onmessage=null;
+      for(const source of pcm.sources)try{Reflect.apply(nativeDisconnect!,source,[]);}catch{}
+      try{Reflect.apply(nativeDisconnect!,pcm.node,[]);}catch{}
+      for(const track of pcm.sink.stream.getTracks())track.stop();
+      void pcm.context.close().catch(()=>{});
+    }
     if (s.phase !== "failed") s.phase = "stopped";
     for (const element of s.mediaElements) actualMute(element, true);
     if (s.deadline !== null) {
@@ -830,6 +848,89 @@ export async function installAudioBridge(config: AudioBridgeConfig): Promise<Aud
         s.feeding = false;
       }
     },
+    async startPcm(options: { sampleRate: number; channels: number; maxSeconds: number }) {
+      const s = state; accepting(s);
+      if (pcm || s.phase === 'capturing' || s.bytes || s.recordings.length) throw error('busy');
+      if (![16000,48000].includes(options.sampleRate) || ![1,2].includes(options.channels) || !Number.isInteger(options.maxSeconds) || options.maxSeconds < 1 || options.maxSeconds > 300 || !Context) throw error('pcm-config');
+      const context = new Context();
+      const code = `class RechPcm extends AudioWorkletProcessor {
+        constructor(o) { super(); this.rate=o.processorOptions.rate; this.channels=o.processorOptions.channels; this.frames=this.rate/50; this.at=0; this.phase=0; this.data=new Int16Array(this.frames*this.channels); }
+        process(inputs) {
+          const channels=inputs[0]; if(!channels?.length)return true;
+          for(let n=0;n<channels[0].length;n++) {
+            this.phase+=this.rate;
+            while(this.phase>=sampleRate) {
+              this.phase-=sampleRate;
+              for(let c=0;c<this.channels;c++) {
+                let v=0;
+                if(this.channels===1) { for(const a of channels)v+=a[n]||0; v/=channels.length; }
+                else v=(channels[c]||channels[0])[n]||0;
+                this.data[this.at*this.channels+c]=Math.round(Math.max(-1,Math.min(1,v))*32767);
+              }
+              if(++this.at===this.frames) {
+                const bytes=new Uint8Array(this.data.length*2),view=new DataView(bytes.buffer);
+                for(let i=0;i<this.data.length;i++)view.setInt16(i*2,this.data[i],true);
+                this.port.postMessage(bytes.buffer,[bytes.buffer]);this.at=0;
+              }
+            }
+          }
+          return true;
+        }
+      } registerProcessor('rech-pcm',RechPcm);`;
+      const url = URL.createObjectURL(new Blob([code], {type:'text/javascript'}));
+      try { await context.audioWorklet.addModule(url); }
+      catch { await context.close(); throw error('pcm-worklet'); }
+      finally { URL.revokeObjectURL(url); }
+      try {
+        accepting(s);
+        const node = new AudioWorkletNode(context, 'rech-pcm', {numberOfInputs:1,numberOfOutputs:1,outputChannelCount:[options.channels],channelCount:options.channels,channelCountMode:'explicit',processorOptions:{rate:options.sampleRate,channels:options.channels}});
+        const sink = context.createMediaStreamDestination();
+        Reflect.apply(nativeConnect!,node,[sink]);
+        pcm={ context,node,sink,sources:[],queue:[],bytes:0,ended:false,stopped:false,rate:options.sampleRate,channels:options.channels,frameBytes:options.sampleRate/50*options.channels*2 };
+        const active=pcm;
+        node.port.onmessage=(event: MessageEvent<ArrayBuffer>)=>{
+          if(active.stopped)return;
+          const bytes=new Uint8Array(event.data);
+          if(bytes.length!==active.frameBytes||active.bytes+bytes.length>65536){ fail(s,'buffer-overflow');return; }
+          active.bytes+=bytes.length;active.queue.push(base64(bytes));
+        };
+        s.phase='capturing';
+        for(const output of s.outputs.values())attachPcm(output);
+        s.deadline=setTimeout(()=>void stopState(s),options.maxSeconds*1000);
+        await context.resume(); accepting(s);
+        return status(s);
+      } catch { await stopState(s); throw error('pcm-start'); }
+    },
+    async feedPcm(input: string) {
+      const s=state; accepting(s); const active=pcm;
+      if(!active||active.ended||active.stopped)throw error('pcm-input-closed');
+      if(typeof input!=='string'||input.length>active.frameBytes/3*4+8)throw error('pcm-frame');
+      const raw=atob(input);
+      if(raw.length!==active.frameBytes||btoa(raw)!==input)throw error('pcm-frame');
+      const destination=virtual(s),context=s.virtual!;
+      const deadline=performance.now()+2000;
+      while(s.queueEnd-context.currentTime>0.18){
+        accepting(s);if(active.stopped||performance.now()>deadline)throw error('pcm-backpressure');
+        await new Promise(r=>setTimeout(r,5));
+      }
+      accepting(s);
+      const frames=raw.length/(2*active.channels), buffer=context.createBuffer(active.channels,frames,active.rate), source=context.createBufferSource();
+      for(let c=0;c<active.channels;c++)for(let i=0;i<frames;i++) {
+        const at=(i*active.channels+c)*2;let value=raw.charCodeAt(at)|(raw.charCodeAt(at+1)<<8);if(value&32768)value-=65536;
+        buffer.getChannelData(c)[i]=value/32768;
+      }
+      source.buffer=buffer;const feed:Feed={source,buffer,bytes:frames*active.channels*4,released:false};
+      if(!charge(s,feed.bytes))throw error('buffer-overflow');s.feeds.add(feed);
+      Reflect.apply(nativeConnect!,source,[destination]);source.onended=()=>release(s,feed);
+      await context.resume();accepting(s);const start=Math.max(context.currentTime,s.queueEnd);source.start(start);s.queueEnd=start+frames/active.rate;
+      return status(s);
+    },
+    endPcmInput() { if(!pcm)throw error('pcm-unavailable');pcm.ended=true;return status(state); },
+    readPcm() {
+      if(!pcm)throw error('pcm-unavailable');
+      const frames=pcm.queue.splice(0);pcm.bytes=0;
+      return {id:state.id,phase:state.phase,frames};
+    },
     async startCapture() {
       const s = state;
       accepting(s);
@@ -879,6 +980,7 @@ export async function installAudioBridge(config: AudioBridgeConfig): Promise<Aud
         old = state;
       if (old.phase === "capturing" || old.stopping || old.bytes > 0) throw error("pending-data");
       await stopState(old);
+      pcm=null;
       state = fresh(limits);
       return api;
     },

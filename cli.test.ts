@@ -12,7 +12,9 @@ test("audio preserves explicit scoped transports and recognizes leading profile/
   expect(isAudioInvocation(["--profile","qa","--isolate=media","audio","status"])).toBe(true);
   expect(isAudioInvocation(["-s=media","audio","drain","--dir","./output"])).toBe(true);
   expect(isAudioInvocation(["--profile","audio","open","https://example.test"])).toBe(false);
-  expect(isAudioInvocation(["pw","audio","status"])).toBe(false);
+  expect(isAudioInvocation(["pw","audio","status"])).toBe(true);
+  expect(isAudioInvocation(["--profile","qa","pw","audio","status"])).toBe(true);
+  expect(isAudioInvocation(["--","audio","status"])).toBe(true);
   const link="http://fixture-scoped-key@127.0.0.1:12345/";
   expect(await transportUrl(link,{preserveListener:true})).toBe(link);
 });

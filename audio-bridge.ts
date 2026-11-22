@@ -29,6 +29,10 @@ export const AUDIO_USAGE = `Usage: rech audio install <url> [--capture] [--max-s
        rech audio capture start
        rech audio drain --dir <client-dir>
        rech audio stop [--dir <client-dir>]
+       rech audio stream --source <id> --destination <id> [--rate 16000|48000] [--channels 1|2]
+       rech audio stream ticket --source <id> --destination <id> --client-origin <origin> --ticket-file <path>
+       rech audio stream stop
+  Stream stdin/stdout are raw negotiated PCM16, metadata is on stderr. EOF closes only input.
   Files and directories stay on this client. Feed accepts at most 2 MiB of PCM16/float32 WAV,
   mono/stereo at 8–96 kHz, at most 30 seconds. Capture is opt-in and limited to 60 seconds.`;
 
