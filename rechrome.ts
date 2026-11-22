@@ -2,6 +2,9 @@
 import { prepareUpload, UPLOAD_USAGE, MAX_UPLOAD_BYTES, type UploadPayload } from "./scoped-upload.ts";
 import { readListeners, writeListeners as writeListenersFile, listenerAddress, isLoopback, normalizePrefix, serviceUrl, allowProfiles, denyProfiles, rotateListenerKey, setPublicUrl, canonicalProfileKeys, planProfileRemoval, parseIceUrl, iceLabel, rtcListeners, shareRtcListeners, defaultRtcListener, DEFAULT_RTC, DEFAULT_RTC_NOTE, LEGACY_RTC, type IceServer, type Listener, type ListenerConfig, type RtcListener } from "./listeners.ts";
 import { recordHoldMs } from "./record.ts";
+import { AUDIO_USAGE } from "./audio-bridge.ts";
+import { runAudioStreamCommand } from "./audio-stream-client.ts";
+import { runAudioCommand } from "./audio-bridge-client.ts";
 
 import { file } from "bun";
 import yargs from "yargs";
@@ -1942,7 +1945,7 @@ async function callServe(
   throwOnFailure = false,
   upload?: UploadPayload,
   secret?: string,
-): Promise<{ status: number; stdout: string; stderr: string; files?: string[]; existingSession?: boolean; secretOut?: string }> {
+): Promise<{ status: number; stdout: string; stderr: string; files?: string[]; existingSession?: boolean; secretOut?: string; audioOut?: unknown; audioStream?: unknown }> {
   const { key, host, port, protocol, extensionId, extensionToken, profileDirectory, userDataDir, loadExtension } = parseUrl(url);
   // Reuse the caller's identity when provided — computing it shells out to `git` several times,
   // and run() has already done so for its log line. Recomputing here would double those git
@@ -2163,7 +2166,7 @@ export function unknownCommandHint(output: string, rechCommands: Iterable<string
   const unknown = output.match(/^Unknown command: (\S+)/m)?.[1];
   if (!unknown) return null;
   const browser = [...output.matchAll(/^ {2}([a-z][a-z0-9-]+) /gm)].map(m => m[1]);
-  const candidates = [...new Set([...rechCommands, ...browser])];
+  const candidates = [...new Set([...rechCommands, "audio", ...browser])];
   const scored = candidates.map(c => ({ c, d: editDistance(unknown.toLowerCase(), c) })).sort((x, y) => x.d - y.d);
   const best = scored[0] && scored[0].d <= Math.max(1, Math.floor(unknown.length / 3)) ? scored[0].c : null;
   return [
@@ -2200,6 +2203,24 @@ async function run(url: string, args: string[], overrideEnv?: Record<string, str
   let secret: string | undefined;
   let upload: UploadPayload | undefined;
   const cmdIdx = args.findIndex(a => !a.startsWith("-s="));
+  if (args[cmdIdx] === "audio") {
+    if (args.some(a => a === "--help" || a === "-h")) { console.log(AUDIO_USAGE); return; }
+    try {
+      await ensureProjectDir(identity.dataDir);
+      if(args.filter(a=>!a.startsWith('-s='))[1]==='stream') {
+        await runAudioStreamCommand(args,(wire)=>callServe(url,wire,overrideEnv,identity,true));
+        return;
+      }
+      const result = await runAudioCommand(args,
+        (wire, data) => callServe(url, wire, overrideEnv, identity, true, data),
+        join(identity.dataDir, "audio"));
+      console.log(JSON.stringify(result));
+    } catch {
+      console.error("[rech] audio command failed. Check `rech audio --help`, the selected page, output directory and updated management daemon. No page output or audio bytes were printed.");
+      process.exitCode = 1;
+    }
+    return;
+  }
   if (args[cmdIdx] === "read-cookie") {
     if (args.some(a => a === "--help" || a === "-h")) { console.log(READ_COOKIE_USAGE); process.exit(0); }
     let cwire: string[];
@@ -4661,9 +4682,22 @@ export function preferManagementListener(url: string, config: { listeners: Liste
   return next.toString();
 }
 
-export async function transportUrl(url: string): Promise<string> {
+/** Audio must never turn a restricted link into management access. */
+export function isAudioInvocation(args: string[]): boolean {
+  const separator = rechSeparatorIndex(args);
+  if (separator !== -1) return args[separator + 1] === "audio";
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (arg === "--profile") { i++; continue; }
+    if (arg.startsWith("--profile=") || /^--isolated?(=|$)/.test(arg) || arg === "--isolate" || arg.startsWith("--isolate=") || arg.startsWith("-s=")) continue;
+    return arg === "audio";
+  }
+  return false;
+}
+
+export async function transportUrl(url: string, options: { preserveListener?: boolean } = {}): Promise<string> {
   const parts = shareLinkParts(url);
-  if (!parts?.webrtc) return preferManagementListener(url, await readListeners().catch(() => null));
+  if (!parts?.webrtc) return options.preserveListener ? url : preferManagementListener(url, await readListeners().catch(() => null));
   const info = await spawnBridge(parts.token, parts.origin, selfCommand());
   const bridged = new URL(`http://127.0.0.1:${info.port}/`);
   new URL(url).searchParams.forEach((v, k) => bridged.searchParams.set(k, v));
@@ -4869,6 +4903,8 @@ const HELP_EPILOGUE = `Browser commands (sent to this project's Chrome session):
                      permission; mjpeg if the host has no ffmpeg
   rech record [--seconds <n>] [...]
                      the same in one call: record n seconds (max 60) and return the file
+  rech audio install <url>       Install an origin-pinned virtual microphone and silent output bridge
+  rech audio --help              Feed a local PCM WAV, capture output, and save ordered WebM files
   rech pw <args>     forward verbatim to playwright-cli, e.g. \`rech pw --version\`
   rech --version     rechrome's version
 
@@ -5120,7 +5156,7 @@ if (import.meta.main) {
       process.exit(1);
     }
     // A WebRTC share link goes through a local bridge; from here on it is plain HTTP.
-    const url = await transportUrl(rawUrl).catch(error => {
+    const url = await transportUrl(rawUrl, { preserveListener: isAudioInvocation(args) }).catch(error => {
       console.error(`[rech] ${error instanceof Error ? error.message : error}`);
       process.exit(1);
     });
