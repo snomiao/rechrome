@@ -231,6 +231,38 @@ export function createPcmGateway(options: StreamOptions, renderer: (url: string,
     const ticket: StreamTicket = { version: 1, url: `ws://127.0.0.1:${server.port}/stream`, capability, clientOrigin: options.clientOrigin, expiresAt, sourceId: options.sourceId, destinationId: options.destinationId, input: options.pcm, output: options.pcm, frameMs: 20, maxFrameBytes: bytes, inputWindowBytes: windowBytes };
     return { ticket, stop, get closed() { return stopped; } };
 }
+/** Only an explicit terminal same-generation stop result can retire a renderer. */
+export function pcmStopConfirmed(text: string): boolean {
+    if (typeof text !== 'string' || Buffer.byteLength(text) > 8192)
+        return false;
+    try {
+        let value: any;
+        try {
+            value = JSON.parse(text);
+        }
+        catch {
+            const matches = [...text.matchAll(/(?:^|\n)### Result\r?\n([\s\S]*?)(?=\r?\n### |$)/g)];
+            if (matches.length !== 1)
+                return false;
+            value = JSON.parse(matches[0]![1]!);
+        }
+        for (let n = 0; n < 5; n++) {
+            if (typeof value === 'string') {
+                value = JSON.parse(value);
+                continue;
+            }
+            if (!value || typeof value !== 'object' || value.isError || value.error)
+                return false;
+            if (Object.hasOwn(value, 'result')) {
+                value = value.result;
+                continue;
+            }
+            return value.closed === true && value.stopConfirmed === true;
+        }
+    }
+    catch { }
+    return false;
+}
 /** Runs inside the browser's existing local session process, never in renderer argv. */
 export function buildPcmRelayCode(url: string, key: string, id: string, origin: string, options: StreamOptions) {
     return `async page => {
@@ -241,7 +273,7 @@ export function buildPcmRelayCode(url: string, key: string, id: string, origin: 
       if(location.origin!==origin||!bridge||bridge.status().id!==generation)throw new Error('audio generation changed');
       return await bridge[fn](data);
     },{generation,origin,fn,data});
-    let stopping=false;
+    let stopping=false, stopConfirmed=false;
     const post=async(path,data)=>{const r=await page.request.post(base+path,{headers,data,timeout:3000});try{if(!r.ok())throw new Error('audio relay unavailable');return await r.json()}finally{await r.dispose()}};
     try {
       await check('startPcm',${JSON.stringify({ ...options.pcm, maxSeconds: options.maxSeconds })});
@@ -255,9 +287,13 @@ export function buildPcmRelayCode(url: string, key: string, id: string, origin: 
       ]);
     } finally {
       stopping=true;
-      await Promise.race([check('stop').catch(()=>{}),page.waitForTimeout(2000)]);
-      await post('/close',{}).catch(()=>{});
+      try {
+        const stopped=await Promise.race([check('stop').catch(()=>null),page.waitForTimeout(2000).then(()=>null)]);
+        stopConfirmed=stopped?.id===generation&&['stopped','failed'].includes(stopped.phase);
+      } finally {
+        await post('/close',{}).catch(()=>{});
+      }
     }
-    return JSON.stringify({closed:true});
+    return JSON.stringify({closed:true,stopConfirmed});
   }`;
 }

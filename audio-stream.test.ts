@@ -129,7 +129,7 @@ test('generated relay works in the actual page-only VM and disposes HTTP respons
     const response = (value: any) => { responses++; return { ok: () => true, json: async () => value, dispose: async () => { disposed++; } }; };
     const page = { evaluate: async (_fn: any, arg: any) => arg.fn === 'readPcm' ? { id: 'b-' + 'a'.repeat(32), phase: 'capturing', frames: [] } : {}, waitForTimeout: async () => { }, request: { post: async (path: string) => response({ stop: path.endsWith('/output') }), get: async () => response({ stop: true }) } };
     const fn = runInNewContext('(' + buildPcmRelayCode('http://127.0.0.1:1', 'synthetic', 'b-' + 'a'.repeat(32), 'https://example.test', options()) + ')', {});
-    expect(JSON.parse(await fn(page))).toEqual({ closed: true });
+    expect(JSON.parse(await fn(page))).toEqual({ closed: true, stopConfirmed: false });
     expect(disposed).toBe(responses);
 });
 test('raw CLI adapter streams output before stdin EOF, half-closes and rejects partial samples', async () => {
@@ -217,8 +217,10 @@ test('management stream stop cancels the renderer and permits a new generation',
             return { isError: false, text: JSON.stringify(status) };
         const response = (r: Response) => ({ ok: () => r.ok, json: () => r.json(), dispose: async () => { } });
         const page = { evaluate: async (_fn: any, arg: any) => {
-                if (arg.fn === 'stop')
+                if (arg.fn === 'stop') {
                     stopped = true;
+                    return { ...status, phase: 'stopped' };
+                }
                 return arg.fn === 'readPcm' ? { id, phase: 'capturing', frames: [] } : status;
             }, waitForTimeout: sleep, request: { get: async (url: string, o: any) => response(await fetch(url, { headers: o.headers })), post: async (url: string, o: any) => response(await fetch(url, { method: 'POST', headers: { ...o.headers, 'content-type': 'application/json' }, body: JSON.stringify(o.data) })) } };
         return { isError: false, text: await runInNewContext('(' + request.code + ')', {})(page) };
@@ -236,4 +238,53 @@ test('management stream stop cancels the renderer and permits a new generation',
     expect(stopped).toBe(true);
     await sleep(30);
     expect((await handler(req(['audio', 'install', 'https://example.test']))).status).toBe(0);
+});
+for (const failure of ['socket-error', 'browser-error', 'unconfirmed'] as const) {
+    test(`unconfirmed ${failure} cleanup cannot retire the generation`, async () => {
+        const { createAudioHandler } = await import('./audio-bridge-server.ts');
+        const id = 'b-' + 'a'.repeat(32);
+        let phase = 'ready';
+        const status = () => ({ id, phase, bufferedBytes: 0, droppedBytes: 0, streamCount: 0, queuedSeconds: 0, unsupported: [] });
+        const handler = createAudioHandler(async (request) => {
+            if (request.code.includes('page.addInitScript')) {
+                phase = 'ready';
+                return { isError: false, text: JSON.stringify(status()) };
+            }
+            if (request.code.includes('const base=')) {
+                if (failure === 'socket-error')
+                    throw Error('synthetic socket timeout');
+                return { isError: failure === 'browser-error', text: JSON.stringify({ closed: true, stopConfirmed: false }) };
+            }
+            if (request.code.includes('"action":"stop"'))
+                phase = 'stopped';
+            return { isError: false, text: JSON.stringify({ ...status(), ...(request.code.includes('"action":"drain"') ? { streams: [] } : {}) }) };
+        });
+        const req = (args: string[]) => ({ args, socketRoot: '/tmp', session: 'synthetic', cwd: '/tmp' });
+        expect((await handler(req(['audio', 'install', 'https://example.test']))).status).toBe(0);
+        const ticket = (await handler(req(['audio', 'stream', 'open', '--source', 'fixture', '--destination', 'browser']))).audioStream;
+        await expect(connectPcmStream(ticket as any, async () => { })).rejects.toThrow();
+        expect((await handler(req(['audio', 'install', 'https://example.test']))).status).toBe(1);
+        expect((await handler(req(['audio', 'stop']))).status).toBe(0);
+        expect((await handler(req(['audio', 'drain']))).status).toBe(0);
+        expect((await handler(req(['audio', 'install', 'https://example.test']))).status).toBe(0);
+    });
+}
+test('renderer stop rejection and deadline never produce stop confirmation', async () => {
+    const { buildPcmRelayCode, pcmStopConfirmed } = await import('./audio-stream-server.ts');
+    const { runInNewContext } = await import('node:vm');
+    for (const kind of ['reject', 'timeout']) {
+        const page = { evaluate: async (_fn: any, arg: any) => {
+                if (arg.fn === 'stop') {
+                    if (kind === 'reject')
+                        throw Error('synthetic stop failure');
+                    return new Promise(() => { });
+                }
+                return {};
+            }, waitForTimeout: async () => { }, request: { get: async () => ({ json: async () => ({ stop: true }), dispose: async () => { } }), post: async () => ({ ok: () => true, json: async () => ({ stop: true }), dispose: async () => { } }) } };
+        const fn = runInNewContext('(' + buildPcmRelayCode('http://127.0.0.1:1', 'synthetic', 'b-' + 'a'.repeat(32), 'https://example.test', options()) + ')', {});
+        const result = await fn(page);
+        expect(pcmStopConfirmed(result)).toBe(false);
+    }
+    expect(pcmStopConfirmed(JSON.stringify({ result: JSON.stringify({ closed: true, stopConfirmed: true }) }))).toBe(true);
+    expect(pcmStopConfirmed('not a reply')).toBe(false);
 });

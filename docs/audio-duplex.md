@@ -16,6 +16,12 @@ streaming only. The management key never travels to the frontend. CLI tickets us
 clientOrigin `null` (absent Origin); browser tickets require exact HTTPS Origin.
 Do not disable mixed-content, CSP, or private-network controls. Hosted pages must
 permit loopback WS under their CSP/browser policy; unsupported browsers fail closed.
+An isolated Chrome check of the hosted Li page was blocked by the default local-network
+permission prompt; allowing local-network access through the standard browser permission
+made the same synthetic duplex connection work. The operator must explicitly allow that
+access in their own browser when prompted. No browser security flags or real profile
+permissions are changed by this feature. If the 30-second ticket expires while importing
+or authorizing local-network access, mint a fresh ticket.
 Phones and remote clients require a separately authorized trusted WSS gateway;
 localhost on a phone is not the host Mac. This implementation does not deploy one.
 
@@ -59,7 +65,11 @@ No input before ready. No automatic reconnect; obtain a fresh ticket explicitly.
   independently of output acknowledgements/input credit. Terminal control is
   `{type:"closed",reason}` then WS close. Protocol, overflow, duration, navigation,
   generation mismatch, lost renderer and disconnect errors close the stream rather
-  than grow memory or redirect audio. Reasons contain no page/credential excerpts.
+  than grow memory or redirect audio. Reuse of a stopped generation requires an
+  explicitly confirmed renderer stop. An error or cleanup deadline leaves it
+  non-retired; confirm a later `audio stop` and an empty drain before reinstalling.
+  If navigation destroyed that generation, use a fresh named isolated session rather
+  than pretending the old stop was confirmed. Reasons contain no page/credential excerpts.
 
 Renderer PCM output is capped at 64KiB; queued input is capped at 200ms plus the
 160ms transport window. The gateway caps requests and WS payloads; its output and

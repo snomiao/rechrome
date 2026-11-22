@@ -1,4 +1,4 @@
-import { createPcmGateway, buildPcmRelayCode } from "./audio-stream-server.ts";
+import { createPcmGateway, buildPcmRelayCode, pcmStopConfirmed } from "./audio-stream-server.ts";
 import { streamOptions } from "./audio-stream.ts";
 // Audio bytes travel in a body field and on the existing local session socket,
 // never in CLI argv, daemon log messages, or ordinary command output.
@@ -104,6 +104,7 @@ export function createAudioHandler(runCode: RunCode = runCodeOnSession) {
         let running = false;
         const stream = createPcmGateway(options, async (url, key) => {
           running = true;
+          let confirmed = false;
           try {
             const reply = await runCode({
               socketRoot: request.socketRoot, session: request.session, cwd: request.cwd,
@@ -111,11 +112,12 @@ export function createAudioHandler(runCode: RunCode = runCodeOnSession) {
               json: true, timeoutMs: (options.maxSeconds + 45) * 1000,
             });
             if (reply.isError) throw Error("stream renderer failed");
+            confirmed = pcmStopConfirmed(reply.text);
           } finally {
             state.stream = undefined;
-            state.phase = "stopped";
-            state.stopConfirmed = true;
-            state.drained = true;
+            state.phase = confirmed ? "stopped" : "failed";
+            state.stopConfirmed = confirmed;
+            state.drained = confirmed;
           }
         }, () => { if (!running) state.stream = undefined; });
         state.stream = stream;
