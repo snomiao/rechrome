@@ -177,3 +177,9 @@ test("tokens say what they are: invite, reusable, and each device's own credenti
   const device = redeemInvite(config, once.id, "mbp", NOW);
   expect(parseToken(device.token)).toMatchObject({ ok: true, kind: "device" });
 });
+
+test("page eval is off unless the share is created with it", () => {
+  const config = empty();
+  expect(createShare(config, { label: "plain", profiles: ["p"], via: ["webrtc"], now: NOW }).eval).toBeUndefined();
+  expect(createShare(config, { label: "evalr", profiles: ["p"], via: ["webrtc"], eval: true, now: NOW }).eval).toBe(true);
+});
