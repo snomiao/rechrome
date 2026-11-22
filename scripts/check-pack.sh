@@ -27,7 +27,8 @@ rm -f "$PACK_ERR"
 printf '%s' "$PACKED" | node -e '
 const fs = require("fs");
 const path = require("path");
-const packed = new Set(JSON.parse(fs.readFileSync(0, "utf8"))[0].files.map(f => f.path.replace(/\\/g, "/")));
+const { packedFiles } = require("./scripts/pack-files.cjs");
+const packed = new Set(packedFiles(fs.readFileSync(0, "utf8")));
 // Entrypoints come from package.json (bin + files, recursing into shipped dirs) rather than a
 // hardcoded list, so a rename cannot silently shrink what is checked. vendor/ is excluded: it
 // carries its own node_modules/playwright-core, so its requires resolve inside its own subtree.
