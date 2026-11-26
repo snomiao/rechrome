@@ -1,0 +1,39 @@
+# Builds the Rust `rechrome` binary for every platform, packs it together with
+# the JavaScript the package ships, and checks on Linux, macOS and Windows
+# (x64 and arm64) that `bun i -g` / `npm i -g` gives working `rech` and
+# `rechrome` commands.
+#
+# It does not publish. Releases still go through release.yml.
+#
+# The pipeline lives in https://github.com/snomiao/rustify.
+
+name: rust-npm-release
+
+on:
+  pull_request:
+    paths:
+      - "rs/**"
+      - "package.json"
+      - ".github/workflows/rust-npm-release.yml"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build, without a leading v (default: the version in rs/Cargo.toml)"
+        required: false
+        type: string
+
+jobs:
+  build:
+    uses: snomiao/rustify/.github/workflows/rust-npm-build.yml@releases/v1
+    with:
+      manifest: rs/Cargo.toml
+      bins: rechrome
+      version: ${{ inputs.version }}
+      # What `npm publish` runs today: vendors the playwright CLI, builds the
+      # .js twins and checks that every shipped import is in the tarball.
+      js-build: bun install && bun run prepublishOnly
+      # Both commands are the same binary, and it hands everything to
+      # rechrome.ts, so these go through the JavaScript on every machine.
+      smoke: rech --version
+      smoke-extra: |
+        rechrome --help => rechrome (rech)
