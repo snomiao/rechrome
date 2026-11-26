@@ -12,7 +12,7 @@ import { readExtensionTokenFromProfile } from "./extension-token.ts";
 import { redact } from "./redact.ts";
 import { READ_COOKIE_USAGE, parseReadCookieArgs, readCookieWireArgs, READ_STORAGE_USAGE, parseReadStorageArgs, readStorageWireArgs, READ_SECRET_USAGE, parseReadSecretArgs, readSecretWireArgs, READ_HEADERS_USAGE, parseReadHeadersArgs, readHeadersWireArgs, FILL_SECRET_USAGE, SECRET_MASK, parseFillSecretArgs, fillSecretWireArgs, readSecretSource, totpCode, totpWaitMs } from "./fill-secret.ts";
 import { createHash, randomBytes } from "crypto";
-import { mkdirSync, fstatSync, appendFileSync, existsSync, realpathSync, accessSync, cpSync, unlinkSync, readFileSync, readdirSync, renameSync, readlinkSync, rmdirSync, constants as fsConstants } from "fs";
+import { writeFileSync, mkdirSync, fstatSync, appendFileSync, existsSync, realpathSync, accessSync, cpSync, unlinkSync, readFileSync, readdirSync, renameSync, readlinkSync, rmdirSync, constants as fsConstants } from "fs";
 import { hostname, homedir, networkInterfaces } from "os";
 import { isIP, isIPv4 } from "net";
 import { join, basename, dirname, resolve } from "path";
@@ -2014,6 +2014,11 @@ async function callServe(
   }
 }
 
+/** Only an attended guide can request another bridge probe. */
+export function setupBridgeCanRetry(interactive: boolean, hasGuide: boolean, yes: boolean): boolean {
+  return interactive && hasGuide && !yes;
+}
+
 /** Probe only the temporary setup session; always release it, including on transport errors. */
 export async function probeSetupBridge(
   url: string,
@@ -2763,6 +2768,64 @@ async function oxmgrEnsureAutostart(mgr: DaemonManager): Promise<void> {
   await runPm(mgr, ["service", "install"]);
 }
 
+const PM2_RUN_KEY = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+const PM2_RUN_NAME = "RechromePm2";
+
+/** Match a direct resurrect command, not an unrelated command mentioning pm2. */
+export function isPm2Resurrect(command: string, bin: string): boolean {
+  const match = command.trim().match(/^(?:"([^"]+)"|(\S+))\s+resurrect\s*$/i);
+  if (!match) return false;
+  const exe = (match[1] ?? match[2]!).replaceAll("/", "\\").toLowerCase();
+  return exe === bin.replaceAll("/", "\\").toLowerCase() || /^pm2(?:\.exe|\.cmd|\.bat)?$/.test(exe);
+}
+
+export function pm2LogonScript(bin: string, env = process.env): string {
+  // Preserve the pm2 home/PATH used by install, including npm and Bun shims.
+  const quote = (s: string) => `'${s.replaceAll("'", "''")}'`;
+  return `$env:PM2_HOME=${quote(env.PM2_HOME || join(HOME, ".pm2"))}; $env:PATH=${quote(env.PATH || "")}; & ${quote(bin)} resurrect; exit $LASTEXITCODE`;
+}
+
+const PM2_LOGON_SCRIPT = join(RECH_DIR, "pm2-logon.ps1");
+export function pm2LogonCommand(): string {
+  // Run values have a 260-character limit: keep environment data in a script.
+  const powershell = join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  return `"${powershell}" -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "${PM2_LOGON_SCRIPT}"`;
+}
+const logonScriptIO = {
+  exists: () => existsSync(PM2_LOGON_SCRIPT),
+  write: (script: string) => { mkdirSync(RECH_DIR, { recursive: true }); writeFileSync(PM2_LOGON_SCRIPT, "\ufeff" + script, "utf8"); },
+};
+
+type RegistryRunner = (args: string[]) => { exitCode: number; stdout: string };
+const runRegistry: RegistryRunner = args => {
+  const result = Bun.spawnSync([join(process.env.SystemRoot || "C:\\Windows", "System32", "reg.exe"), ...args], {
+    stdout: "pipe", stderr: "ignore", windowsHide: true, timeout: 5000,
+  });
+  return { exitCode: result.exitCode, stdout: result.stdout.toString() };
+};
+
+/** Read failures are distinct from missing wiring; never silently claim persistence. */
+export function pm2WindowsAutostart(bin: string, install = false, run: RegistryRunner = runRegistry, scriptIO = logonScriptIO): boolean {
+  const desired = pm2LogonCommand();
+  let query = run(["query", PM2_RUN_KEY]);
+  if (query.exitCode !== 0 && install) {
+    // A fresh Windows account may not have a Run key yet.
+    if (run(["add", PM2_RUN_KEY, "/f"]).exitCode === 0) query = run(["query", PM2_RUN_KEY]);
+  }
+  if (query.exitCode !== 0) throw new Error("Cannot inspect Windows logon autostart (HKCU Run).");
+  const commands = [...query.stdout.matchAll(/REG_(?:EXPAND_)?SZ\s+([^\r\n]+)/g)].map(m => m[1]!.trim());
+  // A direct command inherits the standard pm2 home. Custom homes need our explicit wrapper.
+  if (commands.some(command => !process.env.PM2_HOME && isPm2Resurrect(command, bin))) return true;
+  const registered = commands.includes(desired);
+  if (!install) return registered && scriptIO.exists();
+  if (desired.length > 260) throw new Error("Windows logon command exceeds the Run key's 260-character limit.");
+  scriptIO.write(pm2LogonScript(bin));
+  if (registered) return true;
+  if (run(["add", PM2_RUN_KEY, "/v", PM2_RUN_NAME, "/t", "REG_SZ", "/d", desired, "/f"]).exitCode !== 0)
+    throw new Error("Cannot register pm2 resurrect at Windows logon (HKCU Run).");
+  return pm2WindowsAutostart(bin, false, run, scriptIO);
+}
+
 // Capture the process-manager's process list as text (oxmgr `list` / pm2 `jlist`).
 // Match a name in it with listsProcess, not a substring test.
 async function pmList(mgr: DaemonManager = daemonManager()): Promise<string> {
@@ -2929,7 +2992,10 @@ export async function daemonInstall(serveUrl: string): Promise<void> {
       "--cwd", home,
       "--", rechScript, "serve",
     ], daemonEnv);
-    await runPm(mgr, ["save"]); // persist process list for `pm2 resurrect` on reboot
+    if (startCode === 0) {
+      if (await runPm(mgr, ["save"]) !== 0) throw new Error("pm2 save failed; the daemon cannot be restored at logon.");
+      if (IS_WINDOWS && !pm2WindowsAutostart(mgr.bin, true)) throw new Error("Windows pm2 autostart verification failed.");
+    }
   } else {
     const envArgs = Object.entries(daemonEnv).flatMap(([k, v]) => ["--env", `${k}=${v}`]);
     // oxmgr shell-splits the command string (backslashes are escapes, so `C:\Users\…` became
@@ -3980,6 +4046,11 @@ async function setup(opts: SetupOptions = {}): Promise<void> {
       if (await pingManagement()) { ready = true; break; }
     }
     if (!ready) throw new Error("Local management listener did not start; inspect rech status and daemon logs");
+  } else if (IS_WINDOWS) {
+    // Repair older installs even when setup can reuse the already-running daemon.
+    const mgr = daemonManager();
+    if (mgr.id === "pm2" && !pm2WindowsAutostart(mgr.bin, true))
+      throw new Error("Windows pm2 autostart verification failed.");
   }
   console.log(`✓ [1/5] Local management daemon verified; requested profile access: ${desiredBind}`);
 
@@ -4125,6 +4196,9 @@ async function setup(opts: SetupOptions = {}): Promise<void> {
     }
 
     if (bridgeVerified) break;
+    // Unattended setup cannot click the guide's Retry button. Previously it waited
+    // silently for fifteen minutes after a failed handshake (or even with no guide).
+    if (!setupBridgeCanRetry(isTTY, !!guide, !!opts.yes)) break;
     const safeError = bridgeError.replaceAll(token, "[redacted]").replaceAll(serveKey, "[redacted]").slice(0, 700);
     guide?.update("error", `Connection failed: ${safeError}. Check the daemon and reload the extension if needed, then click Retry connection. A replacement token can also be pasted below.`);
     while (Date.now() < bridgeDeadline && !guide?.takeRetry()) await Bun.sleep(500);
@@ -4820,6 +4894,10 @@ async function status(): Promise<void> {
   if (isHost) {
     const daemonRegistered = mgr ? listsProcess(mgr.id, await pmList(mgr).catch(() => ""), PM_PROCESS_NAME) : false;
     console.log(`daemon:   ${daemonRegistered ? `${mgr!.id} (${PM_PROCESS_NAME})` : mgr ? "not installed" : "not installed (no oxmgr or pm2 on PATH)"}`);
+    if (IS_WINDOWS && mgr?.id === "pm2") {
+      try { console.log(`autostart: ${pm2WindowsAutostart(mgr.bin) ? "wired (Windows logon)" : "not wired — run rech setup"}`); }
+      catch { console.log("autostart: unknown (cannot inspect HKCU Run)"); }
+    }
   }
   // Same resolution as a command: ?profile= in the URL, else PLAYWRIGHT_MCP_PROFILE_DIRECTORY.
   const effective = resolveEffectiveProfile(parsed.profileDirectory);
