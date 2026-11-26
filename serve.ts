@@ -5,6 +5,7 @@ import { WEBRTC, authorizeCredential, credentialForBearer, inviteState, readShar
 import { bearerOf, safeEqual } from "./secret.ts";
 import { WebrtcHost } from "./webrtc.ts";
 import { file } from "bun";
+import { windowsSessionWarning } from "./daemon-manager.ts";
 import { createHash, randomBytes, X509Certificate } from "crypto";
 import { mkdirSync, lstatSync, statSync, chmodSync, unlinkSync, accessSync, readdirSync, realpathSync, existsSync, readFileSync, renameSync, constants as fsConstants } from "fs";
 import { join, resolve, relative, isAbsolute, sep } from "path";
@@ -24,6 +25,8 @@ import {
   readChromeProfileCache,
   checkTailscaleServe,
   chromeDataAccessHint,
+  inspectWindowsSession,
+  interactiveServeHint,
 } from "./rechrome.ts";
 import { SecretMasker, runCodeOnSession, parseReadCookieWire, readCookieOnSession, parseReadStorageWire, readStorageOnSession, parseReadSecretWire, readSecretOnSession, parseReadHeadersWire, readHeadersOnSession, readHeadersEvidence, parseFillSecretWire, fillSecretOnSession, passwordValuesOnSession, hasSnapshot, maskPasswordLines, withholdSnapshots } from "./fill-secret.ts";
 import { parseRecordArgs, buildCaptureChunkCode, resolveFfmpeg, resolveFormat, recordSink, Recording, freeName, withFormatExt, RECORD_CHUNK_MS, RECORD_MAX_SECONDS, type CaptureChunk, type RecordingSummary } from "./record.ts";
@@ -663,6 +666,22 @@ This link contains a secret key: anyone with it can use this browser profile, so
 }
 
 export async function serve() {
+  let windowsSessionError: string | undefined;
+  let windowsSession = await inspectWindowsSession().catch(error => {
+    windowsSessionError = error.message;
+    console.error(`[rech] WARNING: ${windowsSessionError}`);
+    return undefined;
+  });
+  const windowsSessionHint = windowsSession ? interactiveServeHint(windowsSession) : undefined;
+  if (windowsSession) {
+    const warning = windowsSessionWarning(windowsSession);
+    if (warning) console.error(`[rech] ${warning}\n${windowsSessionHint}`);
+    // Refresh after logon/disconnect, without making every status poll run PowerShell.
+    setInterval(async () => {
+      try { windowsSession = await inspectWindowsSession(); windowsSessionError = undefined; }
+      catch (error) { windowsSessionError = (error as Error).message; }
+    }, 30000).unref();
+  }
   // The daemon owns logs/ and output/, so it migrates them before writing anything.
   const migrated = migrateLegacyDataDir();
   const url = await getOrCreateUrl();
@@ -853,6 +872,7 @@ export async function serve() {
         if (scoped || !reqUrl.searchParams.get("deep"))
           return Response.json({
             ok: true, bind: listenHost, listener: listener.name, profiles: listener.profiles, multiListener: true, consecutiveTimeouts, degraded, chromeAccessProblem,
+            ...(!scoped ? { windowsSession, windowsSessionHint, windowsSessionError } : {}),
             ...(cred ? {
               share: cred.share.label, kind: cred.kind, ...(cred.kind === "device" ? { device: { id: cred.device.id, name: cred.device.name, approved: cred.device.approved } } : { invite: inviteState(cred.share) }), expiresAt: cred.share.expiresAt,
               profileInfo: await profileInfo(cred.share.profiles), sessions: shareSessions(cred.share, sessionOwners, liveSessions()),
