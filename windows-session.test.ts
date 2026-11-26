@@ -39,28 +39,45 @@ test("hint uses an idempotent same-user interactive task without credentials or 
   expect(command).toContain("-LogonType Interactive");
   expect(command).toContain("-MultipleInstances IgnoreNew");
   expect(command).toContain("-ExecutionTimeLimit ([TimeSpan]::Zero)");
-  expect(command).toContain("-WindowStyle Hidden");
   expect(command).toContain("-AtLogOn");
   expect(command).toContain("-WorkingDirectory 'C:\\User''s files'");
   expect(command).toContain("Start-ScheduledTask -TaskName 'Rechrome Interactive Serve-S-1-5-21-123'");
-  expect(command).toContain("User''''s files");
   expect(command).not.toMatch(/RECHROME_URL|token=|#key=|Stop-Process|pm2|Password/);
   expect(windowsInteractiveServeCommand(options)).toBe(command);
 });
+test("the task starts serve through a hidden wscript launcher, never a console program", () => {
+  const command = windowsInteractiveServeCommand(options);
+  expect(command).toContain('-Execute "$env:SystemRoot\\System32\\wscript.exe"');
+  expect(command).toContain("serve-interactive.vbs");
+  expect(command).toContain(",0,True)"); // hidden window; wscript waits so the task supervises serve
+  expect(command).not.toContain("powershell.exe");
+});
 
-test.skipIf(process.platform !== "win32")("PowerShell parses the exact hint and preserves action quoting", () => {
-  // Replace scheduler cmdlets with stubs, so this checks real PowerShell parsing
-  // and nested command quoting without registering or starting anything.
-  const script = `
+test.skipIf(process.platform !== "win32")("PowerShell runs the exact hint: launcher written, action quoted", async () => {
+  const { mkdtempSync, readFileSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  // The hint writes the launcher under <home>\.rechrome: point it at a temp home.
+  const home = mkdtempSync(join(tmpdir(), "rechrome user's "));
+  try {
+    // Replace scheduler cmdlets with stubs, so this checks real PowerShell parsing
+    // and nested command quoting without registering or starting anything.
+    const script = `
 function New-ScheduledTaskAction { param($Execute,$Argument,$WorkingDirectory) @{Execute=$Execute;Argument=$Argument} }
 function New-ScheduledTaskPrincipal { param($UserId,$LogonType) }
 function New-ScheduledTaskSettingsSet { param($MultipleInstances,$ExecutionTimeLimit,[switch]$AllowStartIfOnBatteries,[switch]$DontStopIfGoingOnBatteries,$RestartCount,$RestartInterval) }
 function New-ScheduledTaskTrigger { param([switch]$AtLogOn,$User) }
-function Register-ScheduledTask { param($TaskName,$Action,$Principal,$Settings,$Trigger,[switch]$Force) $Action.Argument | ConvertTo-Json -Compress | Write-Host }
+function Register-ScheduledTask { param($TaskName,$Action,$Principal,$Settings,$Trigger,[switch]$Force) $Action | ConvertTo-Json -Compress | Write-Host }
 function Start-ScheduledTask { param($TaskName) }
-${windowsInteractiveServeCommand(options)}`;
-  const result = Bun.spawnSync(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script], { windowsHide: true, timeout: 15000 });
-  expect(result.exitCode).toBe(0);
-  const action = JSON.parse(result.stdout.toString().trim());
-  expect(action).toContain("& 'C:\\Program Files\\Bun\\bun.exe' 'C:\\User''s files\\rechrome.ts' serve");
+${windowsInteractiveServeCommand({ ...options, home })}`;
+    const result = Bun.spawnSync(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script], { windowsHide: true, timeout: 15000 });
+    expect(result.exitCode).toBe(0);
+    const action = JSON.parse(result.stdout.toString().trim());
+    const launcher = join(home, ".rechrome", "serve-interactive.vbs");
+    expect(action.Execute.toLowerCase()).toBe(join(process.env.SystemRoot!, "System32", "wscript.exe").toLowerCase());
+    expect(action.Argument).toBe(`//B //NoLogo "${launcher}"`);
+    const vbs = readFileSync(launcher).toString("utf16le").replace(/^\ufeff/, "");
+    expect(vbs).toContain(`s.CurrentDirectory="${home}"`);
+    expect(vbs).toContain(`s.Run("""C:\\Program Files\\Bun\\bun.exe"" ""C:\\User's files\\rechrome.ts"" serve",0,True)`);
+  } finally { rmSync(home, { recursive: true, force: true }); }
 });

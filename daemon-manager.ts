@@ -12,6 +12,8 @@
 // unit-testable; the impure probing (Bun.which, `oxmgr --version`) lives in
 // rechrome.ts and feeds its results into pickDaemonManager.
 
+import { hiddenLaunchVbs, wscriptCommand } from "./windows-tray.ts";
+
 export type DaemonManager = { id: "oxmgr" | "pm2"; bin: string };
 
 // Base version that first shipped the winfix build tag. A strictly newer base
@@ -144,14 +146,23 @@ export function windowsSessionWarning(info: WindowsDesktopSession): string | und
 
 const psLiteral = (value: string) => `'${value.replaceAll("'", "''")}'`;
 
+export const windowsInteractiveTaskName = (userSid: string) => `Rechrome Interactive Serve-${userSid}`;
+
 // No URLs, tokens, or inherited credential environment in task arguments. The
 // new serve reads the normal machine-wide configuration in ~/.rechrome.
-export function windowsInteractiveServeCommand(opts: { bun: string; script: string; nodeDirectory: string; home: string; userSid: string }): string {
-  const name = psLiteral(`Rechrome Interactive Serve-${opts.userSid}`);
-  const launch = `$env:PATH=${psLiteral(opts.nodeDirectory + ";")}+$env:PATH; $env:RECH_SERVE_MANAGED='1'; & ${psLiteral(opts.bun)} ${psLiteral(opts.script)} serve; exit $LASTEXITCODE`;
-  const args = `-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -Command "${launch.replaceAll('"', '\\"')}"`;
+// The task runs wscript.exe on a one-line VBScript launcher (written next to the
+// other state in ~/.rechrome) that starts bun with a hidden window and waits on it:
+// no console window ever appears, not even the flash of powershell -WindowStyle Hidden.
+export function windowsInteractiveServeCommand(opts: { bun: string; script: string; nodeDirectory: string; home: string; userSid: string; systemRoot?: string }): string {
+  const name = psLiteral(windowsInteractiveTaskName(opts.userSid));
+  const rechDir = `${opts.home}\\.rechrome`;
+  const launcher = `${rechDir}\\serve-interactive.vbs`;
+  const vbs = hiddenLaunchVbs({ argv: [opts.bun, opts.script, "serve"], cwd: opts.home, prependPath: opts.nodeDirectory, env: { RECH_SERVE_MANAGED: "1" }, wait: true });
+  const wscript = wscriptCommand(opts.systemRoot ?? "$env:SystemRoot", launcher);
   return [
-    `$action=New-ScheduledTaskAction -Execute "$env:SystemRoot\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -WorkingDirectory ${psLiteral(opts.home)} -Argument ${psLiteral(args)}`,
+    `New-Item -ItemType Directory -Force -Path ${psLiteral(rechDir)} | Out-Null`,
+    `[IO.File]::WriteAllText(${psLiteral(launcher)}, ${psLiteral(vbs.trimEnd())}, [Text.Encoding]::Unicode)`,
+    `$action=New-ScheduledTaskAction -Execute "${wscript.exe}" -WorkingDirectory ${psLiteral(opts.home)} -Argument ${psLiteral(wscript.args)}`,
     `$principal=New-ScheduledTaskPrincipal -UserId ${psLiteral(opts.userSid)} -LogonType Interactive`,
     `$settings=New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)`,
     `$trigger=New-ScheduledTaskTrigger -AtLogOn -User ${psLiteral(opts.userSid)}`,

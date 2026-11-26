@@ -1,3 +1,4 @@
+#![cfg_attr(windows, windows_subsystem = "windows")] // GUI binary: no console window on Windows
 //! rechrome-tray — a native menu-bar / system-tray icon for the rechrome
 //! `serve` daemon.
 //!

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { isPm2Resurrect, pm2LogonCommand, pm2LogonScript, pm2WindowsAutostart, setupBridgeCanRetry } from "./rechrome.ts";
+import { isPm2Resurrect, isServeCommandLine, legacyPm2LogonCommand, pm2LogonCommand, pm2LogonLauncher, pm2LogonScript, pm2WindowsAutostart, setupBridgeCanRetry } from "./rechrome.ts";
 
 const bin = String.raw`C:\Program Files\pm2\pm2.cmd`;
 test("matches equivalent direct commands, not substrings or other installations", () => {
@@ -15,6 +15,31 @@ test("logon command preserves custom home and quoted shim paths", () => {
   expect(script).toContain("home''s");
   expect(script).toContain(`& '${bin}' resurrect`);
   expect(script).toContain("$env:PATH='C:\\Program Files\\node'");
+});
+test("logon starts pm2 through wscript, and a legacy console entry is upgraded in place", () => {
+  expect(pm2LogonCommand()).toMatch(/^"[^"]+\\wscript\.exe" \/\/B \/\/NoLogo .*pm2-logon\.vbs"?$/i);
+  expect(pm2LogonLauncher()).toContain(",0,True)");
+  expect(pm2LogonLauncher()).toContain("pm2-logon.ps1");
+  let value = legacyPm2LogonCommand();
+  const writes: string[] = [];
+  const run = (args: string[]) => {
+    if (args[0] === "add") { value = args[args.indexOf("/d") + 1]!; writes.push(args[args.indexOf("/v") + 1]!); }
+    return { exitCode: 0, stdout: `    RechromePm2    REG_SZ    ${value}\r\n` };
+  };
+  const io = { exists: () => true, write: () => {} };
+  expect(pm2WindowsAutostart(bin, false, run, io)).toBe(true); // still starts pm2: reported as wired
+  expect(pm2WindowsAutostart(bin, true, run, io)).toBe(true);
+  expect(writes).toEqual(["RechromePm2"]); // same value name: replaced, not duplicated
+  expect(value).toBe(pm2LogonCommand());
+});
+test("serve process matching: this install's serve only", () => {
+  const script = "C:\\Users\\me\\ws\\rechrome\\rechrome.ts";
+  expect(isServeCommandLine('"C:\\Users\\me\\.bun\\bin\\bun.exe" C:\\Users\\me\\ws\\rechrome\\rechrome.ts serve', script)).toBe(true);
+  expect(isServeCommandLine('"C:\\bun.exe" "C:/Users/me/ws/rechrome/rechrome.ts" serve ', script)).toBe(true);
+  expect(isServeCommandLine("bun C:\\Users\\me\\ws\\rechrome\\rechrome.ts status", script)).toBe(false);
+  expect(isServeCommandLine("bun C:\\Users\\me\\ws\\rechrome\\rechrome.ts serve --x", script)).toBe(false);
+  expect(isServeCommandLine("bun C:\\other\\rechrome.ts serve", script)).toBe(false);
+  expect(isServeCommandLine("bun C:\\Users\\me\\ws\\rechrome\\rechrome.tsx serve", script)).toBe(false);
 });
 test("installs once, verifies and reuses existing wiring", () => {
   let command = "";
