@@ -93,5 +93,13 @@
   },
   "trustedDependencies": [
     "node-datachannel"
-  ]
+  ],
+  "rustify": {
+    "mode": "hybrid",
+    "bins": {
+      "rech": "rechrome",
+      "rechrome": "rechrome"
+    },
+    "rootEnv": "RECHROME_PACKAGE_ROOT"
+  }
 }
