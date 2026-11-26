@@ -59,10 +59,11 @@ pub fn run(entry: &str) -> ! {
     };
     let script = root.join(entry);
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let candidates = runtimes(&script);
     let mut last_error = None;
-    for runtime in ["bun", "node"] {
-        let mut command = Command::new(runtime);
-        command.arg(&script).args(&args);
+    for runtime in &candidates {
+        let mut command = program(&runtime[0]);
+        command.args(&runtime[1..]).arg(&script).args(&args);
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
@@ -79,12 +80,64 @@ pub fn run(entry: &str) -> ! {
             }
         }
     }
+    let tried: Vec<&str> = candidates.iter().map(|c| c[0].as_str()).collect();
     eprintln!(
-        "cannot run {}: neither bun nor node could be started ({})",
+        "cannot run {}: none of {} could be started ({})",
         script.display(),
+        tried.join(", "),
         last_error.map(|e| e.to_string()).unwrap_or_default()
     );
     std::process::exit(127);
+}
+
+/// The commands to try for running `script`, in order. First what the
+/// script's own `#!` line names, because that is what ran it before this
+/// binary existed; then bun and node, whichever is installed.
+fn runtimes(script: &std::path::Path) -> Vec<Vec<String>> {
+    let head = std::fs::read(script).unwrap_or_default();
+    let first_line = String::from_utf8_lossy(&head[..head.len().min(512)]).lines().next().unwrap_or("").to_string();
+    let is_typescript = matches!(
+        script.extension().and_then(|e| e.to_str()),
+        Some("ts" | "mts" | "cts" | "tsx")
+    );
+    let mut list: Vec<Vec<String>> = interpreter(&first_line).into_iter().collect();
+    // node cannot be relied on to run TypeScript, so it is only tried for a
+    // TypeScript entry when the entry asks for it.
+    let fallbacks: &[&str] = if is_typescript { &["bun"] } else { &["bun", "node"] };
+    for name in fallbacks {
+        if !list.iter().any(|c| c[0] == *name) {
+            list.push(vec![name.to_string()]);
+        }
+    }
+    list
+}
+
+/// The command a `#!` line asks for, without its directory:
+/// `#!/usr/bin/env node` is `["node"]`, `#!/usr/bin/env -S npx tsx` is
+/// `["npx", "tsx"]`, and a line that is not a `#!` line is `None`.
+fn interpreter(first_line: &str) -> Option<Vec<String>> {
+    let mut words = first_line.strip_prefix("#!")?.split_whitespace();
+    let name = |path: &str| path.rsplit(['/', '\\']).next().unwrap_or(path).to_string();
+    let first = name(words.next()?);
+    let command: Vec<String> = if first == "env" {
+        // Skip env's own flags (-S) and VAR=value settings.
+        words.skip_while(|w| w.starts_with('-') || w.contains('=')).map(String::from).collect()
+    } else {
+        std::iter::once(first).chain(words.map(String::from)).collect()
+    };
+    (!command.is_empty()).then_some(command)
+}
+
+/// A command for `name`. On Windows, tools installed by a package manager
+/// (npx, tsx, …) are `.cmd` files, which have to be started through cmd.
+fn program(name: &str) -> Command {
+    #[cfg(windows)]
+    if !matches!(name, "bun" | "node" | "deno") {
+        let mut command = Command::new("cmd");
+        command.args(["/C", name]);
+        return command;
+    }
+    Command::new(name)
 }
 
 /// Ctrl+C reaches every process attached to the console. Without a handler
@@ -105,5 +158,46 @@ fn stay_alive_on_ctrl_c() {
     }
     unsafe {
         SetConsoleCtrlHandler(Some(handled), 1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(script: &std::path::Path) -> Vec<String> {
+        runtimes(script).into_iter().map(|c| c.join(" ")).collect()
+    }
+
+    #[test]
+    fn the_shebang_names_the_interpreter() {
+        assert_eq!(interpreter("#!/usr/bin/env node"), Some(vec!["node".to_string()]));
+        assert_eq!(interpreter("#!/usr/bin/env bun"), Some(vec!["bun".to_string()]));
+        assert_eq!(interpreter("#!/usr/local/bin/node --no-warnings").unwrap(), ["node", "--no-warnings"]);
+        assert_eq!(interpreter("#!/usr/bin/env -S npx tsx").unwrap(), ["npx", "tsx"]);
+        assert_eq!(interpreter("#!/usr/bin/env npx tsx").unwrap(), ["npx", "tsx"]);
+        assert_eq!(interpreter("#! /usr/bin/env  FOO=1 node").unwrap(), ["node"]);
+        assert_eq!(interpreter("import x from \"y\";"), None);
+        assert_eq!(interpreter("#!/usr/bin/env"), None);
+        assert_eq!(interpreter(""), None);
+    }
+
+    #[test]
+    fn the_script_decides_which_runtime_is_tried_first() {
+        let dir = std::env::temp_dir().join(format!("rustify-fallback-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |name: &str, text: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, text).unwrap();
+            path
+        };
+        assert_eq!(names(&file("a.js", "#!/usr/bin/env node\nx")), ["node", "bun"]);
+        assert_eq!(names(&file("b.js", "#!/usr/bin/env bun\nx")), ["bun", "node"]);
+        assert_eq!(names(&file("c.js", "console.log(1)")), ["bun", "node"]);
+        assert_eq!(names(&file("d.ts", "#!/usr/bin/env bun\nx")), ["bun"]);
+        assert_eq!(names(&file("e.ts", "#!/usr/bin/env npx tsx\nx")), ["npx tsx", "bun"]);
+        assert_eq!(names(&file("f.ts", "#!/usr/bin/env node\nx")), ["node", "bun"]);
+        assert_eq!(names(&dir.join("missing.js")), ["bun", "node"]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
