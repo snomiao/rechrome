@@ -128,3 +128,65 @@ export function listsProcess(id: DaemonManager["id"], output: string, name: stri
   }
   return output.split(/[\s│|┃]+/).includes(name);
 }
+
+export type WindowsDesktopSession = {
+  pid: number;
+  sessionId: number;
+  userSid: string;
+  desktopSessionIds: number[];
+};
+
+export function windowsSessionWarning(info: WindowsDesktopSession): string | undefined {
+  if (info.sessionId !== 0 && info.desktopSessionIds.includes(info.sessionId)) return;
+  const desktop = info.desktopSessionIds.length ? ` Same-user active desktop session(s): ${info.desktopSessionIds.join(", ")}.` : " No active desktop session for this user was found; sign in to Windows first.";
+  return `WARNING: serve PID ${info.pid} runs in Windows session ${info.sessionId}, outside this user's active desktop. Chrome's extension may never connect (Extension connection timeout).${desktop}`;
+}
+
+const psLiteral = (value: string) => `'${value.replaceAll("'", "''")}'`;
+
+// No URLs, tokens, or inherited credential environment in task arguments. The
+// new serve reads the normal machine-wide configuration in ~/.rechrome.
+export function windowsInteractiveServeCommand(opts: { bun: string; script: string; nodeDirectory: string; home: string; userSid: string }): string {
+  const name = psLiteral(`Rechrome Interactive Serve-${opts.userSid}`);
+  const launch = `$env:PATH=${psLiteral(opts.nodeDirectory + ";")}+$env:PATH; $env:RECH_SERVE_MANAGED='1'; & ${psLiteral(opts.bun)} ${psLiteral(opts.script)} serve; exit $LASTEXITCODE`;
+  const args = `-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -Command "${launch.replaceAll('"', '\\"')}"`;
+  return [
+    `$action=New-ScheduledTaskAction -Execute "$env:SystemRoot\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -WorkingDirectory ${psLiteral(opts.home)} -Argument ${psLiteral(args)}`,
+    `$principal=New-ScheduledTaskPrincipal -UserId ${psLiteral(opts.userSid)} -LogonType Interactive`,
+    `$settings=New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)`,
+    `$trigger=New-ScheduledTaskTrigger -AtLogOn -User ${psLiteral(opts.userSid)}`,
+    `Register-ScheduledTask -TaskName ${name} -Action $action -Principal $principal -Settings $settings -Trigger $trigger -Force | Out-Null`,
+    `Start-ScheduledTask -TaskName ${name}`,
+  ].join("; ");
+}
+
+// WTS state 0 = Active. Explorer alone is insufficient: it also survives in
+// disconnected RDP sessions. Compare owner SIDs, never just a username/session ID.
+export function windowsSessionProbeScript(pid: number): string {
+  if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("Invalid process ID");
+  return `$ErrorActionPreference='Stop'
+[Console]::OutputEncoding=[Text.UTF8Encoding]::new()
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class RechromeSessionState {
+  [DllImport("wtsapi32.dll")] static extern bool WTSQuerySessionInformation(IntPtr server, int session, int info, out IntPtr buffer, out int bytes);
+  [DllImport("wtsapi32.dll")] static extern void WTSFreeMemory(IntPtr buffer);
+  public static bool Active(int session) {
+    IntPtr buffer; int bytes;
+    if (!WTSQuerySessionInformation(IntPtr.Zero, session, 8, out buffer, out bytes)) return false;
+    try { return bytes >= 4 && Marshal.ReadInt32(buffer) == 0; }
+    finally { WTSFreeMemory(buffer); }
+  }
+}
+'@
+$target=Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}'
+if (!$target) { throw 'Serve process exited' }
+$owner=Invoke-CimMethod -InputObject $target -MethodName GetOwnerSid
+if ($owner.ReturnValue -ne 0) { throw 'Cannot read serve owner' }
+$desktops=@(Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" | Where-Object {
+  $_.SessionId -gt 0 -and [RechromeSessionState]::Active($_.SessionId) -and
+  (Invoke-CimMethod -InputObject $_ -MethodName GetOwnerSid).Sid -eq $owner.Sid
+} | Select-Object -ExpandProperty SessionId -Unique)
+@{pid=${pid};sessionId=[int]$target.SessionId;userSid=$owner.Sid;desktopSessionIds=@($desktops)} | ConvertTo-Json -Compress`;
+}

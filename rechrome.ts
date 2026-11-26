@@ -20,7 +20,7 @@ import { pathToFileURL } from "url";
 import { createRequire } from "node:module";
 import { spawn as cpSpawn } from "child_process";
 import { readFile, writeFile, rename, chmod, mkdir, stat } from "node:fs/promises";
-import { isDeprecatedPm2Fallback, listsProcess, oxmgrInstallCommand, pickDaemonManager, PM2_DEPRECATION, type DaemonManager } from "./daemon-manager.ts";
+import { isDeprecatedPm2Fallback, listsProcess, oxmgrInstallCommand, pickDaemonManager, PM2_DEPRECATION, windowsSessionProbeScript, windowsSessionWarning, windowsInteractiveServeCommand, type WindowsDesktopSession, type DaemonManager } from "./daemon-manager.ts";
 import { DEFAULT_SIGNAL, INVITE_PATH, WEBRTC, createShare, normalizeSignal, findDevice, findShare, inviteLink, inviteProblem, parseDuration, REUSABLE_DEFAULT_TTL, REUSABLE_MAX_DEVICES, readShares, updateShares, type Share } from "./shares.ts";
 import { bearerOf, looksLikeToken, newToken, parseToken, redactSecrets } from "./secret.ts";
 import { WebrtcClient, loadRTC, runBridge, spawnBridge } from "./webrtc.ts";
@@ -30,6 +30,23 @@ export const ENV_KEY = "RECHROME_URL";
 export const DEFAULT_PORT = 13775;
 // Home dir: HOME on POSIX, USERPROFILE on Windows (handled by os.homedir()).
 export const HOME = homedir();
+
+export async function inspectWindowsSession(pid = process.pid): Promise<WindowsDesktopSession | undefined> {
+  if (process.platform !== "win32") return;
+  const result = Bun.spawn([join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe"), "-NoProfile", "-NonInteractive", "-Command", windowsSessionProbeScript(pid)], {
+    stdout: "pipe", stderr: "ignore", windowsHide: true, timeout: 15000,
+  });
+  const output = await new Response(result.stdout).text();
+  if (await result.exited !== 0) throw new Error("Cannot inspect Windows desktop sessions (CIM/WTS access failed)");
+  return JSON.parse(output);
+}
+
+export function interactiveServeHint(info: WindowsDesktopSession): string {
+  return "Stop only the existing rechrome app first (pm2 stop rechrome, or oxmgr stop rechrome, as applicable; leave the manager and Chrome running). Then run in PowerShell as the same Windows user:\n" + windowsInteractiveServeCommand({
+    bun: Bun.which("bun") ?? process.execPath, script: import.meta.filename,
+    nodeDirectory: dirname(Bun.which("node") ?? process.execPath), home: HOME, userSid: info.userSid,
+  });
+}
 
 // All rechrome state (registry, listeners, extension, logs, daemon output) lives in
 // ~/.rechrome, never next to the code: a bunx/npx install dir is a disposable cache.
@@ -4858,7 +4875,7 @@ async function status(): Promise<void> {
     ? await fetch(serviceUrl(url, "ping"), { headers: { Authorization: `Bearer ${parsed.key}` }, signal: AbortSignal.timeout(2000) }).catch(() => null)
     : null;
   const pingBody = pingResponse?.ok || pingResponse?.status === 403
-    ? await pingResponse.json().catch(() => null) as { bind?: string; listener?: string; profiles?: string[] | "*"; degraded?: boolean; consecutiveTimeouts?: number; chromeAccessProblem?: string; share?: string; kind?: string; device?: { id: string; name: string; approved: boolean }; expiresAt?: number; error?: string } | null
+    ? await pingResponse.json().catch(() => null) as { windowsSession?: WindowsDesktopSession; windowsSessionHint?: string; windowsSessionError?: string; bind?: string; listener?: string; profiles?: string[] | "*"; degraded?: boolean; consecutiveTimeouts?: number; chromeAccessProblem?: string; share?: string; kind?: string; device?: { id: string; name: string; approved: boolean }; expiresAt?: number; error?: string } | null
     : null;
   // Show the URL this client connects to; through a proxy, the daemon's bind is on another port.
   const details = [pingBody?.listener && `listener ${pingBody.listener}`, pingBody?.bind && `bind ${pingBody.bind}`].filter(Boolean).join(", ");
@@ -4887,14 +4904,30 @@ async function status(): Promise<void> {
   // No oxmgr/pm2 on PATH must not take down `rech status`: report it instead of throwing.
   let mgr: DaemonManager | undefined;
   if (isHost) try { mgr = daemonManager(); } catch { /* reported below */ }
+  if (pingBody?.windowsSession) {
+    const info = pingBody.windowsSession;
+    console.log(`session:  serve PID ${info.pid}, Windows session ${info.sessionId}; active desktop: ${info.desktopSessionIds.join(", ") || "none"}`);
+    const warning = windowsSessionWarning(info);
+    if (warning) {
+      console.log(warning);
+      if (pingBody.windowsSessionHint) console.log(pingBody.windowsSessionHint);
+    }
+  }
+  if (pingBody?.windowsSessionError) console.log(`session:  ⚠ ${pingBody.windowsSessionError}`);
   if (pingBody?.chromeAccessProblem)
     console.log(`chrome:   ⚠ daemon ${pingBody.chromeAccessProblem}`);
   if (pingBody?.degraded)
     console.log(`relay:    ⚠ degraded (${pingBody.consecutiveTimeouts} consecutive command timeouts) — if it persists, the daemon self-restarts; ${isHost ? `force it now with \`${mgr?.id ?? "oxmgr"} restart ${PM_PROCESS_NAME}\`` : "the daemon host can restart it"}`);
   if (isHost) {
     const daemonRegistered = mgr ? listsProcess(mgr.id, await pmList(mgr).catch(() => ""), PM_PROCESS_NAME) : false;
-    console.log(`daemon:   ${daemonRegistered ? `${mgr!.id} (${PM_PROCESS_NAME})` : mgr ? "not installed" : "not installed (no oxmgr or pm2 on PATH)"}`);
-    if (IS_WINDOWS && mgr?.id === "pm2") {
+    let interactiveTask: string | undefined;
+    if (IS_WINDOWS && pingBody?.windowsSession) {
+      const taskName = `Rechrome Interactive Serve-${pingBody.windowsSession.userSid}`;
+      const task = Bun.spawnSync(["schtasks.exe", "/Query", "/TN", taskName], { stdout: "ignore", stderr: "ignore", windowsHide: true, timeout: 10000 });
+      if (task.exitCode === 0) interactiveTask = taskName;
+    }
+    console.log(`daemon:   ${interactiveTask ? `interactive scheduled task wired (${interactiveTask})` : daemonRegistered ? `${mgr!.id} (${PM_PROCESS_NAME})` : mgr ? "not installed" : "not installed (no oxmgr or pm2 on PATH)"}`);
+    if (IS_WINDOWS && mgr?.id === "pm2" && !interactiveTask) {
       try { console.log(`autostart: ${pm2WindowsAutostart(mgr.bin) ? "wired (Windows logon)" : "not wired — run rech setup"}`); }
       catch { console.log("autostart: unknown (cannot inspect HKCU Run)"); }
     }
