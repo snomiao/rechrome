@@ -3878,10 +3878,31 @@ export function firstLink(raw: string): string {
   return raw.split(/\r?\n/).map(s => s.trim()).find(Boolean) ?? "";
 }
 
-/** Resolve the connect link from argv, stdin (`-`), or a file. A share link carries a `rech1_` secret,
- *  so passing it as an argv positional exposes it in `ps` and shell history; `-`/`--file` keep it off
- *  the command line. Exactly one source may be given. */
-export async function resolveConnectLink(url: string | undefined, file: string | undefined, readStdin: () => Promise<string> = () => Bun.stdin.text()): Promise<string> {
+/** Env vars `rech connect` reads the link from, in order, when no argument/--file is given. */
+export const CONNECT_ENV_KEYS = ["RECH_CONNECT_URL", ENV_KEY] as const;
+
+/** The connect link from the shell environment only: a RECHROME_URL loaded from a saved .env.local is
+ *  the current connection, not a new link to connect, so only keys the process inherited count. */
+export function connectEnvLink(env: Record<string, string | undefined> = process.env, inherited: Set<string> = inheritedEnvKeys): string | undefined {
+  for (const key of CONNECT_ENV_KEYS) {
+    const v = inherited.has(key) ? env[key]?.trim() : undefined;
+    if (v) return v;
+  }
+  return undefined;
+}
+
+/** Resolve the connect link from argv, stdin (`-`), a file, or the environment (RECH_CONNECT_URL,
+ *  then RECHROME_URL). A share link carries a `rech1_` secret, so passing it as an argv positional
+ *  exposes it in `ps` and shell history; `-`/`--file`/env keep it off the command line. Exactly one
+ *  source may be given; with none, the environment is used if set. */
+export async function resolveConnectLink(url: string | undefined, file: string | undefined, readStdin: () => Promise<string> = () => Bun.stdin.text(), opts: { fromEnv?: boolean; envLink?: () => string | undefined } = {}): Promise<string> {
+  const envLink = opts.envLink ?? (() => connectEnvLink());
+  if (opts.fromEnv) {
+    if (url !== undefined || file !== undefined) throw new Error("Pass the link as an argument, as - (stdin), via --file or --from-env, not more than one.");
+    const link = envLink();
+    if (!link) throw new Error(`--from-env: set ${CONNECT_ENV_KEYS.join(" or ")} in the environment.`);
+    return link;
+  }
   if (file !== undefined) {
     if (url !== undefined) throw new Error("Pass the link as an argument, as - (stdin) or via --file, not more than one.");
     let raw: string;
@@ -3897,7 +3918,11 @@ export async function resolveConnectLink(url: string | undefined, file: string |
     if (!link) throw new Error("No link on stdin. Pipe the link in, e.g. pbpaste | rech connect -");
     return link;
   }
-  if (url === undefined) throw new Error("Which link? rech connect '<link>'  —  or keep it off the command line: rech connect --file <path>, or printf %s \"$LINK\" | rech connect -");
+  if (url === undefined) {
+    const link = envLink();
+    if (link) return link;
+    throw new Error("Which link? rech connect '<link>'  —  or keep it off the command line: rech connect --file <path>, printf %s \"$LINK\" | rech connect -, or RECH_CONNECT_URL=… rech connect");
+  }
   return url;
 }
 
@@ -5149,13 +5174,16 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
       .option("project", { type: "boolean", describe: "Save it for this project only (.rechrome/.env.local); the default without a terminal" })
       .option("global", { type: "boolean", describe: "Save it for every project on this machine without its own link (~/.rechrome/.env.local)" })
       .conflicts("project", "global")
+      .option("from-env", { type: "boolean", describe: "Read the link (or rech1_ token) from RECH_CONNECT_URL, else RECHROME_URL, in the shell environment; also the default with no url/--file" })
       .conflicts("url", "file")
+      .conflicts("from-env", "file")
       .example("printf %s \"$LINK\" | rech connect -", "Preferred: the link stays off argv (never in ps / shell history)")
       .example("rech connect --file ./link.txt", "Preferred: read the link from a 0600 file")
+      .example("RECH_CONNECT_URL=\"$LINK\" rech connect", "Preferred: read the link from the environment (also RECHROME_URL; --from-env to require it)")
       .example("rech connect 'https://rechrome.pages.dev/share/#rech1_invite_…'", "An invite inline (visible in ps): registers this device, then saves its own link")
       .example("rech connect --global -", "An agent machine: one link for every folder, /tmp included"),
       a => (async () => {
-        const link = await resolveConnectLink(a.url, a.file);
+        const link = await resolveConnectLink(a.url, a.file, undefined, { fromEnv: a.fromEnv as boolean | undefined });
         return a.global || a.project ? handlers.connect(link, { global: a.global, project: a.project }) : handlers.connect(link);
       })())
     .command(["listener", "listeners"], "Control who can connect: listeners, allowed profiles, keys, public URLs", y => y

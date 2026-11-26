@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { firstLink, resolveConnectLink } from "./rechrome.ts";
+import { connectEnvLink, firstLink, resolveConnectLink } from "./rechrome.ts";
 
 const LINK = "https://rechrome.pages.dev/share/#rech1_invite_ABCDEFGHJKLMNPQRSTUVWXYZ2345";
 
@@ -50,5 +50,35 @@ test("resolveConnectLink rejects empty stdin", async () => {
 });
 
 test("resolveConnectLink without any source explains the secure options", async () => {
-  await expect(resolveConnectLink(undefined, undefined)).rejects.toThrow(/--file|stdin/);
+  await expect(resolveConnectLink(undefined, undefined, undefined, { envLink: () => undefined })).rejects.toThrow(/--file|stdin/);
+});
+
+const TOKEN = "rech1_invite_ABCDEFGHJKLMNPQRSTUVWXYZ2345";
+
+test("resolveConnectLink reads a bare rech1_ token from stdin", async () => {
+  expect(await resolveConnectLink("-", undefined, async () => `  ${TOKEN}\n`)).toBe(TOKEN);
+});
+
+test("resolveConnectLink without url or file falls back to the environment", async () => {
+  expect(await resolveConnectLink(undefined, undefined, undefined, { envLink: () => LINK })).toBe(LINK);
+  expect(await resolveConnectLink(undefined, undefined, undefined, { envLink: () => TOKEN })).toBe(TOKEN);
+});
+
+test("resolveConnectLink keeps a positional url ahead of the environment", async () => {
+  expect(await resolveConnectLink(TOKEN, undefined, undefined, { envLink: () => LINK })).toBe(TOKEN);
+});
+
+test("resolveConnectLink --from-env requires the variable and no other source", async () => {
+  expect(await resolveConnectLink(undefined, undefined, undefined, { fromEnv: true, envLink: () => LINK })).toBe(LINK);
+  await expect(resolveConnectLink(undefined, undefined, undefined, { fromEnv: true, envLink: () => undefined })).rejects.toThrow(/RECH_CONNECT_URL or RECHROME_URL/);
+  await expect(resolveConnectLink("-", undefined, undefined, { fromEnv: true, envLink: () => LINK })).rejects.toThrow(/not more than one/);
+});
+
+test("connectEnvLink prefers RECH_CONNECT_URL, trims, and ignores keys not inherited from the shell", () => {
+  const all = new Set(["RECH_CONNECT_URL", "RECHROME_URL"]);
+  expect(connectEnvLink({ RECH_CONNECT_URL: ` ${TOKEN}\n`, RECHROME_URL: LINK }, all)).toBe(TOKEN);
+  expect(connectEnvLink({ RECHROME_URL: LINK }, all)).toBe(LINK);
+  // RECHROME_URL loaded from a saved .env.local is the current connection, not a link to connect.
+  expect(connectEnvLink({ RECHROME_URL: LINK }, new Set())).toBeUndefined();
+  expect(connectEnvLink({ RECH_CONNECT_URL: "  " }, all)).toBeUndefined();
 });
