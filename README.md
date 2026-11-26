@@ -187,7 +187,12 @@ printf %s "$LINK" | rech connect -      # from stdin (whitespace trimmed)
 rech connect --file ./link.txt          # from a 0600 file
 RECH_CONNECT_URL="$LINK" rech connect   # from the environment (RECHROME_URL also works)
 rech connect --from-env                 # same, but fail if neither variable is set
+rech connect                            # in a terminal: asks "Paste the share link" (hidden input)
 ```
+
+With no link, file or variable, `rech connect` in a terminal asks for the link without echoing
+it, checks it, then asks whether to save it for this project or every project. Without a
+terminal it never prompts: pipe the link to `rech connect -`.
 
 Only variables set in the shell count: a `RECHROME_URL` saved in `.env.local` is never re-read as
 a new link.

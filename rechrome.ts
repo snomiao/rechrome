@@ -3895,7 +3895,31 @@ export function connectEnvLink(env: Record<string, string | undefined> = process
  *  then RECHROME_URL). A share link carries a `rech1_` secret, so passing it as an argv positional
  *  exposes it in `ps` and shell history; `-`/`--file`/env keep it off the command line. Exactly one
  *  source may be given; with none, the environment is used if set. */
-export async function resolveConnectLink(url: string | undefined, file: string | undefined, readStdin: () => Promise<string> = () => Bun.stdin.text(), opts: { fromEnv?: boolean; envLink?: () => string | undefined } = {}): Promise<string> {
+/** Does this look like something `rech connect` accepts: a bare rech1_ token or an http(s) link? */
+export function connectLinkProblem(link: string): string | null {
+  if (!link) return "Nothing pasted.";
+  if (looksLikeToken(link)) return null;
+  try {
+    const u = new URL(link);
+    if (u.protocol === "http:" || u.protocol === "https:") return null;
+  } catch {}
+  return "That is not a share link (https://…#rech1_…) or a rech1_ token.";
+}
+
+/** Ask for the link in the terminal with nothing echoed; re-asks on an invalid paste (3 tries). */
+export async function promptConnectLink(ask: (q: string) => Promise<string | null> = q => askLine(q, true), warn: (m: string) => void = m => process.stderr.write(m + "\n")): Promise<string> {
+  for (let i = 0; i < 3; i++) {
+    const raw = await ask("Paste the share link (hidden): ");
+    if (raw === null) throw new Error("No link entered.");
+    const link = firstLink(raw);
+    const problem = connectLinkProblem(link);
+    if (!problem) return link;
+    warn(`  ${problem}`);
+  }
+  throw new Error("No valid link entered.");
+}
+
+export async function resolveConnectLink(url: string | undefined, file: string | undefined, readStdin: () => Promise<string> = () => Bun.stdin.text(), opts: { fromEnv?: boolean; envLink?: () => string | undefined; isTTY?: boolean; prompt?: () => Promise<string> } = {}): Promise<string> {
   const envLink = opts.envLink ?? (() => connectEnvLink());
   if (opts.fromEnv) {
     if (url !== undefined || file !== undefined) throw new Error("Pass the link as an argument, as - (stdin), via --file or --from-env, not more than one.");
@@ -3921,6 +3945,8 @@ export async function resolveConnectLink(url: string | undefined, file: string |
   if (url === undefined) {
     const link = envLink();
     if (link) return link;
+    // A person at a terminal: ask for it with hidden input, so it never lands in argv or history.
+    if (opts.isTTY ?? !!process.stdin.isTTY) return (opts.prompt ?? (() => promptConnectLink()))();
     throw new Error("Which link? rech connect '<link>'  —  or keep it off the command line: rech connect --file <path>, printf %s \"$LINK\" | rech connect -, or RECH_CONNECT_URL=… rech connect");
   }
   return url;
@@ -5175,10 +5201,12 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
       .option("global", { type: "boolean", describe: "Save it for every project on this machine without its own link (~/.rechrome/.env.local)" })
       .conflicts("project", "global")
       .option("from-env", { type: "boolean", describe: "Read the link (or rech1_ token) from RECH_CONNECT_URL, else RECHROME_URL, in the shell environment; also the default with no url/--file" })
+      .epilogue("With no link, --file or env var: a terminal is asked for the link (hidden input); without a terminal, pipe it to `rech connect -`.")
       .conflicts("url", "file")
       .conflicts("from-env", "file")
       .example("printf %s \"$LINK\" | rech connect -", "Preferred: the link stays off argv (never in ps / shell history)")
       .example("rech connect --file ./link.txt", "Preferred: read the link from a 0600 file")
+      .example("rech connect", "In a terminal: asks \"Paste the share link\" (input hidden), then this project or every project")
       .example("RECH_CONNECT_URL=\"$LINK\" rech connect", "Preferred: read the link from the environment (also RECHROME_URL; --from-env to require it)")
       .example("rech connect 'https://rechrome.pages.dev/share/#rech1_invite_…'", "An invite inline (visible in ps): registers this device, then saves its own link")
       .example("rech connect --global -", "An agent machine: one link for every folder, /tmp included"),

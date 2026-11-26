@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { connectEnvLink, firstLink, resolveConnectLink } from "./rechrome.ts";
+import { connectEnvLink, connectLinkProblem, firstLink, promptConnectLink, resolveConnectLink } from "./rechrome.ts";
 
 const LINK = "https://rechrome.pages.dev/share/#rech1_invite_ABCDEFGHJKLMNPQRSTUVWXYZ2345";
 
@@ -50,7 +50,7 @@ test("resolveConnectLink rejects empty stdin", async () => {
 });
 
 test("resolveConnectLink without any source explains the secure options", async () => {
-  await expect(resolveConnectLink(undefined, undefined, undefined, { envLink: () => undefined })).rejects.toThrow(/--file|stdin/);
+  await expect(resolveConnectLink(undefined, undefined, undefined, { envLink: () => undefined, isTTY: false })).rejects.toThrow(/--file|stdin/);
 });
 
 const TOKEN = "rech1_invite_ABCDEFGHJKLMNPQRSTUVWXYZ2345";
@@ -81,4 +81,36 @@ test("connectEnvLink prefers RECH_CONNECT_URL, trims, and ignores keys not inher
   // RECHROME_URL loaded from a saved .env.local is the current connection, not a link to connect.
   expect(connectEnvLink({ RECHROME_URL: LINK }, new Set())).toBeUndefined();
   expect(connectEnvLink({ RECH_CONNECT_URL: "  " }, all)).toBeUndefined();
+});
+
+test("resolveConnectLink at a TTY with no link or env asks with the prompt", async () => {
+  let asked = 0;
+  const link = await resolveConnectLink(undefined, undefined, async () => { throw new Error("stdin must not be read"); }, { envLink: () => undefined, isTTY: true, prompt: async () => { asked++; return LINK; } });
+  expect(link).toBe(LINK);
+  expect(asked).toBe(1);
+});
+
+test("resolveConnectLink prefers the environment over the TTY prompt, and - still reads piped stdin", async () => {
+  const prompt = async () => { throw new Error("should not prompt"); };
+  expect(await resolveConnectLink(undefined, undefined, undefined, { envLink: () => TOKEN, isTTY: true, prompt })).toBe(TOKEN);
+  expect(await resolveConnectLink("-", undefined, async () => LINK, { isTTY: true, prompt })).toBe(LINK);
+});
+
+test("promptConnectLink trims, re-asks on an invalid paste, and gives up on EOF or 3 bad tries", async () => {
+  const answers = ["not a link", `  ${LINK}\n`];
+  const warnings: string[] = [];
+  const questions: string[] = [];
+  expect(await promptConnectLink(async q => { questions.push(q); return answers.shift()!; }, m => warnings.push(m))).toBe(LINK);
+  expect(questions[0]).toMatch(/Paste the share link/);
+  expect(warnings).toHaveLength(1);
+  await expect(promptConnectLink(async () => null, () => {})).rejects.toThrow(/No link entered/);
+  await expect(promptConnectLink(async () => "nope", () => {})).rejects.toThrow(/No valid link/);
+});
+
+test("connectLinkProblem accepts share links and bare tokens only", () => {
+  expect(connectLinkProblem(LINK)).toBeNull();
+  expect(connectLinkProblem(TOKEN)).toBeNull();
+  expect(connectLinkProblem("")).toMatch(/Nothing/);
+  expect(connectLinkProblem("ftp://x")).toMatch(/not a share link/);
+  expect(connectLinkProblem("hello")).toMatch(/not a share link/);
 });
