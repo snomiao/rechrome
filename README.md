@@ -179,6 +179,24 @@ rech connect 'https://rechrome.pages.dev/share/#rech1_invite_…'
 rech open https://example.com
 ```
 
+The link (or a bare `rech1_…` token) is a secret, and an argument shows up in `ps` and shell
+history. To keep it off the command line:
+
+```bash
+printf %s "$LINK" | rech connect -      # from stdin (whitespace trimmed)
+rech connect --file ./link.txt          # from a 0600 file
+RECH_CONNECT_URL="$LINK" rech connect   # from the environment (RECHROME_URL also works)
+rech connect --from-env                 # same, but fail if neither variable is set
+rech connect                            # in a terminal: asks "Paste the share link" (hidden input)
+```
+
+With no link, file or variable, `rech connect` in a terminal asks for the link without echoing
+it, checks it, then asks whether to save it for this project or every project. Without a
+terminal it never prompts: pipe the link to `rech connect -`.
+
+Only variables set in the shell count: a `RECHROME_URL` saved in `.env.local` is never re-read as
+a new link.
+
 Over **WebRTC** the two machines need no open port, VPN or domain. A small signal server introduces them, and then traffic flows peer to peer, end-to-end
 encrypted with keys the signal server never sees. The first `rech` command after connecting starts
 a small local bridge that keeps the connection open between commands.
