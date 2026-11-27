@@ -38,3 +38,5 @@ signal-relay.js
 audio-stream.js
 audio-stream-client.js
 audio-stream-server.js
+
+audio-pairing.js

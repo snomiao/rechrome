@@ -1,6 +1,7 @@
+import { createAudioPairing, buildOpenApprovalPanel } from "./audio-pairing.ts";
 import { receiveUpload, readRequestJson } from "./scoped-upload.ts";
 import { createAudioHandler } from "./audio-bridge-server.ts";
-import { readListeners, listenerAddress, authorizeProfileRequest, canReadProfileFile, profileOutputPrefix, normalizePrefix, resolveAllowedProfile, shareRtcListeners, rtcListeners, type Listener } from "./listeners.ts";
+import { readListeners, listenerAddress, isLoopback, authorizeProfileRequest, canReadProfileFile, profileOutputPrefix, normalizePrefix, resolveAllowedProfile, shareRtcListeners, rtcListeners, type Listener } from "./listeners.ts";
 import { WEBRTC, authorizeCredential, credentialForBearer, inviteState, readShares, redeemInvite, shareProblem, shareSessions, updateShares, webrtcCredentials, type Credential, type ShareConfig } from "./shares.ts";
 import { bearerOf, safeEqual } from "./secret.ts";
 import { WebrtcHost } from "./webrtc.ts";
@@ -117,6 +118,7 @@ export const RUN_IDLE_SECONDS = 70 + RECORD_MAX_SECONDS + 20;
 type RecordingEntry = { rec: Recording; dir: string; outputPrefix: string; listener: string; keep: boolean; done?: RecordingSummary; expire?: ReturnType<typeof setTimeout> };
 const recordings = new Map<string, RecordingEntry>();
 const audioHandler = createAudioHandler();
+const audioPairing = createAudioPairing({ targets: audioHandler.pairTargets, grant: audioHandler.pairGrant });
 
 /** Rename a finished recording to its final name and hand it to the client like a download. */
 function deliverRecording(entry: RecordingEntry, s: RecordingSummary, filename: string | undefined): { stdout: string; files: string[] } {
@@ -776,6 +778,12 @@ export async function serve() {
         else if (reqUrl.pathname.startsWith(prefix)) reqUrl.pathname = "/" + reqUrl.pathname.slice(prefix.length);
       }
 
+      // Public pairing can only create pending requests. Approval requires its
+      // separate, short-lived operator credential minted by authenticated /run.
+      if (reqUrl.pathname.startsWith("/audio/pair/")) {
+        if (listener.profiles !== "*" || !isLoopback(listener.host)) return new Response("Unavailable", { status: 403 });
+        return audioPairing.handle(new Request(reqUrl, req), `http${tls ? "s" : ""}://127.0.0.1:${listener.port}`);
+      }
       // Who is asking: the listener's own key (legacy links, the local management key), or a
       // share credential (an invite or a device, see shares.ts) offered on this transport. A
       // share narrows the listener to the share's own profiles.
@@ -1030,6 +1038,21 @@ export async function serve() {
         // Scoped listeners reject audio before here. Never log input paths,
         // page URLs, WAV bytes, generated code, or captured output.
         log(`run: rech audio (session=${namespacedSession})`);
+        if (filteredArgs[1] === "approvals") {
+          if (filteredArgs.length === 3 && filteredArgs[2] === "prepare") return Response.json({ status: 0, stdout: "", stderr: "", files: [] });
+          if (filteredArgs.length !== 2) return Response.json({ status: 1, stdout: "", stderr: "Invalid audio approval command", files: [] });
+          try {
+            const panelBase = `http${tls ? "s" : ""}://127.0.0.1:${listener.port}`;
+            const wake = async () => {
+              const result = await runCodeOnSession({ socketRoot: tmpSocketRoot(), session: namespacedSession, cwd: runWorkDir, code: buildOpenApprovalPanel(panelBase, audioPairing.bootstrap()), json: true });
+              if (result.isError) throw Error("Local approval panel unavailable");
+            };
+            await wake();
+            audioPairing.setOperatorWake(wake);
+            const result = { isError: false };
+            return Response.json({ status: result.isError ? 1 : 0, stdout: "", stderr: result.isError ? "Local approval panel unavailable" : "", files: [] });
+          } catch { return Response.json({ status: 1, stdout: "", stderr: "Local approval panel unavailable", files: [] }); }
+        }
         const reply = await audioHandler({ args: filteredArgs, upload: Array.isArray(body) ? undefined : body.upload, socketRoot: tmpSocketRoot(), session: namespacedSession, cwd: runWorkDir });
         log(`exit: ${reply.status} | audio`);
         return Response.json(reply);
