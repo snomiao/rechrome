@@ -3872,6 +3872,35 @@ export function nearerUrlSource(cwd: string, inherited: boolean, globalFile = GL
 
 type ConnectedShare = { share?: string; device?: { id: string; name: string; approved: boolean }; profiles: string[]; webrtc: boolean; sessions?: { name: string; device: string }[] };
 
+/** The first non-empty, trimmed line of a blob — a share link never contains spaces or newlines, so
+ *  this tolerates a trailing newline (echo/pbpaste) or a file that also holds a comment line. */
+export function firstLink(raw: string): string {
+  return raw.split(/\r?\n/).map(s => s.trim()).find(Boolean) ?? "";
+}
+
+/** Resolve the connect link from argv, stdin (`-`), or a file. A share link carries a `rech1_` secret,
+ *  so passing it as an argv positional exposes it in `ps` and shell history; `-`/`--file` keep it off
+ *  the command line. Exactly one source may be given. */
+export async function resolveConnectLink(url: string | undefined, file: string | undefined, readStdin: () => Promise<string> = () => Bun.stdin.text()): Promise<string> {
+  if (file !== undefined) {
+    if (url !== undefined) throw new Error("Pass the link as an argument, as - (stdin) or via --file, not more than one.");
+    let raw: string;
+    try { raw = readFileSync(file, "utf8"); }
+    catch { throw new Error(`Could not read the link file ${file}.`); }
+    const link = firstLink(raw);
+    if (!link) throw new Error(`No link found in ${file}.`);
+    return link;
+  }
+  // yargs renders a bare `-` positional as "" (empty string); treat both as "read from stdin".
+  if (url === "-" || url === "") {
+    const link = firstLink(await readStdin());
+    if (!link) throw new Error("No link on stdin. Pipe the link in, e.g. pbpaste | rech connect -");
+    return link;
+  }
+  if (url === undefined) throw new Error("Which link? rech connect '<link>'  —  or keep it off the command line: rech connect --file <path>, or printf %s \"$LINK\" | rech connect -");
+  return url;
+}
+
 async function connect(url: string, opts: { global?: boolean; project?: boolean } = {}, shared?: ConnectedShare): Promise<void> {
   if (opts.global && opts.project) throw new Error("Pass --global or --project, not both.");
   // A bare rech1_ token means the default signal server.
@@ -4510,10 +4539,9 @@ function printInvite(share: Share, links: { via: string; link: string; signal?: 
   const width = Math.max(...links.map(l => l.via.length));
   for (const { via, link } of links) console.log(`  ${links.length > 1 ? `${via.padEnd(width)}  ` : ""}${link}`);
   if (links.some(l => l.signal === DEFAULT_SIGNAL)) {
-    console.log(`\n  or in a terminal:  rech connect ${share.invite}`);
-    console.log(`  ${new URL(DEFAULT_SIGNAL).host} is ${DEFAULT_RTC_NOTE}`);
+    console.log(`\n  ${new URL(DEFAULT_SIGNAL).host} is ${DEFAULT_RTC_NOTE}`);
   }
-  console.log(`\nThe other machine runs: rech connect '<link>'${links.length > 1 ? " (any one of them)" : ""}`);
+  console.log(`\nThe other machine runs${links.length > 1 ? " (any one link)" : ""}: copy a link above, then  pbpaste | rech connect -  (keeps the secret off ps and shell history), or save it to a 0600 file and  rech connect --file <path>. Inline  rech connect '<link>'  also works but is visible to ps.`);
   if (share.approve) console.log(`Each new device waits for you: rech share approve ${share.label}`);
   console.log(`Share expires: ${fmtDay(share.expiresAt)}${share.expiresAt ? ` (renew: rech share renew ${share.label})` : ""}`);
 }
@@ -5115,15 +5143,21 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
         }
         return handlers.printProfileUri(profiles[0], a.listener, a.all ? { local: a.local, save: a.save, all: true } : { local: a.local, save: a.save });
       })
-    .command("connect <url>", "Use a URL from another machine (checks it first; asks: this project or every project)", y => y
-      .positional("url", { type: "string", demandOption: true, describe: "The link from `rech share` on the machine with Chrome (or a bare rech1_ token). Quote it: it contains #" })
+    .command("connect [url]", "Use a URL from another machine (checks it first; asks: this project or every project)", y => y
+      .positional("url", { type: "string", describe: "The link from `rech share` on the machine with Chrome (or a bare rech1_ token). It holds a secret, so prefer --file or - (stdin) to keep it out of ps/shell history. Pass - to read it from stdin; quote a literal link, it contains #" })
+      .option("file", { type: "string", requiresArg: true, describe: "Read the link from this file instead of the command line (keeps the secret out of ps and shell history); use this or - by default" })
       .option("project", { type: "boolean", describe: "Save it for this project only (.rechrome/.env.local); the default without a terminal" })
       .option("global", { type: "boolean", describe: "Save it for every project on this machine without its own link (~/.rechrome/.env.local)" })
       .conflicts("project", "global")
-      .example("rech connect 'https://host.example.ts.net/rechrome/?profile=you%40example.com#key=…'", "")
-      .example("rech connect 'https://rechrome.pages.dev/share/#rech1_invite_…'", "An invite: registers this device, then saves its own link")
-      .example("rech connect --global '<url>'", "An agent machine: one link for every folder, /tmp included"),
-      a => a.global || a.project ? handlers.connect(a.url, { global: a.global, project: a.project }) : handlers.connect(a.url))
+      .conflicts("url", "file")
+      .example("printf %s \"$LINK\" | rech connect -", "Preferred: the link stays off argv (never in ps / shell history)")
+      .example("rech connect --file ./link.txt", "Preferred: read the link from a 0600 file")
+      .example("rech connect 'https://rechrome.pages.dev/share/#rech1_invite_…'", "An invite inline (visible in ps): registers this device, then saves its own link")
+      .example("rech connect --global -", "An agent machine: one link for every folder, /tmp included"),
+      a => (async () => {
+        const link = await resolveConnectLink(a.url, a.file);
+        return a.global || a.project ? handlers.connect(link, { global: a.global, project: a.project }) : handlers.connect(link);
+      })())
     .command(["listener", "listeners"], "Control who can connect: listeners, allowed profiles, keys, public URLs", y => y
       .command(["ls", "list", "$0"], "List listeners (keys hidden)", {}, () => handlers.listListeners())
       .command("add <name>", "Expose registered profiles on an address (local for a proxy, lan, tailscale, IP), or add a WebRTC signal server (--webrtc)", y => y
