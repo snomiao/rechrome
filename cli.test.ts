@@ -37,6 +37,11 @@ test("setup parses options in both --opt value and --opt=value forms, keeping nu
   expect((await run(["setup", "-y"]))[0][1]).toMatchObject({ yes: true });
 });
 
+test("setup --new-profile asks setup to create the profile, named by --profile", async () => {
+  expect((await run(["setup", "--new-profile", "--profile", "Work"]))[0][1]).toMatchObject({ profile: "Work", newProfile: true });
+  expect((await run(["setup", "--new-profile"]))[0][1]).toMatchObject({ newProfile: true });
+});
+
 test("setup falls back to RECH_TOKEN and rejects a flag without a value or an unknown flag", async () => {
   process.env.RECH_TOKEN = "env-token";
   try {

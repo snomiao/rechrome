@@ -34,7 +34,7 @@ rech setup
 Setup installs the background daemon, asks which Chrome profile to use, and opens an install
 guide **in that profile** for the one manual step Chrome requires: *Load unpacked* the extension
 at `chrome://extensions`. It then reads the extension's token itself and verifies the connection.
-Pick the profile up front with `rech setup --profile you@example.com`.
+Pick the profile up front with `rech setup --profile you@example.com`, or make a fresh one with `rech setup --new-profile --profile Work` (it opens a new Chrome window; Chrome keeps running). An interactive setup also lists "+ New Chrome profile", and a `--profile` that matches nothing offers to create it.
 
 Check it:
 
@@ -312,6 +312,7 @@ points out keys that cover several profiles. The local management listener is ne
 ```bash
 rech setup                                        # choose a network, then a Chrome profile
 rech setup --profile you@example.com              # non-interactive profile selection
+rech setup --new-profile --profile Work           # create a new Chrome profile named Work, then set it up
 rech setup --listen lan --profile you@example.com # expose the profile on a LAN address
 ```
 

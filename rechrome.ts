@@ -268,6 +268,42 @@ function openInChromeProfile(profileDir: string, target: string): boolean {
   }
 }
 
+/** The first free Chrome profile folder ("Profile 1", "Profile 2", …), ignoring case like Chrome on macOS/Windows. */
+export function nextChromeProfileFolder(existing: Iterable<string>): string {
+  const taken = new Set([...existing].map(dir => dir.toLowerCase()));
+  for (let n = 1; ; n++) if (!taken.has(`profile ${n}`)) return `Profile ${n}`;
+}
+
+/** The folder and display name for a profile `rech setup` creates: a "Profile N" selector names the folder itself. */
+export function planNewChromeProfile(existing: Iterable<string>, selector?: string): { dir: string; name?: string } {
+  const value = selector?.trim();
+  const dirs = [...existing];
+  if (value && /^Profile \d+$/i.test(value) && !dirs.some(dir => dir.toLowerCase() === value.toLowerCase()))
+    return { dir: value.replace(/^profile/i, "Profile") };
+  return { dir: nextChromeProfileFolder(dirs), ...(value ? { name: value } : {}) };
+}
+
+/**
+ * Create a Chrome profile in the user's Chrome without restarting it: seed the new folder's
+ * Preferences with the display name, then open a window with --profile-directory, which makes
+ * Chrome create and register the profile. Waits for it to appear in Local State.
+ */
+async function createChromeProfile(userDataDir: string, plan: { dir: string; name?: string }): Promise<ChromeProfileInfo> {
+  const profilePath = join(userDataDir, plan.dir);
+  if (existsSync(profilePath)) throw new Error(`${profilePath} already exists; pick it with --profile "${plan.dir}"`);
+  await mkdir(profilePath, { recursive: true });
+  if (plan.name) await writeFile(join(profilePath, "Preferences"), JSON.stringify({ profile: { name: plan.name } }));
+  if (!openInChromeProfile(plan.dir, "about:blank")) throw new Error("Chrome was not found, so the new profile could not be created");
+  for (let i = 0; i < 60; i++) {
+    await Bun.sleep(1000);
+    const info = (await readChromeProfileCache())?.[plan.dir];
+    if (info) return info;
+  }
+  // Chrome saves Local State lazily; the profile folder works before it is listed there.
+  console.log(`      Chrome hasn't listed ${plan.dir} in Local State yet; continuing with the new folder.`);
+  return plan.name ? { name: plan.name } : {};
+}
+
 export async function openSetupGuide(profileDir: string, setupHtmlPath: string): Promise<boolean> {
   // A unique URL identifies the window opened in the requested profile, even if
   // other profiles have an older copy of the setup guide open.
@@ -4075,13 +4111,28 @@ async function setup(opts: SetupOptions = {}): Promise<void> {
   if (!cache) { console.error(`      Chrome profiles not found: ${profileCacheProblem ?? "Local State not read"}`); rl?.close(); process.exit(1); }
   const userDataDir = await findChromeUserDataDir();
 
+  async function newProfile(selector?: string): Promise<[string, ChromeProfileInfo] | null> {
+    if (!userDataDir) { console.error("      Chrome's data folder was not found; create the profile in Chrome, then rerun setup."); return null; }
+    const plan = planNewChromeProfile([...Object.keys(cache!), ...readdirSync(userDataDir)], selector);
+    console.log(`      Creating Chrome profile ${plan.name ? `"${plan.name}" ` : ""}[${plan.dir}] (a new Chrome window opens; Chrome keeps running)…`);
+    try {
+      const info = await createChromeProfile(userDataDir, plan);
+      console.log(`      created: ${info.name || plan.name || plan.dir} [${plan.dir}]. Sign in from that window any time.`);
+      cache![plan.dir] = info;
+      return [plan.dir, info];
+    } catch (error) {
+      console.error(`      ${error instanceof Error ? error.message : String(error)}`);
+      return null;
+    }
+  }
+
   async function pickProfile(exclude: Set<string>): Promise<[string, ChromeProfileInfo] | null> {
+    if (opts.newProfile && !exclude.size) return newProfile(opts.profile);
     const available = Object.entries(cache!).filter(([dir]) => !exclude.has(dir));
-    if (!available.length) return null;
     available.forEach(([dir, info], i) =>
       console.log(`        ${String(i + 1).padStart(2)}.  ${(info.user_name || "(no email)").padEnd(32)}  ${(info.name || "").padEnd(20)}  [${dir}]`)
     );
-    if (opts.profile !== undefined) {
+    if (opts.profile !== undefined && !exclude.size) {
       let match: [string, ChromeProfileInfo] | null;
       try {
         match = resolveChromeProfileSelector(available, opts.profile);
@@ -4089,16 +4140,28 @@ async function setup(opts: SetupOptions = {}): Promise<void> {
         console.error(`      ${error instanceof Error ? error.message : String(error)}`);
         return null;
       }
-      if (match) console.log(`      selected: ${match[1].user_name || "(no email)"} [${match[0]}]`);
-      return match;
+      if (match) {
+        console.log(`      selected: ${match[1].user_name || "(no email)"} [${match[0]}]`);
+        return match;
+      }
+      console.log(`      No Chrome profile matches "${opts.profile}".`);
+      if (opts.yes) return newProfile(opts.profile);
+      if (!isTTY) { console.log(`      [agent] To create it, rerun with --new-profile (or --yes).`); return null; }
+      const create = await ask(`      Create a new Chrome profile named "${opts.profile}"? [y/N]: `);
+      return /^y(es)?$/i.test(create.trim()) ? newProfile(opts.profile) : null;
     }
-    if (available.length === 1) {
+    if (available.length === 1 && (exclude.size || !isTTY)) {
       console.log(`      Only one profile available — selecting: ${available[0][1].user_name || available[0][0]}`);
       return available[0];
     }
-    if (!isTTY) console.log("      [agent] Provide profile number on next stdin line, or rerun with --profile <email|name|folder>");
+    console.log(`        ${String(available.length + 1).padStart(2)}.  + New Chrome profile`);
+    if (!isTTY) console.log("      [agent] Provide profile number on next stdin line, or rerun with --profile <email|name|folder> (or --new-profile)");
     const answer = await ask("\n      Profile number: ");
     const idx = parseInt(answer.trim()) - 1;
+    if (idx === available.length) {
+      const name = (await ask("      New profile name (blank for Chrome's default): ")).trim();
+      return newProfile(name || undefined);
+    }
     if (isNaN(idx) || idx < 0 || idx >= available.length) return null;
     return available[idx];
   }
@@ -4945,7 +5008,7 @@ async function status(): Promise<void> {
 }
 
 
-export type SetupOptions = { profile?: string; token?: string; listen?: string; prefix?: string; port?: number; yes?: boolean; /** Called from `rech share`, which shares the profile itself. */ skipShare?: boolean };
+export type SetupOptions = { profile?: string; token?: string; listen?: string; prefix?: string; port?: number; yes?: boolean; /** Create a new Chrome profile (named by `profile`, if given) instead of picking one. */ newProfile?: boolean; /** Called from `rech share`, which shares the profile itself. */ skipShare?: boolean };
 export type RechHandlers = {
   serve(): Promise<void> | void;
   status(): Promise<void>;
@@ -5051,8 +5114,9 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
       .option("listen", { type: "string", requiresArg: true, describe: "Who can reach this profile: local (default) | lan | tailscale | <detected IP>" })
       .option("prefix", { type: "string", requiresArg: true, describe: "URL path for a proxied listener, e.g. rechrome (port defaults to the management port + 1)" })
       .option("port", portOption)
-      .option("yes", { alias: "y", type: "boolean", default: false, describe: "Approve installing a missing oxmgr without prompting" }),
-      a => handlers.setup({ profile: a.profile, token: a.token ?? process.env.RECH_TOKEN, listen: a.listen, prefix: a.prefix, port: a.port, yes: a.yes }))
+      .option("new-profile", { type: "boolean", describe: "Create a new Chrome profile (named by --profile, if given) and set it up" })
+      .option("yes", { alias: "y", type: "boolean", default: false, describe: "Approve without prompting: install a missing oxmgr, create a --profile that doesn't exist" }),
+      a => handlers.setup({ profile: a.profile, token: a.token ?? process.env.RECH_TOKEN, listen: a.listen, prefix: a.prefix, port: a.port, yes: a.yes, ...(a.newProfile ? { newProfile: true } : {}) }))
     .command("status", "Is it working? The URL in use, the daemon, and the current profile", {}, () => handlers.status())
     .command(["profile [name] [target]", "profiles [name] [target]"], "List Chrome profiles; `profile rm <name>` removes one from rech", y => y
       .positional("name", { type: "string", describe: "ls/list lists all (the default); rm/remove <name> removes a profile" })
