@@ -6,6 +6,7 @@ import { bearerOf, safeEqual } from "./secret.ts";
 import { WebrtcHost } from "./webrtc.ts";
 import { file } from "bun";
 import { windowsSessionWarning } from "./daemon-manager.ts";
+import { shouldStartWindowsTray } from "./windows-tray.ts";
 import { createHash, randomBytes, X509Certificate } from "crypto";
 import { mkdirSync, lstatSync, statSync, chmodSync, unlinkSync, accessSync, readdirSync, realpathSync, existsSync, readFileSync, renameSync, constants as fsConstants } from "fs";
 import { join, resolve, relative, isAbsolute, sep } from "path";
@@ -27,6 +28,7 @@ import {
   chromeDataAccessHint,
   inspectWindowsSession,
   interactiveServeHint,
+  startTray,
 } from "./rechrome.ts";
 import { SecretMasker, runCodeOnSession, parseReadCookieWire, readCookieOnSession, parseReadStorageWire, readStorageOnSession, parseReadSecretWire, readSecretOnSession, parseReadHeadersWire, readHeadersOnSession, readHeadersEvidence, parseFillSecretWire, fillSecretOnSession, passwordValuesOnSession, hasSnapshot, maskPasswordLines, withholdSnapshots } from "./fill-secret.ts";
 import { parseRecordArgs, buildCaptureChunkCode, resolveFfmpeg, resolveFormat, recordSink, Recording, freeName, withFormatExt, RECORD_CHUNK_MS, RECORD_MAX_SECONDS, type CaptureChunk, type RecordingSummary } from "./record.ts";
@@ -700,6 +702,10 @@ export async function serve() {
   const markActivity = () => { idleSince = Date.now(); };
   const managed = isManagedServe(process.ppid);
   if (managed) log("serve is supervised (launchd, a process manager, or RECH_SERVE_MANAGED=1) — idle self-exit disabled");
+  // Windows: the supervised desktop daemon has no console, so a tray icon (Status / Restart /
+  // Quit) shows it is running. A singleton: a restart finds the existing icon and keeps it.
+  if (shouldStartWindowsTray({ platform: process.platform, managed, session: windowsSession, env: process.env }))
+    startTray({ quiet: true, port }).catch(error => log(`tray: ${(error as Error).message}`));
   setInterval(() => {
     if (process.ppid === 1) orphaned = true;
     if (shouldExitOrphanedServe({ orphaned, managed, idleMs: Date.now() - idleSince, idleTimeoutMs: ORPHAN_IDLE_EXIT_MS })) {

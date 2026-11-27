@@ -6,6 +6,7 @@ node_modules/
 bun.lock
 rechrome.js
 daemon-manager.js
+windows-tray.js
 extension-token.js
 listeners.js
 fill-secret.js

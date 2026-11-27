@@ -15,8 +15,10 @@ reported as unknown, not as a healthy session. Custom shells without Explorer
 may produce a warning even in an interactive session.
 
 To repair, stop only the process manager's **rechrome** app, then run the printed
-PowerShell command as the same user. If the manager runs elevated, stopping its
-app may require an elevated shell. Leave the manager's other apps and Chrome
+PowerShell command as the same user. Windows only lets an elevated shell register
+a task with a logon trigger (a normal shell gets "Access is denied"), and the same
+applies later to changing, disabling or deleting it. If the manager runs elevated,
+stopping its app may require an elevated shell too. Leave the manager's other apps and Chrome
 running. The command registers a clearly named, per-user task with
 `LogonType Interactive`, starts it immediately, and wires it to future logons.
 It reuses the task name, ignores concurrent starts, disables the default runtime
@@ -37,6 +39,30 @@ stop and delete the `Rechrome Interactive Serve-<user SID>` task there; ordinary
 `rech uninstall` only removes the process-manager app. Machines with multiple
 active sessions for the same user should verify the reported serve session:
 Task Scheduler chooses the interactive token rather than targeting a session ID.
+
+## No console window, and the tray icon
+
+Every background start avoids a console window. The interactive task runs
+`wscript.exe` on `~\.rechrome\serve-interactive.vbs`, which starts bun with a hidden
+window and waits on it (so the task still supervises serve). The pm2 logon entry
+(`HKCU\...\Run\RechromePm2`) runs `wscript.exe` on `~\.rechrome\pm2-logon.vbs`, which
+runs the `pm2-logon.ps1` resurrect script hidden. Entries from older versions started
+PowerShell directly, which flashed a console; `rech setup` replaces them in place.
+pm2 starts its apps hidden by default.
+
+A supervised serve in the user's active desktop session starts the tray: a
+PowerShell NotifyIcon (no build step) launched through `~\.rechrome\tray.vbs`. Its
+tooltip reads "rechrome serve running" (or "not running", polled every 3 seconds
+from the local port), and its menu has **Status** (`rech status` in a dialog),
+**Restart** (`rech daemon restart`) and **Quit** (`rech daemon stop`, then the icon
+closes). A named mutex keeps one icon across serve restarts. Windows 11 puts new
+icons in the hidden overflow; the tray shows itself on the taskbar once unless you
+have already hidden it there. Set `RECH_TRAY=0` in the daemon's environment to skip
+the tray. `rech tray show|hide` starts or removes it by hand.
+
+`rech daemon restart|stop` goes through the process manager when it registers
+`rechrome`; otherwise it ends the interactive task and the serve it started (ending a
+task does not stop that child by itself), then for a restart runs the task again.
 
 References: [Interactive task principals](https://learn.microsoft.com/en-us/powershell/module/scheduledtasks/new-scheduledtaskprincipal)
 and [task settings](https://learn.microsoft.com/en-us/powershell/module/scheduledtasks/new-scheduledtasksettingsset).

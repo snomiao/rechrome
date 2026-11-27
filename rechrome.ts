@@ -20,7 +20,8 @@ import { pathToFileURL } from "url";
 import { createRequire } from "node:module";
 import { spawn as cpSpawn } from "child_process";
 import { readFile, writeFile, rename, chmod, mkdir, stat } from "node:fs/promises";
-import { isDeprecatedPm2Fallback, listsProcess, oxmgrInstallCommand, pickDaemonManager, PM2_DEPRECATION, windowsSessionProbeScript, windowsSessionWarning, windowsInteractiveServeCommand, type WindowsDesktopSession, type DaemonManager } from "./daemon-manager.ts";
+import { isDeprecatedPm2Fallback, listsProcess, oxmgrInstallCommand, pickDaemonManager, PM2_DEPRECATION, windowsSessionProbeScript, windowsSessionWarning, windowsInteractiveServeCommand, windowsInteractiveTaskName, type WindowsDesktopSession, type DaemonManager } from "./daemon-manager.ts";
+import { hiddenLaunchVbs, windowsTrayLauncherVbs, windowsTrayScript, wscriptCommand } from "./windows-tray.ts";
 import { DEFAULT_SIGNAL, INVITE_PATH, WEBRTC, createShare, normalizeSignal, findDevice, findShare, inviteLink, inviteProblem, parseDuration, REUSABLE_DEFAULT_TTL, REUSABLE_MAX_DEVICES, readShares, updateShares, type Share } from "./shares.ts";
 import { bearerOf, looksLikeToken, newToken, parseToken, redactSecrets } from "./secret.ts";
 import { WebrtcClient, loadRTC, runBridge, spawnBridge } from "./webrtc.ts";
@@ -2803,15 +2804,33 @@ export function pm2LogonScript(bin: string, env = process.env): string {
 }
 
 const PM2_LOGON_SCRIPT = join(RECH_DIR, "pm2-logon.ps1");
+const PM2_LOGON_LAUNCHER = join(RECH_DIR, "pm2-logon.vbs");
+const WINDOWS_POWERSHELL = join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+/** Before the wscript launcher: still hidden, but powershell flashed a console window at logon. */
+export function legacyPm2LogonCommand(): string {
+  return `"${WINDOWS_POWERSHELL}" -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "${PM2_LOGON_SCRIPT}"`;
+}
 export function pm2LogonCommand(): string {
-  // Run values have a 260-character limit: keep environment data in a script.
-  const powershell = join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-  return `"${powershell}" -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "${PM2_LOGON_SCRIPT}"`;
+  // Run values have a 260-character limit: keep environment data in a script. wscript is a
+  // GUI program and the launcher starts powershell with a hidden window: no console at logon.
+  const { exe, args } = wscriptCommand(process.env.SystemRoot || "C:\\Windows", PM2_LOGON_LAUNCHER);
+  return `"${exe}" ${args}`;
+}
+export function pm2LogonLauncher(): string {
+  return hiddenLaunchVbs({ argv: [WINDOWS_POWERSHELL, "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass", "-File", PM2_LOGON_SCRIPT], wait: true });
 }
 const logonScriptIO = {
-  exists: () => existsSync(PM2_LOGON_SCRIPT),
-  write: (script: string) => { mkdirSync(RECH_DIR, { recursive: true }); writeFileSync(PM2_LOGON_SCRIPT, "\ufeff" + script, "utf8"); },
+  exists: () => existsSync(PM2_LOGON_SCRIPT) && existsSync(PM2_LOGON_LAUNCHER),
+  write: (script: string) => {
+    mkdirSync(RECH_DIR, { recursive: true });
+    writeFileSync(PM2_LOGON_SCRIPT, "\ufeff" + script, "utf8");
+    writeVbs(PM2_LOGON_LAUNCHER, pm2LogonLauncher());
+  },
 };
+/** WScript reads UTF-16 LE with a BOM regardless of the ANSI code page (paths may be non-ASCII). */
+function writeVbs(path: string, script: string): void {
+  writeFileSync(path, Buffer.from("\ufeff" + script, "utf16le"));
+}
 
 type RegistryRunner = (args: string[]) => { exitCode: number; stdout: string };
 const runRegistry: RegistryRunner = args => {
@@ -2834,7 +2853,8 @@ export function pm2WindowsAutostart(bin: string, install = false, run: RegistryR
   // A direct command inherits the standard pm2 home. Custom homes need our explicit wrapper.
   if (commands.some(command => !process.env.PM2_HOME && isPm2Resurrect(command, bin))) return true;
   const registered = commands.includes(desired);
-  if (!install) return registered && scriptIO.exists();
+  // A legacy (console-flashing) entry still starts pm2; install replaces it in place.
+  if (!install) return (registered || commands.includes(legacyPm2LogonCommand())) && scriptIO.exists();
   if (desired.length > 260) throw new Error("Windows logon command exceeds the Run key's 260-character limit.");
   scriptIO.write(pm2LogonScript(bin));
   if (registered) return true;
@@ -3079,7 +3099,14 @@ function findTrayBinary(): string | undefined {
 // happened to reuse the pid after the real tray died. POSIX only (`ps` isn't on stock
 // Windows); there we fall back to trusting the liveness probe alone (best-effort).
 function isPidRechromeTray(pid: number): boolean {
-  if (IS_WINDOWS) return true;
+  if (IS_WINDOWS) {
+    // The pidfile holds the PowerShell tray (or a custom RECH_TRAY_BIN binary): reject a reused PID.
+    try {
+      const list = Bun.spawnSync([system32("tasklist.exe"), "/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"], { stdout: "pipe", stderr: "ignore", windowsHide: true, timeout: 10000 });
+      const image = list.stdout?.toString().match(/^"([^"]+)"/m)?.[1]?.toLowerCase() ?? "";
+      return image === "powershell.exe" || image.includes("rechrome-tray");
+    } catch { return false; }
+  }
   try {
     const p = Bun.spawnSync(["ps", "-o", "comm=", "-p", String(pid)], { stdout: "pipe", stderr: "ignore", windowsHide: true });
     return (p.stdout?.toString() ?? "").trim().includes("rechrome-tray");
@@ -3125,9 +3152,34 @@ function isTrayRunning(): boolean {
   }
 }
 
-// Start (and "show") the tray. quiet=true is used by `rech setup` auto-start so
-// a missing binary / headless box stays silent rather than noisy.
-async function startTray({ quiet = false }: { quiet?: boolean } = {}): Promise<void> {
+// Windows tray: a PowerShell NotifyIcon (windows-tray.ts) needs no build step, so it ships
+// in the package and works on every install. Started through wscript.exe so no console window
+// appears, and detached from the caller's process tree so a daemon restart (pm2 kills the
+// tree) leaves it running; its named mutex keeps it a singleton across those restarts.
+const WINDOWS_TRAY_SCRIPT = join(RECH_DIR, "tray.ps1");
+const WINDOWS_TRAY_LAUNCHER = join(RECH_DIR, "tray.vbs");
+
+function windowsTrayPort(port?: number): number {
+  if (port) return port;
+  try { return parseUrl(process.env[ENV_KEY] ?? "").port || DEFAULT_PORT; } catch { return DEFAULT_PORT; }
+}
+
+function startWindowsTray(port?: number): number | undefined {
+  mkdirSync(RECH_DIR, { recursive: true });
+  const systemRoot = process.env.SystemRoot || "C:\\Windows";
+  writeFileSync(WINDOWS_TRAY_SCRIPT, "\ufeff" + windowsTrayScript({
+    port: windowsTrayPort(port), bun: Bun.which("bun") ?? process.execPath, script: import.meta.filename, pidFile: TRAY_PID_FILE, home: HOME,
+  }), "utf8");
+  writeVbs(WINDOWS_TRAY_LAUNCHER, windowsTrayLauncherVbs({ systemRoot, trayScript: WINDOWS_TRAY_SCRIPT, home: HOME }));
+  const { exe } = wscriptCommand(systemRoot, WINDOWS_TRAY_LAUNCHER);
+  const child = cpSpawn(exe, ["//B", "//NoLogo", WINDOWS_TRAY_LAUNCHER], { detached: true, stdio: "ignore", windowsHide: true });
+  child.unref();
+  return child.pid;
+}
+
+// Start (and "show") the tray. quiet=true is used by `rech setup` auto-start and the
+// daemon's own start, so a missing binary / headless box stays silent rather than noisy.
+export async function startTray({ quiet = false, port }: { quiet?: boolean; port?: number } = {}): Promise<void> {
   if (!trayGuiAvailable()) {
     if (!quiet) console.log("tray: no desktop GUI session detected — skipped.");
     return;
@@ -3136,13 +3188,18 @@ async function startTray({ quiet = false }: { quiet?: boolean } = {}): Promise<v
     if (!quiet) console.log("tray: already running.");
     return;
   }
+  if (IS_WINDOWS && !process.env.RECH_TRAY_BIN) {
+    startWindowsTray(port);
+    if (!quiet) console.log("tray: started (look for the rechrome icon in the notification area).");
+    return;
+  }
   const bin = findTrayBinary();
   if (!bin) {
     if (!quiet)
       console.error("tray: binary not found. Build it with:  (cd tray && cargo build --release)");
     return;
   }
-  const child = cpSpawn(bin, [], { detached: true, stdio: "ignore" });
+  const child = cpSpawn(bin, [], { detached: true, stdio: "ignore", windowsHide: true });
   child.unref(); // outlive this CLI invocation
   if (child.pid) await Bun.write(TRAY_PID_FILE, String(child.pid));
   if (!quiet) console.log(`tray: started (pid ${child.pid}).`);
@@ -3168,6 +3225,66 @@ async function trayCommand(sub?: string): Promise<void> {
       console.error(`Unknown tray command: "${sub}". Usage: rech tray [show|hide|stop]`);
       process.exit(1);
   }
+}
+
+const system32 = (exe: string) => join(process.env.SystemRoot || process.env.SYSTEMROOT || "C:\\Windows", "System32", exe);
+
+function schtasks(args: string[]): number {
+  try {
+    return Bun.spawnSync([system32("schtasks.exe"), ...args], { stdout: "ignore", stderr: "ignore", windowsHide: true, timeout: 15000 }).exitCode ?? 1;
+  } catch { return 1; }
+}
+
+/** The current user's interactive serve task (daemon-manager.ts), when it is registered. */
+function windowsInteractiveTask(userSid?: string): string | undefined {
+  if (!IS_WINDOWS) return;
+  try {
+    if (!userSid) {
+      const who = Bun.spawnSync([system32("whoami.exe"), "/user", "/fo", "csv", "/nh"], { stdout: "pipe", stderr: "ignore", windowsHide: true, timeout: 10000 });
+      userSid = who.stdout?.toString().match(/"(S-1-[\d-]+)"/)?.[1];
+      if (!userSid) return;
+    }
+  } catch { return; }
+  const name = windowsInteractiveTaskName(userSid);
+  return schtasks(["/Query", "/TN", name]) === 0 ? name : undefined;
+}
+
+/** Live `rech serve` processes started from this install (not clients, not other checkouts). */
+function windowsServePids(): number[] {
+  const script = `Get-CimInstance Win32_Process -Filter "Name='bun.exe'" | ForEach-Object { "$($_.ProcessId)\`t$($_.CommandLine)" }`;
+  try {
+    const out = Bun.spawnSync([system32("WindowsPowerShell\\v1.0\\powershell.exe"), "-NoProfile", "-NonInteractive", "-Command", script], { stdout: "pipe", stderr: "ignore", windowsHide: true, timeout: 20000 }).stdout?.toString() ?? "";
+    return out.split(/\r?\n/).flatMap(line => {
+      const [pid, command = ""] = line.split("\t");
+      return Number(pid) !== process.pid && isServeCommandLine(command, import.meta.filename) ? [Number(pid)] : [];
+    });
+  } catch { return []; }
+}
+
+/** Whether a Windows command line runs `<script> serve` (quoted or not, either slash style). */
+export function isServeCommandLine(command: string, script: string): boolean {
+  const norm = (s: string) => s.replaceAll('"', "").replaceAll("/", "\\").toLowerCase().trim();
+  const escaped = norm(script).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(^|\\s)${escaped}\\s+serve$`).test(norm(command));
+}
+
+// `rech daemon restart|stop` (the tray's Restart/Quit): control serve through whatever runs it —
+// the process manager when it registers `rechrome`, else the Windows interactive logon task.
+async function daemonCommand(action: "restart" | "stop"): Promise<void> {
+  let mgr: DaemonManager | undefined;
+  try { mgr = daemonManager(); } catch { /* fall through to the task */ }
+  if (mgr && listsProcess(mgr.id, await pmList(mgr).catch(() => ""), PM_PROCESS_NAME)) {
+    const code = await runPm(mgr, [action, PM_PROCESS_NAME]);
+    if (code !== 0) throw new Error(`${mgr.id} ${action} ${PM_PROCESS_NAME} failed (exit ${code}).`);
+    return;
+  }
+  const task = windowsInteractiveTask();
+  if (!task) throw new Error(`No ${PM_PROCESS_NAME} daemon registration found (process manager or Windows logon task); run \`rech setup\`.`);
+  // Ending the task terminates only its launcher; the serve it started survives as an orphan.
+  schtasks(["/End", "/TN", task]);
+  for (const pid of windowsServePids()) { try { process.kill(pid); } catch { /* already gone */ } }
+  if (action === "restart" && schtasks(["/Run", "/TN", task]) !== 0) throw new Error(`Cannot start the scheduled task ${task}.`);
+  console.log(`${action === "restart" ? "Restarted" : "Stopped"} ${PM_PROCESS_NAME} (${task}).`);
 }
 
 // The Chromium revision pinned by the playwright-core that the relay (playwright-cli) runs, read
@@ -4920,14 +5037,13 @@ async function status(): Promise<void> {
     console.log(`relay:    ⚠ degraded (${pingBody.consecutiveTimeouts} consecutive command timeouts) — if it persists, the daemon self-restarts; ${isHost ? `force it now with \`${mgr?.id ?? "oxmgr"} restart ${PM_PROCESS_NAME}\`` : "the daemon host can restart it"}`);
   if (isHost) {
     const daemonRegistered = mgr ? listsProcess(mgr.id, await pmList(mgr).catch(() => ""), PM_PROCESS_NAME) : false;
-    let interactiveTask: string | undefined;
-    if (IS_WINDOWS && pingBody?.windowsSession) {
-      const taskName = `Rechrome Interactive Serve-${pingBody.windowsSession.userSid}`;
-      const task = Bun.spawnSync(["schtasks.exe", "/Query", "/TN", taskName], { stdout: "ignore", stderr: "ignore", windowsHide: true, timeout: 10000 });
-      if (task.exitCode === 0) interactiveTask = taskName;
-    }
-    console.log(`daemon:   ${interactiveTask ? `interactive scheduled task wired (${interactiveTask})` : daemonRegistered ? `${mgr!.id} (${PM_PROCESS_NAME})` : mgr ? "not installed" : "not installed (no oxmgr or pm2 on PATH)"}`);
-    if (IS_WINDOWS && mgr?.id === "pm2" && !interactiveTask) {
+    const userSid = pingBody?.windowsSession?.userSid;
+    const interactiveTask = IS_WINDOWS && userSid ? windowsInteractiveTask(userSid) : undefined;
+    // The manager wins (as in `rech daemon`); a leftover task would start a second serve at logon.
+    console.log(`daemon:   ${daemonRegistered ? `${mgr!.id} (${PM_PROCESS_NAME})` : interactiveTask ? `interactive scheduled task wired (${interactiveTask})` : mgr ? "not installed" : "not installed (no oxmgr or pm2 on PATH)"}`);
+    if (daemonRegistered && interactiveTask)
+      console.log(`daemon:   ⚠ also registered as the logon task ${interactiveTask}; both start serve — delete one of them`);
+    if (IS_WINDOWS && mgr?.id === "pm2" && daemonRegistered) {
       try { console.log(`autostart: ${pm2WindowsAutostart(mgr.bin) ? "wired (Windows logon)" : "not wired — run rech setup"}`); }
       catch { console.log("autostart: unknown (cannot inspect HKCU Run)"); }
     }
@@ -4966,6 +5082,7 @@ export type RechHandlers = {
   setListener(name: string, opts: { publicUrl?: string; clearPublicUrl?: boolean; uploads?: boolean; hostUploadDirs?: string[]; noHostUploads?: boolean; readSecrets?: boolean; readCookies?: boolean; readHeaders?: boolean; keepDownloads?: boolean; evalCode?: boolean }): Promise<void>;
   setup(opts: SetupOptions): Promise<void>;
   tray(action?: string): Promise<void>;
+  daemon(action: "restart" | "stop"): Promise<void>;
   provisionProfile(name: string, opts: { headed: boolean; experimental: boolean }): Promise<void>;
   uninstall(): Promise<void>;
   shareNew(profiles: string[], opts: ShareNewOptions): Promise<void>;
@@ -4980,7 +5097,7 @@ export type RechHandlers = {
 const SHARE_ACTIONS = new Set(["new", "allow", "deny", "rotate", "revoke", "rm", "renew", "approve", "devices"]);
 
 /** Commands rech handles itself; anything else is forwarded verbatim to playwright-cli. */
-export const RECH_COMMANDS = new Set(["serve", "status", "listener", "listeners", "profile", "profiles", "share", "connect", "session", "sessions", "signal", "bridge", "setup", "tray", "provision-profile", "uninstall"]);
+export const RECH_COMMANDS = new Set(["serve", "status", "listener", "listeners", "profile", "profiles", "share", "connect", "session", "sessions", "signal", "bridge", "setup", "tray", "daemon", "provision-profile", "uninstall"]);
 
 const portOption = { type: "number", requiresArg: true, describe: "Listener port (1-65535)" } as const;
 
@@ -5184,6 +5301,9 @@ export function rechCli(argv: string[], handlers: RechHandlers) {
     .command("tray [action]", "Menu-bar icon for the daemon (starts after setup)", y => y
       .positional("action", { type: "string", choices: ["show", "start", "hide", "stop", "quit"] }),
       a => handlers.tray(a.action))
+    .command("daemon <action>", "Restart or stop the serve daemon through its manager (or Windows logon task)", y => y
+      .positional("action", { type: "string", choices: ["restart", "stop"], demandOption: true }),
+      a => handlers.daemon(a.action as "restart" | "stop"))
     .command("provision-profile <name>", "(experimental) Clean Chrome-for-Testing profile, fully automated; not your real Chrome", y => y
       .positional("name", { type: "string", demandOption: true })
       .option("experimental", { type: "boolean", default: false })
@@ -5226,6 +5346,7 @@ if (import.meta.main) {
       await startTray({ quiet: true }).catch(() => {});
     },
     tray: trayCommand,
+    daemon: daemonCommand,
     provisionProfile: async (name, { headed, experimental }) => {
       // Experimental: a managed profile runs on Chrome for Testing, not the user's real Google Chrome
       // (branded Chrome 149+ rejects --load-extension). It's a clean browser with no logins/cookies,
