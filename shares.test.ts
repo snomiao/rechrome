@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtempSync, statSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { REUSABLE_MAX_DEVICES, authorizeCredential, createShare, credentialForBearer, inviteLink, inviteState, shareSessions, parseDuration, readShares, redeemInvite, updateShares, webrtcCredentials, type ShareConfig } from "./shares.ts";
+import { REUSABLE_MAX_DEVICES, authorizeCredential, createShare, credentialForBearer, inviteLink, inviteState, shareSessions, parseDuration, readShares, redeemInvite, updateShares, validateShares, webrtcCredentials, type ShareConfig } from "./shares.ts";
 import { bearerOf, formatToken, newToken, parseToken } from "./secret.ts";
 
 const empty = (): ShareConfig => ({ version: 1, shares: [] });
@@ -121,6 +121,27 @@ test("names, profiles and transports are validated", () => {
   createShare(config, { label: "ok", profiles: ["p"], via: ["webrtc"] });
   expect(() => createShare(config, { label: "ok", profiles: ["p"], via: ["webrtc"] })).toThrow(/already exists/);
   expect(() => createShare(config, { label: "s", profiles: ["p"], via: ["webrtc"], signal: "ftp://x" })).toThrow(/http/);
+});
+
+test("a share carries an optional per-share eval level that round-trips and is validated", () => {
+  const config = empty();
+  expect(createShare(config, { label: "plain", profiles: ["p"], via: ["webrtc"] }).eval).toBeUndefined();
+  const dev = createShare(config, { label: "dev", profiles: ["p"], via: ["webrtc"], eval: true });
+  expect(dev.eval).toBe(true);
+  expect(createShare(config, { label: "off", profiles: ["p"], via: ["webrtc"], eval: false }).eval).toBeUndefined();
+  // persists through validation (JSON round-trip of a stored shares.json)
+  expect(validateShares(JSON.parse(JSON.stringify(config))).shares.find(s => s.label === "dev")?.eval).toBe(true);
+  // a non-boolean eval is rejected
+  expect(() => validateShares({ version: 1, shares: [{ ...dev, eval: "yes" as any }] })).toThrow(/malformed/);
+});
+
+test("a share can carry the dangerous debug level, which round-trips and is validated", () => {
+  const config = empty();
+  const dbg = createShare(config, { label: "dbg", profiles: ["p"], via: ["webrtc"], debug: true });
+  expect(dbg.debug).toBe(true);
+  expect(createShare(config, { label: "plain", profiles: ["p"], via: ["webrtc"] }).debug).toBeUndefined();
+  expect(validateShares(JSON.parse(JSON.stringify(config))).shares.find(s => s.label === "dbg")?.debug).toBe(true);
+  expect(() => validateShares({ version: 1, shares: [{ ...dbg, debug: 1 as any }] })).toThrow(/malformed/);
 });
 
 test("durations", () => {
