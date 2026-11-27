@@ -786,7 +786,7 @@ export async function serve() {
         const denial = authorizeCredential(cred, listener.name, route);
         if (denial) return Response.json({ status: 1, stdout: "", stderr: `[rech] ${denial.message}\n`, error: denial.message, pending: denial.pending }, { status: denial.status });
         if (cred.kind === "device") noteDeviceUse(cred);
-        listener = { ...listener, key: presented, profiles: cred.share.profiles };
+        listener = { ...listener, key: presented, profiles: cred.share.profiles, ...(cred.share.eval ? { eval: true } : {}) };
       }
       const key = listener.key;
       const listenHost = listener.host;

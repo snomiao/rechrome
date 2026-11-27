@@ -31,6 +31,7 @@ export type Share = {
   expiresAt?: number;
   maxDevices: number;
   approve: boolean;          // each new device waits for `rech share approve`
+  eval?: boolean;            // devices may run page-context JavaScript (`eval`); off by default
   reusable?: boolean;        // the invite is not used up by one device: many redeem it (up to maxDevices) until it expires or is rotated
   redeemed?: number;         // how many times the invite was redeemed (devices removed since still count)
   devices: Device[];
@@ -114,7 +115,7 @@ export function findShare(config: ShareConfig, name: string): Share {
 
 export type NewShareOptions = {
   label: string; profiles: string[]; via: string[]; signal?: string;
-  expiresAt?: number; inviteTtlMs?: number; maxDevices?: number; approve?: boolean; reusable?: boolean; now?: number;
+  expiresAt?: number; inviteTtlMs?: number; maxDevices?: number; approve?: boolean; reusable?: boolean; eval?: boolean; now?: number;
 };
 
 /** Device cap of a reusable invite when --devices isn't given: bounds what a leaked link can enroll. */
@@ -145,6 +146,7 @@ export function createShare(config: ShareConfig, opts: NewShareOptions): Share {
     approve: !!opts.approve,
     devices: [],
   };
+  if (opts.eval) share.eval = true;
   if (opts.reusable) { share.reusable = true; share.redeemed = 0; }
   config.shares.push(share);
   return share;
